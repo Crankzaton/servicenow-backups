@@ -1,0 +1,320 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1a12b10943642110a878634a1bb8f222</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_fsm_map_integr.FSMMapProviderHelper&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Helper functions to process outbound calls to map providers&lt;/description&gt;
+        &lt;name&gt;FSMMapProviderHelper&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var FSMMapProviderHelper = Class.create();
+FSMMapProviderHelper.prototype = {
+    initialize: function() {
+        this.loggerUtil = new FSMMapProviderLoggerUtil();
+    },
+
+    buildGenericResponseForBeans: function(parseResponse, genericResponse) {
+        genericResponse.matrixId = parseResponse['requestId'];
+        genericResponse.matrix.numOrigins = parseResponse['stat']['uniqueSource'];
+        genericResponse.matrix.numDestinations =
+            parseResponse['stat']['uniqueDestination'];
+		var matrixField = parseResponse.matrixField;
+
+        parseResponse['rows'].forEach((rowElement) =&gt; {
+            for (var i = 0; i &lt; rowElement['value'].length; i++) {
+				if(matrixField =='travelTimeDistances'){
+					genericResponse.matrix[matrixField].push({'duration':Math.round(rowElement['value'][i++]),
+					'distance':Math.round(rowElement['value'][i])});
+				}
+				else{
+					genericResponse.matrix[matrixField].push(rowElement['value'][i]);
+				}
+            }
+        });
+
+        return genericResponse;
+    },
+
+	_getMatrixValue:function(parseResponse,fieldName){
+		var matrixObject = {};
+		Object.keys(parseResponse.matrix.matrixObject).forEach(function(s){
+			if(gs.nil(matrixObject[s])){
+				matrixObject[s] ={};
+			}
+			Object.keys(parseResponse.matrix.matrixObject[s]).forEach(function(d){
+				matrixObject[s][d] = parseResponse.matrix.matrixObject[s][d][fieldName];
+			});
+		});
+		return matrixObject;
+	},
+	buildGenericResponseForGoogle: function(parseResponse, genericResponse) {
+        genericResponse.matrixId = parseResponse['requestId'];
+        genericResponse.matrix.numOrigins = parseResponse.srcArray.length;
+        genericResponse.matrix.numDestinations = parseResponse.destArray.length;
+		var matrixField = parseResponse.matrixField;;
+
+        if(gs.nil(parseResponse.concatedRequest) || parseResponse.concatedRequest == false){
+        	parseResponse.srcArray.forEach((src) =&gt; {
+         	  parseResponse.destArray.forEach((dest) =&gt; {	
+				switch(parseResponse.matrixField)	{	
+					case FSMMapProviderConstants.MATRIX_FIELD.DURATION:
+						genericResponse.matrix[matrixField].push(parseResponse.matrix.matrixObject[src.id][dest.id].duration);
+						break;
+					case FSMMapProviderConstants.MATRIX_FIELD.DISTANCE:
+						genericResponse.matrix[matrixField].push(parseResponse.matrix.matrixObject[src.id][dest.id].distance);	
+						break;
+					case FSMMapProviderConstants.MATRIX_FIELD.DURATION_DISTANCE:
+						genericResponse.matrix[matrixField].push(parseResponse.matrix.matrixObject[src.id][dest.id]);
+						break;
+				}				
+            	});
+        	});
+		}
+		switch(parseResponse.matrixField)	{	
+			case FSMMapProviderConstants.MATRIX_FIELD.DURATION:
+				genericResponse.matrix.matrixObject = this._getMatrixValue(parseResponse, 'duration');
+				break;
+			case FSMMapProviderConstants.MATRIX_FIELD.DISTANCE:
+				genericResponse.matrix.matrixObject = this._getMatrixValue(parseResponse, 'distance');
+				break;
+			case FSMMapProviderConstants.MATRIX_FIELD.DURATION_DISTANCE:
+				genericResponse.matrix.matrixObject = parseResponse.matrix.matrixObject;
+				break;
+			}		
+		genericResponse.concateRequest = parseResponse.concatedRequest;
+        return genericResponse;
+    },
+
+    buildErrorResponse: function(errorType, errorMsg) {
+        return {
+            hasError: true,
+            error: {
+                errorType: errorType,
+                errorMessage: errorMsg,
+            },
+        };
+    },
+
+    buildDataResponse: function(data, logData) {
+        return {
+            hasError: false,
+            data: data,
+            logData: logData,
+        };
+    },
+
+    convertKmhToMph: function(speed) {
+        return Math.round(speed / 1.609344);
+    },
+
+    processRequest: function(vendor, request, config) {
+        try {
+            switch (vendor) {
+                case FSMMapProviderConstants.MAP_VENDOR.BEANS_AI:
+                    return new FSMBeansImpl().processRequest(request, config);
+				case FSMMapProviderConstants.MAP_VENDOR.GOOGLE:
+                    return new FSMGoogleImpl().processRequest(request, config);
+
+                default:
+                    return this.buildDataResponse(null);
+            }
+        } catch (err) {
+            return this.buildErrorResponse(
+                gs.getMessage('MapVendorExceptionError'),
+                err.toString(),
+            );
+        }
+    },
+
+    insertUsageRecord: function(usageGR, provider) {
+        usageGR.initialize();
+        usageGR.setValue('map_provider', provider);
+        usageGR.setValue('request_count', 0);
+        usageGR.setValue('location_elements_count', 0);
+        usageGR.setValue('count_start', new GlideDateTime());
+        let insertedSysId = usageGR.insert();
+        return insertedSysId;
+    },
+
+    queryUsageTable: function(provider) {
+        var usageGR = new GlideRecord(FSMMapProviderConstants.TABLE.USAGE_COUNT);
+        usageGR.orderByDesc('count_start');
+        usageGR.addEncodedQuery(
+            'map_provider=' +
+            provider +
+            '^count_startONToday@javascript:gs.beginningOfToday()@javascript:gs.endOfToday()',
+        );
+        usageGR.setLimit(1);
+        usageGR.query();
+        return usageGR;
+    },
+
+    increaseUsageCounter: function(provider, elementCount) {
+        var usageGR = new GlideRecord(FSMMapProviderConstants.TABLE.USAGE_COUNT);
+        usageGR.orderByDesc('count_start');
+        usageGR.setLimit(1);
+        usageGR.addQuery('map_provider', provider);
+        usageGR.query();
+        usageGR.next();
+
+        if (
+            usageGR.getValue('request_count') == 0 &amp;&amp;
+            usageGR.getValue('location_elements_count') == 0
+        )
+            usageGR.setValue('count_start', new GlideDateTime());
+
+        usageGR.setValue(
+            'request_count',
+            Number(usageGR.getValue('request_count')) + 1,
+        );
+
+        usageGR.setValue(
+            'location_elements_count',
+            Number(usageGR.getValue('location_elements_count')) + elementCount,
+        );
+
+        usageGR.update();
+
+        return {
+            request_count: usageGR.getValue('request_count'),
+            location_elements_count: usageGR.getValue('location_elements_count'),
+        };
+    },
+
+    formatTemplate(params, template) {
+        let res = template.replace(/{([^{}]+)}/g, function(matchedText, key) {
+            return ' ' + (gs.nil(params?.[key]) ? '' : params[key]);
+        });
+        return res;
+    },
+
+    getUserInfo: function() {
+        let userName = gs.getUserName();
+        let userId = gs.getUserID();
+        let userInfo = gs.nil(userName) ? userId : userName;
+        return userInfo;
+    },
+
+    getUsageData: function(response) {
+        let usageData = {};
+        usageData.request_count = response.logData?.request_count;
+        usageData.location_elements_count = response.logData?.location_elements_count;
+        return usageData;
+    },
+
+    addAdminLog: function(vendor, requestPayload, response, usageData) {
+        if (FSMMapProviderConstants.ENABLE_MAP_PROVIDER_LOGGING) {
+            let prefix = response.hasError ?
+                FSMMapProviderConstants.ERROR_LOG_PREFIX :
+                FSMMapProviderConstants.SUCCESS_LOG_PREFIX;
+
+            let emptyString = '" "';
+            let logObject = {};
+
+            logObject.requestPayload = requestPayload;
+            logObject.response = response;
+            logObject.mapProvider = vendor;
+            logObject.action = gs.nil(response.logData?.actionName) ?
+                emptyString :
+                response.logData.actionName;
+
+            logObject.origins = gs.nil(requestPayload?.origins) ?
+                emptyString :
+                this._removeIdFromLocation(requestPayload.origins);
+            logObject.destinations = gs.nil(requestPayload?.destinations) ?
+                emptyString :
+                this._removeIdFromLocation(requestPayload.destinations);
+
+            logObject.request_count = usageData?.request_count;
+            logObject.location_elements_count = usageData?.location_elements_count;
+            logObject.hasError = response.hasError;
+            logObject.errorMessage = gs.nil(response.error?.errorMessage) ?
+                emptyString :
+                response.error.errorMessage;
+
+            let suffix = gs.nil(usageData) ? '' : this.formatTemplate(
+                logObject,
+                FSMMapProviderConstants.LOG_SUFFIX_TEMPLATE,
+            );
+
+            this.loggerUtil.log(
+                prefix,
+                logObject,
+                suffix,
+                FSMMapProviderConstants.LOG_TEMPLATE,
+            );
+        }
+    },
+
+    addUsageLog: function(usageObj) {
+        if (FSMMapProviderConstants.ENABLE_MAP_PROVIDER_LOGGING) {
+            let userInfo = this.getUserInfo();
+            let prefix = FSMMapProviderConstants.USAGE_COUNTER_PREFIX_TEMPLATE;
+            let params = {};
+            params.userInfo = userInfo;
+            params.mapProvider = usageObj.map_provider;
+            params.request_count = usageObj.request_count;
+            params.location_elements_count = usageObj.location_elements_count;
+            params.dateInfo = new GlideDateTime().getDisplayValue();
+
+            let suffix = this.formatTemplate(
+                params,
+                FSMMapProviderConstants.USAGE_COUNTER_SUFFIX_TEMPLATE,
+            );
+
+            this.loggerUtil.log(
+                prefix,
+                params,
+                suffix,
+                FSMMapProviderConstants.USAGE_COUNTER_TEMPLATE,
+            );
+        }
+    },
+
+    _removeIdFromLocation(locArray){
+		var locArrayNoId = [];
+		locArray.forEach(function(o){
+			locArrayNoId.push( {
+				lat:o.lat,
+				lon:o.lon
+				});
+			});
+			return JSON.stringify(locArrayNoId)
+	},
+
+    type: 'FSMMapProviderHelper',
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-01-20 19:29:28&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1a12b10943642110a878634a1bb8f222&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;57&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;FSMMapProviderHelper&lt;/sys_name&gt;
+        &lt;sys_package display_value="Map Integrations for Field Service" source="sn_fsm_map_integr"&gt;32467aba87d8a910f53c7515dabb3598&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Map Integrations for Field Service"&gt;32467aba87d8a910f53c7515dabb3598&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1a12b10943642110a878634a1bb8f222&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-08-16 21:02:30&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:08</sys_created_on>
+        <sys_id>05b0301983b01210c6695855eeaad39f</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>FSMMapProviderHelper</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_05b0301983b01210c6695855eeaad39f</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:08</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,677 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>05e30d60ff9a2010635f056d793bf1b4</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.AutoResolutionSimulationHelper&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;AutoResolutionSimulationHelper&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var AutoResolutionSimulationHelper = Class.create();
+
+AutoResolutionSimulationHelper.STATE_READY = 'ready';
+AutoResolutionSimulationHelper.STATE_RUNNING = 'running';
+AutoResolutionSimulationHelper.STATE_CANCELED = 'canceled';
+AutoResolutionSimulationHelper.STATE_ERROR = 'error';
+AutoResolutionSimulationHelper.STATE_PARTIALLY_COMPLETE = 'partially_complete';
+AutoResolutionSimulationHelper.STATE_COMPLETE = 'complete';
+
+AutoResolutionSimulationHelper.runSimulationForConfig = function(simulationConfigSysID) {
+	var simulationConfigGr = new GlideRecord(AutoResolutionConstants.SIMULATION_CONFIG_TABLE_NAME);
+	simulationConfigGr.get(simulationConfigSysID);
+	simulationConfigGr.setValue('state', AutoResolutionSimulationHelper.STATE_RUNNING);
+	simulationConfigGr.setValue('message', '');
+
+	var languageConfigResults = AutoResolutionLanguageHelper.getSolutionNameAndVersionForLanguage(simulationConfigGr.getValue('auto_res_config'), 'en');
+	
+	var simulationRunGr = new GlideRecord(AutoResolutionConstants.SIMULATION_RUN_TABLE_NAME);
+	simulationRunGr.setValue('config', simulationConfigSysID);
+	simulationRunGr.setValue('state', AutoResolutionSimulationHelper.STATE_RUNNING);
+	simulationRunGr.setValue('query_run', simulationConfigGr.getValue('record_set'));
+	simulationRunGr.setValue('solution_name', languageConfigResults['solution_name']);
+	simulationRunGr.setValue('latest_trained_version', languageConfigResults['solution_version']);
+	simulationRunGr.insert();
+
+	simulationConfigGr.update();
+
+	var logger = new AutoResolutionLoggingUtils()
+		.withName('AutoResolutionSimulationHelper')
+		.withSimulation(simulationRunGr.getUniqueValue())
+		.withSimulationConfiguration(simulationConfigGr.getUniqueValue())
+		.createLogger();
+	
+	var flowContextSysID;
+	try {
+		var inputs = {};
+		inputs['simulation_run_sys_id'] = simulationRunGr.getValue('sys_id'); // String 
+		inputs['ml_prediction_batch_size'] = gs.getProperty(AutoResolutionConstants.SIM_ML_PREDICTION_BATCH_SIZE_PROPERTY, 
+																		AutoResolutionConstants.SIM_ML_PREDICTION_BATCH_SIZE_DEFAULT); 
+		inputs['continue_on_batch_error'] = gs.getProperty(AutoResolutionConstants.SIM_CONTNUE_ON_BATCH_ERROR_PROPERTY, 
+																AutoResolutionConstants.SIM_CONTNUE_ON_BATCH_ERROR_PROPERTY_DEFAULT) === 'true'; 
+		inputs['max_parallel_blocks_to_run'] = gs.getProperty(AutoResolutionConstants.SIM_MAX_PARALLEL_BLOCKS_TO_RUN_PROPERTY, 
+																		AutoResolutionConstants.SIM_MAX_PARALLEL_BLOCKS_TO_RUN_DEFAULT);
+		inputs['max_records_per_block'] = gs.getProperty(AutoResolutionConstants.SIM_MAX_RECORDS_PER_BLOCK_PROPERTY,
+																	AutoResolutionConstants.SIM_MAX_RECORDS_PER_BLOCK_DEFAULT);
+		inputs['block_timeout_in_minutes'] = gs.getProperty(AutoResolutionConstants.SIM_BLOCK_TIMEOUT_IN_MINS_PROPERTY, 
+																		AutoResolutionConstants.SIM_BLOCK_TIMEOUT_IN_MINS_DEFAULT);
+
+		flowContextSysID = sn_fd.FlowAPI.getRunner().subflow('global.autoresolution_run_simulation_blocks')
+							.inBackground().withInputs(inputs).run().getContextId();
+		logger.debug('Starting simulation flow={0} with inputs {1}', 'global.autoresolution_run_simulation_blocks', JSON.stringify(inputs));
+	} catch (error) {
+		logger.error('Error starting simulation flow: {0}', error);
+		simulationConfigGr.setValue('state', AutoResolutionSimulationHelper.STATE_ERROR);
+		simulationConfigGr.update();
+		simulationRunGr.setValue('state', AutoResolutionSimulationHelper.STATE_ERROR);
+		simulationRunGr.setValue('completed_time', new GlideDateTime().getValue());
+		simulationRunGr.update();
+		throw error;
+	}
+	
+	simulationRunGr.setValue('flow_context', flowContextSysID);
+	simulationRunGr.update();
+};
+
+AutoResolutionSimulationHelper.assessNoSimulationRunning = function() {
+	var simulationRunGa = new GlideAggregate(AutoResolutionConstants.SIMULATION_RUN_TABLE_NAME);
+	simulationRunGa.addQuery('state', AutoResolutionSimulationHelper.STATE_RUNNING);
+	simulationRunGa.addAggregate('COUNT');
+	simulationRunGa.query();
+	
+	var simulationRunCount = simulationRunGa.next() ? simulationRunGa.getAggregate('COUNT') : 0;
+	if (simulationRunCount &gt; 0)
+		throw gs.getMessage('Another simulation is in progress. Please try again later.');
+};
+
+AutoResolutionSimulationHelper.assessRecordCountForSimulationConfig = function(simulationConfigSysID) {
+	var simulationConfigGr = new GlideRecord(AutoResolutionConstants.SIMULATION_CONFIG_TABLE_NAME);
+	if (!simulationConfigGr.get(simulationConfigSysID)) {
+		new AutoResolutionLoggingUtils()
+			.withName('AutoResolutionSimulationHelper')
+			.withSimulationConfiguration(simulationConfigSysID)
+			.createLogger()
+			.debug('Invalid simulation configuration sys id: {0}', simulationConfigSysID);
+		return;
+	}
+	
+	var taskGa = new GlideAggregate(simulationConfigGr.auto_res_config.getRefRecord().getValue('target_table_name'));
+	taskGa.addEncodedQuery(simulationConfigGr.getValue('record_set'));
+	taskGa.addAggregate('COUNT');
+	taskGa.query();
+	
+	var recordCount = 0;
+	if (taskGa.next())
+		recordCount = taskGa.getAggregate('COUNT');
+
+	var maxRecordsAllowed = gs.getProperty(AutoResolutionConstants.SIM_MAX_ALLOWED_RECORDS_PROPERTY,
+														AutoResolutionConstants.SIM_MAX_ALLOWED_RECORDS_DEFAULT);
+
+	if (recordCount == 0)
+		throw gs.getMessage('Your Record set returned 0 records. Change the Record set condition to return between 1 and {0} records', maxRecordsAllowed);
+
+	if (recordCount &gt; parseInt(maxRecordsAllowed))
+		throw gs.getMessage('Your Record set returned {0} records, but {1} records is the maximum allowed. Change the Record set condition so that it returns {1} records or less.', [recordCount, maxRecordsAllowed]);
+};
+
+AutoResolutionSimulationHelper.cancelCurrentRunForConfig = function(simulationConfigSysID, reasonMessage) {
+	var logger = new AutoResolutionLoggingUtils()
+		.withName('AutoResolutionSimulationHelper')
+		.withSimulationConfiguration(simulationConfigSysID)
+		.createLogger();
+
+	try {
+		var simulationRunGr = new GlideRecord(AutoResolutionConstants.SIMULATION_RUN_TABLE_NAME);
+		simulationRunGr.addQuery('config', simulationConfigSysID);
+		simulationRunGr.addQuery('state', AutoResolutionSimulationHelper.STATE_RUNNING);
+		simulationRunGr.query();
+		
+		if (!simulationRunGr.next()) {
+			logger.debug('AutoResolutionSimulationHelper.cancelCurrentRunForConfig: No runs to cancel');
+			return;
+		}
+	
+		// Cancel block runs and mark update the statuses accordingly
+		_cancelSimulationRunBlocks(simulationRunGr.getValue('sys_id'));
+		var flowContextSysID = simulationRunGr.getValue('flow_context');
+
+		sn_fd.FlowAPI.cancel(flowContextSysID, reasonMessage);
+	
+		simulationRunGr.setValue('state', AutoResolutionSimulationHelper.STATE_CANCELED);
+		simulationRunGr.setValue('completed_time', new GlideDateTime().getValue());
+		simulationRunGr.setValue('message', reasonMessage + '\n' + simulationRunGr.getValue('message'));
+		simulationRunGr.update();
+		
+		var simulationConfigGr = simulationRunGr.config.getRefRecord();
+		simulationConfigGr.setValue('state', AutoResolutionSimulationHelper.STATE_CANCELED);
+		simulationConfigGr.setValue('message', reasonMessage);
+		simulationConfigGr.update();
+	} catch(error) {
+		logger.error('Error canceling simulation: {0}', error);
+		throw error;
+	}
+};
+
+AutoResolutionSimulationHelper.createBlocksForRun = function(simulationRunSysID, maxRecordsPerBlock) {
+	var errorMessage;
+	var logger = new AutoResolutionLoggingUtils()
+		.withName('AutoResolutionSimulationHelper')
+		.withSimulation(simulationRunSysID)
+		.createLogger();
+	var simulationRunGr = new GlideRecord(AutoResolutionConstants.SIMULATION_RUN_TABLE_NAME);
+	if (!simulationRunGr.get(simulationRunSysID)) {
+		errorMessage = 'Invalid simulation run sys id: ' + simulationRunSysID;
+		logger.error('[AutoResolutionSimulationHelper.createBlocksForRun]: {0}', errorMessage);
+		throw errorMessage;
+	}
+	var runContext = {};
+	try {
+
+		var simulationConfigGr = simulationRunGr.config.getRefRecord();
+		var autoResolutionConfigGr = simulationConfigGr.auto_res_config.getRefRecord();
+		var targetTableName = autoResolutionConfigGr.getValue('target_table_name');
+		var languageToSolutionMap = AutoResolutionLanguageHelper.getLanguageToSolutionMap(autoResolutionConfigGr.getValue('sys_id'));
+		var encodedQuery = simulationConfigGr.getValue('record_set');
+		runContext[AutoResolutionLoggingUtils.SIMULATION_CONFIGURATION] = simulationConfigGr.getUniqueValue();
+		runContext = new sn_log.GlideLogContext(runContext);
+
+		if (Object.keys(languageToSolutionMap) == 0) {
+			throw gs.getMessage('Before running simulation, model training for at least one language must be complete.');
+		}
+
+		var solutionName;
+		var blockCreationInputs = {simulationConfigGr: simulationConfigGr,
+                                   simulationRunSysID: simulationRunSysID,
+                                   targetTableName: targetTableName,
+                                   encodedQuery: encodedQuery,
+                                   maxRecordsPerBlock: maxRecordsPerBlock};
+
+		for (var languageCode in languageToSolutionMap) {
+			solutionName = languageToSolutionMap[languageCode];
+			blockCreationInputs.languageCode = languageCode;			
+			blockCreationInputs.solutionName = solutionName;
+			_createBlocksForLanguage(blockCreationInputs, logger);
+		}
+	} catch(error) {
+		logger.error('[AutoResolutionSimulationHelper.createBlocksForRun]: Error creating blocks for simulation run: {0}: {1}',
+			simulationRunSysID, error);
+		throw error;
+	} finally {
+		runContext.clear();
+	}
+};
+
+AutoResolutionSimulationHelper.runBlocks = function(simulationRunSysID, numberOfBlocks, batchSize, timeoutInMinutes, continueOnBatchError) {
+	var simulationRunBlockGr = new GlideRecord(AutoResolutionConstants.SIMULATION_RUN_BLOCK_TABLE_NAME);
+	simulationRunBlockGr.addQuery('state', AutoResolutionSimulationHelper.STATE_READY);
+	simulationRunBlockGr.addQuery('simulation_run', simulationRunSysID);
+	simulationRunBlockGr.orderBy('sys_created_on');
+	simulationRunBlockGr.setLimit(numberOfBlocks);
+	simulationRunBlockGr.query();
+	
+	while (simulationRunBlockGr.next())
+		_runSimulationRunBlock(simulationRunBlockGr.getValue('sys_id'), batchSize, timeoutInMinutes, continueOnBatchError);
+};
+
+AutoResolutionSimulationHelper.evaluateAndUpdateResult = function(simulationRunSysID) {
+	var simulationRunGr = new GlideRecord(AutoResolutionConstants.SIMULATION_RUN_TABLE_NAME);
+	simulationRunGr.get(simulationRunSysID);
+	
+	var simulationRunBlockGa = new GlideAggregate(AutoResolutionConstants.SIMULATION_RUN_BLOCK_TABLE_NAME);
+	simulationRunBlockGa.addQuery('simulation_run', simulationRunSysID);
+	simulationRunBlockGa.addAggregate('COUNT');
+	simulationRunBlockGa.query();
+	
+	var totalBlocks = simulationRunBlockGa.next() ? simulationRunBlockGa.getAggregate('COUNT') : 0;
+	simulationRunBlockGa = new GlideAggregate(AutoResolutionConstants.SIMULATION_RUN_BLOCK_TABLE_NAME);
+	simulationRunBlockGa.addQuery('simulation_run', simulationRunSysID);
+	simulationRunBlockGa.groupBy('state');
+	simulationRunBlockGa.addAggregate('COUNT');
+	simulationRunBlockGa.query();
+	
+	var blockNumbersByState = {};
+	while (simulationRunBlockGa.next())
+		blockNumbersByState[simulationRunBlockGa.getValue('state')] = parseInt(simulationRunBlockGa.getAggregate('COUNT'));
+
+	var runningBlocks = gs.nil(blockNumbersByState[AutoResolutionSimulationHelper.STATE_RUNNING]) ? 0 : blockNumbersByState[AutoResolutionSimulationHelper.STATE_RUNNING];
+	if (runningBlocks &gt; 0)
+		return;
+	
+	var errorBlocks = gs.nil(blockNumbersByState[AutoResolutionSimulationHelper.STATE_ERROR]) ? 0 : blockNumbersByState[AutoResolutionSimulationHelper.STATE_ERROR];
+	var canceledBlocks = gs.nil(blockNumbersByState[AutoResolutionSimulationHelper.STATE_CANCELED]) ? 0 : blockNumbersByState[AutoResolutionSimulationHelper.STATE_CANCELED];
+	var partiallyCompletedBlocks = gs.nil(blockNumbersByState[AutoResolutionSimulationHelper.STATE_PARTIALLY_COMPLETE]) ? 0 : blockNumbersByState[AutoResolutionSimulationHelper.STATE_PARTIALLY_COMPLETE];
+	var finalState = AutoResolutionSimulationHelper.STATE_COMPLETE;
+	if (errorBlocks &gt; 0) 
+		finalState = AutoResolutionSimulationHelper.STATE_ERROR;
+	else if (canceledBlocks &gt; 0)
+		finalState = AutoResolutionSimulationHelper.STATE_CANCELED;
+	else if (partiallyCompletedBlocks &gt; 0)
+		finalState = AutoResolutionSimulationHelper.STATE_PARTIALLY_COMPLETE;
+
+	// This will populate the following fields on simulation run record: records_matching_intent, records_match_active_topic, records_match_inactive_topic &amp; records_no_matching_intent
+	_evaluateIntentMatchNumbers(simulationRunSysID);
+	
+	var resultMessage = _getResultMessageStringForSimulationRun(simulationRunSysID);
+	var summaryString = _getSummaryStringForSimulationRun(simulationRunSysID);
+	
+	simulationRunGr.setValue('state', finalState);
+	simulationRunGr.setValue('message', resultMessage);
+	simulationRunGr.setValue('summary', summaryString);
+	simulationRunGr.setValue('completed_time', new GlideDateTime().getValue());
+	simulationRunGr.update();
+	
+	// Update state and message on simulation configuration as well
+	var simulationConfigGr = simulationRunGr.config.getRefRecord();
+	simulationConfigGr.setValue('state', finalState);
+	simulationConfigGr.setValue('message', resultMessage);
+	simulationConfigGr.update();
+};
+
+AutoResolutionSimulationHelper.getProgressPercentForSimulationRun = function(simulationRunSysID) {
+	var simulationRunGr = new GlideRecord(AutoResolutionConstants.SIMULATION_RUN_TABLE_NAME);
+	simulationRunGr.get(simulationRunSysID);
+	
+	var totalRecordsInSimulation = parseInt(simulationRunGr.getValue('total_records'));
+	if (totalRecordsInSimulation == 0) {
+		new AutoResolutionLoggingUtils()
+			.withName('AutoResolutionSimulationHelper')
+			.withSimulation(simulationRunSysID)
+			.createLogger()
+			.debug('Total records is 0. Could not compute progress percent for simulation run: {0}', simulationRunSysID);
+		return 0;
+	}
+	
+	var simulationContextGa = new GlideAggregate(AutoResolutionConstants.SIMULATION_CONTEXT_TABLE_NAME);
+	simulationContextGa.addQuery('simulation_run_block.simulation_run', simulationRunSysID);
+	simulationContextGa.addNotNullQuery('intent_topic_state');
+	simulationContextGa.addAggregate('COUNT');
+	simulationContextGa.query();
+	
+	var completedSimulations = simulationContextGa.next() ? parseInt(simulationContextGa.getAggregate('COUNT')) : 0;
+	
+	return (completedSimulations / totalRecordsInSimulation) * 100;
+};
+
+/**
+ * Enable scheduled job on simulation configuration
+ * @param simulationConfigSysID : string
+ */
+AutoResolutionSimulationHelper.enableScheduledJob = function(simulationConfigSysID) {
+	var simulationConfigGr = new GlideRecord(AutoResolutionConstants.SIMULATION_CONFIG_TABLE_NAME);
+	simulationConfigGr.get(simulationConfigSysID);
+	var scheduledJobSysID = simulationConfigGr.getValue('scheduled_job');
+	
+	// if we don't already have it, create it
+	if (gs.nil(scheduledJobSysID)) {
+		var scheduledJobGr = new GlideRecord('sysauto_script');
+		scheduledJobGr.initialize();
+		scheduledJobGr.setValue('name', 'IAR Scheduled Simulation for ' + simulationConfigGr.getValue('name'));
+		scheduledJobGr.setValue('script', 'global.AutoResolutionSimulationHelper.runScheduledSimulationForConfig(\''
+			+ simulationConfigSysID + '\', current.getUniqueValue());');
+		scheduledJobGr.setValue('active', true);
+		scheduledJobSysID = scheduledJobGr.insert();
+		
+		simulationConfigGr.setValue('scheduled_job', scheduledJobSysID);
+		simulationConfigGr.update();
+		return;
+	}
+
+	_updateScheduledJobState(scheduledJobSysID, true);
+};
+
+/**
+ * Disable scheduled job on simulation configuration
+ * @param simulationConfigSysID : string
+ */
+AutoResolutionSimulationHelper.disableScheduledJob = function(simulationConfigSysID) {
+	var simulationConfigGr = new GlideRecord(AutoResolutionConstants.SIMULATION_CONFIG_TABLE_NAME);
+	simulationConfigGr.get(simulationConfigSysID);
+	var scheduledJobSysID = simulationConfigGr.getValue('scheduled_job');
+	_updateScheduledJobState(scheduledJobSysID, false);
+};
+
+/**
+ * Delete the scheduled job
+ * @param scheduledJobSysID : string
+ */
+AutoResolutionSimulationHelper.deleteScheduledJob = function(scheduledJobSysID) {
+	var scheduledJobGr = _getScheduledJob(scheduledJobSysID);
+	if (gs.nil(scheduledJobGr)) {
+		return;
+	}
+	scheduledJobGr.deleteRecord();
+};
+
+/**
+ * Method to be run inside the scheduled job of the simulation configuration
+ * @param simulationConfigSysID : string
+ * @param scheduledJobSysID : string
+ */
+AutoResolutionSimulationHelper.runScheduledSimulationForConfig = function(simulationConfigSysID, scheduledJobSysID) {
+	var logger = new AutoResolutionLoggingUtils()
+		.withName('AutoResolutionSimulationHelper')
+		.withSimulationConfiguration(simulationConfigSysID)
+		.createLogger();
+	
+	// check to make sure sim config still exists
+	var simulationConfigGr = new GlideRecord(AutoResolutionConstants.SIMULATION_CONFIG_TABLE_NAME);
+	if (!simulationConfigGr.get(simulationConfigSysID)) {
+		logger.debug('Error running scheduled simulation: simulation configuration does not exist; deleting scheduled job');
+		AutoResolutionSimulationHelper.deleteScheduledJob(scheduledJobSysID);
+	}
+	
+	try {
+		AutoResolutionSimulationHelper.assessNoSimulationRunning();
+		AutoResolutionSimulationHelper.assessRecordCountForSimulationConfig(simulationConfigSysID);
+		AutoResolutionSimulationHelper.runSimulationForConfig(simulationConfigSysID);
+	} catch(error) {
+		logger.debug('Error running scheduled simulation: {0}', error);
+	}
+};
+	
+function _runSimulationRunBlock(simulationRunBlockSysID, batchSize, timeoutInMinutes, continueOnBatchError) {
+	var simulationRunBlockGr = new GlideRecord(AutoResolutionConstants.SIMULATION_RUN_BLOCK_TABLE_NAME);
+	if (!simulationRunBlockGr.get(simulationRunBlockSysID))
+		throw 'Invalid simulation run block sys id: ' + simulationRunBlockSysID;
+	
+	var flowContextSysID;
+	var timeoutInMilliSeconds = gs.nil(timeoutInMinutes) ? 3 * 60 * 1000 : timeoutInMinutes * 60 * 1000;
+	try {
+		simulationRunBlockGr.setValue('state', AutoResolutionSimulationHelper.STATE_RUNNING);
+		simulationRunBlockGr.update();
+		
+		var inputs = {};
+		inputs['simulation_run_block_sys_id'] = simulationRunBlockSysID;
+		inputs['batch_size'] = batchSize;
+		inputs['continue_on_batch_error'] = continueOnBatchError;
+
+		flowContextSysID = sn_fd.FlowAPI.getRunner().action(AutoResolutionConstants.SIMULATION_BLOCK_RUNNER_ACTION)
+							.inBackground().withInputs(inputs).timeout(timeoutInMilliSeconds).run().getContextId();
+	} catch(error) {
+		new AutoResolutionLoggingUtils()
+			.withName('AutoResolutionSimulationHelper')
+			.withSimulation(simulationRunBlockGr.getValue('simulation_run'))
+			.createLogger()
+			.error('Error invoking action for block with sys id: {0}', simulationRunBlockSysID, error);
+		throw error;
+	}
+		
+	// If the flow invocation was succesful, update the context ID
+	simulationRunBlockGr.setValue('flow_context', flowContextSysID);
+	simulationRunBlockGr.update();
+}
+
+/**
+*  @param {inputs}       {simulationConfigGr, simulationRunSysID, targetTableName, encodedQuery, maxRecordsPerBlock, languageCode, solutionName}
+**/
+function _createBlocksForLanguage(inputs, logger) {
+	
+	var systemLanguage = gs.getProperty('glide.sys.language');
+		
+	var targetGr = new GlideRecord(inputs.targetTableName);
+	targetGr.addEncodedQuery(inputs.encodedQuery);
+	var preferredLanguageCondition = targetGr.addQuery('caller_id.preferred_language', inputs.languageCode);
+	if (systemLanguage === inputs.languageCode) {
+		logger.debug('System language is {0}. Incidents whose caller does not have a preferred language will be considered to be in this language',
+			systemLanguage);
+		preferredLanguageCondition.addOrCondition('caller_id.preferred_language', '');
+	}
+	
+	targetGr.query();
+	
+	if (targetGr.getRowCount() == 0) {
+		logger.warn('[AutoResolutionSimulationHelper.createBlocksForRun]: No records found for the enocded query, for the configuration: {0}',
+			inputs.simulationConfigGr.getValue('name'));
+		return;
+	}
+	
+	var blockNameSuffixIndex = 1;
+	var blockNameSuffix = 'Block_' + inputs.languageCode + '_';
+	var simulationBlockGr = new GlideRecord(AutoResolutionConstants.SIMULATION_RUN_BLOCK_TABLE_NAME);
+	simulationBlockGr.setValue('simulation_run', inputs.simulationRunSysID);
+	simulationBlockGr.setValue('name', blockNameSuffix +  blockNameSuffixIndex);
+	simulationBlockGr.setValue('language_code', inputs.languageCode);
+	simulationBlockGr.insert();
+		
+	var simulationContextGr = new GlideRecord(AutoResolutionConstants.SIMULATION_CONTEXT_TABLE_NAME);
+	var currentRecordIndex = 0;
+	while (targetGr.next()) {
+		simulationContextGr.setValue('task', targetGr.getValue('sys_id'));
+		simulationContextGr.setValue('simulation_run_block', simulationBlockGr.getValue('sys_id'));
+		simulationContextGr.setValue('task_creation_language_code', inputs.languageCode);
+		simulationContextGr.insert();
+			
+		currentRecordIndex++;
+		if (currentRecordIndex % inputs.maxRecordsPerBlock == 0 &amp;&amp; targetGr.hasNext()) {
+			blockNameSuffixIndex++;
+			simulationBlockGr.initialize();
+			simulationBlockGr.setValue('simulation_run', inputs.simulationRunSysID);
+			simulationBlockGr.setValue('name', blockNameSuffix +  blockNameSuffixIndex);
+			simulationBlockGr.setValue('language_code', inputs.languageCode);			
+			simulationBlockGr.insert();
+		}
+		
+		simulationContextGr.initialize();
+	}
+}
+
+function _getResultMessageStringForSimulationRun(simulationRunSysID) {
+	var simulationRunBlockGr = new GlideRecord(AutoResolutionConstants.SIMULATION_RUN_BLOCK_TABLE_NAME);
+	simulationRunBlockGr.addQuery('simulation_run', simulationRunSysID);
+	simulationRunBlockGr.addQuery('state', 'IN', [AutoResolutionSimulationHelper.STATE_ERROR, AutoResolutionSimulationHelper.STATE_PARTIALLY_COMPLETE].join(','));
+	simulationRunBlockGr.query();
+	
+	var messageString = '';
+	while (simulationRunBlockGr.next()) {
+		if (!gs.nil(simulationRunBlockGr.getValue('message')))
+			messageString += simulationRunBlockGr.getValue('message') + '\n';
+	}
+	
+	return messageString;
+}
+
+function _getBlockCountByStateForSimulationRun(state, simulationRunSysID) {
+	var simulationRunBlockGa = new GlideAggregate(AutoResolutionConstants.SIMULATION_RUN_BLOCK_TABLE_NAME);
+	simulationRunBlockGa.addQuery('state', state);
+	simulationRunBlockGa.addQuery('simulation_run', simulationRunSysID);
+	simulationRunBlockGa.addAggregate('COUNT');
+	simulationRunBlockGa.query();
+	
+	return simulationRunBlockGa.next() ? simulationRunBlockGa.getAggregate('COUNT') : 0;
+}
+
+function _cancelSimulationRunBlocks(simulationRunSysID) {
+	var simulationRunBlockGr = new GlideRecord(AutoResolutionConstants.SIMULATION_RUN_BLOCK_TABLE_NAME);
+	simulationRunBlockGr.addQuery('simulation_run', simulationRunSysID);
+	simulationRunBlockGr.addQuery('state', 'IN', [AutoResolutionSimulationHelper.STATE_READY, AutoResolutionSimulationHelper.STATE_RUNNING].join());
+	simulationRunBlockGr.query();
+	
+	var flowContextSysID;
+	while (simulationRunBlockGr.next()) {
+		flowContextSysID = simulationRunBlockGr.getValue('flow_context');
+		if (!gs.nil(flowContextSysID))
+			sn_fd.FlowAPI.cancel(flowContextSysID);
+		
+		simulationRunBlockGr.setValue('state', AutoResolutionSimulationHelper.STATE_CANCELED);
+		simulationRunBlockGr.update();
+	}
+}
+
+function _evaluateIntentMatchNumbers(simulationRunSysID) {
+	var simulationRunGr = new GlideRecord(AutoResolutionConstants.SIMULATION_RUN_TABLE_NAME);
+	simulationRunGr.get(simulationRunSysID);
+	
+	// Evaluate records_matching_intent &amp; records_no_matching_intent
+	var count;
+	var simulationContextGa = new GlideAggregate(AutoResolutionConstants.SIMULATION_CONTEXT_TABLE_NAME);
+	simulationContextGa.addQuery('simulation_run_block.simulation_run', simulationRunSysID);
+	simulationContextGa.addAggregate('COUNT');
+	simulationContextGa.groupBy('intent_match');
+	simulationContextGa.query();
+	
+	while (simulationContextGa.next()) {
+		if (simulationContextGa.getValue('intent_match') === 'true')
+			simulationRunGr.setValue('records_matching_intent', simulationContextGa.getAggregate('COUNT'));
+		else
+			simulationRunGr.setValue('records_no_matching_intent', simulationContextGa.getAggregate('COUNT'));
+	}
+
+	// Evaluate records_match_active_topic &amp; records_match_inactive_topic
+	var foundMatch = false;
+	simulationContextGa = new GlideAggregate(AutoResolutionConstants.SIMULATION_CONTEXT_TABLE_NAME);
+	simulationContextGa.addQuery('simulation_run_block.simulation_run', simulationRunSysID);
+	simulationContextGa.addQuery('intent_match', 'true');
+	simulationContextGa.addAggregate('COUNT');
+	simulationContextGa.groupBy('reason');
+	simulationContextGa.query();
+	
+	while (simulationContextGa.next()) {
+		if (simulationContextGa.getValue('reason') === 'Topic inactive') {
+			simulationRunGr.setValue('records_match_inactive_topic', simulationContextGa.getAggregate('COUNT'));
+			simulationRunGr.setValue('records_match_active_topic', simulationContextGa.getTotal('COUNT') - simulationContextGa.getAggregate('COUNT'));
+			foundMatch = true;
+		}
+	}
+	if (!foundMatch) {
+		simulationRunGr.setValue('records_match_inactive_topic', 0);
+		simulationRunGr.setValue('records_match_active_topic', simulationContextGa.getTotal('COUNT'));
+	}
+
+	// Evaluate no_intent_found &amp; unsupported_intent
+	foundMatch = false;
+	simulationContextGa = new GlideAggregate(AutoResolutionConstants.SIMULATION_CONTEXT_TABLE_NAME);
+	simulationContextGa.addQuery('simulation_run_block.simulation_run', simulationRunSysID);
+	simulationContextGa.addQuery('intent_match', 'false');
+	simulationContextGa.addAggregate('COUNT');
+	simulationContextGa.groupBy('nlu_intent');
+	simulationContextGa.query();
+
+
+	while (simulationContextGa.next()) {
+		if (simulationContextGa.getValue('nlu_intent') === 'NO_INTENT') {
+			simulationRunGr.setValue('no_intent_found', simulationContextGa.getAggregate('COUNT'));
+			simulationRunGr.setValue('unsupported_intent', simulationContextGa.getTotal('COUNT') - simulationContextGa.getAggregate('COUNT'));
+			foundMatch = true;
+		}
+	}
+	if (!foundMatch) {
+		simulationRunGr.setValue('no_intent_found', 0);
+		simulationRunGr.setValue('unsupported_intent', simulationContextGa.getTotal('COUNT'));
+	}
+
+	// Evaluate matching_active_intent &amp; matching_inactive_intent
+	foundMatch = false;
+	simulationContextGa = new GlideAggregate(AutoResolutionConstants.SIMULATION_CONTEXT_TABLE_NAME);
+	simulationContextGa.addQuery('simulation_run_block.simulation_run', simulationRunSysID);
+	simulationContextGa.addQuery('intent_match', 'true');
+	simulationContextGa.addAggregate('COUNT');
+	simulationContextGa.groupBy('reason');
+	simulationContextGa.query();
+
+
+	while (simulationContextGa.next()) {
+		if (simulationContextGa.getValue('reason') === 'Intent topic map record is inactive') {
+			simulationRunGr.setValue('matching_inactive_intent', simulationContextGa.getAggregate('COUNT'));
+			simulationRunGr.setValue('matching_active_intent', simulationContextGa.getTotal('COUNT') - simulationContextGa.getAggregate('COUNT'));
+			foundMatch = true;
+		}
+	}
+	if (!foundMatch) {
+		simulationRunGr.setValue('matching_inactive_intent', 0);
+		simulationRunGr.setValue('matching_active_intent', simulationContextGa.getTotal('COUNT'));
+	}
+
+	// Evaluate resolution_rate
+	foundMatch = false;
+	var totalRecordCount = simulationRunGr.getValue('total_records');
+	simulationContextGa = new GlideAggregate(AutoResolutionConstants.SIMULATION_CONTEXT_TABLE_NAME);
+	simulationContextGa.addQuery('simulation_run_block.simulation_run', simulationRunSysID);
+	simulationContextGa.addQuery('intent_match', 'true');
+	simulationContextGa.addAggregate('COUNT');
+	simulationContextGa.groupBy('reason');
+	simulationContextGa.query();
+
+	while (simulationContextGa.next()) {
+		if (gs.nil(simulationContextGa.getValue('reason'))) { // No reason means it neither has inactive topic nor inactive intent topic map record
+			simulationRunGr.setValue('resolution_rate', (simulationContextGa.getAggregate('COUNT') / totalRecordCount) * 100);
+			foundMatch = true;
+		}
+	}
+	if (!foundMatch) {
+		simulationRunGr.setValue('resolution_rate', 0);
+	}
+	
+	simulationRunGr.update();
+}
+
+function _getSummaryStringForSimulationRun(simulationRunSysID) {
+	var simulationRunGr = new GlideRecord(AutoResolutionConstants.SIMULATION_RUN_TABLE_NAME);
+	simulationRunGr.get(simulationRunSysID);
+	
+	var summaryString = '';
+	summaryString += 'Total records in simulation: ' + simulationRunGr.getValue('total_records') + '\n';
+	summaryString += 'Records with matching intent: ' + simulationRunGr.getValue('records_matching_intent') + '\n';
+	summaryString += 'Records with matching intent active topic: ' + simulationRunGr.getValue('records_match_active_topic') + '\n';
+	summaryString += 'Records with matching intent inactive topic: ' + simulationRunGr.getValue('records_match_inactive_topic') + '\n';
+	summaryString += 'Records without matching intent: ' + simulationRunGr.getValue('records_no_matching_intent') + '\n';
+	
+	return summaryString;
+}
+
+function _getScheduledJob(scheduledJobSysID) {
+	if (gs.nil(scheduledJobSysID)) {
+		return null;
+	}
+	var scheduledJobGr = new GlideRecord('sysauto_script');
+	scheduledJobGr.get(scheduledJobSysID);
+	return scheduledJobGr;
+};
+
+/**
+ * Set scheduled job active state true or false
+ * @param scheduledJobSysID : string
+ * @param state : boolean
+ * @private
+ */
+function _updateScheduledJobState(scheduledJobSysID, state) {
+	var scheduledJobGr = _getScheduledJob(scheduledJobSysID);
+	if (gs.nil(scheduledJobGr) || scheduledJobGr.active == state) {
+		return;
+	}
+	scheduledJobGr.setValue('active', state);
+	scheduledJobGr.update();
+}
+]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-02-09 17:56:19&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;05e30d60ff9a2010635f056d793bf1b4&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;198&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AutoResolutionSimulationHelper&lt;/sys_name&gt;
+        &lt;sys_package display_value="Issue Auto-Resolution" source="com.glide.cs.auto_resolution"&gt;81ddf4a03c75311068bcf327dfe37fa6&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_05e30d60ff9a2010635f056d793bf1b4&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-04-03 17:58:13&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:20</sys_created_on>
+        <sys_id>3240fc5583b01210c6695855eeaad375</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AutoResolutionSimulationHelper</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_3240fc5583b01210c6695855eeaad375</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:20</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

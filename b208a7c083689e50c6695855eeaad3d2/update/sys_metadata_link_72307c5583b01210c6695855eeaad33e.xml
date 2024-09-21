@@ -1,0 +1,554 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>037387c5538101105400ddeeff7b120b</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.AutoResolutionAISearchResult&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;An object that represents a search result that contains many Genius and search results&lt;/description&gt;
+        &lt;name&gt;AutoResolutionAISearchResult&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var AutoResolutionAISearchResult = Class.create();
+
+AutoResolutionAISearchResult.prototype = {
+	
+	record:null,
+	geniusSearchMaxLimit: null, // overriden max number
+	searchMaxLimit: null, // overriden max number
+	
+    initialize: function(param) {
+		
+		if (typeof param === 'string') {
+			// if the param is string, it's the sysId of the record
+			this.record = new GlideRecord(global.AutoResolutionConstants.AI_SEARCH_RESULT_TABLE_NAME);
+			
+			if (!this.record.get(param))
+				throw 'Record not found';
+		
+		} else if (param instanceof GlideRecord) {
+			this.record = param;
+		}
+	},
+	
+	/**
+	* after the record was updated from outside, the method will fetch the same record from db
+	* After this call, the record will be up to date
+	*/
+	refresh: function() {
+		this.initialize(this.record.getUniqueValue(), this.vaContext);
+	},
+	
+	/**
+	* Enforces the max search result size for Genius search
+	*/
+	setGeniusSearchMaxLimit: function(geniusSearchMaxLimit) {
+		this.geniusSearchMaxLimit = parseInt(geniusSearchMaxLimit);
+	},
+	
+	/**
+	* Enforces the max search result size for regular search
+	*/
+	setSearchMaxLimit: function(searchMaxLimit) {
+		this.searchMaxLimit = parseInt(searchMaxLimit);
+	},
+	
+	/**
+	* Returns the allowed max size of genius results
+	*/
+	getAllowedMaxGeniusSearchLimit: function() {
+		
+		// if the max size is set from outside, use the value.
+		if (!gs.nil(this.geniusSearchMaxLimit)) 
+			return this.geniusSearchMaxLimit;
+		
+		// if the app config is not set, use the default size
+		if (gs.nil(this.record.search_app_config))
+			return global.AISearchConstants.DEFAULT_GENIUS_SEARCH_RESULT_LIMIT;
+		
+		var limit = this.record.search_app_config.genius_results_limit;
+		
+		return gs.nil(limit) ? 
+			global.AISearchConstants.DEFAULT_GENIUS_SEARCH_RESULT_LIMIT : 
+				parseInt(this.record.search_app_config.genius_results_limit); 
+	},
+	
+	/**
+	* Returns the allowed max size of search results
+	*/
+	getAllowedMaxSearchLimit: function() {
+		
+		// if the max size is set from outside, use the value.
+		if (!gs.nil(this.searchMaxLimit)) 
+			return this.searchMaxLimit;
+		
+		// if the app config is not set, use the default size
+		if (gs.nil(this.record.search_app_config))
+			return global.AISearchConstants.DEFAULT_SEARCH_RESULT_LIMIT;
+		
+		var limit = this.record.search_app_config.search_results_limit;
+		
+		return gs.nil(limit) ? 
+			global.AISearchConstants.DEFAULT_SEARCH_RESULT_LIMIT : 
+				parseInt(this.record.search_app_config.search_results_limit); 
+	},
+	
+	getSysId : function() {
+		return this.record.getUniqueValue();
+	},
+	
+	getSearchAppConfigId : function() {
+		return this.record.getValue('search_app_config');
+	},
+	
+	getARContextId : function() {
+		return this.record.getValue('ar_context');
+	},
+	
+	getUserId : function() {
+		var context = this.record.ar_context;
+		if (gs.nil(context)) 
+			return null;
+		
+		var user = context.notification_user;
+		if (gs.nil(user))
+			return null;
+		
+		return user.sys_id+'';
+	},
+	
+	getSessionId : function() {
+		return this.record.getValue('session_id');
+	},
+	
+	getExecutionTime : function() {
+		return this.record.getValue('execution_time');
+	},
+	
+	getSearchTerm : function() {
+		return this.record.getValue('search_term');
+	},
+	
+	getResultPayload: function() {
+		return this.record.getValue('result_payload');
+	},
+	
+	getSearchMetadata: function() {
+		return this.record.getValue('search_metadata');
+	},
+	
+	getStatus: function() {
+		return this.record.getValue('status');
+	},
+	
+	getMessage: function() {
+		return this.record.getValue('message');
+	},
+	
+	getGeniusSearchResults: function() {
+		return this._getSearchResults( 
+			global.AISearchConstants.RESULT_TYPE_GENIUS, this.getAllowedMaxGeniusSearchLimit());
+	},
+	
+	getSearchResults: function() {
+		return this._getSearchResults(
+			global.AISearchConstants.RESULT_TYPE_SEARCH, this.getAllowedMaxSearchLimit());
+	},
+
+	getFeedbackType: function() {
+		return this.record.getValue('feedback_type');
+	},
+
+	setFeedbackType: function(feedbackType) {
+		this.record.setValue('feedback_type', feedbackType);
+	},
+	
+	/**
+	* Traverse all line items and fire an event for GlideSignals.
+	* This method also updates the feedback status on each line item record.
+	*/
+	processFeedbacks: function(force) {
+		
+		if (!global.AutoResolutionAISearchHelper.isAISearchFeedbackEnabled())
+			return;
+		
+		// find line items tht have feedback_type set but not submitted yet.
+		var gr = new GlideRecord(global.AutoResolutionConstants.AI_SEARCH_RESULT_LINE_ITEM_TABLE_NAME);
+		gr.addQuery('ai_search_result', this.getSysId());
+		gr.addNotNullQuery('feedback_type');
+		
+		if (!force)
+			gr.addQuery('feedback_submitted', false); // process only the records that have not been processed yet.
+		
+		gr.query();
+		
+		var isSubmitted = false;
+		
+		while(gr.next()) {
+			// updated feedback_submitted as true.
+			var eventType = global.AISearchHelper.getGlideSignalsEventTypeByResultType(gr.getValue('result_type'));
+
+			var feedbackPayload = gr.getValue('feedback_payload');
+
+			if (gs.nil(eventType) || gs.nil(feedbackPayload) )
+				continue;
+			
+			global.AISearchHelper.sendMetricsToGlideSignalsAPI(eventType, JSON.parse(feedbackPayload));
+			
+			gr.setValue('feedback_submitted', true);
+			gr.update();
+			isSubmitted = true;
+		}
+		
+		// if any line-item feedback is submitted and the flag is not set previously, update the flag.
+		if (isSubmitted &amp;&amp; !this.isFeedbackSubmitted()) {
+			this.setFeedbackSent();
+			this.update();
+		}
+	},
+	
+	/**
+	* Return the number of search results
+	*/
+	getSearchResultSize: function() {
+		return this._getResultSize(global.AISearchConstants.RESULT_TYPE_SEARCH);
+	},
+	
+	/**
+	* Return the number of genius search results
+	*/	
+	getGeniusSearchResultSize: function() {
+		return this._getResultSize(global.AISearchConstants.RESULT_TYPE_GENIUS);
+	},
+	
+	/**
+     * Returns the SEARCH_EVENT feedback payload. This payload is for GlideSignals API
+     */
+    getFeedbackPayload: function() {
+        return this.record.getValue('feedback_payload');
+    },
+	
+	/**
+     * After the event fired, mark this column true.
+     */
+    setFeedbackSent: function() {
+        this.record.setValue('feedback_submitted', true);
+    },
+	
+	/**
+     * Tests if the feedback is submitted.
+     */
+    isFeedbackSubmitted: function() {
+		return this.record.getValue('feedback_submitted') == '1';
+    },
+	
+	_getResultSize: function(resultType) {
+		var actualSize = 0;
+		
+		var ga = new GlideAggregate(global.AutoResolutionConstants.AI_SEARCH_RESULT_LINE_ITEM_TABLE_NAME);
+		ga.addQuery('ai_search_result', this.getSysId());
+		ga.addQuery('result_type', resultType);
+		ga.addAggregate('COUNT');
+		ga.query();
+		
+		if (ga.next())
+			actualSize = ga.getAggregate("COUNT");
+		
+		var allowedMaxSize = 0;
+		
+		if (resultType == global.AISearchConstants.RESULT_TYPE_GENIUS)
+			allowedMaxSize = this.getAllowedMaxGeniusSearchLimit();
+		else if (resultType == global.AISearchConstants.RESULT_TYPE_SEARCH)
+			allowedMaxSize  = this.getAllowedMaxSearchLimit();
+		
+		return actualSize &gt; allowedMaxSize ? allowedMaxSize : actualSize;
+	},
+	
+	_getSearchResults: function(resultType, maxSize) {
+		
+		var gr = new GlideRecord(global.AutoResolutionConstants.AI_SEARCH_RESULT_LINE_ITEM_TABLE_NAME);
+		gr.addQuery('ai_search_result', this.getSysId());
+		gr.addQuery('result_type', resultType);
+		
+		// if need to enforce the result size.
+		if(!gs.nil(maxSize))
+			gr.setLimit(maxSize);
+		
+		gr.orderBy('item_index');
+		
+		var arr = [];
+		
+		gr.query();
+		
+		while(gr.next()) {
+			// pass the sysId instead of the glide record 
+			// since the same record keeps getting reused.
+			var result = new AutoResolutionAISearchResultLineItem(gr.getUniqueValue());
+			arr.push(result);
+		}
+		return arr;
+	},
+	
+	/**
+	* Send SEARCH_EVENT feedback to GlideSignals
+	* This method should be executed by the current user, not by the system user.
+	*/
+	sendSearchEventToGlideSignalsAPI: function(force) {
+		
+		// if already submitted, don't proceed
+		if(!force &amp;&amp; this.isFeedbackSubmitted()) 
+			return;
+		
+		
+		var feedback = this.getFeedbackPayload();
+	
+		global.AISearchHelper.sendMetricsToGlideSignalsAPI(
+			global.AISearchConstants.EVENT_TYPE_SEARCH_EVENT, JSON.parse(feedback));
+		
+	},
+	
+	/**
+	* To flush the changes back to db
+	*/
+	update: function() {
+		this.record.update();
+	},
+	
+	type: 'AutoResolutionAISearchResult'
+};
+
+/**
+* Creates a new AI Search result
+* @param contextGr 
+* @param searchTerm
+* @param searchResultsStr : the search result in string format
+* @param executionTime : the time taken for the search execution in milliseconds
+* @param status : the status of the execution
+* @param message : the message from the execution
+* @param language : the language used for search execution
+*/
+AutoResolutionAISearchResult.create = function(contextGr, searchTerm, searchResultsStr, executionTime, status, message, language) {
+	
+	var resultGr = new GlideRecord(global.AutoResolutionConstants.AI_SEARCH_RESULT_TABLE_NAME);
+	resultGr.setValue('ar_context', contextGr.getUniqueValue());
+	resultGr.setValue('result_payload', searchResultsStr);
+	resultGr.setValue('status', status);
+	resultGr.setValue('message', message);
+	
+	var configuration = contextGr.configuration;
+	
+	if (gs.nil(configuration)) //TODO : use logger
+		throw "Auto-Resolution configuration must exist";
+	
+	var searchAppConfig = configuration.search_application;
+	
+	if (gs.nil(searchAppConfig)) //TODO : use logger
+		throw "Search application configuration must exist";
+	
+	resultGr.setValue('search_app_config', searchAppConfig.getValue());
+	resultGr.setValue('search_profile', searchAppConfig.search_profile.getValue());
+	
+	var task = contextGr.task;
+	
+	if (gs.nil(task)) //TODO : use logger
+		throw "task must exist";
+	
+	resultGr.setValue('task_table', task.sys_class_name.getValue());
+	resultGr.setValue('task_id', task.getValue());
+	
+	resultGr.setValue('search_term', searchTerm);
+	resultGr.setValue('execution_time', executionTime);
+	
+	resultGr.setValue('status', status);
+	resultGr.setValue('message', message);
+	
+	var limits = global.AISearchHelper.getResultLimits(searchAppConfig);
+
+	var processedResults 
+		= global.AutoResolutionAISearchHelper.parseAISearchResults(
+			searchResultsStr, limits.genius_results_limit, limits.search_results_limit);
+    
+	var searchMetadataStr = processedResults.searchMetadata; // note this is string
+	resultGr.setValue('search_metadata', searchMetadataStr);
+	
+	var searchMetadata = JSON.parse(searchMetadataStr);
+	
+	// this paramBag is required for all GlideSignalsEvent
+	resultGr.setValue('session_id', gs.generateGUID()); // random id for glide signals
+	var eventParamBag 
+		= global.AutoResolutionAISearchHelper.createParamBagForGlideSignalsEvent(resultGr, language);
+	
+	// get the feedback payload for the search event. 
+	var searchEventPayload =  createSearchEventPayload(eventParamBag, processedResults, searchMetadata);
+	resultGr.setValue('feedback_payload', JSON.stringify(searchEventPayload));
+	
+	// Create a new record.
+	var resultId = resultGr.insert();
+	
+	var contextId = contextGr.getUniqueValue();
+	
+	// creates line items for Genius Results and Search Results
+	createLineItemsForGeniusResult(
+		eventParamBag, resultId, contextId, searchMetadata, JSON.parse(processedResults.geniusSearchResults));
+	
+	createLineItemsForSearchResult(
+		eventParamBag, resultId, contextId, searchMetadata, JSON.parse(processedResults.searchResults));
+	
+	//once creation is done, send the search-event payload to glide signals API.
+	var result = new AutoResolutionAISearchResult(resultGr);
+	result.sendSearchEventToGlideSignalsAPI(); 
+	result.update();
+	
+	return result;
+};
+
+/**
+* Returns AISearch results found by the context Id.
+*/
+AutoResolutionAISearchResult.getByContextId = function(contextId) {
+
+	var gr = new GlideRecord(AutoResolutionConstants.AI_SEARCH_RESULT_TABLE_NAME);
+	gr.addQuery('ar_context', contextId);
+	gr.query();
+	return gr.next()? new AutoResolutionAISearchResult(gr): null;
+};
+
+/**
+* Creates a payload object for the GlideSignals SEARCH_EVENT with the given parameters.
+*/
+function createSearchEventPayload(paramBag, processedResults, searchMetadata) {
+	
+	var searchEvent = new global.AISearchGlideSignalsSearchEvent(searchMetadata.searchResultMetadata, paramBag);
+	
+	var geniusSearchResults = JSON.parse(processedResults.geniusSearchResults) || [];
+	
+	for (var i=0; i&lt;geniusSearchResults.length; i++) 
+		searchEvent.buildPayload(global.AISearchConstants.RESULT_TYPE_GENIUS, geniusSearchResults[i]);
+	
+	var searchResults = JSON.parse(processedResults.searchResults) || [];
+	
+	for (var i=0; i&lt;searchResults.length; i++) 
+		searchEvent.buildPayload(global.AISearchConstants.RESULT_TYPE_SEARCH, searchResults[i]);
+	
+	return searchEvent.getPayload();
+}
+
+/**
+* Creates line-items for search results
+*/
+function createLineItemsForSearchResult(paramBag, resultId, contextId, searchMetadata, results) {
+	
+	// don't proceed if there's no result
+	if (gs.nil(results))
+		return;
+	
+	var resultType = global.AISearchConstants.RESULT_TYPE_SEARCH;
+	var signalType = global.AISearchConstants.CLICK_ACTION_SIGNAL_TYPE;
+	
+	var gr = new GlideRecord(global.AutoResolutionConstants.AI_SEARCH_RESULT_LINE_ITEM_TABLE_NAME);
+	
+	for(var i=0; i&lt;results.length; i++) {
+		
+		var result = results[i]; 
+	
+		var resultEvent
+			= new global.AISearchGlideSignalsSearchResultEvent(searchMetadata.searchResultMetadata, paramBag);
+		
+		// signalValue starts from 1 , not 0
+		var itemIndex = i + 1;
+		resultEvent.buildPayload(result, signalType, itemIndex); 
+		
+		var feedbackPayload = resultEvent.getPayload();
+		
+		gr.initialize();
+		setLineItemValues(itemIndex, gr, contextId, resultId, result, resultType, JSON.stringify(feedbackPayload)); 
+		gr.insert();
+	}
+}
+
+/**
+* Creates line-items for genius results
+*/
+function createLineItemsForGeniusResult(paramBag, resultId, contextId, searchMetadata, results) {
+	
+	// don't proceed if there's no result
+	if (gs.nil(results))
+		return;
+	
+	var resultType = global.AISearchConstants.RESULT_TYPE_GENIUS;
+	
+	var gr = new GlideRecord(global.AutoResolutionConstants.AI_SEARCH_RESULT_LINE_ITEM_TABLE_NAME);
+	
+	for(var i=0; i&lt;results.length; i++) {
+		
+		var result = results[i]; 
+	
+		var resultEvent
+			= new global.AISearchGlideSignalsGeniusResultEvent(searchMetadata.searchResultMetadata, paramBag);
+		
+		resultEvent.buildPayload(result);
+		
+		var payload = resultEvent.getPayload();
+		
+		gr.initialize();
+		
+		var itemIndex = i+1; // Note this starts from 1.
+		setLineItemValues(itemIndex, gr, contextId, resultId, result, resultType, JSON.stringify(payload)); 
+		
+		gr.insert();
+	}
+}
+
+/**
+* Populates the given line-item record with the given parameters
+*/
+function setLineItemValues(currentIndex, currentRecord, contextId, resultId, result, resultType, feedbackPayload) {
+	
+	currentRecord.setValue('ai_search_result', resultId);
+	currentRecord.setValue('item_index', currentIndex+''); // make the value string to avoid any decimal issue
+		
+	currentRecord.setValue('feedback_payload', feedbackPayload);
+	currentRecord.setValue('result_payload', JSON.stringify(result));
+	currentRecord.setValue('result_type', resultType);
+		
+	var model = result.propValues.model;
+	currentRecord.setValue('resource_table', global.AISearchHelper.getResourceTableFromModel(model));
+	currentRecord.setValue('resource_id', global.AISearchHelper.getResourceIdFromModel(model));
+	currentRecord.setValue('description', global.AISearchHelper.getDescriptionFromModel(model));
+	currentRecord.setValue('kb_article', global.AISearchHelper.getKBArticleIdFromModel(model));
+
+	var clickURL = global.AutoResolutionAISearchHelper.getAISearchResultLink(contextId, result);
+	currentRecord.setValue('click_url', clickURL);
+}]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-01-13 05:34:16&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;037387c5538101105400ddeeff7b120b&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;315&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AutoResolutionAISearchResult&lt;/sys_name&gt;
+        &lt;sys_package display_value="Issue Auto-Resolution" source="com.glide.cs.auto_resolution"&gt;81ddf4a03c75311068bcf327dfe37fa6&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_037387c5538101105400ddeeff7b120b&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-06-02 22:10:32&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:04</sys_created_on>
+        <sys_id>72307c5583b01210c6695855eeaad33e</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AutoResolutionAISearchResult</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_72307c5583b01210c6695855eeaad33e</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:04</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

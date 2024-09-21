@@ -1,0 +1,493 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1e17c8b185321110f877e10cffeb7ba7</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_uibtk_api.Screen&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;Screen&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[const Screen = Class.create();
+Screen.prototype = Object.extendsObject(BuilderToolkitAPIBase, {
+    TABLE: 'sys_ux_screen',
+    FIELDS: ['name', 'macroponent', 'parent_macroponent', 'macroponent_config', 'event_mappings', 'rollback_screen', 'order', 'screen_type', 'screen_condition', 'sys_policy'],
+
+    /**
+     * @param fields {string[]}
+     * @param noDomain {boolean}
+     */
+    initialize: function(fields, noDomain) {
+        BuilderToolkitAPIBase.prototype.initialize.call(this, this.TABLE, fields || this.FIELDS, noDomain);
+        this.macroponentHandler = new Macroponent();
+    },
+
+    create: function(experience, screenData, routeParameters = [], applicabilitiesData, screenTestValuesData = {}, templateId = false, mode = false) {
+        const experienceHandler = new Experience();
+        const mcpHandler = new Macroponent();
+        const templateHandler = new UIBTemplate();
+        const screenTestValueHandler = new ScreenTestValue();
+        const screenApplicabilityHandler = new ScreenApplicability([], this.noDomain);
+        let errorMessage = BuilderToolkitConstants.ERRORS.NO_EXPERIENCE_FOUND;
+        if (screenData) {
+            let experienceData = experience;
+            if (typeof experience === 'string') {
+                const experienceRecord = experienceHandler.getRecordById(experience);
+                const extensionPoint = new ExtensionPoint().getRecordById(experience);
+                experienceData = {
+                    appConfig: experienceRecord ? experienceRecord?.adminPanel : null,
+                    parentMacroponent: screenData?.parentMacroponent ?? extensionPoint?.appShell ?? experienceRecord?.rootMacroponent,
+                    extensionPoint: extensionPoint?.sysId ?? null
+                };
+            }
+            let macroponentId = screenData.macroponent ?? false;
+            let mcpResult = false;
+            let macroponentConfig = false;
+            if (templateId &amp;&amp; !macroponentId) {
+                const templateRecord = templateHandler.getRecordById(templateId);
+                if (templateRecord) {
+                    mcpResult = mcpHandler.copy(templateRecord.macroponent);
+                    if (typeof mcpResult === 'string') {
+                        return mcpResult;
+                    }
+                    const templateProperties = [
+                        ...(templateRecord.requiredProperties ?? []),
+                        ...(templateRecord.optionalProperties ?? [])
+                    ];
+                    const testValues = templateProperties.reduce(templateHandler.getTestValues, {});
+                    screenTestValuesData = screenTestValuesData === {} ? screenTestValuesData : {
+                        macroponentConfig: {
+                            ...screenTestValuesData.macroponentConfig ?? {},
+                            ...testValues
+                        }
+                    };
+                    macroponentConfig = templateRecord.macroponentConfig ?? macroponentConfig;
+                } else {
+                    return BuilderToolkitConstants.ERRORS.FAILED_TO_FIND_TEMPLATE;
+                }
+            } else {
+                errorMessage = BuilderToolkitConstants.ERRORS.FAILED_TO_CREATE_MACROPONENT;
+                mcpResult = macroponentId ? (mode === 'reference' ? macroponentId : mcpHandler.copy(macroponentId)) : mcpHandler.createRecord({
+                    name: screenData.name,
+                    ['extends']: BuilderToolkitConstants.PAGE_TEMPLATE_ID,
+                    category: experienceData?.extensionPoint ? BuilderToolkitConstants.SUB_PAGE_CATEGORY : BuilderToolkitConstants.PAGE_CATEGORY,
+                    extensionPoint: experienceData?.extensionPoint ?? null,
+                    props: routeParameters.map(function(routeParam) {
+                        return {
+                            ...BuilderToolkitConstants.ROUTE_PARAM_PROPERTIES,
+                            name: routeParam,
+                            label: routeParam,
+                        };
+                    })
+                });
+            }
+            if (mcpResult &amp;&amp; !mcpResult.error) {
+                const screenDataObject = {
+                    ...screenData,
+                    ...experienceData,
+                    macroponent: mcpResult.newMacroponentId || mcpResult,
+                };
+                if (macroponentConfig) {
+                    screenDataObject.macroponentConfig = macroponentConfig;
+                }
+                const screenId = this.createRecord(screenDataObject);
+                errorMessage = BuilderToolkitConstants.ERRORS.FAILED_TO_CREATE_SCREEN;
+                if (screenId) {
+                    const newApplicabilities = applicabilitiesData.map(function(applicability) {
+                        return {
+                            applicability: applicability,
+                            screen: screenId
+                        };
+                    });
+                    return {
+                        macroponent: mcpResult.newMacroponentId || mcpResult,
+                        screen: screenId,
+                        screenTestValues: screenTestValueHandler.createRecord({
+                            ...screenTestValuesData,
+                            screen: screenId,
+                        }),
+                        applicabilities: screenApplicabilityHandler.createRecords(newApplicabilities)
+                    };
+                }
+            }
+            if (mode !== 'reference') {
+                this.macroponentHandler.deleteRecord({
+                    sysId: mcpResult.newMacroponentId || mcpResult
+                });
+            }
+        }
+        return errorMessage;
+    },
+
+    /**
+     * @param screenSysId {string} the sys_id of the screen we are starting from
+     * @param overrideFieldValues {object} an object with new values for the records e.g {name: value}
+     * @param isSubscreen {boolean} true if we are a subscreen coming from event queue
+     * @param scope {string} the sys_id of the scope we should use
+     * @param domain {string} the sys_id of the domain we should use
+     */
+    duplicate: function(screenSysId, overrideFieldValues = {}, isSubscreen = false, scope = null, domain = null) {
+        const screen = this.getRecordById(screenSysId, true);
+        const originalMCPSysId = screen.getValue('macroponent');
+        const deleteFunctions = [];
+
+        let errorMessage = BuilderToolkitConstants.NO_SCREEN_FOUND;
+        if (!screen) {
+            return errorMessage;
+        }
+        const mcpHandler = new Macroponent();
+        const mcpResult = mcpHandler.copy(screen.macroponent.getRefRecord(), scope, domain);
+        if (typeof mcpResult === 'string') {
+            return mcpResult;
+        }
+        const {
+            newMacroponentId,
+        } = mcpResult;
+
+        const newScreenId = isSubscreen ? new Page().createSubPage(screen, newMacroponentId, overrideFieldValues?.screen, scope, domain) :
+            this.copyRecord(screen, null, {
+                ...(overrideFieldValues?.screen ?? {}),
+                macroponent: newMacroponentId
+            });
+        deleteFunctions.push({
+            handler: new Screen(),
+            records: [{
+                sysId: newScreenId
+            }]
+        });
+        errorMessage = BuilderToolkitConstants.FAILED_TO_CREATE_SCREEN;
+        if (!newScreenId) {
+            this.executeDeleteFunctions(deleteFunctions);
+            return errorMessage;
+        }
+
+        const applicabilityHandler = new ScreenApplicability([], this.noDomain);
+        const newApplicabilities = (overrideFieldValues?.applicabilities ?? []).map(function(applicability) {
+            return {
+                applicability: applicability,
+                screen: newScreenId
+            };
+        });
+        const newApplicabilityM2MIds = applicabilityHandler.createRecords(newApplicabilities);
+        if (newApplicabilityM2MIds !== true) {
+
+            deleteFunctions.push({
+                handler: applicabilityHandler,
+                records: newApplicabilityM2MIds.map((item) =&gt; ({
+                    sysId: item
+                }))
+            });
+            errorMessage = BuilderToolkitConstants.FAILED_TO_CREATE_SCREEN;
+            if (newApplicabilityM2MIds.some((result) =&gt; result === false)) {
+                this.executeDeleteFunctions(deleteFunctions);
+                return errorMessage;
+            }
+        }
+
+        const screenTestValueHandler = new ScreenTestValue();
+        let newScreenTestValue = screenTestValueHandler.copyRecord(null, screenSysId, {
+            screen: newScreenId
+        }, scope, domain);
+        if (!newScreenTestValue) {
+            newScreenTestValue = screenTestValueHandler.createRecord({
+                screen: newScreenId,
+                sysScope: scope
+            });
+        }
+
+        // Check for subroutes and emit event
+        const subscreens = this.getRecordsByQuery('parent_macroponent=' + originalMCPSysId, '', true);
+        const hasSubscreens = subscreens &amp;&amp; subscreens.hasNext();
+        if (hasSubscreens) {
+            while (subscreens.next()) {
+                gs.eventQueue('sn_uibtk_api.create.subscreen', subscreens, this.getUserUpdateSetId(), newMacroponentId);
+            }
+        }
+        return {
+            macroponent: newMacroponentId,
+            screen: newScreenId,
+            screenTestValue: newScreenTestValue,
+            hasSubscreens
+        };
+    },
+
+    /**
+     * @param parentMCP {GlideRecord} the parent macroponent record for the screen
+     * @param pageRegistry {GlideRecord} the page registry record for the screen
+     * @param screen {GlideRecord} the current screen
+     */
+    getParent: function(parentMCP, pageRegistry, screen) {
+        const parentScreen = parentMCP ? this.getRecordsByQuery('macroponent=' + parentMCP.getUniqueValue(), 'name', true) : null;
+        const hasParentScreen = parentScreen &amp;&amp; parentScreen.next();
+        const parentMacroponentValues = parentMCP ? this.macroponentHandler.getValuesFromGlideRecord(parentMCP) : null;
+        const upstreamAttributes = parentMacroponentValues ? this.getUpstreamAttributes(parentMacroponentValues) : {
+            data: []
+        };
+        const parentInfo = hasParentScreen ? this.getValuesFromGlideRecord(parentScreen) : {};
+        const appRoute = new AppRoute().getRecordsByQuery('screen_type=' + screen.getValue('screen_type'));
+        const parentRoutes = parentScreen?.screen_type ? new AppRoute().getRecordsByQuery(`screen_type=${parentScreen?.screen_type}`) : null;
+        parentInfo.compositionElementId = appRoute ? appRoute[0].parentMacroponentCompositionElementId : null;
+        return {
+            ...upstreamAttributes,
+            appInfo: this.getParentAppInfo(pageRegistry),
+            info: parentInfo,
+            routes: parentRoutes,
+            state: parentMacroponentValues?.state ?? {},
+            globalHandledEvents: BuilderToolkitConstants.GLOBAL_HANDLED_EVENT_IDS
+        };
+    },
+
+    /**
+     * @param pageRegistry {GlideRecord} the page registry record for the screen
+     * @param parentMacroponentId {string} the sys_id of the screen's parent macroponent
+     */
+    getAncestor: function(pageRegistry, parentMacroponentId) {
+        const sessionDataBroker = new Macroponent().getRecordById(BuilderToolkitConstants.SESSION_DATABROKER_SYS_ID);
+        const hasDifferentAncestor = !pageRegistry.root_macroponent.nil() &amp;&amp; pageRegistry.getValue('root_macroponent') !== parentMacroponentId;
+        let ancestor = {
+            data: []
+        };
+        if (hasDifferentAncestor &amp;&amp; !pageRegistry.root_macroponent.nil()) {
+            const appShellMacroponentValues = this.macroponentHandler.getValuesFromGlideRecord(pageRegistry.root_macroponent.getRefRecord());
+            ancestor = this.getUpstreamAttributes(appShellMacroponentValues);
+        }
+        ancestor.data = ancestor.data.concat(sessionDataBroker.data);
+        return ancestor;
+    },
+
+    /**
+     * @param upstreamMCPValues {object} an object with all of the fields from an ancestor macroponent
+     */
+    getUpstreamAttributes: function(upstreamMCPValues) {
+        const upstreamScreen = this.getRecordsByQuery('macroponent=' + upstreamMCPValues.sysId)?.[0];
+        const upstreamScreenTestValues = new ScreenTestValue().getRecordsByQuery('screen.macroponent=' + upstreamMCPValues.sysId)?.[0];
+        let upstreamValues = {
+            data: upstreamMCPValues.data || [],
+            elements: this.macroponentHandler.getCompositionElements(upstreamMCPValues.composition),
+            handledEvents: upstreamMCPValues?.handledEvents ? [{
+                sourceId: upstreamMCPValues?.sysId,
+                sourceName: upstreamMCPValues?.name,
+                handledEvents: upstreamMCPValues?.handledEvents
+            }] : [],
+            properties: upstreamMCPValues?.props ?? [],
+            propertyValues: {
+                testValues: upstreamScreenTestValues ? upstreamScreenTestValues?.macroponentConfig : {},
+                values: upstreamScreen ? upstreamScreen.macroponentConfig : {}
+            }
+        };
+        if (upstreamMCPValues['extends']) {
+            const nextUpstreamMacroponent = this.macroponentHandler.getRecordById(upstreamMCPValues['extends']);
+            const furtherUpstreamValues = this.getUpstreamAttributes(nextUpstreamMacroponent);
+            const combinedProperties = upstreamValues?.properties?.concat(furtherUpstreamValues?.properties).reduce((acc, prop) =&gt; {
+                if (!acc.some(({
+                        name
+                    }) =&gt; name === prop?.name)) {
+                    acc.push(prop);
+                }
+                return acc;
+            }, []);
+            return {
+                data: upstreamValues?.data?.concat(furtherUpstreamValues?.data) ?? [],
+                elements: upstreamValues?.elements?.concat(furtherUpstreamValues?.elements) ?? [],
+                handledEvents: upstreamValues?.handledEvents?.concat(furtherUpstreamValues?.handledEvents) ?? [],
+                properties: combinedProperties,
+                propertyValues: {
+                    testValues: {
+                        ...(upstreamValues?.propertyValues?.testValues ?? {}),
+                        ...(furtherUpstreamValues?.propertyValues?.testValues ?? {})
+                    },
+                    values: {
+                        ...(upstreamValues?.propertyValues?.values ?? {}),
+                        ...(furtherUpstreamValues?.propertyValues?.values ?? {})
+                    }
+                }
+            };
+        }
+
+        return upstreamValues;
+    },
+
+    /**
+     * @param pageRegistry {GlideRecord} the page registry record for the screen
+     */
+    getParentAppInfo: function(pageRegistry) {
+        if (!pageRegistry.next()) {
+            return {};
+        }
+        const pageRegistryRootMCP = pageRegistry.getValue('root_macroponent');
+        let parentApp = pageRegistry.parent_app.getRefRecord();
+        if (!parentApp.isValidRecord() &amp;&amp;
+            (pageRegistryRootMCP === 'c276387cc331101080d6d3658940ddd2' // agent workspace shell id
+                ||
+                pageRegistryRootMCP === 'e341e22cc32e2010ea04a5a1d840dd02')) { // breadcrumb shell id
+            parentApp = this.get('sys_ux_app', 'sys_id=c86a62e2c7022010099a308dc7c26022');
+            if (parentApp.next()) {
+                parentApp = null;
+            }
+        }
+        if (parentApp !== null) {
+            return {
+                appId: parentApp ? parentApp.getUniqueValue() : null,
+                appName: parentApp.getValue('name'),
+                themeId: parentApp.getValue('theme'),
+                isPolairs: parentApp.getUniqueValue() === 'c86a62e2c7022010099a308dc7c26022'
+            };
+        }
+        return null;
+    },
+
+    /**
+     * @param parentMacroponentSysId {string} the sys_id of the screen's parent macroponent
+     */
+    getSubroutes: function(parentMacroponentSysId) {
+        const appRoutes = new AppRoute().getRecordsByQuery('parent_macroponent=' + parentMacroponentSysId, 'name');
+        const subroutes = [];
+        appRoutes.forEach((appRoute) =&gt; {
+            const subscreens = [];
+            const subscreenValues = this.getRecordsByQuery('screen_type=' + appRoute.screenType, 'name');
+            subscreenValues.forEach((screen) =&gt; {
+                subscreens.push({
+                    additionalConditions: [],
+                    condition: screen.screenCondition,
+                    eventMappings: screen.eventMappings,
+                    id: screen.sysId,
+                    macroponentConfiguration: screen.macroponentConfig,
+                    macroponentSysId: screen.macroponent,
+                    name: screen.name,
+                    order: screen.order,
+                    screenType: screen.screenType,
+                    sysPolicy: screen.sysPolicy,
+                });
+            });
+            subroutes.push({
+                ...appRoute,
+                controllerDependencyMap: null,
+                controllerElementId: null,
+                id: appRoute.sysId,
+                parentCompositionElementId: appRoute.parentMacroponentCompositionElementId,
+                macroponents: subscreens,
+            });
+        });
+        return subroutes;
+    },
+
+    /**
+     * @param extensionPointSysId {string} the sys_id of the extension point we are starting from
+     */
+    getExperiencesForExtensionPoint: function(extensionPointSysId) {
+        let experiences = [];
+        const grScreen = this.getRecordsByQuery(`active=true^macroponent.compositionLIKE${extensionPointSysId}`, 'name', true);
+
+        if (!grScreen) {
+            return experiences;
+        }
+
+        while (grScreen.next()) {
+            const appConfig = grScreen.getValue('app_config');
+            const grExperience = new GlideRecord('sys_ux_page_registry');
+            grExperience.addEncodedQuery(`active=true^admin_panel=${appConfig}`);
+            grExperience.query();
+
+            while (grExperience.next()) {
+                const experience = grExperience.getValue('title');
+                const sysId = grExperience.getValue('sys_id');
+                const foundIndex = experiences.findIndex((expValue) =&gt; {
+                    return (expValue.experience === experience &amp;&amp; expValue.sysId === sysId);
+                });
+
+                if (foundIndex &lt; 0) {
+                    experiences.push({
+                        experience: experience,
+                        sysId: sysId
+                    });
+                }
+            }
+        }
+
+        experiences.sort((exp1, exp2) =&gt; {
+            // case insensitive sort
+            const title1 = exp1.experience.toUpperCase();
+            const title2 = exp2.experience.toUpperCase();
+            if (title1 &lt; title2) {
+                return -1;
+            }
+
+            if (title1 &gt; title2) {
+                return 1;
+            }
+
+            return 0;
+        });
+
+        return experiences;
+    },
+
+    /**
+     * Gets all of the override screens for a provided screen
+     * @param screenSysId {string} the sysId of the screen we are getting overrides for
+     */
+    getScreenOverrides: function(screenSysId) {
+        const screenGR = this.getRecordById(screenSysId, true);
+        if (!screenGR || !screenGR.getValue('sys_overrides')) {
+            return [];
+        }
+        const screenOverrides = [{
+            sysId: screenGR.getUniqueValue(),
+            name: screenGR.name.getDisplayValue(),
+            domainName: screenGR.sys_domain.getDisplayValue(),
+            sysOverride: screenGR.getValue('sys_overrides')
+        }];
+
+        let screenOverrideSysId = screenGR.getValue('sys_overrides');
+        while (screenOverrideSysId !== null) {
+            const overrideScreenGR = this.getRecordById(screenOverrideSysId, true);
+            if (!overrideScreenGR) {
+                break;
+            }
+            screenOverrideSysId = overrideScreenGR.getValue('sys_overrides');
+            screenOverrides.push({
+                sysId: overrideScreenGR.getUniqueValue(),
+                name: overrideScreenGR.name.getDisplayValue(),
+                domainName: overrideScreenGR.sys_domain.getDisplayValue(),
+                sysOverride: screenOverrideSysId
+            });
+        }
+
+        return screenOverrides;
+    },
+
+    type: 'Screen'
+});]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;maint&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-10-27 20:04:48&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1e17c8b185321110f877e10cffeb7ba7&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;277&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;Screen&lt;/sys_name&gt;
+        &lt;sys_package display_value="@devsnc/uibtk-api" source="sn_uibtk_api"&gt;cdfd3bed43321110e70583020cb8f28e&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="@devsnc/uibtk-api"&gt;cdfd3bed43321110e70583020cb8f28e&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1e17c8b185321110f877e10cffeb7ba7&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-07-28 20:30:18&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:36</sys_created_on>
+        <sys_id>c4d0381983b01210c6695855eeaad300</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Screen</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_c4d0381983b01210c6695855eeaad300</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:36</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

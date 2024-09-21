@@ -1,0 +1,733 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>249a5166073021101fc37a76fed300f5</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_instance_clone.CloneRestService&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Server Side REST Methods for System Clone&lt;/description&gt;
+        &lt;name&gt;CloneRestService&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var CloneRestService = Class.create();
+CloneRestService.prototype = {
+    initialize: function() {
+        this.className = 'CloneRestService';
+        this.SERVER_URL = global.SystemCloneWrapper.getCloneServerURL();
+        if (!gs.nil(this.SERVER_URL) &amp;&amp; !this.SERVER_URL.endsWith('/'))
+            this.SERVER_URL = this.SERVER_URL.concat('/');
+
+        this.STCD_GETNEXTSLOT_URL = this.SERVER_URL + gs.getProperty('sn_instance_clone.glide.db.system.clone.stcd.url');
+        this.STCD_RESERVATION_URL = this.SERVER_URL + gs.getProperty('sn_instance_clone.glide.db.system.clone.reservation.url');
+        this.CLONE_CANCEL_URL = this.SERVER_URL + gs.getProperty('sn_instance_clone.glide.db.system.clone.cancel.url');
+        this.CLONE_ROLLBACK_URL = this.SERVER_URL + gs.getProperty('sn_instance_clone.glide.db.system.clone.rollback.url');
+        this.CLONE_VALIDATE_URL = this.SERVER_URL + gs.getProperty('sn_instance_clone.glide.db.system.clone.validate.url');
+        this.CLONE_SCHEDULE_URL = this.SERVER_URL + gs.getProperty('sn_instance_clone.glide.db.system.clone.schedule.url');
+        this.CLONE_STATUS_URL = this.SERVER_URL + gs.getProperty('sn_instance_clone.glide.db.system.clone.status.url');
+        this.CLONE_CONFLICTS = this.SERVER_URL + gs.getProperty('sn_instance_clone.glide.db.system.clone.conflicts.url');
+
+        this.user = gs.getProperty('instance_id');
+        this.password = global.SystemCloneWrapper.getServerPassword();
+    },
+
+    /**
+     * 
+     * Fetch the conflicts for a given date/time and target instance Id combination.
+     * @param {&lt;string&gt;} &lt;startDateTimeInUTC&gt; - &lt;Start Time in UTC to check for the conflicts&gt;
+     * @param {&lt;string&gt;} &lt;endDateTimeInUTC&gt; - &lt;End Time in UTC to check for the conflicts&gt;
+     * @param {&lt;string&gt;} &lt;tgtInstanceId&gt; - &lt;Target Instance ID &gt;
+     * @returns {&lt;Object&gt;} &lt;an object with Details about the Conflicts&gt;
+     * @example 
+     * @see 
+     */
+    fetchCloneConflicts: function(startDateTimeInUTC, endDateTimeInUTC, tgtInstanceId) {
+        var conflictResult = {
+            isError: true,
+            message: "",
+            conflicts: []
+        };
+
+        if (gs.nil(tgtInstanceId)) {
+            conflictResult.message = 'Target instance Id is required for fetchCloneConflicts.';
+            return conflictResult;
+        }
+
+        var payload = {};
+        try {
+            var json = new global.JSON();
+            var request = new sn_ws.RESTMessageV2();
+            request.setEndpoint(this.CLONE_CONFLICTS);
+            request.setHttpMethod('POST');
+            request.setRequestHeader("Content-Type", "application/json");
+            request.setRequestHeader("Accept", "application/json");
+            request.setBasicAuth(this.user, this.password);
+
+            payload.maintenanceStartDateTimeStringInUTC = startDateTimeInUTC + '';
+            payload.maintenanceEndDateTimeStringInUTC = endDateTimeInUTC + '';
+            payload.inputCiListString = "InstanceIDs:" + tgtInstanceId;
+
+            request.setRequestBody(json.encode(payload));
+            var response = request.execute();
+            var body = json.decode(response.getBody());
+            var responseStatus = response.getStatusCode();
+            var responseObj = json.decode(response.getBody());
+            if (responseStatus == 200 || responseObj.result.status == 'success') {
+                var result = responseObj.result.output;
+                if (!gs.nil(result) &amp;&amp; result.length &gt;= 0)
+                    conflictResult.conflicts = result;
+
+                conflictResult.isError = false;
+            } else if (!gs.nil(responseObj.error))
+                conflictResult.message = responseObj.result.message;
+            else
+                conflictResult.message = "Response Body empty.";
+        } catch (ex) {
+            conflictResult.message = ex.message;
+        }
+
+        return conflictResult;
+    },
+
+    /*
+     * Request for getting the status of the clone.
+     * @param cloneId - String (SysId of the clone request item)
+     */
+    getCloneStatus: function(cloneId) {
+        var statusResp = {
+            isError: true,
+            message: ""
+        };
+
+        var cloneGr;
+        try {
+            var json = new global.JSON();
+            var request = new sn_ws.RESTMessageV2();
+            request.setEndpoint(this.CLONE_STATUS_URL);
+            request.setHttpMethod('GET');
+            request.setRequestHeader("Content-Type", "application/json");
+            request.setRequestHeader("Accept", "application/json");
+            request.setBasicAuth(this.user, this.password);
+            request.setQueryParameter('cloneId', cloneId);
+            var response = request.execute();
+            var body = json.decode(response.getBody());
+            if (body.status != CloneConstants.reqState.FAILURE) {
+                var result = body.result;
+                var isError = result.isError;
+                if (isError == false) {
+                    cloneGr = new GlideRecord(CloneConstants.tableName.CLONE_REQUEST);
+                    if (cloneGr.get(cloneId)) {
+						if(!gs.nil(result.stage))
+							cloneGr.setValue('stage', result.stage);
+						if(!gs.nil(result.sub_stage))
+							cloneGr.setValue('sub_stage', result.sub_stage);
+						if(!gs.nil(result.stage_percent_complete))
+							cloneGr.setValue('stage_percent_complete', result.stage_percent_complete);
+						
+                        cloneGr.setValue('clone_percent_complete', result.clone_percent_complete);
+                        cloneGr.setValue('state', result.state);
+                        cloneGr.setWorkflow(false);
+                        cloneGr.update();
+                        cloneGr.setWorkflow(true);
+                        statusResp.isError = false;
+                        statusResp.message = 'Progress API returned clone state as ' + result.state + ' and %complete as ' + result.clone_percent_complete + '%';
+						SncCloneLoggerUtil.info(cloneId, statusResp.message, this.className);
+                    }
+                } else if (!gs.nil(body.error))
+                    statusResp.message = body.error.message;
+                else
+                    statusResp.message = "Response Body empty.";
+            }
+        } catch (e) {
+            statusResp.isError = true;
+            statusResp.message = "Getting clone request status failed. Error: " + e + ".";
+            SncCloneLoggerUtil.error(cloneId, statusResp.message, this.className);
+        }
+        return statusResp;
+    },
+
+    /*
+     * Gets the next available time slot.
+     * @param srcInstanceId - String (Source Instance Id)
+     * @param targetInstanceId - String (Target Instance Id)
+     */
+    getNextAvailableSlot: function(srcInstanceId, targetInstanceId) {
+        var stcdResponse = {
+            isError: true,
+            message: ""
+        };
+		
+		if (gs.nil(targetInstanceId)) {
+			stcdResponse.message = "Mandatory parameter (Target Instance Id) missing.";
+			return stcdResponse;
+		}
+		
+		var grInstanceRec = new GlideRecord('instance');
+		grInstanceRec.addQuery('instance_id', targetInstanceId);
+		grInstanceRec.query();
+		if(!grInstanceRec.next()) {
+			stcdResponse.message = 'Instance with Id "' + targetInstanceId + '" is not registered for cloning. Unable to continue.';
+			return stcdResponse;
+		}
+		
+        var request = new sn_ws.RESTMessageV2();
+        var json = new global.JSON();
+        try {
+            request.setEndpoint(this.STCD_GETNEXTSLOT_URL);
+            request.setHttpMethod('GET');
+            request.setRequestHeader("Content-Type", "application/json");
+            request.setRequestHeader("Accept", "application/json");
+            request.setBasicAuth(this.user, this.password);
+
+            if (gs.nil(srcInstanceId))
+                srcInstanceId = gs.getProperty('instance_id');
+
+            request.setQueryParameter('srcInstanceId', srcInstanceId);
+            request.setQueryParameter('tgtInstanceId', targetInstanceId);
+            var response = request.execute();
+            var body = json.decode(response.getBody());
+			var result = body.result;
+			var isError = result.isError;
+			if (isError == false) {
+				stcdResponse.isError = false;
+				if(!gs.nil(result.estimatedStartDateTime))
+					stcdResponse.estimatedStartDateTime = result.estimatedStartDateTime;
+				else
+					stcdResponse.estimatedStartDateTime = new GlideDateTime();
+				
+				stcdResponse.estimatedDurationMs = result.estimatedDurationMs;
+                stcdResponse.validation_rules = result.validation_rules || "";
+                stcdResponse.maxRecurringCloneDuration = result.maxRecurringCloneDuration || "";
+                stcdResponse.largeTablesList = result.largeTablesList || "";
+				stcdResponse.onDemandBackupEstimationMsg = result.onDemandBackupEstimationMsg || "";
+				stcdResponse.state = CloneConstants.reqState.SUCCESS;
+			}
+			stcdResponse.message = result.clone_estimation_message;
+        } catch (e) {
+            stcdResponse.message = e;
+        }
+		
+        return stcdResponse;
+    },
+
+    /*
+     * Checks whether the given reservation time is available.
+     * @param srcInstanceId - String (Source Instance Id)
+     * @param targetInstanceId - String (Target Instance Id)
+     * @param requestedTime - Date/Time (Requested date/time)
+     */
+    checkForAvailableSlot: function(srcInstanceId, targetInstanceId, requestedTime) {
+        var stcdResponse = {
+            isError: true,
+            message: ""
+        };
+
+		if (gs.nil(targetInstanceId) || gs.nil(requestedTime)) {
+			stcdResponse.message = "Mandatory parameters (Target Instance Id or Scheduled Time) missing.";
+			return stcdResponse;
+		}
+		
+		var grInstanceRec = new GlideRecord('instance');
+		grInstanceRec.addQuery('instance_id', targetInstanceId);
+		grInstanceRec.query();
+		if(!grInstanceRec.next()) {
+			stcdResponse.message = 'Instance with Id "' + targetInstanceId + '" is not registered for cloning. Unable to continue.';
+			return stcdResponse;
+		}
+
+        var request = new sn_ws.RESTMessageV2();
+        try {
+            request.setEndpoint(this.STCD_RESERVATION_URL);
+            request.setHttpMethod('GET');
+            request.setRequestHeader("Content-Type", "application/json");
+            request.setRequestHeader("Accept", "application/json");
+            request.setBasicAuth(this.user, this.password);
+
+            if (gs.nil(srcInstanceId))
+                srcInstanceId = gs.getProperty('instance_id');
+
+            request.setQueryParameter('srcInstanceId', srcInstanceId);
+            request.setQueryParameter('tgtInstanceId', targetInstanceId);
+            request.setQueryParameter('requestedTime', requestedTime);
+            var json = new global.JSON();
+            var response = request.execute();
+            var body = json.decode(response.getBody());
+            var result = body.result;
+			var isError = result.isError;
+			if (isError == false) {
+				stcdResponse.isError = false;
+				stcdResponse.estimatedDurationMs = result.estimatedCloneDurationMs || "";
+				stcdResponse.validation_rules = result.validation_rules || "";
+				stcdResponse.maxRecurringCloneDuration = result.maxRecurringCloneDuration || "";
+				stcdResponse.largeTablesList = result.largeTablesList || "";
+				stcdResponse.onDemandBackupEstimationMsg = result.onDemandBackupEstimationMsg || "";
+				stcdResponse.state = CloneConstants.reqState.SUCCESS;
+			}
+			stcdResponse.message = result.clone_estimation_message;
+        } catch (e) {
+            stcdResponse.message = e.message;
+        }
+        return stcdResponse;
+    },
+
+    /*
+     * Checks whether the clone request is valid.
+     * @param srcInstanceId - String (Source Instance Id)
+     * @param targetInstanceId - String (Target Instance Id)
+     * @param srcWarVersion - String (Source War version)
+     */
+    validateCloneRequest: function(srcInstanceId, targetInstanceId, srcWarVersion) {
+        var validateCloneResp = {
+            isError: true,
+            message: []
+        };
+
+		var request = new sn_ws.RESTMessageV2();
+		try {
+			request.setEndpoint(this.CLONE_VALIDATE_URL);
+			request.setHttpMethod('GET');
+			request.setRequestHeader("Content-Type", "application/json");
+			request.setRequestHeader("Accept", "application/json");
+			request.setBasicAuth(this.user, this.password);
+			request.setQueryParameter('srcInstanceId', srcInstanceId);
+			request.setQueryParameter('tgtInstanceId', targetInstanceId);
+			request.setQueryParameter('srcWarVersion', gs.nil(srcWarVersion) ? gs.getProperty('glide.war') : srcWarVersion);
+			var json = new global.JSON();
+			var response = request.execute();
+			var body = json.decode(response.getBody());
+			var result = body.result;
+			var isError = result.isError;
+			if (isError == false)
+				validateCloneResp.isError = isError;
+			else
+				validateCloneResp.message = result.message;
+		} catch (e) {
+			validateCloneResp.message.push(e.message);
+		}
+		return validateCloneResp;
+	},
+
+	/*
+     * Request for cancelling the clone.
+     * @param cloneId - String (SysId of the clone request item)
+     * @param cancelReason - String (Cancel reason)
+     */
+    cancelClone: function(cloneId, cancelReason) {
+        var cancelResponse = {
+            isError: true,
+            message: ''
+        };
+
+        var payload = {};
+        try {
+            var json = new global.JSON();
+            var request = new sn_ws.RESTMessageV2();
+            request.setEndpoint(this.CLONE_CANCEL_URL);
+            request.setHttpMethod('POST');
+            request.setRequestHeader("Content-Type", "application/json");
+            request.setRequestHeader("Accept", "application/json");
+            request.setBasicAuth(this.user, this.password);
+            payload.cloneId = cloneId + "";
+            payload.cancelReason = cancelReason;
+            request.setRequestBody(json.encode(payload));
+            var response = request.execute();
+            var body = json.decode(response.getBody());
+            var result = body.result;
+            if (result.isError == true) {
+                gs.error("Error encountered while cancelling clone request. Error: " + result.message + ".");
+                cancelResponse.message = result.message;
+                SncCloneLoggerUtil.error(cloneId, result.message, this.className);
+            } else {
+                cancelResponse.isError = false;
+                var cloneGr = new GlideRecord(CloneConstants.tableName.CLONE_REQUEST);
+                if (cloneGr.get(cloneId)) {
+                    cloneGr.setValue('state', CloneConstants.status.CLONE_STATUS_CANCELED);
+                    cloneGr.update();
+                }
+                SncCloneLoggerUtil.info(cloneId, gs.getMessage('clone.log.info.cancel.initiated'), this.className);
+            }
+        } catch (e) {
+            cancelResponse.isError = true;
+            cancelResponse.message = "Unable to cancel clone, please try again.";
+            SncCloneLoggerUtil.error(cloneId, cancelResponse.message + ": Error : " + e, this.className);
+        }
+
+        return cancelResponse;
+    },
+
+    /*
+     * Request for rolling back the clone.
+     * @param cloneId - String (SysId of the clone request item)
+     * @param rollbackReason - String (Rollback reason)
+     */
+    rollbackClone: function(cloneId, rollbackReason) {
+        var rollbackResp = {};
+        var telemetry = {};
+        var payload = {};
+        try {
+            var json = new global.JSON();
+            var request = new sn_ws.RESTMessageV2();
+            request.setEndpoint(this.CLONE_ROLLBACK_URL);
+            request.setHttpMethod('POST');
+            request.setRequestHeader("Content-Type", "application/json");
+            request.setRequestHeader("Accept", "application/json");
+            request.setBasicAuth(this.user, this.password);
+            payload.cloneId = cloneId + "";
+            payload.rollbackReason = rollbackReason;
+            request.setRequestBody(json.encode(payload));
+            var response = request.execute();
+            var body = json.decode(response.getBody());
+            var result = body.result;
+            rollbackResp.isError = result.isError;
+            if (result.isError == true) {
+                gs.error("Error encountered while rolling back clone request. Error: " + result.message + ".");
+                SncCloneLoggerUtil.error(cloneId, result.message, this.className);
+            }
+
+            rollbackResp.message = result.message;
+            SncCloneLoggerUtil.info(cloneId, gs.getMessage('clone.log.info.rollback.initiated'), this.className);
+        } catch (e) {
+            rollbackResp.isError = true;
+            rollbackResp.message = "Rollback clone request failed. Error: " + e + ".";
+            SncCloneLoggerUtil.error(cloneId, rollbackResp.message, this.className);
+        }
+        return rollbackResp;
+    },
+
+    /*
+     * Request for scheduling the clone.
+     * @param cloneGr - GlideRecord (record of sn_instance_clone_request)
+     */
+    scheduleClone: function(cloneGr) {
+        var scheduleResp = {};
+        var telemetry = {};
+        var payload = {};
+        var targetInstanceGr = this._getInstanceRecord(cloneGr.getValue('target_instance'));
+        try {
+            var json = new global.JSON();
+            var request = new sn_ws.RESTMessageV2();
+            request.setEndpoint(this.CLONE_SCHEDULE_URL);
+            request.setHttpMethod('POST');
+            request.setRequestHeader("Content-Type", "application/json");
+            request.setRequestHeader("Accept", "application/json");
+            request.setBasicAuth(this.user, this.password);
+
+            payload.u_req_origin_instance = gs.getProperty('instance_id');
+            payload.source_instance_id = String(cloneGr.source_instance.instance_id);
+            if (gs.nil(payload.source_instance_id))
+                payload.source_instance_id = String(payload.u_req_origin_instance);
+
+            payload.target_instance_id = String(targetInstanceGr.getValue('instance_id'));
+            payload.state = cloneGr.getValue('state');
+            payload.clone_id = cloneGr.getValue('sys_id');
+            payload.date = cloneGr.getValue('scheduled');
+            payload.security_token = cloneGr.getValue('security_token');
+            payload.source_version = this._formatVersion(gs.getProperty('glide.war'));
+            payload.target_version = this._formatVersion(targetInstanceGr.getValue('war_version'));
+
+            if (!gs.nil(cloneGr.parent_request_id))
+                payload.parent_clone_id = cloneGr.getValue('parent_request_id');
+
+            payload.user_email = cloneGr.getValue('email');
+		payload.user_name = cloneGr.getValue('sys_created_by');
+
+            payload.exclude_tables_specified_in_exclusion_list = Boolean(cloneGr.exclude_all_from_exclusion_list);
+            payload.exclude_audit_and_log_data = Boolean(cloneGr.exclude_large_data);
+            payload.preserve_in_progress_update_sets = cloneGr.getValue('preserve_in_progress_update_sets');
+            payload.exclude_large_attachment_data = Boolean(cloneGr.filter_attachment_data);
+            payload.amount_of_data_copied_from_large_tables = cloneGr.getValue('amount_of_data_copied_from_large_tables');
+            payload.preserve_theme = Boolean(cloneGr.preserve_theme);
+			payload.profile = !gs.nil(cloneGr.getValue('profile_name')) ? cloneGr.getValue('profile_name') : cloneGr.profile.getDisplayValue();
+            payload.lock_clone_config = Boolean(cloneGr.lock_profile_settings);
+            payload.on_demand_backup = Boolean(cloneGr.on_demand_backup);
+
+            request.setRequestBody(json.encode(payload));
+            var response = request.execute();
+            var body = json.decode(response.getBody());
+            var result = body.result;
+            scheduleResp.isError = result.isError;
+            if (result.isError == true) {
+                cloneGr.setValue('state', 'Error');
+                cloneGr.setValue('error_message', 'Error encountered while scheduling clone request. Please contact support team.');
+                cloneGr.setWorkflow(false);
+                cloneGr.update();
+                cloneGr.setWorkflow(true);
+                SncCloneLoggerUtil.error(cloneGr.getValue('sys_id'), result.message, this.className);
+                gs.error("Error encountered while scheduling clone request. Error: " + result.message + ".");
+            } else
+                SncCloneLoggerUtil.info(cloneGr.getValue('sys_id'), gs.getMessage('clone.log.info.schedule.success'), this.className);
+
+            scheduleResp.message = result.message;
+        } catch (e) {
+            scheduleResp.isError = true;
+            scheduleResp.message = "Schedule clone request failed. Error: " + e + ".";
+
+            cloneGr.setValue('state', 'Error');
+            cloneGr.setValue('error_message', 'Error encountered while scheduling clone request. Please contact support team.');
+            cloneGr.setWorkflow(false);
+            cloneGr.update();
+            cloneGr.setWorkflow(true);
+
+            SncCloneLoggerUtil.error(cloneGr.getValue('sys_id'), scheduleResp.message, this.className);
+        }
+        return scheduleResp;
+    },
+
+    /*
+     * Request for authenticate the instance.
+     * @param instanceUrl - String (Instance URL)
+     * @param user - String (Username)
+     * @param pass - String (password)
+     * @param clone_id - String (clone_id)
+     */
+    authenticateInstance: function(instanceUrl, user, pass, clone_id) {
+        var authResp = {
+            isError: false,
+            message: '',
+            securityToken: ''
+        };
+
+        if (gs.nil(instanceUrl) || gs.nil(user) || gs.nil(pass)) {
+            authResp.isError = true;
+            authResp.message = 'Mandatory parameters (instanceUrl/user/password) is missing.';
+            return authResp;
+        }
+
+		if (!instanceUrl.startsWith("https://") &amp;&amp; !instanceUrl.startsWith("http://"))
+			instanceUrl = "https://" + instanceUrl;
+
+        try {
+            var soapdoc = new global.SOAPEnvelope("HAGetParams", "http://www.service-now.com/");
+            soapdoc.setFunctionName("execute");
+            soapdoc.addFunctionParameter("clone_id", clone_id);
+
+            // post the request
+            var url = this._buildWSURL(instanceUrl);
+            var soapRequest = new sn_ws.SOAPMessageV2();
+            soapRequest.setEndpoint(url);
+            soapRequest.setBasicAuth(user, pass);
+            soapRequest.setSOAPAction("execute");
+            soapRequest.setRequestBody(soapdoc.toString());
+            var response = soapRequest.executeAsync();
+            response.waitForResponse(10);
+
+            var responseBody = response.haveError() ? response.getErrorMessage() : response.getBody();
+            var status = response.getStatusCode();
+
+            if (this._isError(response, responseBody, authResp)) {
+                authResp.isError = true;
+                return authResp;
+            }
+
+            var xmlDoc = new XMLDocument2();
+            xmlDoc.parseXML(responseBody);
+
+            if (this._isValidAuthResponse(xmlDoc)) {
+                var instanceGR = new GlideRecord("instance");
+                instanceGR.addQuery("source", false);
+                var qc = instanceGR.addQuery("instance_id", xmlDoc.getNodeText("//instance_id"));
+                qc.addOrCondition("instance_url", instanceUrl);
+                instanceGR.orderBy("instance_id");
+                instanceGR.query();
+
+                if (!instanceGR.next())
+                    instanceGR.initialize();
+
+                // populate instance metadata
+                instanceGR.setValue("instance_id", xmlDoc.getNodeText("//instance_id"));
+                instanceGR.setValue("instance_name", this._getInstanceName(instanceUrl));
+                instanceGR.setValue("instance_url", instanceUrl);
+                instanceGR.setValue("production", xmlDoc.getNodeText("//production"));
+                instanceGR.setValue("war_version", xmlDoc.getNodeText("//war_version"));
+
+                // populate database parameters     
+                var ip = xmlDoc.getNodeText("//ip");
+                var jdbcUrl = xmlDoc.getNodeText("//url");
+                var encryptedPassword = xmlDoc.getNodeText("//password");
+
+                // for ease of development and testing in dev environments, no sql permission setting (IP address lookup takes 5s so try and skip it for dev)
+                if (jdbcUrl !== null &amp;&amp; jdbcUrl.indexOf("localhost") &lt; 0) //&amp;&amp; ip == GlideHostUtil.getPublicIPAddress())
+                    jdbcUrl = jdbcUrl.replace(ip, "localhost");
+
+                instanceGR.setValue("database_name", xmlDoc.getNodeText("//name"));
+                instanceGR.setValue("database_tablespace", xmlDoc.getNodeText("//tablespace"));
+                instanceGR.setValue("database_type", xmlDoc.getNodeText("//rdbms"));
+                instanceGR.setValue("database_user", xmlDoc.getNodeText("//user"));
+                instanceGR.database_password = encryptedPassword;
+                instanceGR.setValue("database_url", jdbcUrl);
+                instanceGR.setValue("source", false);
+                instanceGR.setValue("primary", false);
+
+                if (!gs.nil(xmlDoc.getNodeText("//security_token")))
+                    authResp.securityToken = xmlDoc.getNodeText("//security_token");
+
+                instanceGR.setValue("admin_user", user);
+                instanceGR.setValue("admin_password", pass);
+
+                instanceGR.update();
+            } else {
+                var remoteError = xmlDoc.getNodeText("//error_string");
+                authResp.isError = true;
+                if (gs.nil(remoteError)) {
+                    authResp.isError = true;
+                    var remote_instance_id = xmlDoc.getNodeText("//instance_id");
+                    if (this._isSameInstanceId(remote_instance_id))
+                        authResp.message = "Destination has same Instance ID as source, unable to clone";
+                    else
+                        authResp.message = "Destination returned invalid response";
+                } else
+                    authResp.message = remoteError;
+            }
+        } catch (e) {
+            authResp.isError = true;
+            authResp.message = "Destination returned an error, please check your URL, username, and password.";
+            gs.error('Destination returned an error, please check your URL, username, and password: ' + e.message);
+        }
+
+        return authResp;
+    },
+
+    _isError: function(soapResponse, xmlStr, authResp) {
+        if (soapResponse.getStatusCode() == 401) {
+            authResp.message = CloneConstants.errorMsg.INVALID_USERNAME;
+            return true;
+        }
+
+        if (soapResponse.getStatusCode() == 403) {
+            authResp.message = CloneConstants.errorMsg.DESTINATION_UNAUTHORISED;
+            return true;
+        }
+
+        if (gs.nil(xmlStr) || xmlStr.indexOf("SOAP-ENV:Envelope") == -1) {
+            if (!gs.nil(xmlStr) &amp;&amp; xmlStr.indexOf("service-now") != -1) {
+                authResp.message = CloneConstants.errorMsg.HA_PLUGIN_NOTENABLED;
+                return true;
+            }
+            authResp.message = CloneConstants.errorMsg.NOT_SN_INSTANCE;
+            return true;
+        }
+
+        if (xmlStr.indexOf("Invalid table HAGetParams") != -1) {
+            authResp.message = CloneConstants.errorMsg.INVALID_RESPONSE;
+            return true;
+        }
+
+        if (xmlStr.indexOf("Web service not found") != -1) {
+            authResp.message = CloneConstants.errorMsg.HA_PLUGIN_NOTENABLED;
+            return true;
+        }
+
+        if (soapResponse.getStatusCode() != 200) {
+            authResp.message = CloneConstants.errorMsg.DESTINATION_ERROR_STATUS + soapResponse.getStatusCode();
+            return true;
+        }
+        if (soapResponse.getErrorMessage()) {
+            authResp.message = soapResponse.getErrorMessage();
+            return true;
+        }
+
+        return false;
+    },
+
+    _buildWSURL: function(instance_url) {
+        var url = instance_url + "";
+        var http = "";
+        var slash = "";
+        if (url.charAt(url.length - 1, 1) != '/')
+            slash = "/";
+
+        if (url.indexOf("http") != 0) {
+            http = "http://";
+
+            if (url.indexOf("localhost") == -1)
+                http = "https://";
+        }
+
+        return http + url + slash + "HAGetParams.do?SOAP";
+    },
+
+    _formatVersion: function(version) {
+        if (gs.nil(version))
+            return "";
+
+        if (version == 'null')
+            return "";
+
+        if (version.length &gt; 4 &amp;&amp; version.indexOf('.') &gt; -1)
+            return version.substring(0, version.length - 4);
+
+        return version;
+    },
+
+    _isValidAuthResponse: function(xmlDoc) {
+        var remote_instance_id = xmlDoc.getNodeText("//instance_id");
+        return !gs.nil(remote_instance_id) &amp;&amp; !this._isSameInstanceId(remote_instance_id);
+    },
+
+    _getInstanceRecord: function(instanceSysId) {
+        if (gs.nil(instanceSysId))
+            return null;
+
+        var gr = new GlideRecord('instance');
+        if (gr.get(instanceSysId) &amp;&amp; gr.primary == false) // don't return the primary setup record
+            return gr;
+
+        return null;
+    },
+
+    _getInstanceName: function(instanceUrl) {
+        if (gs.nil(instanceUrl))
+            return '';
+
+        var name = instanceUrl;
+        name = name.replace("http://", "");
+        name = name.replace("https://", "");
+        name = name.replace(".service-now.com", "");
+        name = name.replace(".servicenow.com", "");
+        if (name.endsWith("/"))
+            name = name.substring(0, name.length - 1);
+
+        return name;
+    },
+
+    _isSameInstanceId: function(remote_instance_id) {
+        var self_instance_id = gs.getProperty("instance_id");
+        if (gs.nil(remote_instance_id) || gs.nil(self_instance_id))
+            return false;
+
+        return remote_instance_id == self_instance_id;
+    },
+
+    type: 'CloneRestService'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-02-06 19:53:49&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;249a5166073021101fc37a76fed300f5&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;64&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;CloneRestService&lt;/sys_name&gt;
+        &lt;sys_package display_value="Clone Admin Console" source="sn_instance_clone"&gt;31774a2953839110a6f8ddeeff7b12cb&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Clone Admin Console"&gt;31774a2953839110a6f8ddeeff7b12cb&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_249a5166073021101fc37a76fed300f5&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-04-24 21:22:26&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:20</sys_created_on>
+        <sys_id>fef0345983b01210c6695855eeaad337</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>CloneRestService</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_fef0345983b01210c6695855eeaad337</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:20</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

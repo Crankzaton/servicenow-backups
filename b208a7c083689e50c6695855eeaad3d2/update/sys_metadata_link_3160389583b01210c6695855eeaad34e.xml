@@ -1,0 +1,358 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0b6d3f829f102200598a5bb0657fcf37</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.CostPlanUpdateAPI&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;CostPlanUpdateAPI&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var CostPlanUpdateAPI = Class.create();
+CostPlanUpdateAPI.prototype = {
+    COST_PLAN_TABLE: 'cost_plan',
+    COST_PLAN_BREAKDOWN_TABLE: 'cost_plan_breakdown',
+
+    initialize: function(ignoreTimezone) {
+		this.ignoreTimezone = ignoreTimezone;
+    },
+
+    fiscalCalendar: function () {
+         return new SNC.FiscalCalendar();
+    },
+
+    fiscalUnit: function () {
+        return new FinancialsForPPM().getBreakdownUnit();
+    },
+
+    fiscalPeriod: function(fiscalPeriodId) {
+        var fiscalPeriod = new GlideRecord('fiscal_period');
+        if ( fiscalPeriod.get(fiscalPeriodId) )
+            return fiscalPeriod;
+    },
+
+    task: function(taskSysId) {
+        var task = new GlideRecord("task");
+        if(task.get(taskSysId))
+            return task;
+    },
+
+    breakdown: function(costPlanSysId, fiscalPeriodId) {
+        var gr = new GlideRecord(this.COST_PLAN_BREAKDOWN_TABLE);
+        gr.addQuery("cost_plan", costPlanSysId);
+        gr.addQuery("fiscal_period", fiscalPeriodId);
+        gr.addQuery("breakdown_type", "requirement");
+        gr.query();
+        gr.next();
+        return gr;
+    },
+
+    costplans: function(taskSysId) {
+        var gr = new GlideRecord(this.COST_PLAN_TABLE);
+        gr.addQuery("task", taskSysId);
+        gr.addNullQuery("resource_plan");
+        //For Financial Attribute based cost plans, since resource plan may not be present on cost plan generated from resource plans, 
+        //so only move the cost plan if is_labor_cost_plan is false
+        if (GlidePluginManager.isActive("sn_plng_att_core")) {
+            gr.addQuery("is_labor_cost_plan", false);
+        }
+        gr.query();
+        return gr;
+    },
+
+    breakdowns: function(costPlanSysId) {
+        var gr = new GlideRecord(this.COST_PLAN_BREAKDOWN_TABLE);
+        gr.addQuery("cost_plan", costPlanSysId);
+        gr.addQuery("breakdown_type", "requirement");
+        gr.orderBy("fiscal_period.fiscal_start_date_time");
+        gr.query();
+        return gr;
+    },
+
+    breakdownsArray: function(breakdownsGr) {
+		var breakdownsObj = { breakdownActuals: {}, breakdowns:[] };
+        if(JSUtil.notNil(breakdownsGr) &amp;&amp; breakdownsGr.hasNext()) {
+            while(breakdownsGr.next()) {
+                breakdownsObj.breakdowns.push({
+                    sys_id: breakdownsGr.getValue("sys_id"),
+                    breakdown_type: breakdownsGr.getValue("breakdown_type"),
+                    expense_type: breakdownsGr.getValue("expense_type"),
+                    fiscal_period: breakdownsGr.getValue("fiscal_period"),
+                    cost_default_currency: breakdownsGr.getValue("cost_default_currency"),
+                    cost_local_currency: breakdownsGr.getValue("cost_local_currency"),
+                    fx_rate: breakdownsGr.getValue("fx_rate"),
+                    task: breakdownsGr.getValue("task"),
+                    probreakdownsGram: breakdownsGr.getValue("probreakdownsGram"),
+                    portfolio: breakdownsGr.getValue("portfolio"),
+                    budget: breakdownsGr.getValue("budget"),
+                    allocated: breakdownsGr.getValue("allocated"),
+                    variance: breakdownsGr.getValue("variance")
+                });
+				breakdownsObj.breakdownActuals[breakdownsGr.getValue("fiscal_period")] = breakdownsGr.getValue("actual");
+            }   
+        }
+        return breakdownsObj;
+    },
+
+    getFiscalPeriodForDate: function(dateTime) {
+        PPMDebug.log("Into CostPlanUpdateAPI.getFiscalPeriodForDate -&gt; " + dateTime);
+        var fin = new FinancialsForPPM();
+		if(this.ignoreTimezone) {			
+			var date = new GlideDateTime(dateTime);
+			date = date.getDate();
+			return fin.getFiscalPeriodByFloatingDate(date);
+		} else {
+			return fin.getFiscalPeriod(dateTime);
+		}
+    },
+
+    getFiscalPeriodDifference: function(startDateTime, newStartDateTime) {
+        var fiscalPeriod = new GlideRecord('fiscal_period');
+        fiscalPeriod.addActiveQuery();
+        fiscalPeriod.addQuery("fiscal_type", this.fiscalUnit()); // shouldnt it be derived from fiscal unit?
+        fiscalPeriod.addQuery('fiscal_start_date_time','&gt;', startDateTime);
+        fiscalPeriod.addQuery('fiscal_start_date_time', '&lt;', newStartDateTime);
+        fiscalPeriod.query();
+        return fiscalPeriod.getRowCount();
+    },
+
+    costPlanDatesDiffer: function(costPlanGr, taskStartDate) {
+        var fiscalStartPeriodId = costPlanGr.getValue("start_fiscal_period");
+        var taskFiscalPeriodId = this.getFiscalPeriodForDate(taskStartDate).getValue("sys_id");
+        PPMDebug.log("costPlanDatesDiffer -&gt; fiscalStartPeriodId: " + this.fiscalPeriod(fiscalStartPeriodId).getValue("name") 
+            + " - taskFiscalPeriodId: " + this.fiscalPeriod(taskFiscalPeriodId).getValue("name"));
+        if(JSUtil.notNil(fiscalStartPeriodId) &amp;&amp; JSUtil.notNil(taskFiscalPeriodId) &amp;&amp; 
+            taskFiscalPeriodId != fiscalStartPeriodId) {
+            return true;
+        }
+        return false;
+    },
+
+    getNextFiscalPeriodId: function(fiscalStartPeriodId, fiscalPeriodsCount) {
+        var fiscalPeriodId = fiscalStartPeriodId;
+        if(JSUtil.notNil(fiscalPeriodsCount) &amp;&amp; fiscalPeriodsCount &gt; 0) {
+            for (var i = 0; i &lt; fiscalPeriodsCount; i++) {
+                var fiscalEndDateTime = this.fiscalCalendar().getPeriodEndDate(fiscalPeriodId);
+                var endDateTime = new GlideDateTime(fiscalEndDateTime);
+    
+                endDateTime.addDaysUTC(3); // Fail-Safe FiscalCalendar is returning a day before
+                endDateTime.setValue(endDateTime.getLocalDate() + " " + endDateTime.getLocalTime());
+                var fiscalPeriodGr = this.getFiscalPeriodForDate(endDateTime.getValue());
+                if( JSUtil.notNil(fiscalPeriodGr) &amp;&amp; fiscalPeriodGr.isValidRecord()) {
+                    fiscalPeriodId = fiscalPeriodGr.getValue("sys_id");
+        
+                } else {
+                    PPMDebug.log(" ******* Unable to find the fiscal Period for date -&gt; " + endDateTime);
+                }
+            }   
+        } else if(JSUtil.notNil(fiscalPeriodsCount) &amp;&amp; fiscalPeriodsCount &lt; 0) {
+            for (var i = fiscalPeriodsCount; i &lt; 0; i++) {
+                var fiscalStartDateTime = this.fiscalCalendar().getPeriodStartDate(fiscalPeriodId);
+                var startDateTime = new GlideDateTime(fiscalStartDateTime);
+    
+                startDateTime.addDaysUTC(-3); // Fail-Safe FiscalCalendar is returning a day before
+                startDateTime.setValue(startDateTime.getLocalDate() + " " + startDateTime.getLocalTime());
+                var fiscalPeriodGr = this.getFiscalPeriodForDate(startDateTime.getValue());
+                if( JSUtil.notNil(fiscalPeriodGr) &amp;&amp; fiscalPeriodGr.isValidRecord()) {
+                    fiscalPeriodId = fiscalPeriodGr.getValue("sys_id");
+        
+                } else {
+                    PPMDebug.log(" ******* Unable to find the fiscal Period for date -&gt; " + endDateTime);
+                }
+            }   
+        } 
+        return fiscalPeriodId;
+    },
+
+    newFiscalPeriodFromDateDifference: function (costPlanGr, taskStartDate, previousStartDate) {
+        var difference  = 0;
+        var newTaskStartDateFiscalPeriod = this.getFiscalPeriodForDate(taskStartDate);
+        var newTaskStartDateFiscalPeriodId = newTaskStartDateFiscalPeriod.getValue("sys_id");
+        var newFiscalStartPeriodId  = newTaskStartDateFiscalPeriodId;
+        var fiscalStartPeriodId = costPlanGr.getValue("start_fiscal_period");
+
+        // Calculate the Fiscal Period Diffrence between New Task Start Date and Previous Task Start Date
+        if(JSUtil.notNil(previousStartDate)) {
+
+            var previousStartDateFiscalPeriod = this.getFiscalPeriodForDate(previousStartDate);
+            if(previousStartDateFiscalPeriod.getValue("sys_id") != newTaskStartDateFiscalPeriodId ) {
+                var previousFiscalStart = previousStartDateFiscalPeriod.getValue("fiscal_start_date_time");
+                var previousStart = new GlideDateTime(previousFiscalStart);
+
+                var newFiscalStart = newTaskStartDateFiscalPeriod.getValue("fiscal_start_date_time");
+                var newStart = new GlideDateTime(newFiscalStart);
+                
+                if(newStart.compareTo(previousStart) &gt; 0) {
+        
+                    difference = this.getFiscalPeriodDifference(previousStart, newTaskStartDateFiscalPeriod.getValue("fiscal_end_date_time"));
+                } else {
+        
+                    difference = -(this.getFiscalPeriodDifference(newStart, previousStartDateFiscalPeriod.getValue("fiscal_end_date_time")));
+                }
+                newFiscalStartPeriodId = this.getNextFiscalPeriodId(fiscalStartPeriodId, difference);   
+            }
+        } else {
+            // Retain the later CP starting later than New Task start date else reset to new Task start Date
+            var costPlanFiscalStartPeriod =  this.fiscalPeriod(fiscalStartPeriodId);
+            var costPlanFiscalStartPeriodDateTime = new GlideDateTime(costPlanFiscalStartPeriod.getValue("fiscal_start_date_time"));
+            var taskStart = new GlideDateTime(taskStartDate);
+            if(costPlanFiscalStartPeriodDateTime.compareTo(taskStart) &gt; 0) {
+                newFiscalStartPeriodId = fiscalStartPeriodId;
+            }
+        }
+        return newFiscalStartPeriodId;
+    },
+
+    applyDifference: function(costPlanGr, taskStartDate, previousStartDate) {
+        PPMDebug.log("Into CostPlanUpdateAPI.applyDifference -&gt; " + costPlanGr.getValue("name") + 
+            " | " + taskStartDate + " | " + previousStartDate);
+        var fiscalStartPeriodId = costPlanGr.getValue("start_fiscal_period");
+        var newFiscalStartPeriodId = this.newFiscalPeriodFromDateDifference(costPlanGr, taskStartDate, previousStartDate);
+        var breakdownsGr = this.breakdowns(costPlanGr.getValue("sys_id"));
+        var breakdownObj = this.breakdownsArray(breakdownsGr);
+        var breakdowns = breakdownObj.breakdowns;
+		var breakdownActuals = breakdownObj.breakdownActuals;
+        
+        PPMDebug.log("fiscalStartPeriodId -&gt; " + this.fiscalPeriod(fiscalStartPeriodId).getValue("name") + 
+            " | newFiscalStartPeriodId -&gt; " + this.fiscalPeriod(newFiscalStartPeriodId).getValue("name"));
+        if(JSUtil.notNil(newFiscalStartPeriodId) &amp;&amp; fiscalStartPeriodId != newFiscalStartPeriodId) {
+            // find the diffrence periods between old period and new period and propagate the same.
+            var newFiscalEndPeriodId = this.getNextFiscalPeriodId(newFiscalStartPeriodId, breakdowns.length-1);
+            PPMDebug.log("newFiscalEndPeriodId -&gt; " + this.fiscalPeriod(newFiscalEndPeriodId).getValue("name"));
+
+            costPlanGr.setValue("start_fiscal_period", newFiscalStartPeriodId);
+            costPlanGr.setValue("end_fiscal_period", newFiscalEndPeriodId);
+            costPlanGr.update();    
+        }
+        if(JSUtil.notNil(breakdowns) &amp;&amp; breakdowns.length &gt; 0) {
+            this.applyPreviousValues(costPlanGr, breakdowns, breakdownActuals);
+        }
+    },
+
+    applyPreviousValues: function(costPlanGr, breakdowns, breakdownActuals) {
+        // Ideally Old Breakdowns count = New Breakdowns count
+        var count = 0;
+        // var newBreakdowns = this.breakdowns(costPlanGr.getValue("sys_id"));
+        // Fail-Safe -- Current Old Breakdowns are NOT getting Deleted
+        var costPlanId = costPlanGr.getValue("sys_id");
+        var fiscalStartPeriodId = costPlanGr.getValue("start_fiscal_period");
+        var fiscalEndPeriodId = costPlanGr.getValue("end_fiscal_period");
+        var fiscalPeriodId = fiscalStartPeriodId; 
+        var newBreakdowns;
+        while(count &lt; breakdowns.length) {
+            newBreakdowns = this.breakdown(costPlanId, fiscalPeriodId);
+            var oldBreakdown = breakdowns[count];
+            var oldActual = breakdownActuals[newBreakdowns.fiscal_period];
+			if(JSUtil.notNil(oldBreakdown)) {
+				newBreakdowns.setValue("cost_default_currency", oldBreakdown.cost_default_currency);
+				newBreakdowns.setValue("cost_local_currency", oldBreakdown.cost_local_currency);
+				newBreakdowns.setValue("fx_rate", oldBreakdown.fx_rate);
+				newBreakdowns.setValue("budget", oldBreakdown.budget);
+				newBreakdowns.setValue("actual", oldActual);
+				newBreakdowns.setValue("allocated", oldBreakdown.allocated);
+				newBreakdowns.setValue("variance", oldBreakdown.variance);
+				newBreakdowns.update();
+			}
+            fiscalPeriodId = this.getNextFiscalPeriodId(fiscalPeriodId, 1);
+            count += 1;
+        }
+    },
+
+    fiscalPeriodsDiffer: function(previousStartDate, taskStartDate) {
+        var previousStart = new GlideDateTime(previousStartDate);
+        var taskStart = new GlideDateTime(taskStartDate);
+        var oldFiscalPeriod = this.getFiscalPeriodForDate(previousStartDate);
+        var newFiscalPeriod = this.getFiscalPeriodForDate(taskStart);
+        PPMDebug.log("oldFiscalPeriod -&gt; " + oldFiscalPeriod.getValue("name") 
+            + " | newFiscalPeriod -&gt; " + newFiscalPeriod.getValue("name"));
+        if(JSUtil.notNil(oldFiscalPeriod) &amp;&amp; JSUtil.notNil(newFiscalPeriod) &amp;&amp; 
+            oldFiscalPeriod.getValue("sys_id") != newFiscalPeriod.getValue("sys_id")) {
+            return true;
+        }
+        return false;
+    },
+
+    hanldeWithPreviousStartDate: function (taskSysId, taskStartDate, previousStartDate) {
+        var costPlansUpdated = false;
+        if(this.fiscalPeriodsDiffer(previousStartDate, taskStartDate)) {
+            PPMDebug.log("Into CostPlanUpdateAPI.hanldeWithPreviousStartDate -&gt; fiscal period differs");
+            var costPlanGr = this.costplans(taskSysId);
+            while(costPlanGr.next()) {
+                this.applyDifference(costPlanGr, taskStartDate, previousStartDate);
+                if(!costPlansUpdated)
+                    costPlansUpdated = true;
+            }
+        } else {
+
+        }
+        return costPlansUpdated;
+    },
+
+    handleWithoutPreviousStartDate: function (taskSysId, taskStartDate, previousStartDate) {
+        var costPlanGr = this.costplans(taskSysId);
+        var costPlansUpdated = false;
+        while(costPlanGr.next()) {
+            var costPlanDatesDiffer = this.costPlanDatesDiffer(costPlanGr, taskStartDate);
+            var cpActuals = parseInt(costPlanGr.getValue('actual_cost_default_currency')) || 0;
+            if(costPlanDatesDiffer &amp;&amp; cpActuals == 0) {
+                PPMDebug.log("Into CostPlanUpdateAPI.handleWithoutPreviousStartDate -&gt; fiscal period differs");
+                this.applyDifference(costPlanGr, taskStartDate, previousStartDate);
+                if(!costPlansUpdated)
+                    costPlansUpdated = true;
+            } else if(cpActuals != 0) {
+                gs.addInfoMessage(gs.getMessage("{0} cost plan not moved as it has actuals recorded against it.", [costPlanGr.getDisplayValue()]));
+            }
+        }
+        return costPlansUpdated;
+    },
+
+    changeDate: function(taskSysId, taskStartDate, previousStartDate) { // to be called by demand
+        PPMDebug.log("Into CostPlanUpdateAPI.changeDate -&gt; " + taskSysId + " | " + taskStartDate + " | " + previousStartDate);
+        var costPlansUpdated = false;
+        if(JSUtil.notNil(taskSysId) &amp;&amp; JSUtil.notNil(taskStartDate)) {
+            if(JSUtil.notNil(previousStartDate)) {
+                costPlansUpdated = this.hanldeWithPreviousStartDate(taskSysId, taskStartDate, previousStartDate);
+            } else {
+                costPlansUpdated = this.handleWithoutPreviousStartDate(taskSysId, taskStartDate, previousStartDate);
+            }
+        } else {
+
+        }
+        return costPlansUpdated;
+    },
+
+    type: 'CostPlanUpdateAPI'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2016-06-30 19:42:30&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0b6d3f829f102200598a5bb0657fcf37&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;57&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;CostPlanUpdateAPI&lt;/sys_name&gt;
+        &lt;sys_package display_value="PPM Standard" source="com.snc.financial_planning_pmo"&gt;92ef82e747e64210cd4e1ce4316d43e3&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0b6d3f829f102200598a5bb0657fcf37&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2021-06-10 09:58:48&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:48</sys_created_on>
+        <sys_id>3160389583b01210c6695855eeaad34e</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>CostPlanUpdateAPI</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_3160389583b01210c6695855eeaad34e</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:48</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,238 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules">
+    <x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection/>
+        <condition>!current.isActionAborted() &amp;&amp; (current.stage.changes() || current.asset.changes() || current.operation() == 'insert')</condition>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>Push Status to Asset/Consumable</name>
+        <order>500</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[var asset = new GlideRecord('alm_asset');
+asset.addQuery('sys_id', current.asset);
+asset.query();
+if (asset.next()) {
+    var updateAsset = true;
+    var assetIsDefective = false;
+    var assetIsPreallocated = false;
+    if ('defective' === asset.getValue('substatus'))
+        assetIsDefective = true; // Preserve existing status of 'defective'
+    if ('pre_allocated' === asset.getValue('substatus'))
+        assetIsPreallocated = true; // Preserve existing status of preallocated
+
+    // Update asset when TOL is created (Stage = 'draft')
+    if (current.stage.toString() === 'draft') {
+        // install_status = 6 = In stock
+        asset.install_status = '6';
+        asset.substatus = 'pending_transfer';
+        asset.active_to = true;
+    }
+
+    // For further updates on asset, check the state of task to auto update asset
+    var taskGr = new GlideRecord('alm_transfer_order_line_task');
+    taskGr.addQuery('transfer_order_line', current.sys_id);
+    taskGr.addQuery('state', 'IN', '3,7');
+    taskGr.orderByDesc('order');
+    taskGr.setLimit(1);
+    taskGr.query();
+    if (taskGr.next()) {
+        var stateOfTask = taskGr.getValue('state');
+        // state = 7 = Closed Skipped
+        // Do not auto update the asset if the last task was closed skipped
+        if (stateOfTask !== '7') {
+            //Update the asset when the last task closed was completed successfully
+            switch (current.stage.toString()) {
+                case 'requested':
+                    // install_status = 6 = In stock
+                    asset.install_status = '6';
+                    asset.substatus = 'pending_transfer';
+                    asset.active_to = true;
+                    // Update asset with user information
+                    if (asset.sys_class_name.toString() !== 'alm_consumable') {
+                        setAssetReservedFor();
+                    }
+                    break;
+
+                case 'shipment_preparation':
+                    // install_status = 6 = In stock
+                    asset.install_status = '6';
+                    asset.substatus = 'pending_transfer';
+                    asset.active_to = true;
+                    // Update asset with user information
+                    if (asset.sys_class_name.toString() !== 'alm_consumable') {
+                        setAssetReservedFor();
+                    }
+                    break;
+
+                case 'in_transit':
+                    // install_status = 9 = In transit
+                    asset.install_status = '9';
+                    asset.substatus = 'reserved';
+                    asset.active_to = true;
+                    // Update asset with user information
+                    if (asset.sys_class_name.toString() !== 'alm_consumable') {
+                        setAssetReservedFor();
+                    }
+                    break;
+
+                case 'received':
+                    // This needs an update when we touch FSM as the item has to go back to
+                    // pending transfer
+                    if (SNC.AssetMgmtUtil.isPluginRegistered('com.snc.work_management') && JSUtil.notNil(current.transfer_order.service_order_task)) {
+                        // If this TOL is under a work order task then asset.active_to cannot
+                        // be released yet,
+                        // Once the service order is complete then the active_to will be
+                        // released. Also since
+                        // this is not the final destination of this asset, it will be in
+                        // pending transfer stage
+                        if (current.model.sys_class_name == 'cmdb_consumable_product_model' || current.model.asset_tracking_strategy == 'track_as_consumable') {
+                            current.asset = new Consumables().split(current.asset,
+                                current.quantity_received - current.quantity_returned,
+                                '6', 'pending_transfer', '', asset.stockroom,
+                                asset.location, asset.assigned_to);
+                            updateAsset = false;
+                        } else {
+                            asset.install_status = '6';
+                            asset.substatus = 'pending_transfer';
+                            asset.stockroom = current.transfer_order.to_stockroom;
+                        }
+                    } else if (SNC.AssetMgmtUtil.isPluginRegistered('com.snc.field_service_management') && JSUtil.notNil(current.transfer_order.service_order)) {
+                        // If this TOL is under a service order then asset.active_to cannot
+                        // be released yet,
+                        // Once the service order is complete then the active_to will be
+                        // released. Also since
+                        // this is not the final destination of this asset, it will be in
+                        // pending transfer stage
+                        if (current.model.sys_class_name == 'cmdb_consumable_product_model' || current.model.asset_tracking_strategy == 'track_as_consumable') {
+                            current.asset = new Consumables().split(current.asset,
+                                current.quantity_received - current.quantity_returned,
+                                '6', 'pending_transfer', '', asset.stockroom,
+                                asset.location, asset.assigned_to);
+                            updateAsset = false;
+                        } else {
+                            asset.install_status = '6';
+                            asset.substatus = 'pending_transfer';
+                            asset.stockroom = current.transfer_order.to_stockroom;
+                        }
+                    } else {
+                        // If FSM is not actiavated or TOL is not attached to an SO then
+                        // release the asset and
+                        // make it available in this stockroom which is its final
+                        // destination
+
+                        // install_status = 6 = In stock
+                        asset.install_status = '6';
+                        asset.stockroom = current.transfer_order.to_stockroom;
+                        asset.active_to = false;
+                        // Update asset with user information
+                        if (asset.sys_class_name.toString() !== 'alm_consumable') {
+                            setAssetReservedFor();
+                        }
+                        // Keep the asset substate as reserved when there's a Requested For value in the Request Line, otherwise mark it as Available
+                        if (asset.substatus != 'reserved' || current.request_line.nil() || current.request_line.requested_for.nil()) {
+                            asset.substatus = 'available';
+                        }
+                    }
+                    break;
+
+                case 'delivered':
+   // The TOL will only reach this stage if it has an SO attached to it, in
+   // that case the asset
+   // cannot be released yet, once the SO completes, it will be released.
+   // At this stage,
+   // the asset us marked 'reserved' (for work) by the FSA in his personal
+   // stockroom.
+   asset.install_status = '6';
+   // Marking asset as available when transfer order type is Field Stockroom request as there will be no service order task linked to part requirement
+            asset.substatus =  current.transfer_order.type == 'field_stockroom_request' ? 'available' : 'reserved';
+   asset.active_to = false;
+     
+   if(current.transfer_order.type == 'field_stockroom_request')
+    asset.stockroom = current.transfer_order.to_stockroom;  
+   else if (SNC.AssetMgmtUtil.isPluginRegistered('com.snc.service_management.core'))
+    asset.stockroom = new SMStockRooms().getAgentStockroom(current.transfer_order.service_order_task.assigned_to);
+   else if (SNC.AssetMgmtUtil.isPluginRegistered('com.snc.field_service_management'))
+    asset.stockroom = new FSMUtils().getFSAStockroom(current.transfer_order.service_order.assigned_to);
+   break;
+
+                default:
+                    // Nothing to do
+                    updateAsset = false;
+            }
+
+
+        } else {
+   // Update active transfer order of asset even when TOL task is closed skipped 
+   // so that, customers can edit state/substate manually when tol is received/delivered
+            if (stateOfTask === '7') {
+                if (current.stage.toString() === 'received' || current.stage.toString() === 'delivered') {
+                    if (asset.active_to.toString() !== 'false') {
+                        asset.active_to = false;
+                    }
+                }
+
+            }
+        }
+    }
+ // Update the asset
+    updateTOLAsset(updateAsset, assetIsDefective, assetIsPreallocated, asset);
+}
+
+function updateTOLAsset(updateAsset, assetIsDefective, assetIsPreallocated, asset) {
+    if (updateAsset) {
+        if (assetIsDefective)
+            asset.substatus = 'defective';
+        else if (assetIsPreallocated)
+            asset.substatus = 'pre_allocated';
+        asset.update();
+    }
+}
+
+function setAssetReservedFor() {
+    // Update asset with user information ('reserved_for') when the TOL is created from Service Catalog REQ
+    // Or when a TOL has 'request_line' (REQ-->RITM) and has been 'requested_for' (reference to sys_user) 
+    if (!gs.nil(current.request_line)) {
+        if (!gs.nil(current.request_line.request.requested_for)) {
+            asset.reserved_for = current.request_line.request.requested_for;
+        }
+    }
+}]]></script>
+        <sys_class_name>x_938076_now_utils_now_utils_business_rules</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:49:27</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>27bbe41583701210c6695855eeaad304</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Push Status to Asset/Consumable</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>x_938076_now_utils_now_utils_business_rules_27bbe41583701210c6695855eeaad304</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:49:27</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </x_938076_now_utils_now_utils_business_rules>
+    <sys_translated_text action="delete_multiple" query="documentkey=27bbe41583701210c6695855eeaad304"/>
+</record_update>

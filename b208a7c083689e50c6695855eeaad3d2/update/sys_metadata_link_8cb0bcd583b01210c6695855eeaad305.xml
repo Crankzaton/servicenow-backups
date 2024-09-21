@@ -1,0 +1,916 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>19676264b75600101cadbc78ee11a919</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_doc.PdfTemplateUtilsSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;PdfTemplateUtilsSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var PdfTemplateUtilsSNC = Class.create();
+PdfTemplateUtilsSNC.prototype = {
+
+    initialize: function() {
+        this.CONTENT_TYPE_PDF = 'application/pdf';
+        this.nonTextFieldTypes = ['check_box', 'radio_button', 'choice_box', 'multi_select_choice_box', 'combo_box'];
+        this.flattenType = 'fully_flatten';
+        this.ignoredFields = ['push_button', 'signature'];
+        this.LANG_DISPLAY_VALUE_METHOD_EXISTS = new sn_doc.DocumentTemplateUtils().checkGetDisplayValueLangApiSupport();
+    },
+
+    /**
+     * Checks whether the document is a pdf or not
+     *
+     * @param {string} docAttachmentId - Document attachment sys id
+     * @return {boolean} - true/false
+     */
+    isPdf: function(docAttachmentId) {
+        var isPdf = false;
+        if (!gs.nil(docAttachmentId)) {
+            var attachmentGr = new GlideRecord('sys_attachment');
+            if (attachmentGr.get(docAttachmentId) &amp;&amp; !gs.nil(attachmentGr.content_type) &amp;&amp; attachmentGr.content_type == this.CONTENT_TYPE_PDF)
+                isPdf = true;
+        }
+        return isPdf;
+    },
+
+    /**
+     * Checks whether the document is an editable pdf or not
+     *
+     * @param {string} docAttachmentId - Document attachment sys id
+     * @return {boolean} - true/false
+     */
+    isFillable: function(docAttachmentId) {
+        var isPdfFillable = false;
+        if (!gs.nil(docAttachmentId)) {
+            var response = new sn_pdfgeneratorutils.PDFGenerationAPI().isDocumentFillable(docAttachmentId);
+            isPdfFillable = (response.document_editable == 'true');
+        }
+        return isPdfFillable;
+    },
+
+    /**
+     * Checks whether the document has pdf template mappings records with fields mapped
+     *
+     * @param {string} pdfTemplateId - Pdf Template sys Id
+     * @return {boolean} - true/false
+     */
+    hasFieldMappings: function(pdfTemplateId) {
+        var templateMappingGr = new GlideRecord('sn_doc_pdf_template_mapping');
+        templateMappingGr.addQuery('document', pdfTemplateId);
+        templateMappingGr.addNotNullQuery('mapping_field');
+        templateMappingGr.setLimit(1);
+        templateMappingGr.query();
+        return templateMappingGr.hasNext();
+    },
+    /**
+     * Checks whether there are fields that are not mapped to either participant or mapping field
+     *
+     * @param {string} pdfTemplateId - Pdf Template sys Id
+     * @return {boolean} - true/false
+     */
+    hasFieldsWithoutMapping: function(pdfTemplateId) {
+        var templateMappingGr = new GlideRecord('sn_doc_pdf_template_mapping');
+        templateMappingGr.addQuery('document', pdfTemplateId);
+        templateMappingGr.addNullQuery('mapping_field');
+        templateMappingGr.addNullQuery('participant');
+        templateMappingGr.setLimit(1);
+        templateMappingGr.query();
+        return templateMappingGr.hasNext();
+    },
+
+    /**
+     * Checks whether if there are any participants without any user assigned to them
+     *
+     * @param {string} pdfTemplateId - Pdf Template sys Id
+     * @return {boolean} - true/false
+     */
+    hasParticipantsWithoutUser: function(pdfTemplateId) {
+        var participantGr = new GlideRecord("sn_doc_participant");
+        participantGr.addEncodedQuery("doc_template_userISEMPTY^participant_emailISEMPTY");
+        participantGr.addQuery("document_template", pdfTemplateId);
+        participantGr.addQuery("advanced_script_toggle", false);
+        participantGr.query();
+
+        if (participantGr.hasNext())
+            return true;
+    },
+
+    /**
+     * Checks whether the document has pdf template mappings created
+     *
+     * @param {string} pdfTemplateId - Pdf Template sys Id
+     * @return {boolean} - true/false
+     */
+    containsDocumentMap: function(pdfTemplateId) {
+        var documentMapGR = new GlideRecord('sn_doc_pdf_template_mapping');
+        documentMapGR.addQuery('document', pdfTemplateId);
+        documentMapGR.addNullQuery('document_field_type').addOrCondition('document_field_type', '!=', 'signature');
+        documentMapGR.setLimit(1);
+        documentMapGR.query();
+        return documentMapGR.hasNext();
+    },
+
+    /**
+     * Creates pdf template mappings
+     *
+     * @param {string} pdfTemplateId - Pdf template sys Id
+     * @param {string} docAttachmentId - Document attachment sys Id
+     * @return {boolean} - true/false
+     */
+    createDocumentMap: function(pdfTemplateId, docAttachmentId) {
+        var properties = [];
+        if (!gs.nil(docAttachmentId)) {
+            properties = this._getFieldType(docAttachmentId);
+            for (var f in properties) {
+                this._createDocumentMapHelper(pdfTemplateId, f, properties[f]);
+            }
+        }
+    },
+
+    _createDocumentMapHelper: function(documentId, documentField, fieldProperty) {
+
+        if (this.ignoredFields.indexOf(fieldProperty['type']) == -1) {
+            var fieldLabel = documentField.substring(documentField.lastIndexOf('.') + 1, documentField.length);
+            var gr = new GlideRecord('sn_doc_pdf_template_mapping');
+            gr.document_field_type = fieldProperty['type'];
+            gr.document_field = documentField;
+            gr.document_field_label = fieldLabel;
+            gr.page_number = fieldProperty['pageNumber'];
+
+            if (this.nonTextFieldTypes.indexOf(fieldProperty['type']) &gt; -1) {
+                var fieldDetails = fieldProperty['fieldsDetails'];
+                var states = [];
+
+                for (var i = 0; i &lt; fieldDetails.length; i++) {
+                    states.push(fieldDetails[i].fieldName);
+                }
+
+                gr.states = states.toString();
+                if (states &amp;&amp; states.length &gt; 0) {
+                    gr.preview_value = states[states.length - 1];
+                }
+            } else {
+                var previewValue = fieldLabel.substring(0, fieldLabel.indexOf("["));
+                if (!previewValue)
+                    previewValue = fieldLabel;
+                gr.preview_value = previewValue;
+            }
+
+            gr.document = documentId;
+            return gr.insert();
+        }
+
+    },
+
+    _getFieldType: function(attachmentSysId) {
+        var pdfUtils = new sn_pdfgeneratorutils.PDFGenerationAPI();
+        var jsonString = new pdfUtils.getDocumentFieldsType(attachmentSysId);
+        return jsonString.fields_type;
+    },
+
+    /**
+     * Description: Generate a pdf with preview values and attach it to
+     * the pdf template
+     * @param {SysId} pdfTemplateId
+     * @return {SysId}
+     */
+    preview: function(pdfTemplateId) {
+        var pdfTemplateGr = this._getGlideRecord("sn_doc_pdf_template", pdfTemplateId)();
+
+        if (pdfTemplateGr.isValid()) {
+            //Remove existing preview pdfs before creating a new one
+            var sysAttachment = new GlideSysAttachment();
+            var attachmentGR = sysAttachment.getAttachments(pdfTemplateGr.getTableName(), pdfTemplateId);
+            while (attachmentGR.next())
+                sysAttachment.deleteAttachment(attachmentGR.getValue('sys_id'));
+
+            var params = {
+                fieldMap: this._getPreviewMapping(pdfTemplateId),
+                fillablePdfAttachmentId: pdfTemplateGr.getValue("document"),
+                targetTable: pdfTemplateGr.getTableName(),
+                targetSysId: pdfTemplateGr.getUniqueValue(),
+                generatedPdfName: 'preview.pdf'
+            };
+
+            return this.generateDocumentAsAttachment(params);
+        }
+
+        return null;
+    },
+
+    /**
+     * Description: Generate a pdf document for a task and attach it to
+     * the task record
+     * @param {SysId} pdfTemplateId
+     * @param {SysId} taskId
+     * @param {String} pdfName
+     * @return {SysId}
+     */
+    generate: function(taskId, pdfTemplateId, pdfName) {
+        var pdfTemplateGr = this._getGlideRecord("sn_doc_pdf_template", pdfTemplateId)();
+        var taskGr = this._getGlideRecord(pdfTemplateGr.getValue("table"), taskId)();
+
+        if (pdfTemplateGr.isValid() &amp;&amp; taskGr.isValid()) {
+            var params = {
+                fieldMap: this._getMapping(pdfTemplateId, taskGr),
+                fillablePdfAttachmentId: pdfTemplateGr.getValue("document"),
+                targetTable: taskGr.getRecordClassName(),
+                targetSysId: taskGr.getUniqueValue(),
+                generatedPdfName: this._getPdfName(pdfName, pdfTemplateGr)
+            };
+            return this.generateDocumentAsAttachment(params);
+        } else
+            gs.error("Error generating the document");
+
+        return null;
+    },
+
+    /**
+     * Description: Generate a pdf document and attach to the given execution(sn_doc_task_execution) record
+     * @param {SysId} pdfTemplateId
+     * @param {SysId} executionId
+     * @param {String} pdfName
+     * @return {SysId}
+     */
+    generateAndAttachToExecutionRecord: function(taskId ,executionId, pdfTemplateId, pdfName) {
+        var pdfTemplateGr = this._getGlideRecord("sn_doc_pdf_template", pdfTemplateId)();
+        var taskGr = this._getGlideRecord(pdfTemplateGr.getValue("table"), taskId)();
+        var executionGr = this._getGlideRecord("sn_doc_task_execution", executionId)();
+
+        if (pdfTemplateGr.isValid() &amp;&amp; taskGr.isValid() &amp;&amp; executionGr.isValid()) {
+            var params = {
+                fieldMap: this._getMapping(pdfTemplateId, taskGr),
+                fillablePdfAttachmentId: pdfTemplateGr.getValue("document"),
+                targetTable: executionGr.getRecordClassName(),
+                targetSysId: executionGr.getUniqueValue(),
+                generatedPdfName: this._getPdfName(pdfName, pdfTemplateGr)
+            };
+            return this.generateDocumentAsAttachment(params);
+        } else
+            gs.error("Error generating the document");
+
+        return null;
+    },
+
+    /**
+     * Description: Generate a pdf document for a task and attach it to
+     * the task record
+     * @param {SysId} pdfTemplateId
+     * @param {SysId} taskId
+     * @return {{status: string, message: string, pdf_name:string, document_base64: string}}
+     */
+    getPreFilledDocumentAsBase64: function(taskId, pdfTemplateId) {
+        var pdfTemplateGr = this._getGlideRecord("sn_doc_pdf_template", pdfTemplateId)();
+        var taskGr = this._getGlideRecord(pdfTemplateGr.getValue("table"), taskId)();
+        var params = {
+            fieldMap: this._getMapping(pdfTemplateId, taskGr),
+            fillablePdfAttachmentId: pdfTemplateGr.getValue("document")
+        };
+        var response;
+        var isFillable = this.isFillable(params.fillablePdfAttachmentId);
+        if (isFillable)
+            response = this.getFilledDocumentAsBase64(params);
+        else {
+            response = {};
+            var gr = this._getGlideRecord("sys_attachment", params.fillablePdfAttachmentId)();
+            response.document_base64 = new GlideSysAttachment().getContentBase64(gr);
+        }
+        response.pdf_name = pdfTemplateGr.getValue("name");
+        return response;
+    },
+
+    _getPdfName: function(pdfName, pdfTemplateGr) {
+        pdfName = pdfName || pdfTemplateGr.getValue("name");
+        if (pdfName.indexOf('.pdf') &gt; -1)
+            return pdfName;
+        return pdfName + '.pdf';
+    },
+
+    /**
+     * Description: Generates a pdf from fillable pdf with
+     * given document field values and attach it the given record
+     * @param {Object} params
+     * @param {params.fieldMap} : document_field to value mapping
+     * @param {params.fillablePdfAttachmentId} : Fillable pdf attachment
+     * @param {params.targetTable} : Table to which pdf is attached
+     * @param {params.targetSysId} : Record to which pdf is attached
+     * @param {params.generatedPdfName} : Name of the generated pdf
+     * @return {SysId}
+     */
+    generateDocumentAsAttachment: function(params) {
+        var pdfSignRequestor;
+        if (!gs.nil(params.signMap)) {
+            pdfSignRequestor = new sn_pdfgeneratorutils.PdfMergeSignRequestor();
+            for (var i = 0; i &lt; params.signMap.length; i++) {
+                var signature = params.signMap[i];
+                pdfSignRequestor.addSignatureMapping(
+                    signature.pageNumber,
+                    signature.signLeft,
+                    signature.signTop,
+                    signature.boxWidth,
+                    signature.boxHeight,
+                    signature.attachmentId
+                );
+            }
+        }
+
+        var additionalParams = {
+            FlattenType: gs.nil(params.flattenType) ? this.flattenType : params.flattenType
+        };
+
+        var pdfUtils = new sn_pdfgeneratorutils.PDFGenerationAPI();
+        var response = pdfUtils.fillFieldsAndMergeSignature(
+            params.fieldMap,
+            params.fillablePdfAttachmentId,
+            params.targetTable,
+            params.targetSysId,
+            pdfSignRequestor,
+            params.generatedPdfName,
+            additionalParams
+        );
+
+        if (response &amp;&amp; response.status != "success") {
+            gs.error("Error generating the document : " + response.message);
+            return null;
+        }
+
+        return response.attachment_id;
+    },
+
+    /**
+     * Description: Generates a pdf content from fillable pdf with
+     * given document field values and return as base64
+     * @param {Object} params
+     * @param {params.fieldMap} : document_field to value mapping
+     * @param {params.signMap} : signature box metadata to value mapping
+     * @param {params.fillablePdfAttachmentId} : Fillable pdf attachment
+     * @return {{status: string, message: string, document_base64: string}}
+     */
+    getFilledDocumentAsBase64: function(params) {
+        var pdfSignRequestor;
+        if (!gs.nil(params.signMap)) {
+            pdfSignRequestor = new sn_pdfgeneratorutils.PdfMergeSignRequestor();
+            for (var i = 0; i &lt; params.signMap.length; i++) {
+                var signature = params.signMap[i];
+                pdfSignRequestor.addSignatureMapping(
+                    signature.pageNumber,
+                    signature.signLeft,
+                    signature.signTop,
+                    signature.boxWidth,
+                    signature.boxHeight,
+                    signature.attachmentId
+                );
+            }
+        }
+        var pdfUtils = new sn_pdfgeneratorutils.PDFGenerationAPI();
+        var additionalParams = {
+            FlattenType: this.flattenType
+        };
+        var response = pdfUtils.getFilledDocumentWithSignatureAsBase64(
+            params.fieldMap,
+            params.fillablePdfAttachmentId,
+            pdfSignRequestor,
+            additionalParams
+        );
+        return response;
+    },
+
+    /*
+    API to return JSON object for the template mapping records as per mapping fields.
+    pdfTemplateId : sys id of the pdf template.
+    recordId : record sys id of the table selected in the template.
+	*/
+    getMappedValuesAsJson: function(pdfTemplateId, recordId) {
+        var map = {};
+        var documentMapGR = this._getGlideRecord('sn_doc_pdf_template_mapping')({
+            'document': pdfTemplateId
+        });
+        while (documentMapGR.next()) {
+            var key = documentMapGR.getValue('sys_id');
+            var value = this._getMappedFieldValue(documentMapGR, recordId);
+            map[key] = value;
+        }
+        return map;
+    },
+
+    /*
+    API to return JSON object for filled fields column.
+	For the first task, Values are populated from the mapping table
+	For Rejection flow - Participants see the values filled in last Task and the latest values of the participants with order less than the participant.
+    recordId : record sys id of the table selected in the template.
+	pdfTemplateId: document template Id for the pdf
+	previousDocTask: Document task created for the previous participant
+	participant: current participant ID
+	*/
+    getParticipantLastFilledFields: function(pdfTemplateId, recordId, previousDocTask, participant) {
+        var map = {};
+        if (!previousDocTask)
+            map = this.getMappedValuesAsJson(pdfTemplateId, recordId);
+        else {
+            var prevGr = new GlideRecord('sn_doc_task');
+            prevGr.get(previousDocTask.sys_id);
+            var prevTaskJson = JSON.parse(prevGr.getValue('filled_fields'));
+            var lastFilledTaskGr = new DocumentTaskUtils().getParticipantLastFilledTask(recordId, pdfTemplateId, participant);
+            var lastFilledTaskJson;
+            if (lastFilledTaskGr)
+                lastFilledTaskJson = JSON.parse(lastFilledTaskGr.getValue('filled_fields'));
+            map = this._createParticipantJson(prevTaskJson, lastFilledTaskJson, participant, pdfTemplateId);
+        }
+        return map;
+
+    },
+
+    _isFirstParticipant: function(participantId, docTemplateId) {
+        var isFirstParticipant = false;
+        var participantGr = new GlideRecord('sn_doc_participant');
+        participantGr.addQuery('document_template', docTemplateId);
+        participantGr.addActiveQuery();
+        participantGr.orderBy('order');
+        participantGr.setLimit(1);
+        participantGr.query();
+        if (participantGr.next()) {
+            if (participantGr.getValue('sys_id') == participantId)
+                isFirstParticipant = true;
+        }
+        return isFirstParticipant;
+    },
+
+    /*
+    returns the JSON object for filled fields column.
+	For the first task, Values are populated from Database
+	For Rejection flow - Participants see the values filled in last Task and the latest values of the participants with order less than the participant.
+   */
+    _createParticipantJson: function(prevParticipantJson, participantLastTaskJson, participant, pdfTemplateId) {
+        if (participantLastTaskJson) {
+            for (var key in participantLastTaskJson) {
+                var isFieldEditableByParticipant = this._isFieldEditableByParticipant(key, participant);
+                var isFirstParticipant = this._isFirstParticipant(participant, pdfTemplateId);
+                if (!isFieldEditableByParticipant &amp;&amp; !isFirstParticipant) {
+                    participantLastTaskJson[key] = prevParticipantJson[key];
+                }
+            }
+            return participantLastTaskJson;
+        } else
+            return prevParticipantJson;
+    },
+
+    _isFieldEditableByParticipant: function(key, participant) {
+        var templateMappingGr = new GlideRecord('sn_doc_pdf_template_mapping');
+        var mapping = templateMappingGr.get(key);
+        if (mapping &amp;&amp; templateMappingGr.participant == participant)
+            return true;
+        else
+            return false;
+    },
+
+    _isFieldMapped: function(key) {
+        var templateMappingGr = new GlideRecord('sn_doc_pdf_template_mapping');
+        var mapping = templateMappingGr.get(key);
+        if (mapping &amp;&amp; !templateMappingGr.mapping_field.nil())
+            return true;
+        else
+            return false;
+    },
+
+    _getPreviewMapping: function(pdfTemplateId) {
+        var documentMapGR = this._getGlideRecord("sn_doc_pdf_template_mapping")({
+            'document': pdfTemplateId
+        });
+        var previewMap = {};
+
+        while (documentMapGR.next()) {
+            if (documentMapGR.getValue('document_field_type') == 'signature')
+                continue;
+            var key = documentMapGR.getValue("document_field");
+            var value = documentMapGR.getValue('preview_value');
+
+            if (!gs.nil(key) &amp;&amp; !gs.nil(value))
+                previewMap[key] = value;
+        }
+
+        return previewMap;
+    },
+
+    _getMapping: function(pdfTemplateId, taskGr) {
+
+        var documentMapGR = this._getGlideRecord('sn_doc_pdf_template_mapping')({
+            'document': pdfTemplateId
+        });
+
+        var map = {};
+        var template_language = null;
+        while (documentMapGR.next()) {
+            var key = documentMapGR.getValue('document_field');
+            var value = '';
+            if(!template_language &amp;&amp; documentMapGR.document.language)
+                template_language = documentMapGR.document.language;
+
+            if (documentMapGR.getValue('document_field_type') == 'signature')
+                continue;
+
+            if (gs.nil(documentMapGR.mapping_table)) {
+                gs.error("Mapping table is not found for: " + key);
+                continue;
+            }
+
+            if (!gs.nil(documentMapGR.mapping_field)) {
+                var ge = taskGr.getElement(documentMapGR.mapping_field);
+                var offsets = this._dateOffset(documentMapGR)(ge);
+                if(!gs.nil(ge)) {
+                    var displayVal;
+                    if(this.LANG_DISPLAY_VALUE_METHOD_EXISTS &amp;&amp; template_language)
+                        displayVal = ge.getDisplayValueLang(template_language);
+                    else
+                        displayVal = ge.getDisplayValue();
+                    value = displayVal;
+                } else
+                    value = '';
+                if (documentMapGR.advanced_script_toggle)
+                    value = this._evaluateTemplateMapping(documentMapGR, taskGr, value);
+                // if internal type is date/glide_date/glide_date_time, check for and apply the date offset
+                else if (offsets.regex.type.test(offsets.internalType()))
+                    value = offsets.offsetValue();
+            } else if (documentMapGR.advanced_script_toggle)
+                value = this._evaluateTemplateMapping(documentMapGR, taskGr, value);
+
+            if (!gs.nil(value))
+                map[key] = value;
+        }
+        return map;
+    },
+
+    /*
+     * Get GlideRecord by sysId or use query
+     * @param tablel - @string table name
+     * @param sysId - @string sysId of table
+     * @param query - @object {prop: value}
+     */
+    _getGlideRecord: function(table, sysId) {
+        var gr = new GlideRecord(table);
+        return function(query) {
+            if (sysId)
+                gr.get(sysId);
+            else {
+                gr.addActiveQuery();
+                Object.keys(query).map(function(q) {
+                    gr.addQuery(q, query[q]);
+                });
+                gr.query();
+            }
+            return gr;
+        };
+    },
+
+    /*
+     * Method to offset date by days, weeks, months, and redefine date format
+     * @param dmgr: "sn_doc_pdf_template_mapping" glide record
+     */
+    _dateOffset: function(dmgr) {
+        var dateOffsetType = dmgr.getValue('date_offset_type');
+        var dateOffsetUnits = dmgr.getValue('date_offset_units');
+        var dateOffsetQuantity = dmgr.getValue('date_offset_quantity');
+        var sysDateFormat = gs.getProperty('glide.sys.date_format');
+        var selectDateFormat = dmgr.getValue('select_date_format');
+        var specificDateFormat = dmgr.getValue('specific_date_format') || sysDateFormat;
+        var sysUserGr = this._getGlideRecord('sys_user', gs.getUserID())();
+        var templateGr = dmgr.document.getRefRecord();
+        var templateDateFormat = templateGr.getValue('template_date_format');
+        var dtSysPropertyDateFormat = gs.getProperty('sn_doc.template_date_format');
+
+        /*
+         * Using closure to access private variable and expose private functions
+         * @param ge: dmgr.mapping_field element of dmgr.mapping_table glide record
+         */
+        return function(ge) {
+            return {
+                regex: {
+                    before: /^(before)$/i,
+                    beforeAfter: /^(before|after)$/i,
+                    dateFormat: /[M|d]{2}|y{4}/g,
+                    firstLetter: /^(\w)/,
+                    notLetter: /\W|_/g,
+                    notNum: /\D/g,
+                    templateDateFormat: /template_date_format/i,
+                    other: /other/i,
+                    units: /^(days|weeks|months)$/i,
+                    type: /^(date|glide_date|glide_date_time)$/i
+                },
+                // returns the internalType as string
+                internalType: function() {
+                    var gr = new GlideRecord(dmgr.mapping_table);
+                    if (!gr.isValid()) {
+                        gs.info('PdfTemplateUtils: PDF Mapping table: ' + dmgr.mapping_table + ' not found, see: ' + dmgr.getDisplayValue('document'));
+                        return null;
+                    }
+                    var ele = gr.getElement(dmgr.mapping_field);
+                    if (ele.toString() == null) {
+                        gs.info('PdfTemplateUtils: PDF Mapping field: ' + dmgr.mapping_field + ' not found in mapping table: ' + dmgr.mapping_table + ', see: ' + dmgr.getDisplayValue('document'));
+                        return null;
+                    }
+                    return ele.getED().getInternalType();
+                },
+                // return amount to multiply quantity by
+                getOffsetDirection: function() {
+                    // if not before or after, return 0
+                    if (!this.regex.beforeAfter.test(dateOffsetType))
+                        return 0;
+                    // -1 will subtract from date, 1 will add
+                    return this.regex.before.test(dateOffsetType) ? -1 : 1;
+                },
+                // @param dv: Date string
+                setDateFormat: function(dv) {
+                    var sysUserDateFormatArr = sysUserGr.date_format || sysDateFormat;
+
+                    if (selectDateFormat === 'template_date_format')
+                        specificDateFormat = templateDateFormat || dtSysPropertyDateFormat || sysUserDateFormatArr;
+
+                    var specificUserDateFormatArr = specificDateFormat.split(this.regex.notLetter);
+                    // if user didn't include a seperator, split by match
+                    if (specificUserDateFormatArr.length &lt; 2)
+                        specificUserDateFormatArr = specificDateFormat.match(this.regex.dateFormat);
+                    var dateFormatSpecialChar = specificDateFormat.match(this.regex.notLetter);
+                    var dvArr = dv.split(this.regex.notNum);
+                    var formattedDv = '';
+                    sysUserDateFormatArr = sysUserDateFormatArr.split(this.regex.notLetter);
+                    /*
+                     * construct a new date format by iterating through specific_date_format
+                     * and grabbing the index of the actual date using the default date format
+                     * e.g. MM[0]/dd[1]/yyyy[2] =&gt; dd[1]/MM[0]/yyyy[2]
+                     */
+                    specificUserDateFormatArr.map(function(o, i) {
+                        formattedDv += dvArr[sysUserDateFormatArr.indexOf(o)];
+                        if (dateFormatSpecialChar &amp;&amp; dateFormatSpecialChar[i])
+                            formattedDv += dateFormatSpecialChar[i];
+                    });
+                    return formattedDv;
+                },
+                // Calculate and return the offset GlideDate string value
+                offsetValue: function() {
+                    if (!ge.getDisplayValue())
+                        return '';
+                    var glideDateTime = new GlideDateTime();
+                    glideDateTime.setDisplayValue(ge.getDisplayValue());
+                    // check for isNaN to ensure data quality
+                    if (!isNaN(dateOffsetQuantity) &amp;&amp; this.regex.units.test(dateOffsetUnits)) {
+                        var offsetAmount = this.getOffsetDirection() * dateOffsetQuantity;
+                        // capitalize the unit - 'days' to 'Days' for method name. i.e. 'addDaysLocalTime'
+                        var capitalizedUnit = dateOffsetUnits.replace(this.regex.firstLetter, dateOffsetUnits.charAt(0).toUpperCase());
+                        glideDateTime['add' + capitalizedUnit + 'LocalTime'](offsetAmount);
+                    }
+                    var gdtLocalDateValue = glideDateTime.getLocalDate().getDisplayValue();
+                    if (this.regex.other.test(selectDateFormat) || this.regex.templateDateFormat.test(selectDateFormat))
+                        return this.setDateFormat(gdtLocalDateValue);
+                    return gdtLocalDateValue;
+                }
+            };
+        };
+    },
+
+    _evaluateTemplateMapping: function(pdfTemplateMappingGr, taskGr, mappingField) {
+        var evaluator = new GlideScopedEvaluator();
+        evaluator.putVariable('taskGr', taskGr);
+        evaluator.putVariable('mappingField', mappingField);
+        return evaluator.evaluateScript(pdfTemplateMappingGr, 'script', null);
+    },
+
+    /**
+     * Description: Get field data to prefill editable pdf.
+     * @param {SysId} pdfTemplateId
+     * @param {SysId} docTaskId
+     * @return {ArrayString}
+     */
+    getFieldDataFromDocumentTask: function(pdfTemplateId, docTaskId) {
+        var data = [];
+        var docTaskGr = new GlideRecord("sn_doc_task");
+        if (docTaskGr.get(docTaskId) &amp;&amp; docTaskGr.canRead()) {
+            var fieldJson = {};
+            try {
+                fieldJson = JSON.parse(docTaskGr.getValue("filled_fields"));
+            } catch (e) {
+                gs.info(gs.getMessage("Error parsing the field json"));
+            }
+            fieldJson = fieldJson || {};
+            var templateMapGr = new GlideRecord("sn_doc_pdf_template_mapping");
+            templateMapGr.addQuery("document", pdfTemplateId);
+            templateMapGr.addActiveQuery();
+            templateMapGr.query();
+            while (templateMapGr.next()) {
+                var mapping = {
+                    fieldId: templateMapGr.getUniqueValue(),
+                    fieldName: templateMapGr.getValue("document_field"),
+                    fieldDisplayName: templateMapGr.getValue("document_field_label"),
+                    fieldLabel: templateMapGr.getValue("document_field_label"),
+                    fieldType: templateMapGr.getValue("document_field_type"),
+                    pageNumber: templateMapGr.getValue("page_number"),
+                    isReadOnly: templateMapGr.getValue("read_only") == 1,
+                    canUserEdit: docTaskGr.getValue("participant") == templateMapGr.getValue("participant"),
+                    isMandatory: templateMapGr.getValue("mandatory") == 1
+                };
+
+                if (mapping.fieldType == "signature") {
+                    // As signature is not a field in pdf, fieldName will be empty.
+                    // Populate the field name for signature fields.
+                    mapping.fieldName = templateMapGr.getUniqueValue();
+                    var sign_left = templateMapGr.getValue("sign_left");
+                    var sign_top = templateMapGr.getValue("sign_top");
+                    var box_width = templateMapGr.getValue("box_width");
+                    var box_height = templateMapGr.getValue("box_height");
+                    mapping.rect = [sign_left, sign_top, box_width, box_height];
+                    mapping.isSigned = false;
+                    if (fieldJson.hasOwnProperty(mapping.fieldId) &amp;&amp; fieldJson[mapping.fieldId]) {
+                        var signAttachmentId = fieldJson[mapping.fieldId];
+                        var signDetails = new DocumentTaskUtils().getSignatureFromAttachmentId(signAttachmentId);
+                        mapping.user = signDetails.user;
+                        mapping.signedOn = signDetails.signedOn;
+                        mapping.isSigned = true;
+                    }
+                    mapping.fieldLabel = this._getSignatureAriaLabel(mapping);
+                }
+                mapping.validations = [];
+                if (!gs.nil(templateMapGr.format)) {
+                    var regexFlag = "";
+                    if (templateMapGr.getElement("format.regex_flag") == 2 || templateMapGr.getElement("format.regex_flag") == 66)
+                        regexFlag = "i";
+
+                    mapping.validations.push({
+                        type: "CHECK_REGEX",
+                        messageForError: templateMapGr.getElement("format.validation_message").getDisplayValue(),
+                        regex: templateMapGr.getElement("format.regex").getDisplayValue(),
+                        regexFlag: regexFlag
+                    });
+                }
+                if (fieldJson.hasOwnProperty(mapping.fieldId))
+                    mapping.fieldValue = fieldJson[mapping.fieldId];
+                data.push(mapping);
+            }
+        }
+        return JSON.stringify(data);
+    },
+
+    _getSignatureAriaLabel: function(mapping) {
+        if (!mapping.canUserEdit) {
+            if (mapping.isSigned)
+                return gs.getMessage("Signed on {0} by {1}", [mapping.signedOn, mapping.user.name]);
+            else
+                return gs.getMessage("{0} signature", mapping.fieldDisplayName);
+        } else {
+            if (mapping.isSigned)
+                return gs.getMessage("Signed on {0}, click to re-sign", mapping.signedOn);
+            else
+                return gs.getMessage("Signature field, click to sign");
+        }
+    },
+
+    _getMappedFieldValue: function(documentMapGR, recordId) {
+        var value = '';
+        if (gs.nil(documentMapGR.mapping_table))
+            return value;
+        var gr = new GlideRecord(documentMapGR.mapping_table);
+        if (!gr.get(recordId))
+            return value;
+
+        var template_language = documentMapGR.document.language;
+        if (!gs.nil(documentMapGR.mapping_field)) {
+            var ge = gr.getElement(documentMapGR.mapping_field);
+            var offsets = this._dateOffset(documentMapGR)(ge);
+            if(!gs.nil(ge)) {
+                var displayVal;
+                if(this.LANG_DISPLAY_VALUE_METHOD_EXISTS &amp;&amp; template_language)
+                    displayVal = ge.getDisplayValueLang(template_language);
+                else
+                    displayVal = ge.getDisplayValue();
+                value = displayVal;
+            } else
+                value = '';
+            if (documentMapGR.advanced_script_toggle)
+                value = this._evaluateTemplateMapping(documentMapGR, gr, value);
+            // if internal type is date/glide_date/glide_date_time, check for and apply the date offset
+            else if (offsets.regex.type.test(offsets.internalType()))
+                value = offsets.offsetValue();
+        } else if (documentMapGR.advanced_script_toggle)
+            value = this._evaluateTemplateMapping(documentMapGR, gr, value);
+        return value;
+    },
+
+    /**
+     * Description: Get field data to prefill editable pdf.
+     * @param {SysId} pdfTemplateId : template id attached to task.
+     * @param {SysId} taskId : record id having document template.
+     * @return {ArrayString}
+     */
+    getFieldDataForTask: function(pdfTemplateId, taskId) {
+        var data = [];
+        var templateMapGr = new GlideRecord('sn_doc_pdf_template_mapping');
+        templateMapGr.addQuery('document', pdfTemplateId);
+        templateMapGr.addActiveQuery();
+        templateMapGr.query();
+        while (templateMapGr.next()) {
+            var mapping = {
+                fieldId: templateMapGr.getUniqueValue(),
+                fieldName: templateMapGr.getValue('document_field'),
+                fieldType: templateMapGr.getValue('document_field_type')
+            };
+            if (mapping.fieldType == 'signature')
+                continue;
+            mapping.fieldValue = this._getMappedFieldValue(templateMapGr, taskId);
+            data.push(mapping);
+        }
+        return JSON.stringify(data);
+    },
+
+    /**
+     * Description: Clear Signature while re-filling tasks load document.
+     * @param {SysId} pdfTemplateId : template id attached to task.
+     * @param {SysId} taskRetriggeredBy : doc tasks id who re-triggered flow.
+     * @param {Object} filledFields : pdf template mapping records key value.
+     * @return {Object} filledFields : updated map after clearing signatures.
+     */
+    clearSignatureFieldForRefillTasks: function(pdfTemplateId, taskRetriggeredBy, filledFields, participantId) {
+        if (gs.nil(taskRetriggeredBy)) //Clear signature only when it is re-triggered.
+            return filledFields;
+
+        var participantGr = new GlideRecord('sn_doc_participant');
+        if (!participantGr.get(participantId))
+            return filledFields;
+
+        if (participantGr.getValue('action') == 'review') //Don't clear signature for review action.
+            return filledFields;
+
+        var templateMapGr = new GlideRecord('sn_doc_pdf_template_mapping');
+        templateMapGr.addQuery('document', pdfTemplateId);
+        templateMapGr.addQuery('document_field_type', 'Signature');
+        templateMapGr.addActiveQuery();
+        if (!this._isFirstParticipant(participantId, pdfTemplateId))
+            templateMapGr.addQuery('participant', participantId);
+
+        templateMapGr.query();
+        while (templateMapGr.next()) {
+            var templateMappingRecordId = templateMapGr.getUniqueValue();
+            if (filledFields[templateMappingRecordId] != '')
+                filledFields[templateMappingRecordId] = '';
+        }
+
+
+        return filledFields;
+    },
+
+    /**
+     * Description: Returns a list of plublished documents logged in user has access to
+     * @return [Array] docRevs : Array of sys ids of documents the user has access to
+     */
+    getAccessibleDocRevisions: function() {
+        var docRevGR = new GlideRecord('dms_document_revision');
+        docRevGR.addActiveQuery();
+        docRevGR.addQuery('stage', 'published');
+        docRevGR.query();
+
+        var docRevs = [];
+        while (docRevGR.next()) {
+            if (this._isDocRevOwner(docRevGR))
+                docRevs.push(docRevGR.getUniqueValue());
+        }
+        return docRevs;
+    },
+
+    _isDocRevOwner: function(docRevGR) {
+        return (docRevGR.document.owner == gs.getUserID()) || gs.getUser().isMemberOf(docRevGR.document.owning_group.toString());
+    },
+
+
+    type: 'PdfTemplateUtilsSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-01-09 08:49:05&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;19676264b75600101cadbc78ee11a919&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;290&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;PdfTemplateUtilsSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Document Templates" source="sn_doc"&gt;6a9ea833b763330088d9bc78ee11a88q&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Document Templates"&gt;6a9ea833b763330088d9bc78ee11a88q&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_19676264b75600101cadbc78ee11a919&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-04 11:48:07&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:03</sys_created_on>
+        <sys_id>8cb0bcd583b01210c6695855eeaad305</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>PdfTemplateUtilsSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_8cb0bcd583b01210c6695855eeaad305</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:03</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

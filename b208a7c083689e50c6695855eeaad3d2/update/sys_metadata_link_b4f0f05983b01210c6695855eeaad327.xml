@@ -1,0 +1,706 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>236af563ef003000f830b47e95c0fb33</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.ProjectGanttSchedulePage&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;true&lt;/client_callable&gt;
+        &lt;description&gt;Schedule page script include for the Gantt chart. See the AbstractTimelineSchedulePage script include description for correct implementation and API usage.&lt;/description&gt;
+        &lt;name&gt;ProjectGanttSchedulePage&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[ // Class Imports
+
+
+var TimelineItem = GlideTimelineItem;
+var StringUtil = GlideStringUtil;
+
+// String Constants (These are all injected using gs.getMessage)
+var MOVE_CONFIRM = gs.getMessage('{0}Move{1} the following task:', ['&lt;strong&gt;', '&lt;/strong&gt;']);
+var REL_CONFIRM = gs.getMessage('{0}Create{1} the following relationship:', ['&lt;strong&gt;', '&lt;/strong&gt;']);
+var START_CONFIRM = gs.getMessage('Change the &lt;strong&gt;start date&lt;/strong&gt; of the following task:');
+var END_CONFIRM = gs.getMessage('Change the {1}end date{1} of the following task:', ['&lt;strong&gt;', '&lt;/strong&gt;']);
+var ITEM_MOVE_1 = gs.getMessage('Make task');
+var ITEM_MOVE_2 = gs.getMessage('(and its child tasks) a child of:');
+var ERROR_TITLE = gs.getMessage('Error');
+var GANTT_REQUIREMENT = gs.getMessage('This is required for displaying a gantt chart');
+var ERROR_NO_TASK_ID = gs.getMessage('No "sysparm_timeline_task_id" specified in the original Url. This is required for displaying a gantt chart');
+var ERROR_NO_GR_TASK = gs.getMessage('Unable to find a matching task record with the specified system Id');
+var ERROR_INVALID_1 = gs.getMessage("That action is not allowed because it would place a child task's start date prior to the start date of its parent");
+var ERROR_REL_EXISTS = gs.getMessage('That relationship already exists');
+var ERROR_CHANGE_INVALID = gs.getMessage('This change is not allowed. Check with your System Admin');
+var ERROR_REL_INVALID = gs.getMessage('That relationship is not allowed');
+var ERROR_MOVE = gs.getMessage('The parent and child relationship is invalid');
+var ERROR_MOVE_INVALID = gs.getMessage('The moved task or the new parent are invalid');
+var ERROR_MOVE_RECURSIVE = gs.getMessage('This relationship is not allowed because the specified parent is already a nested child of the task');
+var ERROR_MOVE_DUP = gs.getMessage('The specified task is already an immediate child of the desired parent');
+var CONFIRM_TITLE = gs.getMessage('Confirm Action');
+var REL_IS_PRED = gs.getMessage('will now be a predecessor of');
+var ERROR_NO_NAME = gs.getMessage('You must specify a name for the planned task you wish to add');
+var START_LABEL = gs.getMessage('Start');
+var NEW_START_LABEL = gs.getMessage('New Start');
+var END_LABEL = gs.getMessage('End');
+var SCHEDULE_NOTICE = gs.getMessage('Project schedule may impact date calculation');
+var STATUS_CODE_FAIL = 0;
+var STATUS_CODE_SUCCESS = 1;
+var STATUS_CODE_DUPLICATE = 2;
+var STATUS_CODE_RECURSIVE = 3;
+var STATUS_CODE_INVALID = 4;		
+var STATUS_CODE_NOT_LOADED = 5;
+var STATUS_CODE_ALREADY_STARTED = 6;
+var STATUS_CODE_ITSELF = 7;
+
+var ProjectGanttSchedulePage = Class.create();
+ProjectGanttSchedulePage.prototype = Object.extendsObject(AbstractTimelineSchedulePage, {
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+    // GET_ITEMS
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+
+    getItems: function() {
+        var taskID = this.getParameter("sysparm_timeline_task_id");
+
+        if (taskID == null)
+            return this.setStatusError(ERROR_TITLE, ERROR_NO_TASK_ID);
+
+        var gr = new GlideRecord('planned_task');
+        if (!gr.get(taskID))
+            return this.setStatusError(ERROR_TITLE, ERROR_NO_GR_TASK + ' ' + GANTT_REQUIREMENT);
+		
+        // We will utilize the ProjectTaskManager script include to perform the calculations.
+        var ptm = new SNC.ProjectTaskManager();
+        ptm.load(gr);
+				
+		// Specify the page title. The page title will always be the title of enclosed project for tasks and 
+		// for projects it will be the title of self
+		if (ptm.getData(gr.sys_id, "sys_class_name") == "pm_project")  
+			this.setPageTitle(gs.getMessage('{0} Gantt Chart', StringUtil.escapeHTML(ptm.getData(gr.sys_id, "short_description"))));
+		else
+			this.setPageTitle(gs.getMessage('{0} Gantt Chart', StringUtil.escapeHTML(ptm.getData(gr.top_task, "short_description"))));
+
+        this._returnItemsFromptm(ptm);
+    },
+
+    /*
+     * get baseline records for top task
+     */
+    _getBaselineItems: function(baseline) {
+        var baselineItems = new GlideRecord("planned_task_baseline_item");
+        baselineItems.addQuery("baseline", baseline);
+        baselineItems.query();
+        if (baselineItems.hasNext())
+            return baselineItems;
+    },
+
+    _returnItemsFromptm: function(ptm) {
+		var baseline = this.getParameter("sysparm_timeline_baseline_id");
+		this.baselineInfo = new Array();
+		if (!JSUtil.nil(baseline))
+			var baselineItems = this._getBaselineItems(baseline);		
+				
+		var taskID = this.getParameter("sysparm_timeline_task_id");
+		var gr = new GlideRecord('planned_task');
+		gr.get(taskID);
+	
+		var earliestStart = 0;
+		var projectTasks = ptm.getTasks();
+		var projectVal;
+		
+		//sets whether the gantt chart displays the WBS number before the short description
+		this.wbsDisplay = gs.getProperty("com.snc.project.wbs_gantt") == "true";
+		if (projectTasks == null) {
+			gs.logWarning("ProjectGanttSchedulePage::_returnItemsFromptm null projectTasks");
+			return;
+		}
+		var excludeList = gs.getProperty("com.snc.project.gantt.exclude_list");
+		for (var i = 0; i &lt; projectTasks.length; ++i) {
+			var task = projectTasks[i];
+			if (task.sys_id != gr.top_task){
+				if(!excludeList || excludeList.indexOf(task.sys_class_name) == -1)
+					earliestStart = this._generateSpanItems(gr, ptm, task, earliestStart, baselineItems);
+			}else
+				projectVal = i;
+        }
+		
+		//create the span item for the top task (project)
+		this._generateSpanItems(gr, ptm, projectTasks[projectVal], earliestStart, baselineItems);
+    },
+	
+	_generateSpanItems: function(gr, ptm, task, earliestStart, baselineItems) {
+		var sysID = task.sys_id;
+		var item = new TimelineItem('planned_task', sysID);
+		if (task.wbs == '' || !this.wbsDisplay)
+			item.setLeftLabelText(task.short_description);
+		else
+			item.setLeftLabelText(task.wbs + " (" + task.short_description + ")");
+		item.setParent(task.parent);
+
+		var span = item.createTimelineSpan('planned_task', sysID);
+
+		//use actual dates when available
+		span.setAllowXDragLeft(task.attribute_start_date);
+		span.setAllowXMove(task.attribute_start_date);
+		span.setAllowXDragRight(task.attribute_end_date);
+		item.setIsDraggable(task.attribute_change_parent); 
+		var startDate = task.start_date;
+		var endDate = task.end_date;
+		var workStart = task.work_start;
+		var workEnd = task.work_end;
+		var start;
+		var end;
+
+		if (sysID == gr.top_task) {
+			if (earliestStart)
+				start = earliestStart;
+			else {
+				if (workStart != '0')
+					start = startDate &lt; workStart ? startDate  : workStart;
+				else
+					start = startDate;
+			}
+		}
+		else {
+			if (workStart != '0')
+				if (task.child_count &gt; 0)
+					start = startDate &lt; workStart ? startDate : workStart;
+				else
+					 start = workStart;
+			else
+				start = startDate;
+			if (!earliestStart || start &lt; earliestStart)
+				earliestStart = start;
+		}
+		if (workEnd != '0')
+			end = workEnd;
+		else
+			end = endDate;
+		span.setTimeSpan(start, end);
+		//gs.log("_returnItemsFromptm startDate=" + startDate +  " workStart=" + workStart + " earliestStart=" + earliestStart + " workEnd=" + workEnd + " start=" + start+ " end=" + end);
+		// Set the inner span from the completion percentage
+		var pc = parseFloat(task.percent_complete, 10) / 100;
+		if (pc &gt; 0) {
+			span.setInnerSegmentTimeSpan(span.getStartTimeMs(), span.getStartTimeMs() + ((span.getEndTimeMs() - span.getStartTimeMs()) * pc));
+			span.setInnerSegmentClass(task.child_count &gt; 0 ? 'silver' : 'green');
+		}
+
+		span.setSpanText(task.short_description);
+		span.addPredecessor(ptm.getPredecessors(sysID));
+		span.setIsChanged(task.changed);
+		
+		var gr = new GlideRecord("pm_project_task");
+		if (gr.get(sysID) &amp;&amp; gr.link)
+			item.setIsDroppable(false);
+
+		if ("pm_project_task_link" == task.sys_class_name) {
+			if (task.approval != "approved") {
+				span.setIsChanged(true);
+			}
+			span.setInnerSegmentClass('orange');
+			span.setSpanColor("orange");
+			item.setIsDroppable(false);
+		} else if (task.child_count &gt; 0) {
+			span.setSpanColor("#898989"); // Has Children
+			span.setSpanBorderColor("898989");
+			span.setHasChildren(true);
+			span.setInnerSegmentClass('silver');
+		} else if (task.state == "3") {
+			span.setSpanColor("#7C98EA"); // Closed Complete
+			span.setSpanBorderColor("#7C98EA");
+			span.setInnerSegmentClass('blue');
+		} else if (task.state == "2") {
+			span.setSpanColor("#38E902"); // Work In Progress
+			span.setSpanBorderColor("#38E902");
+			span.setInnerSegmentClass('green');
+		} else if (task.critical_path == true) {
+			span.setSpanColor("#DC6565"); // Critical path
+			span.setInnerSegmentClass('red');
+		} else if (task.state == "-5") {
+			span.setSpanColor("#7C98EA");
+			span.setSpanBorderColor("#7C98EA");
+			span.setInnerSegmentClass('cyan');
+		}
+
+		span.setAllowYMove(false);
+		span.setAllowYMovePredecessor(true);
+
+		if (baselineItems) {
+			if (baselineItems.find("task", sysID)) {
+				var baseline = baselineItems;
+				var baselineSpan = item.createTimelineSpan('planned_task_baseline_item', baseline.getUniqueValue());
+				baselineSpan.setIsBaseline(true);
+				var baseStart = baseline.start.getGlideObject().getNumericValue();
+				var baseEnd = baseline.end.getGlideObject().getNumericValue();
+				baselineSpan.setTimeSpan(baseStart, baseEnd);
+				if (baseEnd &gt; end) {
+					//ahead of baseline
+					var variance = (baseEnd - end)/1000/3600/24; //get days
+					variance = Math.round(variance*10)/10;
+					var baselineInfo = variance + " days ahead of baseline";
+				}
+				else {
+					//later than baseline
+					var variance = (end - baseEnd)/1000/3600/24; //get days
+					variance = Math.round(variance*10)/10;
+					var baselineInfo = variance + " days behind baseline";
+				}
+				baselineSpan.setTooltip(task.number + " is " + baselineInfo);
+				this.baselineInfo[sysID] = baselineInfo;
+			}
+		}
+		span.setTooltip(this._generateTooltip(ptm, sysID));
+		this.add(item);
+		return earliestStart;
+	},
+
+  _generateTooltip: function(ptm, sysID) {
+		var projectTask = ptm.getTask(sysID);
+        var tt = '&lt;div style="padding:2px;"&gt;&lt;div style="font-size:10pt;border-bottom:1px solid #ccc;padding-bottom:5px;"&gt;&lt;strong&gt;' +
+        StringUtil.escapeHTML(projectTask.short_description) +
+        '&lt;/strong&gt;&lt;br /&gt;';
+        tt += '&lt;/div&gt;';
+        tt += '&lt;div style="padding-top:5px;"&gt;';
+        tt += '&lt;strong&gt;State: &lt;/strong&gt;' + projectTask.state_display + '&lt;br/&gt;';
+		var assigned = new GlideRecord("sys_user");
+        if (assigned.get(projectTask.assigned_to))
+            tt += '&lt;strong&gt;Assigned To: &lt;/strong&gt;' + assigned.getDisplayValue() + '&lt;br /&gt;';
+
+        tt += "&lt;strong&gt;Time Constraint: &lt;/strong&gt;" + (projectTask.time_constraint == 'start_on' ? 'Specified' : 'ASAP') + '&lt;br /&gt;';
+
+        if (projectTask.work_start &gt; 0) {
+            tt += "&lt;strong&gt;Actual Start: &lt;/strong&gt;" + this._getDisplayTime(projectTask.work_start) + '&lt;br /&gt;';
+        }
+        else
+            tt += "&lt;strong&gt;Planned Start: &lt;/strong&gt;" + this._getDisplayTime(projectTask.start_date) + '&lt;br /&gt;';
+
+        if (projectTask.work_end &gt; 0) {
+            tt += "&lt;strong&gt;Actual End: &lt;/strong&gt;" + this._getDisplayTime(projectTask.work_end) + '&lt;br /&gt;';
+        }
+        else
+            tt += "&lt;strong&gt;Planned End: &lt;/strong&gt;" + this._getDisplayTime(projectTask.end_date) + '&lt;br /&gt;';
+
+        if (projectTask.work_duration &gt; 0)
+            tt += "&lt;strong&gt;Actual Duration: &lt;/strong&gt;" + this._getDisplayDuration(projectTask.work_duration) + '&lt;br /&gt;';
+        else
+            tt += "&lt;strong&gt;Duration: &lt;/strong&gt;" + this._getDisplayDuration(projectTask.duration) + '&lt;br /&gt;';
+
+        if (!JSUtil.nil(projectTask.percent_complete) &amp;&amp; parseInt(projectTask.percent_complete, 10) &gt; 0)
+            tt += "&lt;strong&gt;% Complete: &lt;/strong&gt;" + projectTask.percent_complete + '%&lt;br /&gt;';
+
+        tt += "&lt;strong&gt;Critical: &lt;/strong&gt;" + (projectTask.critical_path == true ? 'Yes' : 'No') + '&lt;br /&gt;';
+
+        if (this.baselineInfo[sysID])
+            tt += this.baselineInfo[sysID];
+
+        tt += '&lt;/div&gt;&lt;/div&gt;';
+        return tt;
+    },
+
+
+    _getDisplayTime: function(timeMs) {
+        var gdt = new GlideDateTime();
+        gdt.setNumericValue(timeMs);
+        return gdt.getDisplayValue();
+    },
+		
+	_getDisplayDuration: function(timeMs) {
+		var gd = new GlideDuration();
+		gd.setNumericValue(timeMs);
+		return gd.getDisplayValue();
+	},
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+    // HELPER
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+
+    _getSpanTask: function(spanId) {
+        // Get information about the current task
+        var grTask = new GlideRecord('planned_task');
+        grTask.addQuery('sys_id', spanId);
+        grTask.query();
+        return grTask;
+    },
+    
+	_getSecureSpanTask: function(spanId) {
+        // Get information about the current task
+        var grTask = new GlideRecord('planned_task');
+        grTask.get(spanId);
+		grTask = new GlideRecord(grTask.sys_class_name);
+		grTask.addQuery('sys_id', spanId);
+		grTask.query();
+        return grTask;
+    },
+		
+    _noSpanTaskId: function(taskId) {
+		var ptm = new SNC.ProjectTaskManager();
+        ptm.loadFromSysId(taskId);
+        this.setStatusError(ERROR_TITLE, ERROR_NO_GR_TASK);
+		return this._returnItemsFromptm(ptm);
+    },
+	
+	_invalidUpdate: function (taskId) {
+		var ptm = new SNC.ProjectTaskManager();
+        ptm.loadFromSysId(taskId);
+        this.setStatusError(ERROR_TITLE, ERROR_CHANGE_INVALID);
+		return this._returnItemsFromptm(ptm);
+	},
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+    // ELEMENT_MOVE_X
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+
+    elementMoveX: function(spanId, newStartDateTimeMs) {
+        // Get information about the current task
+        var gr = this._getSpanTask(spanId);
+        if (!gr.next())
+            return this._noSpanTaskId(spanId);
+
+        // Set the dialog prompt message
+        var gdt = new GlideDateTime();
+        gdt.setNumericValue(newStartDateTimeMs);
+        
+        this.setStatusPrompt(CONFIRM_TITLE, MOVE_CONFIRM +
+        '&lt;div style="margin:10px 0 10px 14px;padding:4px;background-color:#EBEBEB;"&gt;&lt;strong&gt;' +
+        StringUtil.escapeHTML(gr.short_description) +
+        '&lt;/strong&gt;&lt;br /&gt;&lt;div class="font_smaller"&gt;' +
+        gr.number + '&lt;br/&gt;' + 
+        START_LABEL + ': ' + this._getDisplayTime(gr.start_date.getGlideObject().getNumericValue()) + '&lt;br/&gt;' +
+		NEW_START_LABEL + ': ' + this._getDisplayTime(newStartDateTimeMs) + '&lt;br/&gt;' +							 
+        '&lt;/div&gt;&lt;/div&gt;', 'this._elementMoveX_Yes', 'this._elementMoveX_No', 'this._elementMoveX_No');
+        this._elementMoveXPreview(spanId, gr, newStartDateTimeMs);
+    },
+
+	//Called from GlideTimeline
+    _elementMoveX_Yes: function(spanId, newStartDateTimeMs) {
+        // Get information about the current task
+        var gr = this._getSecureSpanTask(spanId);
+        if (!gr.next())
+            return this._noSpanTaskId(spanId);
+		
+		gr.start_date.getGlideObject().setNumericValue(newStartDateTimeMs);
+		if (!gr.canWrite())
+            return this._invalidUpdate(spanId);
+		if (!gr.update()) 
+			return this._invalidUpdate(spanId);
+        this.setDoReRenderTimeline(true);
+    },
+
+    _elementMoveXPreview: function(spanId, grTask, newStartDateTimeMs) {
+        var ptm = new SNC.ProjectTaskManager();
+        ptm.load(grTask);
+        ptm.shiftProjectTask(spanId, newStartDateTimeMs, ptm.getData(spanId, "start_date"));
+        ptm.recalcProject(spanId);
+        return this._returnItemsFromptm(ptm);		
+    },
+
+    _elementMoveX_No: function(spanId, newStartDateTimeMs) {
+        this.setDoReRenderTimeline(true);
+    },
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+    // ELEMENT_SUCCESSOR
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+    elementSuccessor: function(spanId, newSuccSpanId) {
+        // Get information about the predecessor task
+        var grPred = this._getSpanTask(spanId);
+        if (!grPred.next())
+            return this._noSpanTaskId(taskId);
+
+        // Get information about the successor task
+        var grSucc = this._getSpanTask(newSuccSpanId);
+        if (!grSucc.next())
+            return this._noSpanTaskId();
+
+        // Set status prompt
+        this.setStatusPrompt(CONFIRM_TITLE, REL_CONFIRM +
+        '&lt;div style="margin:10px 0 10px 14px;padding:4px;background-color:#EBEBEB;"&gt;&lt;strong&gt;' +
+        StringUtil.escapeHTML(grPred.short_description) +
+        '&lt;/strong&gt;&lt;br /&gt;&lt;div class="font_smaller"&gt;' +
+        grPred.number +
+        '&lt;/div&gt;&lt;/div&gt;' +
+        '&lt;div&gt;' +
+        REL_IS_PRED +
+        '&lt;/div&gt;' +
+        '&lt;div style="margin:10px 0 10px 14px;padding:4px;background-color:#EBEBEB;"&gt;&lt;strong&gt;' +
+        StringUtil.escapeHTML(grSucc.short_description) +
+        '&lt;/strong&gt;&lt;br /&gt;&lt;div class="font_smaller"&gt;' +
+        grSucc.number +
+        '&lt;/div&gt;&lt;/div&gt;', 'this._elementSuccessor_Yes', 'this._elementSuccessor_No', 'this._elementSuccessor_No');
+
+        this._elementSuccessorPreview(spanId, grPred, grSucc, newSuccSpanId);
+    },
+
+    _elementSuccessor_Yes: function(spanId, newSuccSpanId) {
+        // Get information about the predecessor task
+        var grPred = this._getSpanTask(spanId);
+        if (!grPred.next())
+            return this._noSpanTaskId(taskId);
+
+        // Get information about the successor task
+        var grSucc = this._getSpanTask(newSuccSpanId);
+        if (!grSucc.next())
+            return this._noSpanTaskId(taskId);
+		
+		if (!this._addRelationship(spanId, newSuccSpanId))
+			return this._invalidUpdate(spanId);
+		
+		return this.setDoReRenderTimeline(true);
+    },
+
+    _elementSuccessorPreview: function(spanId, grPred, grSucc, newSuccSpanId) {
+        var ptm = new SNC.ProjectTaskManager();
+        ptm.load(grPred);
+        var statusCode = ptm.addRelationship(spanId, newSuccSpanId);
+        if (statusCode == STATUS_CODE_DUPLICATE)
+            return this.setStatusError(ERROR_TITLE, ERROR_REL_EXISTS);
+        if (statusCode == STATUS_CODE_RECURSIVE)
+            return this.setStatusError(ERROR_TITLE, ERROR_REL_INVALID);
+
+        var gr = this._getSpanTask(newSuccSpanId);
+		if (!gr.next())
+			return this.setStatusError(ERROR_TITLE, ERROR_REL_INVALID);
+        ptm.recalculateProjectOnSysId(gr.top_task, true, false, true);
+        return this._returnItemsFromptm(ptm);
+    },
+
+    _elementSuccessor_No: function(spanId, newSuccSpanId) {
+        this.setDoReRenderTimeline(true);
+    },
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+    // ELEMENT_TIME_ADJUST START
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+    elementTimeAdjustStart: function(spanId, newStartDateTimeMs) {
+        // Get information about the current task
+        var gr = this._getSpanTask(spanId);
+        if (!gr.next())
+            return this._noSpanTaskId(taskId);
+	   
+	    var ptm = new SNC.ProjectTaskManager();
+        ptm.load(gr);
+
+        // Set the Prompt box properties
+        this.setStatusPrompt(CONFIRM_TITLE, START_CONFIRM +
+        '&lt;div style="margin:10px 0 10px 14px;padding:4px;background-color:#EBEBEB;"&gt;&lt;strong&gt;' +
+        StringUtil.escapeHTML(gr.short_description) +
+        '&lt;/strong&gt;&lt;br /&gt;&lt;div class="font_smaller"&gt;' +
+        gr.number + '&lt;br/&gt;' + 
+        START_LABEL + ': ' + this._getDisplayTime(gr.start_date.getGlideObject().getNumericValue()) + '&lt;br/&gt;' +
+		NEW_START_LABEL + ': ' + this._getDisplayTime(newStartDateTimeMs) + '&lt;br/&gt;' +
+        '&lt;/div&gt;&lt;/div&gt;', 'this._elementTimeAdjustStart_Yes', 'this._elementTimeAdjustStart_No', 'this._elementTimeAdjustStart_No');
+
+        this._elementTimeAdjustStartPreview(spanId, gr, ptm, newStartDateTimeMs, false);
+    },
+		
+	//Glide Timeline calls it
+    _elementTimeAdjustStart_Yes: function(spanId, newStartDateTimeMs) {
+        // Get information about the current task
+        var gr = this._getSecureSpanTask(spanId);
+        if (!gr.next())
+            return this._noSpanTaskId(spanId);	
+		
+        //As we need to keep the duration same, we need to adjust the "end date" accordingly based on the shift in "start date".
+        //So first sse PTM to get the change in start date, so that we can calculate end date to be shifted    	
+		var ptm = new SNC.ProjectTaskManager();
+        ptm.load(gr);
+		var previousEndDate = gr.getDisplayValue("end_date");
+		gr.start_date.getGlideObject().setNumericValue(newStartDateTimeMs);
+		if (!gr.canWrite())
+            return this._invalidUpdate(spanId);
+		if (!gr.update()) 
+			return this._invalidUpdate(spanId);
+		
+		var gr = this._getSecureSpanTask(spanId);
+        if (!gr.next())
+            return this._noSpanTaskId(spanId);
+		gr.setDisplayValue("end_date", previousEndDate); //as we want to keep the end date same
+		if (!gr.canWrite())
+            return this._invalidUpdate(spanId);
+		if (!gr.update()) 
+			return this._invalidUpdate(spanId);
+		
+        return this.setDoReRenderTimeline(true);
+    },
+
+    _elementTimeAdjustStartPreview: function(spanId, gr, ptm, newStartDateTimeMs) {
+        ptm.changeProjectTask(spanId, 'start_date', newStartDateTimeMs, ptm.getData(spanId, "start_date"));
+        ptm.recalcProject(spanId);
+        return this._returnItemsFromptm(ptm);
+    },
+
+    _elementTimeAdjustStart_No: function(spanId, newStartDateTimeMs) {
+        this.setDoReRenderTimeline(true);
+    },
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+    // ELEMENT_TIME_ADJUST END
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+    elementTimeAdjustEnd: function(spanId, newEndDateTimeMs) {
+        // Get information about the current task
+        var gr = this._getSpanTask(spanId);
+        if (!gr.next())
+            return this._noSpanTaskId(spanId);
+
+        var ptm = new SNC.ProjectTaskManager();
+        ptm.load(gr);
+
+        var scheduleNotice = "";
+        if (ptm.containSchedule(spanId))
+            scheduleNotice = '&lt;font style="color:red"&gt;' + SCHEDULE_NOTICE + '&lt;/font&gt;&lt;br/&gt;';
+        
+        // Set the Prompt box properties
+        this.setStatusPrompt(CONFIRM_TITLE, END_CONFIRM +
+        '&lt;div style="margin:10px 0 10px 14px;padding:4px;background-color:#EBEBEB;"&gt;&lt;strong&gt;' +
+        StringUtil.escapeHTML(gr.short_description) +
+        '&lt;/strong&gt;&lt;br /&gt;&lt;div class="font_smaller"&gt;' +
+        gr.number + '&lt;br/&gt;' +
+        END_LABEL + ': ' + this._getDisplayTime(newEndDateTimeMs) + '&lt;br/&gt;' +
+        scheduleNotice + 
+        '&lt;/div&gt;&lt;/div&gt;', 'this._elementTimeAdjustEnd_Yes', 'this._elementTimeAdjustEnd_No', 'this._elementTimeAdjustEnd_No');
+
+        this._elementTimeAdjustEndPreview(spanId, gr, ptm, newEndDateTimeMs);
+    },
+
+    _elementTimeAdjustEnd_Yes: function(spanId, newEndDateTimeMs) {
+        // Get information about the current task
+        var gr = this._getSecureSpanTask(spanId);
+        if (!gr.next())
+            return this._noSpanTaskId(spanId);
+		
+		gr.end_date.getGlideObject().setNumericValue(newEndDateTimeMs);
+		if (!gr.canWrite())
+            return this._invalidUpdate(spanId);
+        if (!gr.update()) 
+			return this._invalidUpdate(spanId);
+        return this.setDoReRenderTimeline(true);
+     },
+
+    _elementTimeAdjustEndPreview: function(spanId, gr, ptm, newEndDateTimeMs) {
+        ptm.changeProjectTask(spanId, 'end_date', newEndDateTimeMs, ptm.getData(spanId, "end_date"));
+        ptm.recalcProject(spanId);
+        return this._returnItemsFromptm(ptm);
+    },
+
+    _elementTimeAdjustEnd_No: function(spanId, newEndDateTimeMs) {
+        this.setDoReRenderTimeline(true);
+    },
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+    // INPUT_ADD
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+    inputBox: function(strItemName) {
+        var taskID = this.getParameter("sysparm_timeline_task_id");
+        if (taskID == null)
+            return this.setStatusError(ERROR_TITLE, ERROR_NO_TASK_ID);
+			
+		var parent = new GlideRecord('pm_project_task');
+		if (parent.get(taskID) &amp;&amp; parent.link)
+			return this.setStatusError(ERROR_TITLE, gs.getMessage('Cannot add a child to a Change Link parent task {0}: {1}', [parent.number, parent.short_description]));
+			
+		
+        // Create a new planned task
+        var gr = new GlideRecord('pm_project_task');
+        gr.setValue('short_description', strItemName);
+        gr.setValue('parent', taskID);
+        if (!gr.canCreate()) 
+			return this._invalidUpdate(taskID);
+		if(!gr.insert())
+			return this._invalidUpdate(taskID);
+
+        return this.setDoReRenderTimeline(true);
+    },
+
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+    // ITEM_MOVE
+    //////////////////////////////////////////////////////////////////////////////////////////////////
+    itemMove: function(itemSysId, newItemSysId) {
+		// Get information about the current Task and Parent
+        var grChild = this._getSpanTask(itemSysId);
+        if (!grChild.next())
+            return this._noSpanTaskId(itemSysId);
+		
+		var grParent = this._getSpanTask(newItemSysId);
+        if (!grParent.next())
+            return this._noSpanTaskId(newItemSysId);
+
+        // Set status prompt
+        this.setStatusPrompt(CONFIRM_TITLE, ITEM_MOVE_1 +
+        '&lt;div style="margin:10px 0 10px 14px;padding:4px;background-color:#EBEBEB;"&gt;&lt;strong&gt;' +
+        StringUtil.escapeHTML(grChild.short_description) +
+        '&lt;/strong&gt;&lt;br /&gt;&lt;div class="font_smaller"&gt;' +
+        grChild.number +
+        '&lt;/div&gt;&lt;/div&gt;' +
+        '&lt;div&gt;' +
+        ITEM_MOVE_2 +
+        '&lt;/div&gt;' +
+        '&lt;div style="margin:10px 0 10px 14px;padding:4px;background-color:#EBEBEB;"&gt;&lt;strong&gt;' +
+        StringUtil.escapeHTML(grParent.short_description) +
+        '&lt;/strong&gt;&lt;br /&gt;&lt;div class="font_smaller"&gt;' +
+        grParent.number +
+        '&lt;/div&gt;&lt;/div&gt;', 'this._itemMoveYesClick', 'this._itemMoveNoClick', 'this._itemMoveNoClick');
+    },
+
+    _itemMoveYesClick: function(itemSysId, newItemSysId) {
+	   var gr = this._getSecureSpanTask(itemSysId);
+       if (!gr.next())
+            return this._noSpanTaskId(itemSysId);
+	   gr.parent = newItemSysId;
+	  
+		if (!gr.canWrite())
+            return this._invalidUpdate(itemSysId);
+        // Check the result
+        if (!gr.update())
+            return this.setStatusError(ERROR_TITLE, ERROR_MOVE);
+        /*else if (result == STATUS_CODE_INVALID)
+            return this.setStatusError(ERROR_TITLE, ERROR_MOVE_INVALID);
+		else if (result == STATUS_CODE_RECURSIVE)
+			return this.setStatusError(ERROR_TITLE, ERROR_MOVE_RECURSIVE);*/
+	   
+	   return this.setDoReRenderTimeline(true);
+    },
+
+    _itemMoveNoClick: function(itemSysId, newItemSysId) {
+        return this.setDoReRenderTimeline(true);
+    },
+
+    _addRelationship: function(predSysId, succSysId) {
+		var gr = new GlideRecord('planned_task_rel_planned_task');
+		gr.type.setDisplayValue('Predecessor of::Successor of');
+		gr.setValue('parent', predSysId);
+		gr.setValue('child', succSysId);
+		if (!gr.canCreate())
+            return false;
+		return gr.insert();
+	}
+});]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2012-08-30 18:27:06&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;236af563ef003000f830b47e95c0fb33&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;257&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ProjectGanttSchedulePage&lt;/sys_name&gt;
+        &lt;sys_package display_value="Project Management" source="com.snc.project_management_v3"&gt;9eef82e747e64210cd4e1ce4316d43e3&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_236af563ef003000f830b47e95c0fb33&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2017-06-27 07:59:10&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:11</sys_created_on>
+        <sys_id>b4f0f05983b01210c6695855eeaad327</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ProjectGanttSchedulePage</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_b4f0f05983b01210c6695855eeaad327</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:11</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,203 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>132dcb310f331010a2bb13b2ff767e8f</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.SamModelLifecycleToProductLifecycle&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;SamModelLifecycleToProductLifecycle&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var SamModelLifecycleToProductLifecycle = Class.create();
+SamModelLifecycleToProductLifecycle.prototype = {
+	SAMS_ENABLED: GlidePluginManager.isActive('com.snc.sams'),
+
+	initialize: function() {},
+
+	process: function() {
+		this._copyCustomSources();
+		this._copyInternalRecords();
+		this._copyServiceNowRecords();
+	},
+
+	_copyValues: function(oldGR, source) {
+		var newGR = new GlideRecord('sam_custom_sw_product_lifecycle');
+		newGR.initialize();
+
+		if (this.SAMS_ENABLED) {
+			newGR.setValue('norm_product', oldGR.model.product);
+		} else {
+			newGR.setValue('product_name', oldGR.model.name);
+		}
+
+		newGR.setValue('publisher', oldGR.model.manufacturer);
+		newGR.setValue('norm_version', oldGR.model.version);
+		newGR.setValue('norm_edition', oldGR.model.edition);
+		newGR.setValue('lifecycle_phase', oldGR.getValue('lifecycle_phase'));
+		newGR.setValue('lifecycle_type', oldGR.getValue('lifecycle_type'));
+		newGR.setValue('source', source);
+		newGR.setValue('start_date', oldGR.getValue('start_date'));
+		newGR.setValue('active', oldGR.getValue('active'));
+		newGR.setValue('content_active', oldGR.getValue('content_active'));
+		newGR.setValue('risk', oldGR.getValue('risk'));
+		newGR.setValue('description', oldGR.getValue('description'));
+		newGR.setValue('reported', oldGR.getValue('reported'));
+		newGR.setValue('sys_domain', oldGR.getValue('sys_domain'));
+		newGR.setValue('sys_created_by', oldGR.getValue('sys_created_by'));
+		newGR.setValue('sys_updated_by', oldGR.getValue('sys_updated_by'));
+		return newGR.insert();
+	},
+
+	// Determine if risk, description, or active fields have been modified
+	_isModified: function(lifecycleGR) {
+		if (!gs.nil(lifecycleGR.getValue('description'))) {
+			return true;
+		} // if desc changed
+		if (!lifecycleGR.getDisplayValue('active')) {
+			return true;
+		} // if inactive
+
+		var risk = lifecycleGR.getValue('risk');
+		// We used to default risk by phase in script include: SampSWModelLifecycleAPI
+		switch (lifecycleGR.getValue('lifecycle_phase')) {
+		case 'pre_release':
+			return risk !== 'low';
+		case 'availability':
+			return risk !== 'moderate';
+		case 'end_of_life':
+			return risk !== 'very_high';
+		case 'end_of_support':
+			return risk !== 'high';
+		case 'end_of_extended_support':
+			return risk !== 'very_high';
+		default:
+			return risk !== 'moderate';
+		}
+	},
+
+	_copyCustomSources: function() {
+		var choiceGR = new GlideRecord('sys_choice');
+		choiceGR.addQuery('name', 'sam_sw_model_lifecycle');
+		choiceGR.addQuery('element', 'source');
+		choiceGR.addQuery('value', '!=', 'internal');
+		choiceGR.addQuery('value', '!=', 'service_now');
+		choiceGR.query();
+
+		while (choiceGR.next()) {
+			var dupGR = new GlideRecord('sys_choice'); // Used to check for duplicate sources
+			var newGR = new GlideRecord('sys_choice'); // Used to insert a new source
+			newGR.initialize();
+
+			// So that the list of fields will contain the new table name
+			choiceGR.setValue('name', 'sam_sw_product_lifecycle');
+			var fields = choiceGR.getFields();
+			for (var i = 0; i &lt; fields.size(); i++) {
+				var currField = fields.get(i);
+
+				if (currField.hasValue()) {
+					var field = currField.getName();
+					var value = currField.getValue();
+					dupGR.addQuery(field, value);
+					newGR.setValue(field, value);
+				}
+			}
+
+			dupGR.query();
+			if (!dupGR.hasNext()) {
+				newGR.autoSysFields(false);
+				newGR.insert();
+			}
+		}
+	},
+
+	_copyInternalRecords: function() {
+		var oldGR = new GlideRecord('sam_sw_model_lifecycle');
+		oldGR.addQuery('source', '!=', 'service_now');
+
+		if (this.SAMS_ENABLED) {
+			oldGR.orderBy('model.product');
+		} else {
+			oldGR.orderBy('model.name');
+		}
+		oldGR.orderBy('model.manufacturer');
+		oldGR.orderBy('model.version');
+		oldGR.orderBy('model.edition');
+		oldGR.orderBy('lifecycle_phase');
+		oldGR.orderBy('lifecycle_type');
+		oldGR.orderBy('source');
+		oldGR.orderBy('sys_domain');
+		oldGR.orderBy('start_date');
+		oldGR.query();
+
+		var prevLifecycleKey;
+		while (oldGR.next()) {
+			var source = oldGR.getValue('source');
+			var product;
+			if (this.SAMS_ENABLED) {
+				product = oldGR.model.product;
+			} else {
+				product = oldGR.model.name;
+			}
+
+			// If a LC is duplicate of the previous one, keep the one with more conservative date
+			// Since its ordered by start_date, it will always insert the earliest LC
+			var currLifecycleKey = product + oldGR.model.manufacturer + oldGR.model.version + oldGR.model.edition
+			+ oldGR.getValue('lifecycle_phase') + oldGR.getValue('lifecycle_type')
+			+ source + oldGR.getValue('sys_domain');
+			if (currLifecycleKey === prevLifecycleKey) {
+				continue;
+			} else {
+				prevLifecycleKey = currLifecycleKey;
+				this._copyValues(oldGR, source); // insert and return the sysID
+			}
+		}
+	},
+
+	_copyServiceNowRecords: function() {
+		var oldGR = new GlideRecord('sam_sw_model_lifecycle');
+		oldGR.addQuery('source', 'service_now');
+		oldGR.query();
+
+		while (oldGR.next()) {
+			// Convert the servicenow record to internal record if modified
+			if (this._isModified(oldGR)) {
+				this._copyValues(oldGR, 'internal');
+			}
+		}
+	},
+
+	type: 'SamModelLifecycleToProductLifecycle',
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-10-12 18:33:34&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;132dcb310f331010a2bb13b2ff767e8f&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;2&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;SamModelLifecycleToProductLifecycle&lt;/sys_name&gt;
+        &lt;sys_package display_value="Model Management" source="com.snc.model"&gt;1d64b8e83c31311068bcf327dfe37f3a&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_132dcb310f331010a2bb13b2ff767e8f&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2020-11-06 22:06:42&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:10:31</sys_created_on>
+        <sys_id>1c90f0d583b01210c6695855eeaad336</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>SamModelLifecycleToProductLifecycle</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_1c90f0d583b01210c6695855eeaad336</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:10:31</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

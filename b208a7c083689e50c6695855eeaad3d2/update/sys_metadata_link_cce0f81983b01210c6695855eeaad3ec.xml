@@ -1,0 +1,423 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>206bf4b3772a33002bc4914f581061e8</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_csm_case_types.CaseTypeProcessor&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;CaseTypeProcessor&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var CaseTypeProcessor = Class.create();
+CaseTypeProcessor.prototype = {
+    initialize: function() {
+    },
+   //returns "{}" if no CT returned, or error in input, stringified JSON
+   getCaseTypes: function(source, sourceId) {
+      // security check
+      var accessRoles = gs.getProperty("sn_csm_case_types.get_case_types_roles");
+      var canAccess = false;
+      if (!gs.nil(accessRoles)) {
+        var roles = accessRoles.split(',');
+        canAccess = roles.some(function(role) {
+          return gs.hasRole(role);
+        });
+      }
+
+      if (!canAccess) {
+        gs.error("Authorization error, insufficient access to fetch the results");
+		return "{}";
+      }
+
+      var inputs = {};
+      if (sourceId)
+         inputs['source_id'] = sourceId;
+      if (source)
+         inputs['source_table'] = source;
+      var results_by_category = {};
+      //check if flow input present
+      var result = [];
+      try {
+        var output = sn_fd.FlowAPI.executeSubflow('sn_csm_case_types.get_case_types', inputs);
+        result = output['case_types'];
+      }
+      catch(err){ 
+         gs.error("CaseTypeProcessor expected JSON result from subflow {0} with 'case_types' key, received {1}",
+               "sn_csm_case_types.get_case_types", JSON.stringify(output) + "\nError " + err.name + ": " + err.message);
+         return JSON.stringify(results_by_category);
+      }
+      //check format of JSON, assure needed keys present
+      if(result[0]) {
+         var result_keys = Object.keys(result[0]);
+         var expected_keys = ['id', 'table_name', 'label', 'category_value', 'category_label'];
+         for (var key in expected_keys) {
+            if(result_keys.indexOf(expected_keys[key]) === -1) {
+               gs.error("CaseTypeProcessor expected JSON result from subflow {0} containing '{1}' key, received [{2}]",
+                     "sn_csm_case_types.get_case_types", expected_keys[key], result_keys.toString());
+               return JSON.stringify(results_by_category);
+            }
+         }
+      }
+      else {
+         gs.error("CaseTypeProcessor expected format [JSON] from subflow {0}", "sn_csm_case_types.get_case_types");
+         return JSON.stringify(results_by_category);
+      }
+      //generate list of case types
+      var category_object = {};
+      var category_label = '';
+      var category_value = '';
+      for(var result_item in result) {
+         //check roles
+         if (result[result_item].table_name &amp;&amp; new GlideRecord(result[result_item].table_name).canCreate()) {
+            //format
+            category_object = {};
+            category_value = result[result_item].category_value;
+			category_label = result[result_item].category_label;
+			((category_value === 'null' || category_value === '') ? category_value = 0 : category_value);
+            ((category_label === 'null' || category_label === '') ? category_label = 'No Category' : category_label);
+            //if cat DNE
+            if(!(category_value in results_by_category)){
+               category_object['category_label'] = category_label;
+               category_object['case_types'] = [{'id': result[result_item].id, 
+                                 'label': result[result_item].label,
+                                 'table_name': result[result_item].table_name,
+                                 'subtype': result[result_item].subtype,
+                                 'short_description': result[result_item].short_description,
+								 'selection': result[result_item].selection				 
+                              }];
+               results_by_category[category_value] = category_object;
+            }
+            //add to existing category case types list
+            else {
+               results_by_category[category_value]['case_types'].push({'id': result[result_item].id, 
+                                             'label': result[result_item].label,
+                                             'table_name': result[result_item].table_name,
+                                             'subtype': result[result_item].subtype,
+                                             'short_description': result[result_item].short_description,
+											 'selection': result[result_item].selection						  
+											});
+            }            
+         }
+      }
+      if (results_by_category.length === 0) {
+         gs.info("getCaseTypes returned no case types");
+         return JSON.stringify(results_by_category);
+      }
+      var inner_sort = function(inner_lhs, inner_rhs) {
+            return (((inner_lhs.label.toUpperCase()) &lt;= (inner_rhs.label.toUpperCase())) ? -1 : 1);
+         };
+      
+      //sort results alphabetically by table label
+      for(var type in results_by_category) {
+         results_by_category[type]['case_types'].sort(inner_sort);
+      }
+      return JSON.stringify(results_by_category);
+    },
+	
+	hasCaseTypeTable: function() {
+		var attributeGr = new GlideRecord('sys_schema_attribute_m2m');
+		attributeGr.addQuery('schema.element', 'case_type_table');
+		attributeGr.addQuery('attribute.name', 'base_table');
+		attributeGr.query();
+		var baseTable = 'sn_customerservice_case';
+		if (attributeGr.hasNext()) {
+			if (attributeGr.next() instanceof GlideRecord) {
+				baseTable = attributeGr.getValue('value');
+			}
+		}
+		var caseTypeGr = new GlideRecord('sys_db_object');
+		caseTypeGr.addQuery('super_class.name', baseTable);
+		caseTypeGr.query();
+		return caseTypeGr.hasNext();
+	},
+	
+	populateCaseTypes: function(caseTypeGr) {
+		var caseTypes = {};
+		var subtypes = [];
+		var caseTypeSelections = [];
+		var isSingleSelectEnabled = (gs.getProperty('sn_csm_case_types.case_type_single_field_select', false) == 'true');
+		
+		var subtype = {};
+		//Populate case type selection for the caseTypeGr
+		if (isSingleSelectEnabled)
+			caseTypeSelections = this._getCaseTypeSelections(caseTypeGr.getUniqueValue());
+		
+		
+		var tableGr = new GlideRecord('sys_db_object');
+		tableGr.addQuery("name", caseTypeGr.case_type_table);
+		tableGr.query();
+		if(tableGr.next()) {
+			if(!gs.nil(caseTypeGr.subtype)) {
+				var dictTypeGr = this.getCaseTypeHierarchy(caseTypeGr.case_type_table, caseTypeGr.subtype);
+				if(dictTypeGr) {
+					subtype.parent_table = dictTypeGr.name + "";
+					subtype.label = dictTypeGr.getDisplayValue('column_label') + "";
+					subtype.field = dictTypeGr.element + "";
+					subtype.type = dictTypeGr.internal_type + "";
+					if(dictTypeGr.internal_type == 'reference') {
+						subtype.table_name = dictTypeGr.reference.name + "";
+						var refQualType = dictTypeGr.use_reference_qualifier;
+						if(refQualType == 'simple') {
+							subtype.filter = dictTypeGr.reference_qual_condition + "";
+							subtype.values = this._getSimpleReferenceSubtypeValues(dictTypeGr);
+						} else if (refQualType == 'advanced') {
+							var advSubtypes = this._getAdvancedReferenceSubtypeValues(dictTypeGr);
+							if (advSubtypes.filter){
+								subtype.filter = advSubtypes.filter;
+							}
+							subtype.values = advSubtypes.values;
+						} else {
+							if(dictTypeGr.dynamic_ref_qual) {
+								var dynSubtypes = this._getDynamicReferenceSubtypeValues(dictTypeGr);
+								if (dynSubtypes.filter){
+									subtype.filter = dynSubtypes.filter;
+								}
+								subtype.values = dynSubtypes.values;
+							} else {
+								subtype.values = this.getAllReferenceValuesFromSubtype(dictTypeGr);
+							}
+						}
+					} else {
+						subtype.type = 'choice';
+						subtype.values = this._getSubtypeChoices(caseTypeGr.subtype, this._getChoiceTableName(caseTypeGr.case_type_table,caseTypeGr.subtype),                                                        dictTypeGr.element);
+					}
+				}
+			}
+			return {
+				'id': caseTypeGr.getUniqueValue() + "",
+				'table_name': tableGr.getValue('name') + "",
+				'label': tableGr.getDisplayValue('label') + "",
+				'category_value': caseTypeGr.getValue('category') + "",
+				'category_label': caseTypeGr.getDisplayValue('category') + "",
+				'subtype': subtype,
+				'short_description': caseTypeGr.short_description + "",
+				'selection' : caseTypeSelections
+			};
+		}
+		return {};
+	},
+	
+	_getChoiceTableName: function(table, element){
+		var isValidChoiceTable = false;
+		while(!isValidChoiceTable){
+			isValidChoiceTable = this._hasActiveChoiceRecord(table, element);
+			if (!isValidChoiceTable &amp;&amp; table !== new GlideTableHierarchy(table).getBase())
+				table = new GlideTableHierarchy(table).getBase();
+			else
+				break;
+		}
+		return table;
+	},
+	
+	_hasActiveChoiceRecord: function(table, element){
+		var activeChoice = false;
+		var sysChoiceGr = new GlideRecord('sys_choice');
+		sysChoiceGr.addQuery('element', element);
+		sysChoiceGr.addQuery('name', table);
+		sysChoiceGr.addQuery('inactive',false);
+		sysChoiceGr.query();
+		if (sysChoiceGr.hasNext())
+			activeChoice = true;
+		return activeChoice;
+	},
+	
+	_getSubtypeChoices: function(subtype, dictTable, dictElement){
+		var subTypeChoices = [];
+		var sysChoiceGr = new GlideRecord('sys_choice');
+		var session = gs.getSession();
+		sysChoiceGr.addQuery('element', subtype);
+		sysChoiceGr.addQuery('name', dictTable);
+		sysChoiceGr.addQuery('inactive',false);
+		sysChoiceGr.addQuery('language', session.getLanguage());
+		sysChoiceGr.query();
+		while(sysChoiceGr.next()) {
+			subTypeChoices.push({
+				'id': sysChoiceGr.getValue('value') + "",
+				'value': sysChoiceGr.getDisplayValue() + "",
+				'field': dictElement + ""
+			});
+		}
+		return subTypeChoices;
+	},
+	
+	_getSimpleReferenceSubtypeValues: function(dictTypeGr){
+		var subTypeValues =[];
+		var referenceTableGr = new GlideRecord(dictTypeGr.reference);
+		if(dictTypeGr.reference_qual_condition == '') {
+			referenceTableGr.addEncodedQuery(dictTypeGr.reference_qual_condition);
+		}
+		referenceTableGr.query();
+		while(referenceTableGr.next()) {
+			subTypeValues.push({
+				'id': referenceTableGr.getValue('sys_id') + "",
+				'value': referenceTableGr.getDisplayValue() + ""
+			});
+		}
+		return subTypeValues;
+	},
+	
+	_getAdvancedReferenceSubtypeValues: function(dictTypeGr) {
+		var advRefSubTypes = {};
+		var subTypeValues =[];
+		var referenceTableGr = new GlideRecord(dictTypeGr.reference);
+		var evaluator = new GlideScopedEvaluator();
+		var dictNameGr = new GlideRecord(dictTypeGr.name);
+		var advancedWithCurrentQuery = evaluator.evaluateScript(dictTypeGr, 'reference_qual', {current: dictNameGr});
+		if(typeof advancedWithCurrentQuery == 'string') {
+			referenceTableGr.addEncodedQuery(advancedWithCurrentQuery);
+			referenceTableGr.query();
+			if(referenceTableGr.hasNext()) {
+				advRefSubTypes["filter"] = advancedWithCurrentQuery + "";
+				while(referenceTableGr.next()) {
+					subTypeValues.push({
+						'id': referenceTableGr.getValue('sys_id') + "",
+						'value': referenceTableGr.getDisplayValue() + ""
+					});
+				}
+			} else {
+				subTypeValues = this.getAllReferenceValuesFromSubtype(dictTypeGr);
+			}
+		} else {
+			subTypeValues = this.getAllReferenceValuesFromSubtype(dictTypeGr);
+		}
+		advRefSubTypes["values"] = subTypeValues;
+		return advRefSubTypes;
+	},
+	
+	_getDynamicReferenceSubtypeValues: function(dictTypeGr){
+		var dynSubtype = {};
+		var subTypeValues =[];
+		var dynamicRefGr = new GlideRecord('sys_filter_option_dynamic');
+		dynamicRefGr.addQuery('sys_id', dictTypeGr.dynamic_ref_qual);
+		dynamicRefGr.query();
+		if (dynamicRefGr.next()){
+			var dynamicEvaluator = new GlideScopedEvaluator();
+			var dynamicCurrentGr = new GlideRecord(dictTypeGr.name);
+			var dynamicQuery = dynamicEvaluator.evaluateScript(dynamicRefGr, 'script', {current: dynamicCurrentGr});
+			if(typeof dynamicQuery == 'string') {
+				var referenceTableGr = new GlideRecord(dictTypeGr.reference);
+				referenceTableGr.addEncodedQuery(dynamicQuery);
+				referenceTableGr.query();
+				if(referenceTableGr.hasNext()) {
+					dynSubtype["filter"] = dynamicQuery + "";
+					while(referenceTableGr.next()) {
+						subTypeValues.push({
+							'id': referenceTableGr.getValue('sys_id') + "",
+							'value': referenceTableGr.getDisplayValue() + ""
+						});
+					}
+				} else {
+					subTypeValues = this.getAllReferenceValuesFromSubtype(dictTypeGr);
+				}
+			}
+		}
+		dynSubtype["values"] = subTypeValues;
+		return dynSubtype;
+	},
+	
+   /**
+    * Get dictionary hierarchy for case type extension
+    */
+    getCaseTypeHierarchy: function(tableName, fieldName) {
+        var dictGr = new GlideRecord('sys_dictionary');
+        var ancestors = new GlideTableHierarchy(tableName).getTables();
+        dictGr.addQuery('name', 'IN', ancestors);
+        dictGr.addQuery('element', fieldName);
+        dictGr.query();
+        if (dictGr.next()) {
+            return dictGr;
+        }
+    },
+	
+    /**
+    * If glide scoped evaluator returns filter with no available subtypes
+    * return all subtypes from reference field
+    */
+    getAllReferenceValuesFromSubtype: function(dictTypeGr) {
+        var subs = [];
+        var refGr = new GlideRecord(dictTypeGr.reference);
+        refGr.query();
+        while(refGr.next()) {
+            subs.push({
+                'id': refGr.getValue('sys_id') + "",
+                'value': refGr.getDisplayValue() + ""
+			});
+        }
+        return subs;
+    },
+	
+	getReferenceTables: function(tableName) {
+		var referenceTables = [];
+		var notesConfigGR = new GlideRecord('sn_shn_configuration');
+		notesConfigGR.get('table_name', tableName);
+		var relatedFields = notesConfigGR.getValue('related_fields');
+		if (!gs.nil(relatedFields)) {
+			var fields = relatedFields.split(',');
+			var tableGR = new GlideRecord(tableName);
+			tableGR.initialize();
+			for (var i = 0; i &lt; fields.length; i++) {
+				var fieldName = fields[i];
+				if(tableGR.isValidField(fieldName)) {
+		  			var type = tableGR.getElement(fieldName).getED().getInternalType();
+					if (type == 'reference') {
+						var refTable = tableGR[fields[i]].getReferenceTable();
+	    				if (!gs.nil(refTable)) {
+						   referenceTables.push(refTable);
+    				  	}
+    				}
+				}
+			}
+		}
+		return referenceTables;
+	},
+	
+	_getCaseTypeSelections: function(caseTypeId){
+		var selection = [];
+		var caseTypeSelectionGr = new GlideRecord('sn_case_type_selection');
+		caseTypeSelectionGr.addQuery('case_type',caseTypeId);
+		caseTypeSelectionGr.query();
+		while (caseTypeSelectionGr.next()){
+			var mapping = {};
+			mapping['table'] = caseTypeSelectionGr.table + '';
+			mapping['name'] = caseTypeSelectionGr.name + '';
+			mapping['template'] = caseTypeSelectionGr.template + '';
+			selection.push(mapping);
+		}
+		return selection;
+	},
+	
+    type: 'CaseTypeProcessor'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2019-07-16 17:29:01&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;206bf4b3772a33002bc4914f581061e8&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;52&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;CaseTypeProcessor&lt;/sys_name&gt;
+        &lt;sys_package display_value="CSM Case Types" source="sn_csm_case_types"&gt;8ba29585872633003c1c8467a7cb0be4&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="CSM Case Types"&gt;8ba29585872633003c1c8467a7cb0be4&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_206bf4b3772a33002bc4914f581061e8&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-07 00:23:31&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:52</sys_created_on>
+        <sys_id>cce0f81983b01210c6695855eeaad3ec</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>CaseTypeProcessor</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_cce0f81983b01210c6695855eeaad3ec</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:52</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>2d9b59b40b001300283eed3ab4673a05</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.ResourceGridFrontLoadAllocator&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;ResourceGridFrontLoadAllocator&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ResourceGridFrontLoadAllocator = Class.create();
+ResourceGridFrontLoadAllocator.prototype = Object.extendsObject(ResourceGridBaseAllocator,{
+    initialize: function(totalHours, startDate, endDate, userIds, capacityHelper) {
+		ResourceGridBaseAllocator.prototype.initialize.call(this,totalHours,startDate, endDate, userIds, 'front_load',capacityHelper);
+		this.leftOvers = {};
+		this.totalHours = ResourceManagementUtils.roundOffBasedOnCalendarEventProperty(this.totalHours);
+		this.leftOvers.total = this.totalHours;
+		this.leftOvers.users = {};
+    },
+	
+	hoursToAllocatePerUserPerDate: function(rpId,overAllocate,isResPlanEdit, isResPlanReplace, percentCapacity){
+		var hoursToAllocPerUser = {};
+		this.isResPlanReplace = JSUtil.notNil(isResPlanReplace) ? isResPlanReplace : false;
+		hoursToAllocPerUser = this._initializeHoursToAllocPerUser(hoursToAllocPerUser);
+		this._getBlockedHoursPerDay(rpId);
+		var remainingHours = this._fillAvailableHours(hoursToAllocPerUser,rpId,this.totalHours,percentCapacity);
+		if (remainingHours &gt; 0 &amp;&amp; overAllocate)
+			this._fillUptoMaxHoursADay(hoursToAllocPerUser,rpId,remainingHours);
+		this._setHoursAllocatedPerUserPerDate(hoursToAllocPerUser);
+		return hoursToAllocPerUser;
+	},
+	
+	_initializeHoursToAllocPerUser: function(hoursToAllocPerUser){
+		var date = new GlideDate();
+		date.setValue(this.startDate.getValue());
+		for (var day = 0; day &lt; this.noOfDays; day++) {
+			for (var i = 0; i &lt; this.userIds.length; i++){
+				var userId = this.userIds[i];
+				if(!(userId in hoursToAllocPerUser))
+					hoursToAllocPerUser[userId] = {};
+				if(!(date.getValue() in hoursToAllocPerUser[userId]))
+					hoursToAllocPerUser[userId][date.getValue()] = 0;
+			}
+			date.addDaysUTC(1);
+		}
+		return hoursToAllocPerUser;
+	},
+	
+	_getBlockedHoursPerDay: function(rpId){
+		var blockedFilter = this.isResPlanReplace ? '' : 'allocationISEMPTY^NQallocationISNOTEMPTY^allocation.resource_plan!='+rpId;
+		this.blockedHoursPerDay = {};
+		for(var u = 0; u &lt; this.userIds.length; u++){
+			var resourceAllocationDailyAgg = new ResourceAllocationDailyAggregate(this.userIds[u], this.startDate.getValue(), this.endDate.getValue());
+			this.blockedHoursPerDay[this.userIds[u]] = resourceAllocationDailyAgg.hoursByDay(blockedFilter);
+		}
+	},
+	
+	_fillAvailableHours: function(hoursToAllocPerUser,rpId, hours, percentCapacity) {
+		var date = new GlideDate();
+		date.setValue(this.startDate.getValue());
+		var percentBasedMaxCapacityPerUser = [];
+		if(percentCapacity)
+			percentBasedMaxCapacityPerUser = this.getPercentBasedMaxCapacityPerUser(percentCapacity);
+			
+		for (var day = 0; (day &lt; this.noOfDays) &amp;&amp; (hours &gt; 0); day++) {
+			for (var i = 0; (i &lt; this.userIds.length)&amp;&amp; (hours &gt; 0); i++){
+				if (hours &lt;= 0 || (percentCapacity &amp;&amp; percentBasedMaxCapacityPerUser[i]&lt;=0))
+					break;
+				
+				var userId = this.userIds[i];
+				var capacityPerDay = this.users[userId]['capacity']['hoursPerDay'];
+				var availabilityPerDay = this.users[userId]['availability']['hoursPerDay'];
+				var availability = capacityPerDay[day] - this.blockedHoursPerDay[userId][day];	
+				if (capacityPerDay[day] &lt;= 0){
+					delete hoursToAllocPerUser[userId][date.getValue()];
+					continue;
+				}
+				
+				if(availability &lt;=0)
+					continue;
+				var hoursToAlloc = hours &gt; availability ? Number(availability) : Number(hours);
+				if(percentCapacity){
+				  hoursToAlloc = hoursToAlloc &gt; percentBasedMaxCapacityPerUser[i]? percentBasedMaxCapacityPerUser[i] : hoursToAlloc;
+				  percentBasedMaxCapacityPerUser[i]-=hoursToAlloc;
+			    }
+				hoursToAllocPerUser[userId][date.getValue()] = hoursToAlloc;
+				availabilityPerDay[day] = availability - hoursToAlloc;
+				hours = hours - hoursToAlloc;
+				this.leftOvers.total -= hoursToAlloc;
+			}
+			date.addDaysUTC(1);
+		}
+		return hours;
+	},
+	
+	getPercentBasedMaxCapacityPerUser: function(percentCapacity){
+		var percentBasedMaxCapacityPerUser = [];
+		for(var userIndex = 0; userIndex&lt;this.userIds.length; userIndex++){
+			var userId = this.userIds[userIndex];
+			percentBasedMaxCapacityPerUser[userIndex] = Math.floor((percentCapacity*this.users[userId]['capacity']['totalHours'])/100);
+		}
+		return percentBasedMaxCapacityPerUser;
+	},
+	
+	_fillUptoMaxHoursADay: function(hoursToAllocPerUser, rpId, hours) {
+		var date = new GlideDate();
+		date.setValue(this.startDate.getValue());
+		var maxHoursInADay = 24.0;
+		for (var day = 0; (day &lt; this.noOfDays) &amp;&amp; (hours &gt; 0); day++) {
+			for (var i = 0; (i &lt; this.userIds.length)&amp;&amp; (hours &gt; 0); i++){
+				if (hours &lt;= 0)
+					break;
+
+				var userId = this.userIds[i];
+				var capacityPerDay = this.users[userId]['capacity']['hoursPerDay'];
+				var availabilityPerDay = this.users[userId]['availability']['hoursPerDay'];
+				var availability = maxHoursInADay - (Number(this.blockedHoursPerDay[userId][day])+Number(hoursToAllocPerUser[userId][date.getValue()]));
+				if(availabilityPerDay[day] &gt; 0)
+					availability += Number(availabilityPerDay[day]);
+				if (capacityPerDay[day] &lt;= 0 ){
+					delete hoursToAllocPerUser[userId][date.getValue()];
+					continue;
+				}
+					
+				if(availability &lt;=0)
+					continue;
+				
+				var hoursToAlloc = hours &gt; availability ? Number(availability) : Number(hours);
+				hoursToAllocPerUser[userId][date.getValue()] = Number(hoursToAllocPerUser[userId][date.getValue()])+hoursToAlloc;
+				availabilityPerDay[day] = availability - hoursToAlloc;
+				hours = hours - hoursToAlloc;
+				this.leftOvers.total -= hoursToAlloc;
+			}
+			date.addDaysUTC(1);
+		}
+		return hours;
+	},
+	
+	getHoursLeft: function(){
+		return this.leftOvers;
+    },
+	
+    type: 'ResourceGridFrontLoadAllocator'
+});]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2018-01-31 13:00:46&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;2d9b59b40b001300283eed3ab4673a05&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;128&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ResourceGridFrontLoadAllocator&lt;/sys_name&gt;
+        &lt;sys_package display_value="Resource Grid Interface" source="com.snc.resource_grid"&gt;7e00da2b47e64210cd4e1ce4316d438f&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_2d9b59b40b001300283eed3ab4673a05&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2021-11-30 12:20:29&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:13:18</sys_created_on>
+        <sys_id>0931749983b01210c6695855eeaad388</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ResourceGridFrontLoadAllocator</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_0931749983b01210c6695855eeaad388</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:13:18</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

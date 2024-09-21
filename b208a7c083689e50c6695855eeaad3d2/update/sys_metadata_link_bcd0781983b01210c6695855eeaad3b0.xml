@@ -1,0 +1,342 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1e96c16db77220108223e126de11a906</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_mab_api.UpdateConfigurationService&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;UpdateConfigurationService&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var UpdateConfigurationService = Class.create();
+
+UpdateConfigurationService.prototype = {
+
+    initialize: function () {
+        this.errorHandler = new sn_mab_api.ErrorHandler();
+        this.mobileDAOCache = new sn_mab_api.MobileDAOCache();
+        this.validationHandler = new sn_mab_api.ValidationHandler();
+        this.recordValidator = new sn_mab_api.RecordValidator();
+        this.configSortingService = new sn_mab_api.ConfigSortingService();
+        this.fieldEncryptor = new sn_mab_api.MobileFieldEncryptor();
+        this.operations = ['inserts', 'updates', 'deletes'];
+    },
+
+    /**
+     *
+     * @param payload {{}}
+     * @return {{}}
+     */
+    processRecords: function (payload) {
+        var idMap = {};
+        this.validateAllTables(payload);
+
+        for (var i = 0; i &lt; this.operations.length; i++) {
+            var operation = this.operations[i];
+            if (operation === 'deletes') {
+                this.processDeletes(this.configSortingService.sortNodes(payload[operation]), idMap);
+            } else {
+                this.preProcessInsertsAndUpdates(payload[operation]);
+                this.processInsertsAndUpdates(this.configSortingService.sortNodes(payload[operation]), idMap);
+            }
+            if (this.containsError(idMap)) {
+                return idMap;
+            }
+        }
+
+        return idMap;
+    },
+
+    preProcessInsertsAndUpdates: function(records) {
+        // encrypt any password2 fields before field objects are flattened
+        this.encryptAnyPassword2Fields(records);
+        // flatten all records to avoid issues with sorting and id replacements
+        this.flattenRecords(records);
+    },
+
+    processInsertsAndUpdates: function (sortedRecords, idMap) {
+        for (var i = 0; i &lt; sortedRecords.length; i++) {
+            var record = sortedRecords[i];
+            var table = record.tableName;
+
+            var mobileAppBuilderDao = this.mobileDAOCache.getDAO(this._snakeCaseString(table));
+
+            this.replaceReference(record.fields, idMap);
+
+            var response = this.insertOrUpdate(record.sysId, record.fields, mobileAppBuilderDao);
+
+            if (!response) return;
+
+            idMap[record.sysId] = response;
+        }
+    },
+
+    /**
+     *
+     * @param sysId {String}
+     * @param record {{}}
+     * @param mobileAppBuilderDao {MobileAppBuilderDAO}
+     * @return {{sys_id: null, message: string, operation: string, table: MobileAppBuilderDAO.table, is_success: boolean}}
+     */
+    insertOrUpdate: function (sysId, record, mobileAppBuilderDao) {
+        var operation = this.isGeneratedId(sysId) ? 'insert' : 'update';
+
+        if (operation === 'update') {
+            record.sys_id = sysId;
+        }
+
+        if (record.sys_class_name) record.sys_class_name = this._snakeCaseString(record.sys_class_name);
+
+        var invalidReferences = this.getInvalidReferences(record);
+
+        if (invalidReferences.length &gt; 0) {
+			this.errorHandler.throwBadRequestError('invalid reference from field(s) ' + invalidReferences.join(','));
+        }
+
+        try {
+            var realSysId = mobileAppBuilderDao.saveRecord(record);
+        } catch (error) {
+			this.errorHandler.throwBadRequestError('unable to ' + operation + ' record into table ' + mobileAppBuilderDao.table + ' - ' + error.message);
+        }
+
+        // currently this condition might not ever be met. we need to update the dao to include lastErrorMessage
+        if (!realSysId) {
+			this.errorHandler.throwBadRequestError('unable to ' + operation + ' record: ' + realSysId + ' into table ' + mobileAppBuilderDao.table);
+        }
+
+        // if we got to this point the record is assumed to have saved
+        return {
+            sys_id: realSysId,
+            is_success: true,
+            message: 'successfully ' + operation + ' record: ' + realSysId + ' into table ' + mobileAppBuilderDao.table,
+            operation: operation,
+            table: mobileAppBuilderDao.table
+        };
+    },
+
+    encryptPassword2Fields: function(record, tableName) {
+        for (var fieldName in record) {
+            var field = record[fieldName];
+            if (typeof field === 'object' &amp;&amp; 'type' in field) {
+                if (field.type === 'password2')
+                    record[fieldName] = this.fieldEncryptor.encrypt(this._snakeCaseString(tableName), fieldName, field.value);
+            } else if (typeof field === 'string' &amp;&amp; ['map_provider_app_secret', 'location_provider_app_secret'].indexOf(fieldName) &gt; -1)  {
+                record[fieldName] = this.fieldEncryptor.encrypt(this._snakeCaseString(tableName), fieldName, field);
+            }
+        }
+    },
+
+    encryptAnyPassword2Fields: function (records) {
+        for (var tableName in records) {
+            var recordsPerTable = records[tableName];
+            for (var sysId in recordsPerTable) {
+                this.encryptPassword2Fields(recordsPerTable[sysId], tableName);
+            }
+        }
+    },
+
+    flattenRecords: function (records) {
+        for (var tableName in records) {
+            var recordsPerTable = records[tableName];
+
+            for (var sysId in recordsPerTable) {
+                var record = recordsPerTable[sysId];
+                recordsPerTable[sysId] = this.flattenRecord(record);
+            }
+        }
+    },
+
+    flattenRecord: function (record) {
+        var flattenedRecord = {};
+
+        for (var field in record) {
+            var currValue = record[field];
+            if (typeof currValue === 'object') {
+                flattenedRecord[field] = currValue.value ? currValue.value : null;
+            } else {
+                flattenedRecord[field] = currValue;
+            }
+        }
+
+        return flattenedRecord;
+    },
+
+    /**
+     *
+     * @param payload {{}}
+     */
+    validateAllTables: function (payload) {
+        var operations = ['inserts', 'updates', 'deletes'];
+
+        operations.forEach(function (operation) {
+            var allRecords = payload[operation];
+
+            if (!allRecords) return;
+
+            Object.keys(allRecords).forEach(function (table) {
+                if (!this.validationHandler.isValidTable(this._snakeCaseString(table))) {
+                    this.errorHandler.throwBadRequestError("invalid table: " + table);
+                }
+            }.bind(this));
+        }.bind(this));
+    },
+
+    /**
+     *
+     * @param record {{}}
+     * @param idMap {{}}
+     */
+    replaceReference: function (record, idMap) {
+        for (var field in record) {
+            if (this.hasGeneratedId(record[field])) {
+                var generatedIds = this.extractGeneratedIds(record[field]);
+                generatedIds.forEach(function(generatedId) {
+                    if (idMap[generatedId] &amp;&amp; idMap[generatedId].sys_id) {
+                        record[field] = record[field].replace(generatedId, idMap[generatedId].sys_id);
+                    }                        
+                });
+            }
+        }
+    },
+
+    /**
+     * @param sortedRecords {[]}
+     * @param idMap
+     */
+    processDeletes: function (sortedRecords, idMap) {
+        for (var i = 0; i &lt; sortedRecords.length; i++) {
+            var record = sortedRecords[i];
+            var table = record.tableName;
+
+            var mobileAppBuilderDao = this.mobileDAOCache.getDAO(this._snakeCaseString(table));
+
+            var response = this.deleteRecord(record.sysId, mobileAppBuilderDao);
+
+            if (!response) return;
+
+            idMap[record.sysId] = response;
+        }
+    },
+
+    deleteRecord: function (sysId, mobileAppBuilderDao) {
+        try {
+            var isDeleted = mobileAppBuilderDao.deleteRecord(sysId);
+        } catch (error) {
+			this.errorHandler.throwBadRequestError('unable to delete record from table ' + mobileAppBuilderDao.table + ' - ' + error.message);
+        }
+
+        if (!isDeleted) {
+			this.errorHandler.throwBadRequestError('unable to delete record: ' + sysId + ' from table ' + mobileAppBuilderDao.table);
+        }
+
+        return {
+            is_success: true,
+            sys_id: sysId,
+            operation: 'delete',
+            table: mobileAppBuilderDao.table,
+            message: 'successfully deleted record: ' + sysId + ' from table ' + mobileAppBuilderDao.table
+        };
+    },
+
+
+    /**
+     *
+     * @param idMap {{}}
+     * @return {boolean}
+     */
+    containsError: function (idMap) {
+        for (var sysId in idMap) {
+            if (!idMap[sysId].is_success) {
+                return true;
+            }
+        }
+
+        return false;
+    },
+
+    /**
+     *
+     * @param value {String}
+     * @return {boolean}
+     */
+    isGeneratedId: function (value) {
+        return this.validationHandler.isGeneratedId(value);
+    },
+
+    /**
+     *
+     * @param value {String}
+     * @return {boolean}
+     */
+    hasGeneratedId: function (value) {
+        return this.validationHandler.hasGeneratedId(value);
+    },
+
+    /**
+     * 
+     * @param value {string}
+     * @return {[]}
+     */
+    extractGeneratedIds: function (value) {
+        return this.validationHandler.extractGeneratedIds(value);
+    },
+
+    /**
+     * Checks to see if a record contains a reference the has not been replaced by a valid sysId
+     * @param record {{}}
+     * @return {[]}
+     */
+    getInvalidReferences: function (record) {
+        var invalidFields = [];
+        Object.keys(record).forEach(function (field) {
+            if (this.isGeneratedId(record[field])) {
+                invalidFields.push(field);
+            }
+        }.bind(this));
+
+        return invalidFields;
+    },
+
+    // todo: move into a utility service
+    _snakeCaseString: function (string) {
+        return string.replace(/M2M/g, 'M2m').replace(/[A-Z]/g, function (capital) {
+            return '_' + capital.toLowerCase();
+        });
+    },
+
+    type: 'UpdateConfigurationService'
+};
+]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-03-09 17:13:03&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1e96c16db77220108223e126de11a906&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;UpdateConfigurationService&lt;/sys_name&gt;
+        &lt;sys_package display_value="Mobile App Builder API" source="sn_mab_api"&gt;3c64259bc7812010100f2f3bf4c2609a&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Mobile App Builder API"&gt;3c64259bc7812010100f2f3bf4c2609a&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1e96c16db77220108223e126de11a906&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2021-03-09 17:13:03&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:39</sys_created_on>
+        <sys_id>bcd0781983b01210c6695855eeaad3b0</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>UpdateConfigurationService</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_bcd0781983b01210c6695855eeaad3b0</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:39</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

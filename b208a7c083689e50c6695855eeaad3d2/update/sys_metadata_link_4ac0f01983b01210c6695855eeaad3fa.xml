@@ -1,0 +1,214 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1ce305c9c7221110c59d3d9c95c260df</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_nlu_workbench.TuneModel&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;TuneModel&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var TuneModel = Class.create();
+
+(function() {
+    var tables = sn_nlu_workbench.NLUWorkbenchConstants.tables;
+
+    function getModelName(modelId) {
+        var modelGr = new GlideRecord(tables.SYS_NLU_MODEL);
+        if (modelGr.get(modelId)) {
+            return modelGr.getValue('name');
+        }
+        return null;
+    }
+
+    function getModelId(modelName) {
+        var modelGr = new GlideRecord(tables.SYS_NLU_MODEL);
+        modelGr.addQuery('name', modelName);
+        modelGr.query();
+        if (modelGr.next()) {
+            return modelGr.getUniqueValue();
+        }
+        return null;
+    }
+
+    function shuffleIds(ultIds) {
+        for (var i = ultIds.length - 1; i &gt; 0; i--) {
+            var j = Math.floor(Math.random() * (i + 1));
+            var temp = ultIds[i];
+            ultIds[i] = ultIds[j];
+            ultIds[j] = temp;
+        }
+        return ultIds;
+    }
+
+    TuneModel.prototype = {
+        initialize: function(modelId, removedIds, trainPercent) {
+            this.modelId = modelId;
+            this.removedIds = removedIds;
+            this.trainPercent = trainPercent;
+        },
+
+        tuneModel: function() {
+            var modelName = getModelName(this.modelId);
+            var encodedQuery = 'labelSTARTSWITHintent:' + modelName;
+            if (this.removedIds.length &gt; 0) {
+                encodedQuery = encodedQuery + '^sys_idNOT IN' + this.removedIds.join(',');
+            }
+            var statusGr = new GlideRecord(tables.SYS_NLU_MODEL_STATUS);
+            statusGr.addEncodedQuery('model.name=' + modelName);
+            statusGr.query();
+
+            var ultGr = new GlideRecord(tables.ULT);
+            ultGr.addEncodedQuery(encodedQuery);
+            ultGr.addQuery('product', 'nlu');
+            ultGr.addQuery('source', 'virtual_agent');
+            if (statusGr.next() &amp;&amp; statusGr.getValue('last_tuned_on')) {
+                ultGr.addQuery('sys_updated_on', '&gt;=', statusGr.getValue('last_tuned_on'));
+            }
+            ultGr.query();
+            var targetModelsMap = {};
+            targetModelsMap[modelName] = [];
+            while (ultGr.next()) {
+                var correctLabel = ultGr.getValue('correct_label');
+                var recId = ultGr.getUniqueValue();
+                if (!correctLabel) {
+                    targetModelsMap[modelName].push(recId);
+                } else {
+                    /**
+                     * label is of the format `intent:${modelName}.${intentName}`
+                     * correctLabel.substring(7) gives us modelIntentStr `${modelName}.${intentName}`
+                     * by splitting modelIntentStr using . as delimitter we get array of two values [$modelName, $intentName]
+                     */
+                    var modelIntentStr = correctLabel.substring(7);
+                    var tgtModel = modelIntentStr.split('.')[0];
+                    if (targetModelsMap[tgtModel]) {
+                        targetModelsMap[tgtModel].push(recId);
+                    } else {
+                        targetModelsMap[tgtModel] = [recId];
+                    }
+                }
+            }
+
+            // add feedback to models
+            for (var key in targetModelsMap) {
+                var feedback;
+                var modelGr = global.NLUModel.getGRByName(key);
+                if (!modelGr || modelGr.getValue('oob') == '1')
+                    continue;
+
+                // randomise sysIds
+                targetModelsMap[key] = shuffleIds(targetModelsMap[key]);
+                var trainIdsIdx = Math.floor((this.trainPercent / 100) * targetModelsMap[key].length);
+
+                // add feedback to model intents
+                ultGr = new GlideRecord(tables.ULT);
+                ultGr.addEncodedQuery('sys_idIN' + targetModelsMap[key].slice(0, trainIdsIdx).join(','));
+                ultGr.addQuery('label_type', '!=', 'irrelevant');
+                ultGr.addQuery('label_type', '!=', 'irrelevant_to_this_model');
+                ultGr.query();
+
+                while (ultGr.next()) {
+                    feedback = ultGr.getValue('label_type');
+                    if (!(feedback == 'negative' &amp;&amp; !ultGr.getValue('correct_label'))) {
+                        var tgtIntentId = (key == modelName &amp;&amp; feedback == 'positive') ? ultGr.getValue('label_reference') : ultGr.getValue('correct_label_reference');
+                        var uttGr = new GlideRecord(tables.SYS_NLU_UTTERANCE);
+                        uttGr.initialize();
+                        uttGr.setValue('utterance', ultGr.getValue('text'));
+                        uttGr.setValue('intent', tgtIntentId);
+                        uttGr.setValue('source', 'expert_feedback');
+                        uttGr.setValue('sys_scope', modelGr.getValue('sys_scope'));
+                        if (uttGr.insert())
+                            global.MLLabeledData.deleteRecords('sys_id=' + ultGr.getValue('sys_id'));
+                    }
+                }
+
+                // add feedback to default test set
+                var tgtModelId = getModelId(key);
+                if (tgtModelId) {
+                    var defaultTestGr = new GlideRecord(tables.NLU_BATCH_TEST_SET);
+                    defaultTestGr.addQuery('model', tgtModelId);
+                    defaultTestGr.query();
+
+                    if (defaultTestGr.next()) {
+                        ultGr = new GlideRecord(tables.ULT);
+                        ultGr.addEncodedQuery('sys_idIN' + targetModelsMap[key].slice(trainIdsIdx).join(','));
+                        ultGr.query();
+
+                        while (ultGr.next()) {
+                            feedback = ultGr.getValue('label_type');
+                            if (!(feedback == 'negative' &amp;&amp; !ultGr.getValue('correct_label'))) {
+                                var tgtIntent = (key == modelName &amp;&amp; feedback == 'positive') ? ultGr.label_reference.name : ultGr.correct_label_reference.name;
+                                var testUttGr = new GlideRecord(tables.NLU_BATCH_TEST_UTTERANCE);
+                                testUttGr.initialize();
+                                testUttGr.setValue('test_set', defaultTestGr.getUniqueValue());
+                                testUttGr.setValue('utterance', ultGr.getValue('text'));
+                                if (feedback != 'irrelevant' &amp;&amp; feedback != 'irrelevant_to_this_model') {
+                                    testUttGr.setValue('intent', tgtIntent);
+                                }
+                                testUttGr.setValue('source', 'expert_feedback');
+
+                                if (testUttGr.insert())
+                                    global.MLLabeledData.deleteRecords('sys_id=' + ultGr.getValue('sys_id'));
+                            }
+                        }
+                    } else {
+                        gs.debug('NLU EFL Tune: default testset not found for model: ' + key);
+                    }
+                } else {
+                    gs.debug('NLU EFL Tune: model Id not found for modelname ' + key);
+                }
+            }
+
+            // update last tuned date
+            var statusGr = new GlideRecord(tables.SYS_NLU_MODEL_STATUS);
+            statusGr.addQuery('model', this.modelId);
+            statusGr.query();
+            if (statusGr.next()) {
+                statusGr.setValue('last_tuned_on', new GlideDateTime());
+                statusGr.update();
+            }
+
+            statusGr = global.NLUModel.getModelStatusGr(this.modelId);
+
+            return {
+                status: 'success',
+                lastTunedDate: statusGr ? statusGr.getValue('last_tuned_on') : null
+            };
+        },
+
+        type: 'TuneModel'
+    };
+})();]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-10-13 06:48:15&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1ce305c9c7221110c59d3d9c95c260df&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;44&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;TuneModel&lt;/sys_name&gt;
+        &lt;sys_package display_value="NLU Workbench - Advanced Features" source="sn_nlu_workbench"&gt;31f5f491c3a710100bf407720f40ddf4&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="NLU Workbench - Advanced Features"&gt;31f5f491c3a710100bf407720f40ddf4&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1ce305c9c7221110c59d3d9c95c260df&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-05-25 11:26:43&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:27</sys_created_on>
+        <sys_id>4ac0f01983b01210c6695855eeaad3fa</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>TuneModel</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_4ac0f01983b01210c6695855eeaad3fa</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:27</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

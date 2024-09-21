@@ -1,0 +1,418 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>08886bed538720100999ddeeff7b129d</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.OnCallAssignByAckSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;OnCallAssignByAckSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var OnCallAssignByAckSNC = Class.create();
+
+OnCallAssignByAckSNC.prototype = {
+	ASSIGNMENT_GROUP: 'assignment_group',
+	ASSIGNED_TO: 'assigned_to',
+	DOCUMENT: 'document',
+	DOCUMENT_TABLE: 'document_table',
+	SYS_CREATED_ON: 'sys_created_on',
+	TABLE: 'table',
+	TRIGGER_USER_FIELD: 'trigger_user_field',
+	TRIGGER_GROUP_FIELD: 'trigger_group_field',
+	TRIGGER_RULE_WF_CONTEXT: 'trigger_rule_wf_context',
+	WF_CONTEXT: 'wf_context',
+	ACCEPT: 'ACC',
+	REJECT: 'REJ',
+	RESUME: 'resume',
+	PARENT: 'parent',
+
+	initialize: function() {
+		this._escalationUtil = new OnCallEscalationUtil();
+		this._onCallWorkflowUtils = new OnCallWorkflowUtils();
+		this._log = new GSLog('com.snc.on_call_rotation.log.level', this.type);
+	},
+
+	process: function() {
+		var hasValidUserAndRecord = this._hasValidUserAndRecord();
+
+		if (this._log.atLevel(GSLog.DEBUG))
+			this._log.logDebug('[process] hasValidUserAndRecord: ' + hasValidUserAndRecord);
+
+		if (!hasValidUserAndRecord)
+			return;
+
+		// check if the incident number is part of the original mail
+		if (this._email) {
+			// original message sent to user from on-call: assign by acknowledgement workflow
+			this._userResponse = this._onCallWorkflowUtils.parseEmailResponse(this._email.body_text, this._recordGR.getValue('number'));
+
+			if (this._log.atLevel(GSLog.DEBUG))
+				this._log.logDebug('[process] user response: ' + this._userResponse);
+		}
+
+		// process user response
+		if (this._userResponse &amp;&amp; this._userResponse === this.ACCEPT)
+			this._accepted();
+		else if (this._userResponse &amp;&amp; this._userResponse === this.REJECT)
+			this._rejected();
+		else
+			this._invalid();
+	},
+
+	setRecord: function(record) {
+		this._recordGR = record;
+		return this;
+	},
+
+	setEmail: function(email) {
+		this._email = email;
+		this.setCommunicationType(this._escalationUtil.COMMUNICATION_TYPE.EMAIL);
+		this.setCommunicationTypeValue(email.origemail);
+		return this;
+	},
+
+	setUser: function(userSysId) {
+		this._userSysId = userSysId;
+		return this;
+	},
+
+	setCommunicationType: function(commType) {
+		this._communicationType = commType;
+		return this;
+	},
+	
+	setCommunicationTypeValue: function(commTypeValue) {
+		this._commTypeValue = commTypeValue;
+		return this;
+	},
+	
+	setUserResponse: function(userResponse) {
+		if (this._onCallWorkflowUtils.EMAIL_CHANNEL_ACCEPT_RESPONSES.includes(userResponse))
+			this._userResponse = this.ACCEPT;
+		else if (userResponse === this._escalationUtil.COMMUNICATION_RESPONSE.ACCEPTED)
+			this._userResponse = this.ACCEPT;
+		else if (this._onCallWorkflowUtils.EMAIL_CHANNEL_REJECT_RESPONSES.includes(userResponse))
+			this._userResponse = this.REJECT;
+		else if (userResponse === this._escalationUtil.COMMUNICATION_RESPONSE.REJECTED)
+			this._userResponse = this.REJECT;
+		else
+			this._userResponse = null;
+
+		return this;
+	},
+
+	setPushResponse: function(pushResponse) {
+		this._pushResponse = pushResponse;
+		return this;
+	},
+
+	_accepted: function() {
+
+		var tablename = this._recordGR.getRecordClassName();
+		var sysId = this._recordGR.getUniqueValue();
+
+		if (this._log.atLevel(GSLog.DEBUG))
+			this._log.logDebug('[_accepted] tablename: ' + tablename + ' sysId: ' + sysId + ' userField: ' + this._userField + ' userId: ' + this._userSysId);
+
+		this._onCallWorkflowUtils.updateEscalationResponse(
+			this._userSysId,
+			tablename,
+			sysId,
+			this._escalationUtil.COMMUNICATION_RESPONSE.ACCEPTED
+		);
+
+		this._setCommunicationResponse(
+			tablename,
+			sysId,
+			this._escalationUtil.COMMUNICATION_RESPONSE.ACCEPTED
+		);
+
+		this._recordGR.setValue(this._userField, this._userSysId);
+		this._recordGR.update();
+
+		this._resumeWorkflowContext();
+
+		if (new OnCallWorkflowUtils().isMobilePushInstalled()) {
+			if (this._pushResponse &amp;&amp; this._pushResponse.acceptor &amp;&amp; this._pushResponse.acceptor.getValue() === this._userSysId) {
+				this._pushResponse.comments = gs.getMessage('User: {0} {1} assignment on record: {2}', [
+					this._pushResponse.acceptor.getDisplayValue(),
+					this._pushResponse.state.getDisplayValue(),
+					this._recordGR.getDisplayValue()
+				]);
+			}
+
+			// Cleanup other mobile push notifications
+			new OnCallPushRequest().expireMobileNotifications(
+				this._userSysId,
+				this._recordGR.getRecordClassName(),
+				this._recordGR.getUniqueValue()
+			);
+		}
+	},
+
+	_rejected: function() {
+		var tablename = this._recordGR.getRecordClassName();
+		var sysId = this._recordGR.getUniqueValue();
+
+		if (this._log.atLevel(GSLog.DEBUG))
+			this._log.logDebug('[_rejected] tablename: ' + tablename + ' sysId: ' + sysId + ' userField: ' + this._userField + ' userId: ' + this._userSysId);
+
+		this._onCallWorkflowUtils.updateEscalationResponse(
+			this._userSysId,
+			tablename,
+			sysId,
+			this._escalationUtil.COMMUNICATION_RESPONSE.REJECTED
+		);
+
+		var wfContextsResponse = this._onCallWorkflowUtils.getWFContextsWithRejectedEscalation(
+			this._userSysId,
+			tablename,
+			sysId
+		);
+
+		for (var wfContextId in wfContextsResponse)
+			if (wfContextsResponse[wfContextId] == true)
+				new global.Workflow().broadcastEvent(wfContextId, this.RESUME);
+
+		this._setCommunicationResponse(
+			tablename,
+			sysId,
+			this._escalationUtil.COMMUNICATION_RESPONSE.REJECTED
+		);
+
+		if (new OnCallWorkflowUtils().isMobilePushInstalled() &amp;&amp; this._pushResponse &amp;&amp; this._pushResponse.acceptor &amp;&amp; this._pushResponse.acceptor.getValue() === this._userSysId) {
+			this._pushResponse.comments = gs.getMessage('User: {0} {1} assignment on record: {2}', [
+				this._pushResponse.acceptor.getDisplayValue(),
+				this._pushResponse.state.getDisplayValue(),
+				this._recordGR.getDisplayValue()
+			]);
+		}
+	},
+
+	_setCommunicationResponse: function(tablename, sysId, response) {
+		if (this._communicationType &amp;&amp; this._commTypeValue) {
+			this._escalationUtil.setCommunicationResponse(
+				tablename,
+				sysId,
+				this._communicationType,
+				this._commTypeValue,
+				response
+			);
+		}
+	},
+
+	_invalid: function() {
+		var tablename = this._recordGR.getRecordClassName();
+		var sysId = this._recordGR.getUniqueValue();
+
+		if (this._log.atLevel(GSLog.DEBUG))
+			this._log.logDebug('[_invalid] tablename: ' + tablename + ' sysId: ' + sysId + ' userField: ' + this._userField + ' userId: ' + this._userSysId);
+
+		this._onCallWorkflowUtils.updateEscalationResponse(
+			this._userSysId,
+			tablename,
+			sysId,
+			this._escalationUtil.COMMUNICATION_RESPONSE.INVALID_RESPONSE
+		);
+
+		this._setCommunicationResponse(
+			tablename,
+			sysId,
+			this._escalationUtil.COMMUNICATION_RESPONSE.INVALID_RESPONSE
+		);
+
+		if (this._pushResponse) {
+			this._pushResponse.comments = gs.getMessage('User: {0} gave invalid response to assignment of record: {1}', [
+				this._pushResponse.acceptor.getDisplayValue(),
+				this._recordGR.getDisplayValue()
+			]);
+		}
+	},
+
+	_getMatchingUser: function(emailAddress) {
+		var emailDevice = new GlideRecord('cmn_notif_device');
+		emailDevice.addQuery('email_address', emailAddress);
+		emailDevice.query();
+		while (emailDevice.next())
+			if (emailDevice.user)
+				return emailDevice.user;
+
+		var csGr = new GlideRecord('sys_on_call_contact_source');
+		csGr.addQuery('source_type', 'email');
+		csGr.addQuery('active', true);
+		csGr.query();
+		while (csGr.next()) {
+			var gr = new GlideRecord(csGr.table + '');
+			gr.addQuery(csGr.email_source, emailAddress);
+			gr.query();
+			if (gr.next()) {
+				if (csGr.table == 'sys_user')
+					return gr.getUniqueValue();
+				else
+					return gr.getValue(csGr.user_field);
+			}
+		}
+	},
+
+	_hasValidGrpUserFields: function() {
+		this._groupField = this.ASSIGNMENT_GROUP;
+		this._userField = this.ASSIGNED_TO;
+
+		if (!this._recordGR || !this._recordGR.isValidRecord())
+			return false;
+
+		var table = this._recordGR.getRecordClassName();
+		if (typeof TriggerRuleTableConfigUtil !== 'undefined') {
+			var triggerRuleTableGR = new TriggerRuleTableConfigUtil().getTriggerRuleTableConfigRecord(table);
+			if (triggerRuleTableGR) {
+				this._groupField = triggerRuleTableGR.getValue(this.TRIGGER_GROUP_FIELD);
+				this._userField = triggerRuleTableGR.getValue(this.TRIGGER_USER_FIELD);
+			}
+		}
+
+		if (!this._recordGR.isValidField(this._groupField) || !this._recordGR.isValidField(this._userField)) {
+			if (this._log.atLevel(GSLog.DEBUG))
+				this._log.logDebug('[process] group or user field not valid for table: ' + table);
+
+			return false;
+		}
+
+		return true;
+	},
+
+	_resumeWorkflowContext: function() {
+		if (!this._recordGR)
+			return;
+
+		var documentTable = this._recordGR.getRecordClassName();
+		var documentId = this._recordGR.getUniqueValue();
+		if (!documentTable || !documentId)
+			return;
+
+		var triggerRuleWfCxtGr = new GlideRecord(this.TRIGGER_RULE_WF_CONTEXT);
+		triggerRuleWfCxtGr.addQuery(this.DOCUMENT_TABLE, documentTable);
+		triggerRuleWfCxtGr.addQuery(this.DOCUMENT, documentId);
+		triggerRuleWfCxtGr.orderByDesc(this.SYS_CREATED_ON);
+		triggerRuleWfCxtGr.setLimit(1);
+		triggerRuleWfCxtGr.query();
+
+		var parentWfContextSysId = null;
+		if (triggerRuleWfCxtGr.next())
+			parentWfContextSysId = triggerRuleWfCxtGr.getValue(this.WF_CONTEXT);
+
+		if (parentWfContextSysId) {
+			var wfContextGr = new GlideRecord(this.WF_CONTEXT);
+			wfContextGr.addQuery(this.PARENT, parentWfContextSysId);
+			wfContextGr.query();
+			while (wfContextGr.next()) {
+				var wfContextSysId = wfContextGr.getUniqueValue();
+
+				if (this._log.atLevel(GSLog.DEBUG))
+					this._log.logDebug('[_resumeWorkflowContext] resume wf_context.sys_Id: ' + wfContextSysId);
+
+				new global.Workflow().broadcastEvent(wfContextSysId, this.RESUME);
+			}
+		}
+	},
+
+	_hasValidUserAndRecord: function() {
+
+		// Validate User
+		this._userSysId = this._userSysId ? this._userSysId : gs.getUserID();
+		if (!this._userSysId) {
+
+			if (this._log.atLevel(GSLog.DEBUG))
+				this._log.logDebug('[_hasValidUserAndRecord] user is invalid');
+
+			return false;
+		}
+
+		if (this._email &amp;&amp; gs.getUser().getUserByID(this._userSysId).isDefault()) {
+			var matchingUserId = this._getMatchingUser(this._email.origemail);
+			if (matchingUserId)
+				this._userSysId = matchingUserId;
+		} else if (new OnCallWorkflowUtils().isMobilePushInstalled() &amp;&amp; this._pushResponse &amp;&amp; this._pushResponse.acceptor &amp;&amp; this._pushResponse.acceptor.getValue() === this._userSysId)
+			this._userSysId = this._pushResponse.acceptor.getValue();
+
+		var isValidUser = !!gs.getUser().getUserByID(this._userSysId);
+		if (!isValidUser) {
+
+			if (this._log.atLevel(GSLog.DEBUG))
+				this._log.logDebug('[_hasValidUserAndRecord] user is invalid');
+
+			return false;
+		}
+
+		// Validate Record
+		if (!this._hasValidGrpUserFields()) {
+
+			if (this._log.atLevel(GSLog.ERROR))
+				this._log.logError('[_hasValidUserAndRecord] record does not have valid user group in trigger_rule_table_cfg');
+
+			return false;
+		}
+
+		// Validate record is not already assigned to a user
+		if (this._recordGR.getValue(this._userField)) {
+
+			if (this._log.atLevel(GSLog.DEBUG))
+				this._log.logDebug('[_hasValidUserAndRecord] record: [' + this._recordGR + '] is already assigned to a user');
+
+			return false;
+		}
+
+		var recordAccessible = this.isRecordAccessibleToUser();
+
+		if (!recordAccessible) {
+			if (this._log.atLevel(GSLog.DEBUG))
+				this._log.logDebug('[_hasValidUserAndRecord] record: [' + this._recordGR + '] cannot be read by user: ' + this._userSysId);
+			return false;
+		}
+
+		return true;
+	},
+
+	isRecordAccessibleToUser: function() {
+		if (!this._accessCache) {
+			this._accessCache = {};
+		}
+		if (typeof this._accessCache[this._userSysId + "_" + this._recordGR.getUniqueValue()] === 'undefined')
+			this._accessCache[this._userSysId + "_" + this._recordGR.getUniqueValue()] = new global.OnCallCommon().isRecordAccessibleToUser(this._userSysId, this._recordGR); 
+		return this._accessCache[this._userSysId + "_" + this._recordGR.getUniqueValue()];
+	},
+
+	type: 'OnCallAssignByAckSNC',
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-03-22 15:16:06&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;08886bed538720100999ddeeff7b129d&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;55&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;OnCallAssignByAckSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="On-Call Scheduling" source="com.snc.on_call_rotation"&gt;4bca78ec3cf1311068bcf327dfe37f86&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_08886bed538720100999ddeeff7b129d&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-02-22 19:02:41&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:32</sys_created_on>
+        <sys_id>f550709583b01210c6695855eeaad3ea</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>OnCallAssignByAckSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_f550709583b01210c6695855eeaad3ea</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:32</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

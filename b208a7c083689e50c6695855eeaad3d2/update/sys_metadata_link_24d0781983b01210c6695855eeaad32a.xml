@@ -1,0 +1,192 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1e6e73619f001200598a5bb0657fcfc2</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.PercentCompleteRollupHandler&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;PercentCompleteRollupHandler&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var PercentCompleteRollupHandler = Class.create();
+PercentCompleteRollupHandler.prototype = {
+	
+	initialize: function() {
+	},
+	
+	handle: function(childRecord, parentTable, parentNavigator, rollupColumn, isAverage) {
+		PPMDebug.log('PercentCompleteRollupHandler.handle: ' + parentTable + " | " + parentNavigator + " | " + rollupColumn);
+		var rollupStructureLoader = new RollupStructureLoader();
+		var parentSysId = childRecord.getValue(parentNavigator);
+		var childRecordTable = childRecord.instanceOf("rm_story")? childRecord.getValue("sys_class_name"): "planned_task";
+		if(childRecord &amp;&amp; childRecord.operation() == "delete") {
+			this.updateParent(parentTable, parentSysId, parentNavigator, childRecordTable, childRecord.getValue("sys_id"));
+		} else {
+			this.updateParent(parentTable, parentSysId, parentNavigator, childRecordTable);
+		}
+	},
+	
+	updateParent: function(parentTable, parentSysId, parentNavigator, childTableName, excludeSysId) {
+		PPMDebug.log('PercentCompleteRollupHandler.updateParent: ' + parentTable + " | " + parentSysId + " | " + parentNavigator +
+		" | " + childTableName + " | " + excludeSysId);
+		//Calculate durations from sibling tasks
+		var parent = new GlideRecord(parentTable);
+		if (parent.get(parentSysId)) {
+			var sibling = new GlideRecord(childTableName);
+			sibling.addQuery(parentNavigator, parentSysId);
+			sibling.addNullQuery('orig_sys_id');
+			var lookupTable = parentTable;
+			if(parent.instanceOf('pm_project') || parent.instanceOf('pm_project_task'))
+				lookupTable = parent.instanceOf('pm_project') ? 'pm_project' : 'pm_project_task';
+			
+			var ptRollupApi = new PlannedTaskRollupApi();
+			var sysClassExclusions = ptRollupApi.getRollupExclusions(lookupTable,'percent_complete');
+			if(sysClassExclusions.length &gt;0 )
+				sibling.addQuery('sys_class_name', 'NOT IN', sysClassExclusions.join(','));
+			
+			if( excludeSysId ) {
+				sibling.addQuery("sys_id", "!=", excludeSysId);
+			}
+			sibling.query();
+			this.rollupFromChildrenAndUpdateParent(sibling, parent, parentTable, parentSysId, parentNavigator, childTableName);
+		}
+	},
+	
+	
+	rollupFromChildrenAndUpdateParent: function(childRecords, parentRecord, parentTable, parentSysId, parentNavigator, childTableName) {
+        PPMDebug.log('PercentCompleteRollupHandler.rollupFromChildrenAndUpdateParent: ' + parentRecord.getValue("short_description") +
+            " | Child Record Count -&gt; " + childRecords.getRowCount() + " - " + childRecords.getEncodedQuery());
+        var totalDur = 0;
+        var workedDuration = 0;
+        var percentCalc = 0;
+        var totalRecords = childRecords.getRowCount();
+        var schedule;
+        var durationCalculator = new DurationCalculator();
+		var hoursPerDayBasedOnSchedule;
+        var duration;
+        if (totalRecords == 0) {
+            parentRecord.percent_complete = percentCalc;
+            parentRecord.update();
+        } else {
+            var mileStones = 0;
+            var completedMileStones = 0;
+            while (childRecords.next()) {
+				if(!schedule &amp;&amp; childRecords.top_task)
+					schedule = childRecords.top_task.schedule;
+					
+                if (schedule) {
+					var ptGlobalApi = new PTGlobalAPI();
+					if(JSUtil.nil(hoursPerDayBasedOnSchedule))
+						hoursPerDayBasedOnSchedule = ptGlobalApi.getHoursPerDay(childRecords.start_date, schedule, childRecords.getUniqueValue());
+					//Duration value is in format d HH:mm:ss, to get hours,minutes,values we are splitting on space. if duration only has hours it will give us HH:mm:ss
+					// durationCalculator._timeToSeconds will calculate seconds if we give value in the format HH:mm:ss
+					var durationArray = childRecords.duration.getGlideObject().getDurationValue().split(' ');
+					var durValueIn_HH_mm_ss_format = durationArray.length == 2 ? childRecords.duration.getGlideObject().getDurationValue().split(' ')[1] : childRecords.duration.getGlideObject().getDurationValue();
+
+					duration = hoursPerDayBasedOnSchedule * parseInt(childRecords.duration.getGlideObject().getDayPart()) * 60 * 60 + durationCalculator._timeToSeconds(durValueIn_HH_mm_ss_format);
+                } else {
+                    duration = childRecords.duration.getGlideObject().getNumericValue() / 1000;
+                }
+                totalDur += duration;
+                if (JSUtil.notNil(childRecords.getValue("percent_complete")) &amp;&amp; childRecords.getValue("percent_complete") != "0") {
+                    workedDuration += duration * (childRecords.percent_complete / 100);
+                }
+
+                if (childRecords.milestone == true) {
+                    mileStones++;
+                    if (JSUtil.notNil(childRecords.getValue("percent_complete")) &amp;&amp; childRecords.getValue("percent_complete") != "0") {
+                        if ((childRecords.percent_complete / 100) === 1) {
+                            completedMileStones++;
+                        }
+                    }
+                }
+            }
+            percentCalc = (workedDuration / totalDur) * 100;
+
+            /* case 1: when project contains all milestones
+            then project %complete will be 100% ONLY if all the milestones are 100% complete.
+            */
+            if (totalRecords === mileStones) {
+                //even if one is not completed then its 0%
+                if (completedMileStones == mileStones) {
+                    percentCalc = 100;
+                } else {
+                    percentCalc = 0;
+                }
+            } else {
+                /* case 2: when project has milestones and regular tasks 
+                Project %complete = 100% ONLY when all the milestones &amp; regular tasks are 100% complete.
+                */
+                if (!isNaN(percentCalc) &amp;&amp; parseInt(percentCalc) === 100 &amp;&amp; completedMileStones != mileStones) {
+                    percentCalc = 99;
+                }
+            }
+
+
+            if (!isNaN(percentCalc) &amp;&amp; parentRecord.percent_complete != percentCalc) {
+                parentRecord.percent_complete = percentCalc;
+                PPMDebug.log('PercentCompleteRollupHandler.rollupFromChildrenAndUpdateParent - Updating Parent Percent Complete -&gt; ' +
+                    parentRecord.getValue("short_description") + " - " + percentCalc);
+                parentRecord.update();
+            } else {
+                /* parent percent complete and percentCalc are same, but there will be case where its parent 
+                   percent complete will be different. this else condition handles this scenerio
+                   
+                   ex:
+                   Project
+                      T1 -   Closed Complete - 100 percent - 20 days
+                	  T2    - Pending        - 0%          - 2  days
+                	    T21 - Pending        - 0%          - 1  day
+                		T22 - Pending        - 0%          - 1  day
+                		
+                   for above project structure, if T22 duration is updated to 20 days, T2 duration will get updated to 20 days and this will have impact of Project percent complete, though there is no change in T2 percent complete		
+                 */
+                if (parentRecord.parent) {
+                    var newParent = parentRecord.parent.getRefRecord();
+                    if (newParent.instanceOf('pm_project') || newParent.instanceOf('pm_project_task'))
+                        parentTable = newParent.instanceOf('pm_project') ? 'pm_project' : 'pm_project_task';
+
+                    this.updateParent(parentTable, newParent.getValue('sys_id'), parentNavigator, childTableName)
+
+                }
+
+            }
+        }
+
+    },
+    	
+	type: 'PercentCompleteRollupHandler'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2015-12-01 00:03:03&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1e6e73619f001200598a5bb0657fcfc2&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;48&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;PercentCompleteRollupHandler&lt;/sys_name&gt;
+        &lt;sys_package display_value="Planned Task_v2" source="com.snc.planned_task_v2"&gt;92ef82e747e64210cd4e1ce4316d43f1&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1e6e73619f001200598a5bb0657fcfc2&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-04-24 09:57:05&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:38</sys_created_on>
+        <sys_id>24d0781983b01210c6695855eeaad32a</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>PercentCompleteRollupHandler</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_24d0781983b01210c6695855eeaad32a</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:38</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

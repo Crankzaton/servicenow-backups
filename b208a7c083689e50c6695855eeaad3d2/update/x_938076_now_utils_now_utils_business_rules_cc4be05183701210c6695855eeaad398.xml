@@ -1,0 +1,217 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules">
+    <x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>true</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection/>
+        <condition/>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>Set risk control levels</name>
+        <order>100</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function executeRule(current, previous /*null when async*/ ) {
+    const getRiskToleranceLevel = (
+        likelihood,
+        severity,
+        likelihoodLevels,
+        severityLevels
+    ) => {
+        const likelihoodLevel = likelihoodLevels.get(likelihood) || 0;
+        const severityLevel = severityLevels.get(severity) || 0;
+        const toleranceLevel = likelihoodLevel * severityLevel;
+
+        return toleranceLevel;
+    };
+
+    const getRiskTolerance = (riskToleranceLevel, riskTolerances) => {
+        /**
+         * For tolerances as:
+         *   [
+         *     {minRange: 0, maxRange: 3, riskTolerance: 'abf787d6537a311090b4ddeeff7b126e'},
+         *     {minRange: 4, maxRange: 9, riskTolerance: 'abf787d6537a311090b4ddeeff7b129e'},
+         *     {minRange: 10, maxRange: 16, riskTolerance: 'abf787d6537a311090b4ddeeff7b125e'}
+         *   ]
+         * locate the range which given riskToleranceLevel resides in, and the tolerance will be the one to find. 
+         */
+        const {
+            riskTolerance
+        } = riskTolerances.find(({
+            minRange,
+            maxRange
+        }) => riskToleranceLevel >= minRange && riskToleranceLevel <= maxRange) || {};
+
+        return riskTolerance;
+    };
+
+    const getRiskTolerances = (riskMatrixSysId) => {
+        const riskTolerances = [];
+        const riskToleranceGR = new GlideRecord("sn_hs_rm_risk_tolerance");
+        riskToleranceGR.addQuery("risk_matrix", riskMatrixSysId);
+        riskToleranceGR.query();
+
+        while (riskToleranceGR.next()) {
+            const minRange = riskToleranceGR.getValue("min_range");
+            const maxRange = riskToleranceGR.getValue("max_range");
+            const riskTolerance = riskToleranceGR.getValue("sys_id");
+
+            riskTolerances.push({
+                minRange,
+                maxRange,
+                riskTolerance,
+            });
+        }
+
+        return riskTolerances;
+    };
+
+    const getLikelihoodSeverityLevels = (riskMatrixRecord) => {
+        const MAX_LIKELIHOOD_SEVERITY_LEVEL = 5;
+        const likelihoodPrefix = "likelihood_level_";
+        const severityPrefix = "severity_level_";
+        const likelihoodLevels = new Map();
+        const severityLevels = new Map();
+        const indexes = Array.from({
+                length: MAX_LIKELIHOOD_SEVERITY_LEVEL,
+            },
+            (_, i) => i + 1
+        );
+
+        for (const index of indexes) {
+            const likelihoodKey = `${likelihoodPrefix}${index}`;
+            const severityKey = `${severityPrefix}${index}`;
+            likelihoodLevels.set(riskMatrixRecord.getValue(likelihoodKey), index);
+            severityLevels.set(riskMatrixRecord.getValue(severityKey), index);
+        }
+
+        return [likelihoodLevels, severityLevels];
+    };
+
+    // fetch and check parent risk assessment record
+    const riskAssessmentGR = new GlideRecord("sn_hs_rm_risk_assessment");
+    const riskAssessmentExisted = riskAssessmentGR.get(current.risk_assessment);
+    if (!riskAssessmentExisted) return;
+
+    // fetch and check risk matrix been chosen
+    const riskMatrixGR = new GlideRecord("sn_hs_rm_risk_matrix");
+    const riskMatrixExisted = riskMatrixGR.get(riskAssessmentGR.risk_matrix);
+    if (!riskMatrixExisted) return;
+
+    // collect likelihood and severity levels
+    const [likelihoodLevels, severityLevels] = getLikelihoodSeverityLevels(riskMatrixGR);
+    // collect risk tolerances configured in chosen risk matrix
+    const riskTolerances = getRiskTolerances(riskMatrixGR.getValue("sys_id"));
+
+    const riskToleranceLevelBefore = getRiskToleranceLevel(
+        current.getValue("likelihood_before_controls"),
+        current.getValue("severity_before_controls"),
+        likelihoodLevels,
+        severityLevels
+    );
+    const riskToleranceBefore = getRiskTolerance(
+        riskToleranceLevelBefore,
+        riskTolerances
+    );
+
+    const riskToleranceLevelAfter = getRiskToleranceLevel(
+        current.getValue("likelihood_after_controls"),
+        current.getValue("severity_after_controls"),
+        likelihoodLevels,
+        severityLevels
+    );
+    const riskToleranceAfter = getRiskTolerance(
+        riskToleranceLevelAfter,
+        riskTolerances
+    );
+
+    // update risk tolerance in risk assessment
+    try {
+        current.setValue("risk_before_controls", riskToleranceBefore);
+        current.setValue("risk_after_controls", riskToleranceAfter);
+        current.update();
+    } catch (err) {
+        gs.error(err);
+    }
+
+    // update parent risk control's risk tolerance
+    const riskControlGR = new GlideRecord("sn_hs_rm_risk_controls");
+    riskControlGR.addQuery(
+        "risk_assessment",
+        riskAssessmentGR.getValue("sys_id")
+    );
+    riskControlGR.query();
+
+    let maxRiskToleranceLevelBefore = -1;
+    let maxRiskToleranceLevelAfter = -1;
+    while (riskControlGR.next()) {
+        const currentRiskToleranceLevelBefore = getRiskToleranceLevel(
+            riskControlGR.getValue("likelihood_before_controls"),
+            riskControlGR.getValue("severity_before_controls"),
+            likelihoodLevels,
+            severityLevels
+        );
+        const currentRiskToleranceLevelAfter = getRiskToleranceLevel(
+            riskControlGR.getValue("likelihood_after_controls"),
+            riskControlGR.getValue("severity_after_controls"),
+            likelihoodLevels,
+            severityLevels
+        );
+
+        if (currentRiskToleranceLevelBefore > maxRiskToleranceLevelBefore) {
+            maxRiskToleranceLevelBefore = currentRiskToleranceLevelBefore;
+        }
+
+        if (currentRiskToleranceLevelAfter > maxRiskToleranceLevelAfter) {
+            maxRiskToleranceLevelAfter = currentRiskToleranceLevelAfter;
+        }
+    }
+
+    const maxRiskToleranceBefore = getRiskTolerance(maxRiskToleranceLevelBefore, riskTolerances);
+    const maxRiskToleranceAfter = getRiskTolerance(maxRiskToleranceLevelAfter, riskTolerances);
+
+    // update risk assessment's risk tolerance
+    try {
+        riskAssessmentGR.setValue("risk_before_controls", maxRiskToleranceBefore ?? '');
+        riskAssessmentGR.setValue("risk_after_controls", maxRiskToleranceAfter ?? '');
+        riskAssessmentGR.update();
+    } catch (err) {
+        gs.error(err);
+    }
+})(current, previous);]]></script>
+        <sys_class_name>x_938076_now_utils_now_utils_business_rules</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:47:18</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>cc4be05183701210c6695855eeaad398</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Set risk control levels</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>x_938076_now_utils_now_utils_business_rules_cc4be05183701210c6695855eeaad398</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:47:18</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </x_938076_now_utils_now_utils_business_rules>
+    <sys_translated_text action="delete_multiple" query="documentkey=cc4be05183701210c6695855eeaad398"/>
+</record_update>

@@ -1,0 +1,821 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>159831de878df1905199c957cebb3553</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.wfSPMCMSDemandUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Thsi script include is used to include all the Demand Related functions.&lt;/description&gt;
+        &lt;name&gt;wfSPMCMSDemandUtils&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var wfSPMCMSDemandUtils = Class.create();
+wfSPMCMSDemandUtils.prototype = {
+    initialize: function() {
+        this.DEMAND = 'dmn_demand';
+        this.DEMAND_TASK = 'dmn_demand_task';
+        this.ASMT_INSTANCE = 'asmt_assessment_instance';
+
+    },
+
+    /*@name createDemandTask
+    @description creates a demand task,
+    @param {parent demand record sys Id, Short description}
+    @returns does not return anything*/
+
+    createDemandTask: function(dmnParent, shortDesc) {
+
+        var dmnTaskGr = new GlideRecord(this.DEMAND_TASK);
+        dmnTaskGr.initialize();
+        dmnTaskGr.parent = dmnParent;
+        dmnTaskGr.short_description = shortDesc;
+        dmnTaskGr.correlation_display = shortDesc;
+        dmnTaskGr.insert();
+
+    },
+
+    /*@name createDemandTaskAssessment
+    @description creates a Assessment for Demand Task,
+    @param {metType, dmnTask, assignTo}
+    @returns does not return anything*/
+
+    createAssessment: function(metType, srcTask, assignTo, trgTable) {
+
+        var typeSysID = metType; //The sys_id of the assessment, should be in published state
+        var sourceRecordID = srcTask; //sys_id of the transaction record (Ex: sys_id of the IMS record)
+        var userID = assignTo; // sys_id in the opened_by field
+        var result = new SNC.AssessmentCreation().createAssessments(typeSysID, sourceRecordID, userID); // successfully created the Survey instance record
+
+        //Association of Trigger ID and Trigger Records
+        var asmtGR = new GlideRecord(this.ASMT_INSTANCE);
+        asmtGR.get(result.split(",")[0]); // gets the sys_id of the newly created assessment record from the 'result' variable array
+        asmtGR.setValue('trigger_table', trgTable); //setting target table to demand
+        asmtGR.setValue('trigger_id', sourceRecordID);
+        asmtGR.setValue('task_id', sourceRecordID); //sys_id of the task id to the current demand record
+        asmtGR.update();
+
+    },
+
+
+    /*@name cancelCFITAssessments
+    @description cancels other CFIT Assessments if one is completed per group
+    @param {mtrType - sys ID of the metric Type, dmnSysID- Sys ID of the Demand Record, 
+	userID - Sys ID of the User record}
+    @returns does not return anything*/
+
+    cancelCFITAssessments: function(mtrType, dmnSysID, insId) {
+
+        //var strGrp = this.getcfitGroupName(insId, dmnSysID);
+        var insRec;
+        var resultGr = new GlideRecord("u_assessment_results");
+
+        resultGr.addQuery('u_cfit_instance_ids', 'CONTAINS', insId);
+        resultGr.addQuery('u_demand.sys_id', dmnSysID);
+        resultGr.query();
+        if (resultGr.next()) {
+            insRec = resultGr.u_cfit_instance_ids;
+        }
+
+        //cancelling the instance records
+        var insGr = new GlideRecord("asmt_assessment_instance");
+        insGr.addQuery("task_id.sys_id", dmnSysID);
+        insGr.addQuery("metric_type.sys_id", mtrType);
+        insGr.addQuery('sys_id', 'IN', insRec);
+        insGr.addQuery("state", "NOT IN", "complete");
+        insGr.query();
+        while (insGr.next()) {
+            insGr.setValue("state", "canceled");
+            insGr.update();
+        }
+
+    },
+
+
+    /*@name getImpactedGroups
+    @description used to calculate the no of groups
+    @param demand record
+    @returns the number of impacted Group*/
+    getImpactedGroups: function(dmnGr) {
+        var intGrpLength = 0;
+        var impGrps = "";
+        var impquest = gs.getProperty("wf.spm.cms.impacted.questions");
+        var impArray = impquest.split(",");
+        var mtrTypeRec = gs.getProperty('wf.spm.cms.demand.assessments');
+        var metricObj = JSON.parse(mtrTypeRec);
+        var mtrType = metricObj["initAssessment"];
+        var asmtInsGr = new GlideRecord("asmt_assessment_instance");
+        asmtInsGr.addQuery("task_id", dmnGr);
+        asmtInsGr.addQuery("metric_type", mtrType);
+        asmtInsGr.addQuery("state", "complete");
+        asmtInsGr.query();
+        if (asmtInsGr.next()) {
+
+            var asmtGr = new GlideRecord("asmt_metric_result");
+            asmtGr.addQuery('instance', asmtInsGr.sys_id);
+            asmtGr.addQuery('metric.name', 'IN', impArray);
+            asmtGr.query();
+            while (asmtGr.next()) {
+                var answer = asmtGr.string_value;
+                impGrps = impGrps + "," + answer;
+
+            }
+        }
+        var str = impGrps.toString();
+        str = str.substring(1);
+
+        return str;
+
+    },
+
+    /*@name getImpactedGrpsFromCFITAssessment
+        @description used to get the impacted group selected from CFIT assessment question "Impacted Functional Business Group"
+        @param  sysId of the Demand record
+        @returns the impacted groups*/
+
+    getImpactedGrpsFromCFITAseesssment: function(dmnGr, ins_record) {
+
+
+        var impGrps;
+
+        var mtrTypeRec = gs.getProperty('wf.spm.cms.demand.assessments');
+        var metricObj = JSON.parse(mtrTypeRec);
+        var mtrType = metricObj["cfitReview"];
+
+
+        var asmtResult = new GlideRecord('u_assessment_results');
+        asmtResult.addQuery('u_demand.sys_id', dmnGr);
+        asmtResult.addNotNullQuery('u_parent');
+        asmtResult.addQuery('u_metrictype', mtrType);
+        asmtResult.addQuery('u_cfit_instance_ids', 'CONTAINS', ins_record);
+        asmtResult.query();
+        if (asmtResult.next()) {
+            if (!gs.nil(asmtResult.u_cfit_functional_business_sub_group)) {
+
+                impGrps = asmtResult.u_cfit_functional_business_sub_group;
+
+            }
+            if (!gs.nil(asmtResult.u_cfit_functional_business_sub_group_area)) {
+
+                impGrps = impGrps + "," + asmtResult.u_cfit_functional_business_sub_group_area;
+            }
+
+        }
+
+        return impGrps;
+
+    },
+
+
+    /*@name check CFIT Groups other than Triggered Previesly
+            @description used to get the impacted group selected from initial assessment question "Impacted Functional Business Group"
+            @param  sysId of the Demand record
+            @returns the impacted groups*/
+    getCFITGroupsTriggeredOtherThanPreviesly: function(dmn_record, inst_rec) {
+        var mtrTypeRec = gs.getProperty('wf.spm.cms.demand.assessments');
+        var metricObj = JSON.parse(mtrTypeRec);
+        var mtrType = metricObj["cfitReview"];
+        var strValue = "";
+        var nonMatchingValue = [];
+        var triggerdGroups = this.getImpactedGrpsFromCFITAseesssment(dmn_record, inst_rec);
+        //var impServGrp = this.getAssignmentGrpsModified(triggerdGroups);
+        var assgstr = triggerdGroups.toString();
+
+        var cfittg = new GlideRecord("u_assessment_results");
+        cfittg.addQuery("u_demand", dmn_record);
+        cfittg.addQuery("u_metrictype", mtrType);
+        cfittg.addEncodedQuery("u_parentISNOTEMPTY^u_functional_impacted_group_nameISNOTEMPTY");
+        cfittg.query();
+        var matchingGroups = []; // To store the groups found in u_assessment_results
+        while (cfittg.next()) {
+            var assignGrp = cfittg.getValue("u_functional_impacted_group_name");
+            matchingGroups.push(assignGrp);
+        }
+        var arry = assgstr.split(",");
+        var arr = arry.length;
+        for (var i = 0; i &lt; arr; i++) {
+            var obj = arry[i];
+            var found = false;
+            var matchval = matchingGroups.length;
+            for (var j = 0; j &lt; matchval; j++) {
+                if (obj === matchingGroups[j]) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                //nonMatchingValue.push(obj);
+                strValue = strValue + "," + obj;
+            }
+        }
+
+        strValue = strValue.substring(1);
+        return strValue;
+    },
+
+
+
+
+
+    getGroupsSysIDsBasedOnServicegroups: function(grpList) {
+
+
+        var grp = grpList.split(",");
+        var grpsys_ids = [];
+        var arry = grp.length;
+        for (i = 0; i &lt; arry; i++) {
+            var groupName = grp[i];
+            var userGrp = new GlideRecord("sys_user_group");
+            userGrp.addQuery('name', groupName);
+            userGrp.query();
+            while (userGrp.next()) {
+                grpsys_ids.push(userGrp.getValue("sys_id").toString());
+            }
+
+
+        }
+        return grpsys_ids;
+
+    },
+
+    /*@name identifycfitexisting
+        @description used to get the impacted group selected from initial assessment question "Impacted Functional Business Group" and check its already existing in u_assessment_results table
+        @param  sysId of the Demand record
+        @returns the impacted groups*/
+    identifycfitexisting: function(dmn_record, triggerdGroups) {
+        var mtrTypeRec = gs.getProperty('wf.spm.cms.demand.assessments');
+        var metricObj = JSON.parse(mtrTypeRec);
+        var mtrType = metricObj["cfitReview"];
+        var strValue = "";
+        var assgstr = triggerdGroups.toString();
+        var cfittg = new GlideRecord("u_assessment_results");
+        cfittg.addQuery("u_demand", dmn_record);
+        cfittg.addQuery("u_metrictype", mtrType);
+        cfittg.addEncodedQuery("u_parentISNOTEMPTY^u_functional_impacted_group_nameISNOTEMPTY");
+        cfittg.query();
+        var matchingGroups = []; // To store the groups found in u_assessment_results
+        while (cfittg.next()) {
+            var assignGrp = cfittg.getValue("u_functional_impacted_group_name");
+            matchingGroups.push(assignGrp);
+        }
+
+        if (matchingGroups.length != 0) {
+            var arry = assgstr.split(",");
+            var arr = arry.length;
+            for (var i = 0; i &lt; arr; i++) {
+                var obj = arry[i];
+                var found = false;
+                var matchval = matchingGroups.length;
+                for (var j = 0; j &lt; matchval; j++) {
+                    if (obj === matchingGroups[j]) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) {
+                    //nonMatchingValue.push(obj);
+                    strValue = strValue + "," + obj;
+                }
+            }
+
+            strValue = strValue.substring(1);
+            return strValue;
+
+        } else {
+            return triggerdGroups;
+        }
+
+
+
+
+
+
+
+    },
+
+    /*@name getImpactedGrpsFromInitAssessmen
+        @description used to get the impacted group selected from initial assessment question "Impacted Functional Business Group"
+        @param  sysId of the Demand record
+        @returns the impacted groups*/
+
+    getImpactedGrpsFromInitAssessment: function(dmnGr) {
+
+        var impGrps;
+        var asmtResult = new GlideRecord('u_assessment_results');
+        asmtResult.addQuery('u_demand.sys_id', dmnGr);
+        asmtResult.addNullQuery('u_parent');
+        asmtResult.query();
+        if (asmtResult.next()) {
+            if (!gs.nil(asmtResult.u_select_impacted_functional_business_sub_groups)) {
+
+                impGrps = asmtResult.u_select_impacted_functional_business_sub_groups;
+
+            }
+            if (!gs.nil(asmtResult.u_select_impacted_functional_business_sub_group_areas)) {
+
+                impGrps = impGrps + "," + asmtResult.u_select_impacted_functional_business_sub_group_areas;
+            }
+
+        }
+
+        var impgroups2 = this.identifycfitexisting(dmnGr, impGrps);
+
+        return impgroups2;
+
+    },
+
+    getDepndtValuesfromAssRsltChoiceTable: function(subGrpVls, subgrpAreaVls) {
+        var strValue = "";
+        var impArray = subGrpVls.toString();
+        var impArray2 = subgrpAreaVls.toString();
+        var dependentgrps = "";
+        if (impArray2.length === 0) {
+            strValue = subGrpVls;
+            return strValue;
+        } else {
+            var chsgr = new GlideRecord("sys_choice");
+            chsgr.addQuery("name", "u_assessment_results");
+            chsgr.addQuery("element", "u_select_impacted_functional_business_sub_group_areas");
+            chsgr.addQuery("value", 'IN', impArray2);
+            chsgr.groupBy("dependent_value");
+            chsgr.query();
+
+            while (chsgr.next()) {
+                var assignGrpsStr = chsgr.getValue("dependent_value");
+                dependentgrps = dependentgrps + "," + assignGrpsStr;
+                //dependentgrps.push(assignGrpsStr);
+            }
+
+
+            var array1 = subGrpVls.split(",");
+            var array2 = dependentgrps.split(",");
+            var nonMatchingValues = array1.filter(function(value) {
+                return array2.indexOf(value) === -1;
+            });
+
+
+
+        }
+
+        var impNonMatchValue = nonMatchingValues.toString();
+        return impNonMatchValue;
+
+    },
+
+
+
+    getUniqueValuesFromString: function(strvl) {
+
+        var Arr = strvl.split(",");
+        var outputArray = [];
+        var count = 0;
+        var start = false;
+        var len = Arr.length;
+        for (var j = 0; j &lt; len; j++) {
+            var lengk = outputArray.length;
+            for (var k = 0; k &lt; lengk; k++) {
+                if (Arr[j] === outputArray[k]) {
+                    start = true;
+                }
+            }
+            count++;
+            if (count === 1 &amp;&amp; start === false) {
+                outputArray.push(Arr[j]);
+            }
+            start = false;
+            count = 0;
+        }
+
+        return outputArray;
+
+
+    },
+
+
+    /*@name getAssignmentGrps
+    @description used to get assignment groups
+    @param strings of impacted groups seperated by comma
+    @returns the Assignment groups*/
+
+    getAssignmentGrps: function(impStr) {
+
+        var assignGrpsStr = "";
+        var arry = impStr.split(",");
+        // gs.addInfoMessage(arry.length);
+        var grps = gs.getProperty('wf.spm.demand.imp.assignment.group');
+        var grpsStr = JSON.parse(grps);
+        var len = arry.length;
+        for (var i = 0; i &lt; len; i++) {
+            var obj = arry[i];
+
+            if (!gs.nil(grpsStr[arry[i]])) {
+                assignGrpsStr = assignGrpsStr + "," + grpsStr[arry[i]]
+            }
+        }
+        if (gs.nil(assignGrpsStr)) {
+            return "CM_CL_CMS_REG_POL_CHANGE_CHAMPIONS";
+        } else {
+            return assignGrpsStr.substring(1);
+        }
+
+    },
+
+    getAssignmentGrpsModified: function(impStr) {
+        if (impStr.length != 0) {
+            var assignGrpsStr = "";
+            var arry = impStr.split(",");
+            // gs.addInfoMessage(arry.length);
+            var grps = gs.getProperty('wf.spm.demand.imp.assignment.group');
+            var grpsStr = JSON.parse(grps);
+            var len = arry.length;
+            for (var i = 0; i &lt; len; i++) {
+                var obj = arry[i];
+
+                if (!gs.nil(grpsStr[arry[i]])) {
+                    assignGrpsStr = assignGrpsStr + "," + obj;
+                }
+            }
+
+            assignGrpsStr = assignGrpsStr.substring(1);
+            return assignGrpsStr;
+        } else {
+            return "";
+        }
+
+
+
+    },
+
+
+    /*@name getcfitGroupName
+        @description used to getcfit group name
+        @param sys id of the instance id
+        @returns the Cfit group name*/
+
+    getcfitGroupName: function(insId, dmnSysID) {
+        var strGrp = "";
+        var resultGr = new GlideRecord("u_assessment_results");
+
+        resultGr.addQuery('u_cfit_instance_ids', 'CONTAINS', insId);
+        resultGr.addQuery('u_demand.sys_id', dmnSysID);
+        resultGr.query();
+        if (resultGr.next()) {
+
+            strGrp = resultGr.u_cfitgroup_name;
+            // gs.addInfoMessage('test' + strGrp);
+        }
+
+        return strGrp.toString();
+
+
+    },
+
+
+    /*@name getImpactType
+     @description used to get Impact type
+     @param strings of ys Id of the Instance Id
+     @returns the Impacted types*/
+
+    getImpactType: function(insId) {
+        var type = "";
+        var answer;
+        var impType = "u_will_this_initiative_potentially_impact_any_of_the_following";
+        var asmtGr = new GlideRecord("asmt_metric_result");
+        asmtGr.addQuery('instance', insId);
+        asmtGr.addQuery('metric.name', impType);
+        asmtGr.query();
+        while (asmtGr.next()) {
+            //answer = asmtGr.string_value;
+            type = type + "," + asmtGr.string_value;
+
+        }
+
+        type = type.substring(1);
+        return type.toString();
+
+    },
+
+    getGrpTypeCombination: function(dmnGr) {
+        var metricTypeRecords = gs.getProperty('wf.spm.cms.demand.assessments');
+        var metricObj = JSON.parse(metricTypeRecords);
+        var mtrType = metricObj["cfitReview"];
+        var arrayImpType;
+        var strComb = [];
+        var asmtGr = new GlideRecord("u_assessment_results");
+        asmtGr.addQuery("u_demand.sys_id", dmnGr);
+        asmtGr.addEncodedQuery('u_metrictype=' + mtrType + '^u_is_your_group_impacted_by_this_change=Impacted^u_functional_impacted_group_nameISNOTEMPTY');
+        asmtGr.query();
+        while (asmtGr.next()) {
+            var impType = asmtGr.u_will_this_initiative_potentially_impact_any_of_the_following;
+
+            //impacted
+            if (!gs.nil(impType)) {
+                arrayImpType = impType.split(",");
+            }
+            var len = arrayImpType.length;
+            for (var i = 0; i &lt; len; i++) {
+                strComb.push(asmtGr.u_functional_impacted_group_name + ' - ' + arrayImpType[i]);
+
+            }
+
+        }
+        return strComb.toString();
+
+    },
+
+    /*@name getUserList
+        @description used send list of user ID's
+        @param  sysId of the group record
+        @returns the list of User Id's*/
+    getUserList: function(grpSysId) {
+        var userList = [];
+        var grUser = new GlideRecord('sys_user_grmember');
+        grUser.addQuery('group.sys_id', grpSysId);
+        grUser.addQuery('user.active', "true");
+        grUser.query();
+        while (grUser.next()) {
+            var usrSysID = grUser.user.getValue('sys_id');
+            userList.push(usrSysID);
+
+        }
+        return userList.toString();
+
+
+    },
+
+
+
+    /*@name getNoOfImpactedGrps
+        @description used to get no of CMS impacted Grps
+        @param  sysId of the Demand record
+        @returns the count of impacted group*/
+
+    getNoOfImpactedGrps: function(dmnGr) {
+        var count = 0;
+        var impGrp = "u_impacted_functional_business_group";
+        var mtrTypeRec = gs.getProperty('wf.spm.cms.demand.assessments');
+        var metricObj = JSON.parse(mtrTypeRec);
+        var mtrType = metricObj["initAssessment"];
+        var asmtInsGr = new GlideRecord(this.ASMT_INSTANCE);
+        asmtInsGr.addQuery("task_id", dmnGr);
+        asmtInsGr.addQuery("metric_type", mtrType);
+        asmtInsGr.addQuery("state", "complete");
+        asmtInsGr.query();
+        if (asmtInsGr.next()) {
+            var asmtGr = new GlideAggregate('asmt_metric_result');
+            asmtGr.addAggregate('COUNT');
+            asmtGr.addQuery('instance', asmtInsGr.sys_id);
+            asmtGr.addQuery('metric.name', impGrp);
+            asmtGr.query();
+            if (asmtGr.next()) {
+                count = asmtGr.getAggregate('COUNT');
+            }
+        }
+        return count;
+
+    },
+
+    /*@name getNoOfImpactedSubGrps
+        @description used to get no of CMS impacted Sub Grps
+        @param  sysId of the Demand record
+        @returns the count of impacted sub group*/
+
+    getNoOfImpactedSubGrps: function(dmnGr) {
+        var count = 0;
+        var impSubGrp = "u_select_impacted_functional_business_sub_groups";
+        var mtrTypeRec = gs.getProperty('wf.spm.cms.demand.assessments');
+        var metricObj = JSON.parse(mtrTypeRec);
+        var mtrType = metricObj["initAssessment"];
+        var asmtInsGr = new GlideRecord(this.ASMT_INSTANCE);
+        asmtInsGr.addQuery("task_id", dmnGr);
+        asmtInsGr.addQuery("metric_type", mtrType);
+        asmtInsGr.addQuery("state", "complete");
+        asmtInsGr.query();
+        if (asmtInsGr.next()) {
+            var asmtGr = new GlideAggregate('asmt_metric_result');
+            asmtGr.addAggregate('COUNT');
+            asmtGr.addQuery('instance', asmtInsGr.sys_id);
+            asmtGr.addQuery('metric.name', impSubGrp);
+            asmtGr.query();
+            if (asmtGr.next()) {
+                count = asmtGr.getAggregate('COUNT');
+            }
+        }
+        return count;
+
+    },
+
+
+    /*@name checkIsProcedureType
+        @description to check whether its procedure Type, called in the flow SPM-CMSDemandIdeationAssessment
+        @param  sysId of the Demand record
+        @returns boolen true/false*/
+
+    checkIsProcedureType: function(dmnGr) {
+
+        var procQuest = gs.getProperty('wf.sp.cms.procedure.questions');
+        var procQuestObj = JSON.parse(procQuest);
+
+        var resIsRCSA;
+        var resDriver;
+        var resCustImpact;
+        var resEmpImpact;
+        var resNegImpact;
+        var resProcType;
+        if (dmnGr.getValue('u_imp_type') === "procedure") {
+
+            var mtrTypeRec = gs.getProperty('wf.spm.cms.demand.assessments');
+            var metricObj = JSON.parse(mtrTypeRec);
+            var mtrType = metricObj["initAssessment"];
+            var asmtInsGr = new GlideRecord(this.ASMT_INSTANCE);
+            asmtInsGr.addQuery("task_id", dmnGr.sys_id);
+            asmtInsGr.addQuery("metric_type", mtrType);
+            asmtInsGr.addQuery("state", "complete");
+            asmtInsGr.query();
+            if (asmtInsGr.next()) {
+
+                resIsRCSA = this.checkAsmtResponse(asmtInsGr.sys_id, procQuestObj["isRCSA"]).toString();
+                resDriver = this.checkAsmtResponse(asmtInsGr.sys_id, procQuestObj["driver"]).toString();
+                resCustImpact = this.checkAsmtResponse(asmtInsGr.sys_id, procQuestObj["custImpact"]).toString();
+                resEmpImpact = this.checkAsmtResponse(asmtInsGr.sys_id, procQuestObj["empImpact"]).toString();
+                resNegImpact = this.checkAsmtResponse(asmtInsGr.sys_id, procQuestObj["negImpact"]).toString();
+                resProcType = this.checkAsmtResponse(asmtInsGr.sys_id, procQuestObj["procType"]).toString();
+
+                if (resDriver !== "Regulatory Mandate" &amp;&amp; resIsRCSA === "No" &amp;&amp; resCustImpact === "No Customer impact" &amp;&amp; resEmpImpact === "Less than 25% &lt; 750 people (whichever is lower)" &amp;&amp; resNegImpact === "No" &amp;&amp; resProcType === "Update") {
+                    return true;
+                }
+
+            }
+        }
+
+        return false;
+    },
+
+
+    /*@name    checkAsmtResponse
+        @description to check te response of the assessment question
+        @param  insId -Instance ID and MetricName - name of the metric
+        @returns string */
+    checkAsmtResponse: function(insId, mtrName) {
+        var asmtGr = new GlideRecord('asmt_metric_result');
+        asmtGr.addQuery('instance', insId);
+        asmtGr.addQuery('metric.name', mtrName);
+        asmtGr.query();
+        if (asmtGr.next()) {
+            return asmtGr.string_value;
+        }
+
+    },
+
+    getLRCCAssignmentGroups: function(driver) {
+        var grps = gs.getProperty('wf.spm.cms.LRCC.assign.groups');
+        var grpsStr = JSON.parse(grps);
+        // var len = arry.length;
+        // for (var i = 0; i &lt; len; i++) {
+        //     var obj = arry[i];
+
+        //     if (!gs.nil(grpsStr[arry[i]])) {
+        //         assignGrpsStr = assignGrpsStr + "," + grpsStr[arry[i]]
+        //     }
+        // }
+
+        return grpsStr;
+
+
+    },
+    getOptionFromRequestingFunctionalGroup: function(dmnGr) {
+
+        var impGrps = "";
+        var funSubgroup = "u_functional_business_sub_group";
+        var mtrTypeRec = gs.getProperty('wf.spm.cms.demand.assessments');
+        var metricObj = JSON.parse(mtrTypeRec);
+        var mtrType = metricObj["initAssessment"];
+        var asmtInsGr = new GlideRecord("asmt_assessment_instance");
+        asmtInsGr.addQuery("task_id", dmnGr);
+        asmtInsGr.addQuery("metric_type", mtrType);
+        asmtInsGr.addQuery("state", "complete");
+        asmtInsGr.query();
+        if (asmtInsGr.next()) {
+
+            var asmtGr = new GlideRecord("asmt_metric_result");
+            asmtGr.addQuery('instance', asmtInsGr.sys_id);
+            asmtGr.addQuery('metric.name', 'IN', funSubgroup);
+            asmtGr.query();
+            while (asmtGr.next()) {
+
+
+                if (asmtGr.string_value != "N/A") {
+                    var anSubArea = asmtGr.string_value;
+                    impGrps = impGrps + "," + anSubArea;
+                }
+
+
+            }
+
+        }
+        var funSunGroupVls = impGrps.toString();
+        funSunGroupVls = funSunGroupVls.substring(1);
+        return funSunGroupVls;
+
+    },
+
+    /*@name    getLRCCGrpsBasedOnReqFunGroups
+    @description used to get LRCC groups based on selection of impacted groups
+    @param demand record 
+    @returns the list ofLRCC Groups*/
+    getLRCCGrpsBasedOnReqFunGroups: function(dmnRec) {
+
+        var grpStr = new wfSPMCMSDemandUtils().getOptionFromRequestingFunctionalGroup(dmnRec);
+        var grpArray = grpStr.split(",");
+        var grpImpLength = grpArray.length;
+
+        var lrccGrps = gs.getProperty('wf.spm.cms.lrcc.group');
+        var lrccGrpsObj = JSON.parse(lrccGrps);
+        var lrccSBCStr = lrccGrpsObj["SBCLegal"];
+        var lrccPCStr = lrccGrpsObj["PCLegal"];
+        var lrccCSStr = lrccGrpsObj["CreditSvcs"];
+        var lrccDefaultStr = lrccGrpsObj["DefaultLegal"];
+        var lrccChgStr = lrccGrpsObj["ChgMangement"];
+        var lrccSBC = lrccSBCStr.split(',');
+        var lrccPC = lrccPCStr.split(',');
+        var lrccChg = lrccChgStr.split(',');
+        var lrccDefault = lrccDefaultStr.split(',');
+        var lrccCS = lrccCSStr.split(',');
+        var impLrccGrps = [];
+        var lrccUtil = new ArrayUtil();
+
+        for (var i = 0; i &lt; grpImpLength; i++) {
+
+            if (grpArray[i] === 'Product Execution') {
+                impLrccGrps.push(lrccSBC);
+            } else if (grpArray[i] === 'Credit Services') {
+                impLrccGrps.push(lrccCS);
+            } else if (grpArray[i] === 'Product Capabilities') {
+                impLrccGrps.push(lrccPC);
+            } else if (grpArray[i] === 'Change Management and Delivery') {
+                impLrccGrps.push(lrccChg);
+            } else if (grpArray[i] === 'Business Execution and Governance') {
+                impLrccGrps.push(lrccSBC);
+            } else if (grpArray[i] === 'Product Strategy Branding and Network') {
+                impLrccGrps.push(lrccSBC);
+            } else if (grpArray[i] === 'Marketing') {
+                impLrccGrps.push(lrccSBC);
+            } else if (grpArray[i] === 'Customer Experience') {
+                impLrccGrps.push(lrccSBC);
+            } else if (grpArray[i] === 'Product Innovation') {
+                impLrccGrps.push(lrccSBC);
+            }
+        }
+        impLrccGrps = lrccUtil.unique(impLrccGrps);
+
+        return impLrccGrps;
+    },
+
+    getSNGrpsFromFunGroup: function(fun_opt) {
+
+        var assignGrpsStr;
+        var grps = gs.getProperty('wf.spm.demand.imp.assignment.group');
+        var grpsStr = JSON.parse(grps);
+        if (grpsStr.hasOwnProperty(fun_opt)) {
+            assignGrpsStr = grpsStr[fun_opt];
+        }
+        return assignGrpsStr;
+
+    },
+
+
+
+
+    type: 'wfSPMCMSDemandUtils'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;K098414&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-09-05 10:13:47&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;159831de878df1905199c957cebb3553&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;498&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;wfSPMCMSDemandUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Global" source="global"&gt;global&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_159831de878df1905199c957cebb3553&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-02-04 17:23:03&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:10:44</sys_created_on>
+        <sys_id>679078d583b01210c6695855eeaad3a6</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>wfSPMCMSDemandUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_679078d583b01210c6695855eeaad3a6</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:10:44</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

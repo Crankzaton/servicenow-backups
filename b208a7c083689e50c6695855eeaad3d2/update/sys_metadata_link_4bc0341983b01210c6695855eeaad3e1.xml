@@ -1,0 +1,332 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1d588691539610104196ddeeff7b12aa</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.RMCapacityAPI&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;RMCapacityAPI&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var RMCapacityAPI = Class.create();
+RMCapacityAPI.prototype = {
+    initialize: function(startDate, endDate, isSingleUser) {
+        this.startDate = new GlideDate();
+        this.startDate.setValue(startDate);
+        this.endDate = new GlideDate();
+        this.endDate.setValue(endDate);
+		this.employeeProfiles = {};
+		this.scheduleCapacity = {};
+		this.isSingleUser = JSUtil.nil(isSingleUser) ? true : isSingleUser;
+    },
+
+    getCapacityForUser: function(userId) {
+        var noOfDays = GlideDateTime.subtract(this.startDate, this.endDate).getDayPart() + 1;
+        var capacityByDay = RMUtil.createArray(noOfDays, 0);
+
+        var hoursObj = this.fetchHoursToCalculateCapacity(userId);
+        if (JSUtil.nil(hoursObj)) {
+            return capacityByDay;
+        }
+
+        var scheduledHours = hoursObj['scheduledHours'];
+        var excludedHours = hoursObj['excludedHours'];
+        var j = hoursObj['noOfDaysAhead'];
+		var k = this.isSingleUser ? 0 : j;
+        for (var i = 0; i &lt; excludedHours.length; ++i) {
+            var capacity = scheduledHours[k++] - excludedHours[i];
+            if (capacity &lt; 0)
+                capacity = 0;
+            capacityByDay[j++] = capacity;
+        }
+
+        return capacityByDay;
+    },
+	
+	/* Returns capacity between startDate and endDate (startDate and endDate included) for the User.
+	 * if startDate is 2020-08-31, endDate is 2020-09-02 then an object with the following format is returned:
+	 * { 
+	 *   2020-08-31: 8,
+	 *   2020-09-01: 8,
+	 *   2020-09-02: 6
+	 * }
+	 */
+	getCapacityForUserByDate: function(userId) {
+		var capacityByDay;
+		var capacityByDate = {};
+		var tempDate;
+		
+		capacityByDay = this.getCapacityForUser(userId);
+		tempDate = new GlideDate();
+		tempDate.setValue(this.startDate.getValue());
+		
+		for (var i = 0; i &lt; capacityByDay.length; i++) {
+			capacityByDate[tempDate.getValue()] = capacityByDay[i];
+			tempDate.addDaysUTC(1);
+		}
+		
+		return capacityByDate;
+	},
+	
+	/* Returns number of days with capacity greater than 0
+	 * between startDate and endDate (startDate and endDate included) for the User.
+	 */
+	getWorkingDaysCount: function(userId) {
+		var workingDaysCount = 0;
+		var capacityByDay;
+		
+		capacityByDay = this.getCapacityForUser(userId);
+		
+		for (var i = 0; i &lt; capacityByDay.length; i++) {
+			if (capacityByDay[i] &gt; 0)
+				workingDaysCount++;
+		}
+		
+		return workingDaysCount;
+	},
+	
+	fetchHoursToCalculateCapacity: function(userId) {
+        var employeeDates = this._getEmployeeProfileDates(userId);
+		
+		if(JSUtil.notNil(employeeDates)){
+			var hoursObj = {};
+			var scheduledHours = [];
+			if(this.isSingleUser){
+				scheduledHours = this._getCapacityForSchedule(userId, employeeDates.startDate, employeeDates.endDate);
+			}else{
+				scheduledHours = this._getCapacityForSchedule(userId, this.startDate, this.endDate);
+			}
+			if(scheduledHours.length == 0)
+				return null;
+			hoursObj['scheduledHours'] = scheduledHours;
+			this.dailyAllocations = new ResourceAllocationDailyAggregate(userId, employeeDates.startDate.getValue(), employeeDates.endDate.getValue());
+			hoursObj['excludedHours'] = this.dailyAllocations.excludedHoursByDay();
+			hoursObj['noOfDaysAhead'] = employeeDates.noOfDaysAhead;
+			return hoursObj;
+		} else {
+			return null;
+		}
+    },
+	
+	getAvailabilityForUser: function(userId) {
+        var noOfDays = GlideDateTime.subtract(this.startDate, this.endDate).getDayPart() + 1;
+        var availabilityByDay = RMUtil.createArray(noOfDays, 0);
+
+        var hoursObj = this.fetchHoursToCalculateAvailability(userId);
+        if (JSUtil.nil(hoursObj)) {
+            return availabilityByDay;
+        }
+
+		var capacityByDay = hoursObj['capacity'];
+		var allocatedHours = hoursObj['allocatedHours'];
+		var j = hoursObj['noOfDaysAhead'];
+        for (var i = 0; i &lt; allocatedHours.length; ++i) {
+            availabilityByDay[j] = capacityByDay[j] - allocatedHours[i];
+            j++;
+        }
+		return availabilityByDay;
+    },
+	
+	fetchHoursToCalculateAvailability: function(userId) {
+		var employeeDates = this._getEmployeeProfileDates(userId);
+		if(JSUtil.notNil(employeeDates)){
+			var hoursObj = {};
+			hoursObj['capacity'] = this.getCapacityForUser(userId);
+			var additionalFilter = RMUtil.allocatedEventsFilter();
+			hoursObj['allocatedHours'] = this.dailyAllocations.hoursByDay(additionalFilter);
+			hoursObj['noOfDaysAhead'] = employeeDates.noOfDaysAhead;
+			return hoursObj;
+		} else {
+			return null;
+		}
+    },
+
+    getCapacityForGroup: function(groupId) {
+        var noOfDays = GlideDateTime.subtract(this.startDate, this.endDate).getDayPart() + 1;
+        var totalCapacityByDay = RMUtil.createArray(noOfDays, 0);
+        var gr = new GlideRecord('sys_user_grmember');
+        gr.addQuery('group', groupId);
+        gr.addQuery('user.active', true);
+        gr.query();
+        var i;
+        while (gr.next()) {
+            var userId = gr.getValue('user');
+            var userCapacity = this.getCapacityForUser(userId);
+            for (i = 0; i &lt; totalCapacityByDay.length; i++) {
+                totalCapacityByDay[i] += userCapacity[i];
+            }
+        }
+        return totalCapacityByDay;
+    },
+	
+	_getEmployeeProfileDates: function(userId) {
+		if(JSUtil.nil(this.employeeProfiles[userId])){
+			var employeeDatesAPI = new EmployeeDatesAPI(userId);
+			var employeeDates = employeeDatesAPI.getStartAndEndDatesBasedOnEmployeeProfile(this.startDate, this.endDate);
+			if(employeeDates.startDate.onOrBefore(employeeDates.endDate)){
+				var noOfDaysToIgnore = 0;
+				if (employeeDates.startDate.after(this.startDate)) {
+					noOfDaysToIgnore = GlideDateTime.subtract(this.startDate, employeeDates.startDate).getDayPart();
+				}
+				employeeDates.noOfDaysAhead = noOfDaysToIgnore;
+				this.employeeProfiles[userId] = employeeDates;
+			}
+		}
+		return this.employeeProfiles[userId];
+	},
+
+    _getCapacityForSchedule: function(userId, startDate, endDate) {
+		var start = new GlideDate();
+		start.setValue(startDate.getValue());
+		var end = new GlideDate();
+		end.setValue(endDate.getValue());
+		var api = new SNC.ResourceManagementAPI();
+		var scheduleId = api.getUserScheduleId(userId);
+		if(!(scheduleId in this.scheduleCapacity)){
+			var actualStart = new GlideDate();
+			actualStart.setValue(start.getValue());
+			RMUtil.adjustDatesBasedOnSchedule(scheduleId, start, end);
+			
+			if(start.after(end)){
+				this.scheduleCapacity[scheduleId] = [];
+				return this.scheduleCapacity[scheduleId];
+			}
+			
+			var timeZone = api.getUserTimeZone(userId);
+			var scheduledHours = api.getScheduledHoursByDay(scheduleId, start.getValue(), endDate.getValue(), timeZone);
+			var daysDiff = GlideDate.subtract(actualStart,start).getDayPart();
+			if(daysDiff == 0)
+				this.scheduleCapacity[scheduleId] = scheduledHours;
+			else{
+				//When year of schedule start date is after year of the given start date
+				var finalScheduledHours = RMUtil.createArray(daysDiff, 0);
+				var util = new ArrayUtil();
+				finalScheduledHours = util.concat(finalScheduledHours,scheduledHours);
+				this.scheduleCapacity[scheduleId] = finalScheduledHours;
+			}
+		}
+		return this.scheduleCapacity[scheduleId];
+    },
+	
+	//This API expects startdate and enddate to be Week START and Week END
+	getCapacityPerWeek: function(userId) {
+		var noOfDays = GlideDateTime.subtract(this.startDate, this.endDate).getDayPart() + 1;
+		var noOfWeeks = Math.floor(noOfDays / 7);
+		var hoursByWeek = RMUtil.createArray(noOfWeeks, 0);
+		
+		var hoursObj = this.fetchHoursToCalculateCapacity(userId);
+		if (JSUtil.notNil(hoursObj)) {
+			var scheduledHours = hoursObj['scheduledHours'];
+			var excludedHours = hoursObj['excludedHours'];
+			var dayIndex = hoursObj['noOfDaysAhead'];
+			var date = new GlideDate();
+			date.setValue(this.startDate.getValue());
+			date.addDaysUTC(dayIndex);
+			var weekIndex = Math.floor(dayIndex/7);
+			var k = this.isSingleUser ? 0 : j;
+			for (var j = 0; j &lt; excludedHours.length; j++) {
+				var dayCapacity = scheduledHours[k++] - excludedHours[j];
+				if(dayCapacity &gt; 0) {
+					hoursByWeek[weekIndex] += dayCapacity;
+				}
+				dayIndex++;
+				date.addDaysUTC(1);
+				if(dayIndex%7 == 0)
+					weekIndex++;
+			}
+		}
+		return hoursByWeek;
+    },
+	
+	//This API expects startdate and enddate to be Month START and Month END
+	getCapacityPerMonth: function(userId) {
+		var noOfMonths = ((this.endDate.getYearUTC() - this.startDate.getYearUTC()) * 12) + (this.endDate.getMonthUTC() - this.startDate.getMonthUTC()) + 1;
+		var hoursByMonth = RMUtil.createArray(noOfMonths, 0);
+		
+		var hoursObj = this.fetchHoursToCalculateCapacity(userId);
+		if (JSUtil.notNil(hoursObj)) {
+			var scheduledHours = hoursObj['scheduledHours'];
+			var excludedHours = hoursObj['excludedHours'];
+			var startIndex = hoursObj['noOfDaysAhead'];
+			var endIndex = startIndex+excludedHours.length;
+
+			var monthlyDateRanges = new RMDateRangeHelper().getMonthlyDateRanges(this.startDate, this.endDate);
+			
+			var currentRowDate = new GlideDate();
+			currentRowDate.setValue(this.startDate);
+			currentRowDate.addDaysUTC(startIndex);
+			var monthIndex = ((currentRowDate.getYearUTC() - this.startDate.getYearUTC()) * 12) + (currentRowDate.getMonthUTC() - this.startDate.getMonthUTC());
+			var offset = currentRowDate.getDayOfMonthNoTZ();
+			
+			var k = this.isSingleUser ? 0 : startIndex;
+			var monthStartIndex = 1-offset; //When start date is in middle of the month
+			var monthEndIndex = 0;
+			var dayIndex = 0;
+			
+			for(var i = monthIndex ; i&lt;monthlyDateRanges.length; i++) {
+				var monthStart = monthlyDateRanges[i].start;
+				var monthEnd = monthlyDateRanges[i].end;
+				monthEndIndex = monthStartIndex + GlideDateTime.subtract(monthStart, monthEnd).getDayPart() + 1;
+				if(monthEndIndex&gt;endIndex)
+					monthEndIndex = endIndex;
+				for(;dayIndex&lt;monthEndIndex;dayIndex++){
+					var dayCapacity = scheduledHours[k++] - excludedHours[dayIndex];
+					if(dayCapacity &gt; 0) {
+						hoursByMonth[i] += dayCapacity;
+					}
+				}
+				if(dayIndex == endIndex)
+					break;
+				monthStartIndex = monthEndIndex; 
+			}
+		}
+		
+		return hoursByMonth;
+    },
+	
+	setEmployeeProfileDates: function(userId, employeeDates) {
+        if (employeeDates.startDate.onOrBefore(employeeDates.endDate)) {
+            var noOfDaysToIgnore = 0;
+            if (employeeDates.startDate.after(this.startDate)) {
+                noOfDaysToIgnore = GlideDateTime.subtract(this.startDate, employeeDates.startDate).getDayPart();
+            }
+            employeeDates.noOfDaysAhead = noOfDaysToIgnore;
+            this.employeeProfiles[userId] = employeeDates;
+        }
+    },
+
+    type: 'RMCapacityAPI'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-07-28 11:01:53&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1d588691539610104196ddeeff7b12aa&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;91&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;RMCapacityAPI&lt;/sys_name&gt;
+        &lt;sys_package display_value="Resource Management" source="com.snc.resource_management"&gt;7200da2b47e64210cd4e1ce4316d438e&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1d588691539610104196ddeeff7b12aa&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2020-10-01 13:03:16&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:31</sys_created_on>
+        <sys_id>4bc0341983b01210c6695855eeaad3e1</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>RMCapacityAPI</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_4bc0341983b01210c6695855eeaad3e1</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:31</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

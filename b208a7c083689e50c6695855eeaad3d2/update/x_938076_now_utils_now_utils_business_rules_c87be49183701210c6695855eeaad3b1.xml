@@ -1,0 +1,213 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules">
+    <x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection/>
+        <condition/>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>Interaction - "Assigned to" changes</name>
+        <order>100</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function executeRule(current, previous /*null when async*/ ) {
+ var chatLogger = new global.ChatLogger("", current.sys_id);
+ var canSendMessages = new InteractionTypeUtil().canSendMessages(current);
+
+ if (!current.channel_metadata_document || !current.channel_metadata_table){
+  chatLogger.log("Interaction - 'Assigned to' changes - Failure, interaction channel_metadata_document field is empty");
+  return;
+ }
+
+ var util = new global.UnifiedConversationUtil(current.channel_metadata_document);
+ if (util.isConversationLegacyVersion()) {
+  var liveGroupProfileId = sn_connect.Conversation.getLiveGroupProfileIdByInteractionMetadata(current.channel_metadata_table, current.channel_metadata_document);
+  if (!liveGroupProfileId || isAssigneeMember(current, liveGroupProfileId)){
+   chatLogger.log("Interaction - 'Assigned to' changes, live_group_member record found for assignee " + current.assigned_to.getDisplayValue());
+   return;
+  }
+ } else if (util.isConversationUDMVersion()) {
+  if (isAssigneeMemberUDM(current)){
+   chatLogger.log("Interaction - 'Assigned to' changes, sys_cs_conversation_member record found for assignee " + current.assigned_to.getDisplayValue());
+   return;
+  }
+ }
+
+ if (!current.assigned_to) {
+  chatLogger.log("Interaction - 'Assigned to' changes - Failure, interaction assigned_to field is empty ");
+  return;
+ }
+
+ /**
+  * Add assignee to conversation and send canned agent message
+  */
+ var conversation = sn_connect.Conversation.get(
+  current.channel_metadata_document,
+  current.channel_metadata_table
+ );
+ conversation.addSubscriber(current.assigned_to, true);
+
+ var chatInteractionUtil = new ChatInteractionUtil();
+ var requesterLanguage = chatInteractionUtil.getRequesterLanguage(current);
+ //Use agent's language if dynamic translation is ON
+ var language = chatInteractionUtil.getDynamicTranslateLanguage(current);
+
+ var workItemGR = getRecentActiveWorkItem();
+ var isQueueTransferred = (workItemGR.getValue('is_queue_transferred') === "1");
+
+ var interactionType = current.getValue('type');
+ switch (interactionType) {
+  case 'chat' : {
+   sendMessageAgentEnteredChat();
+   break;
+  }
+  case 'messaging': {
+   // only get the device type when its messaging since its an expensive db access
+   var deviceType = conversation.getDeviceType();
+   var isMweb = (deviceType.equalsIgnoreCase('mweb') || deviceType.equalsIgnoreCase('android') || deviceType.equalsIgnoreCase('ios'));
+   var isSMS = deviceType.equalsIgnoreCase('SMS');
+   // if it is SMS, do not display any of these messages
+   if (!isMweb && !isSMS)
+    sendMessageAgentEnteredChat();
+   break;
+  }
+  case 'phone': {
+   if (canSendMessages)
+    sendMessageAgentEnteredChat();
+   break;
+  }
+  case 'video': {
+   if (canSendMessages)
+    sendMessageAgentEnteredChat();
+   break;
+  }
+  default: {
+   break;
+  }
+ }
+
+
+ if (isWorkItemEligibleForInitialAgentResponse(workItemGR)) {
+  // call the queueEntryAccepted method here if the work item is auto assigned
+  if (workItemGR.auto_accepted) {
+   new SNC.ConnectListeners().queueEntryAccepted(current.channel_metadata_document);
+  }
+  if (canSendMessages) {
+   var initAgentResponse = sn_interaction_awa.MessageLocalization.getLocalizedAgentMessage('awa_queue', 'initial_agent_response', workItemGR.queue.initial_agent_response, language);
+   conversation.sendMessage({
+    body: initAgentResponse,
+    from: current.assigned_to
+   });
+  }
+  chatLogger.setWorkItemSysId(workItemGR.sys_id);
+  chatLogger.log("Interaction - 'Assigned to' changes - Success, " + current.number + " assigned to " + current.assigned_to.getDisplayValue() + " from group " + workItemGR.assignment_group.getDisplayValue() + " using " + workItemGR.assignment_rule.getDisplayValue());
+ }
+
+ function sendMessageAgentEnteredChat(){
+  /**
+   * If interaction is was assigned previously,
+   * send notification that the new agent has joined the conversation.
+   *  !workItemGR.auto_accepted prevents sending duplicate 'Agent has joined' message already sent in queueEntryAccepted method
+   *  (previous.assigned_to || isQueueTransferred) is to make sure duplicate 'Agent has joined' messages are not sent out during transfer to agent/queue
+   */
+  if (!workItemGR.auto_accepted && (previous.assigned_to || isQueueTransferred)) {
+   var currentUser = current.assigned_to;
+   var agentName = sn_connect.Conversation.getAgentName(currentUser);
+   chatInteractionUtil.sendSystemMessage(conversation, '{0} has joined.', requesterLanguage, language, agentName, null, null);
+   chatLogger.log("Interaction - 'Assigned to' changes - Success, " + current.number.getDisplayValue() + " assigned to agent " + current.assigned_to.getDisplayValue() + ", previously agent " + previous.assigned_to.getDisplayValue());
+   return;
+  }
+ }
+
+
+ // Only send an initial response if:
+ // 1. This is a requester-initiated interaction that is being accepted by a live agent for the first time OR
+ // 2. A queue transferred live chat interaction
+ function isWorkItemEligibleForInitialAgentResponse(workItemGR) {
+  if(!workItemGR) return false;
+  var isRequesterInitiated = (current.direction == 'inbound');
+  var isAcceptedForTheFirstTime = (workItemGR.getRowCount() == 1);
+
+  // second condition (isQueueTransfer || isAcceptedForTheFirstTime) will also ensure that
+  // the message is NOT sent out for the second time for agent transferred work items - DEF0293137
+  return (isQueueTransferred || isAcceptedForTheFirstTime) && isRequesterInitiated;
+ }
+})(current, previous);
+
+function isAssigneeMember(interaction, liveGroupProfileId) {
+ var profileGR = new GlideRecord('live_profile');
+ profileGR.addQuery('table', 'sys_user');
+ profileGR.addQuery('document', interaction.assigned_to);
+ profileGR.query();
+
+ if (!profileGR.next())
+  return false;
+
+ var liveMemberGR = new GlideRecord('live_group_member');
+ liveMemberGR.addQuery('member', profileGR.getValue('sys_id'));
+ liveMemberGR.addQuery('group', liveGroupProfileId);
+ liveMemberGR.addQuery('state', 'admin');
+ liveMemberGR.addQuery('visible', true);
+ liveMemberGR.query();
+
+ return liveMemberGR.hasNext();
+}
+
+function isAssigneeMemberUDM(interaction) {
+ var conversationGR = new GlideRecord('sys_cs_conversation');
+ if (!conversationGR.get(interaction.channel_metadata_document))
+  return false;
+
+ var memberGR = new GlideRecord('sys_cs_conversation_member');
+ memberGR.addEncodedQuery('conversation=' + interaction.channel_metadata_document + '^member.user_table=sys_user^member.user_document=' + interaction.assigned_to);
+ memberGR.addActiveQuery();
+ memberGR.query();
+ return memberGR.hasNext();
+}
+
+function getRecentActiveWorkItem() {
+ var workItemGR = new GlideRecord('awa_work_item');
+ workItemGR.addQuery('document_id', current.getUniqueValue());
+ workItemGR.addQuery('state', 'accepted');
+ workItemGR.orderByDesc('active');
+ workItemGR.query();
+ workItemGR.next();
+ return workItemGR;
+}]]></script>
+        <sys_class_name>x_938076_now_utils_now_utils_business_rules</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:48:07</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>c87be49183701210c6695855eeaad3b1</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Interaction - "Assigned to" changes</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>x_938076_now_utils_now_utils_business_rules_c87be49183701210c6695855eeaad3b1</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:48:07</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </x_938076_now_utils_now_utils_business_rules>
+    <sys_translated_text action="delete_multiple" query="documentkey=c87be49183701210c6695855eeaad3b1"/>
+</record_update>

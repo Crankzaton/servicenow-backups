@@ -1,0 +1,1216 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>234859e1c3011200b12d9f2974d3ae32</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.CSQueryBRUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Query business rule helper functions for Customer Service Management&lt;/description&gt;
+        &lt;name&gt;CSQueryBRUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var CSQueryBRUtil = Class.create();
+CSQueryBRUtil.prototype = Object.extendsObject(AbstractAjaxProcessor, {
+
+	TABLE_CONTACT              : 'customer_contact',
+	TABLE_ACCOUNT              : 'customer_account',
+	TABLE_CONTACT_RELATIONSHIP : 'sn_customerservice_contact_relationship',
+	TABLE_ACCOUNT_RELATIONSHIP : 'account_relationship',
+	TABLE_SERVICE_ENTITLEMENT  : 'service_entitlement',
+	TABLE_AST_CONTRACT         : 'ast_contract',
+	TABLE_ALM_ASSET            : 'alm_asset',
+	TABLE_CS_CASE              : 'sn_customerservice_case',
+	TABLE_CSM_CONSUMER         : 'csm_consumer',
+	TABLE_PRODUCT              : 'cmdb_model',
+	TABLE_PRODUCT_CATEGORY     : 'cmdb_model_category',
+	TABLE_ORDER                : 'csm_order',
+	TABLE_ORDER_CASE           : 'csm_order_case', 
+	TABLE_WORKORDER            : 'wm_order',
+	MY_ACCOUNT                 : 'my_account',
+	SUB_ACCOUNTS               : 'sub_accounts',
+	TABLE_ACCOUNT_CONSUMER     : 'sn_acct_consumer_account_consumer',
+	ACCTS_FROM_CONTACT_RELATIONSHIP      : 'accounts_from_contact_relationship',
+	ACCTS_FROM_ACCTS_RELATIONSHIP        : 'accounts_from_account_relationship',
+	ACCTS_FROM_ACCOUNT_CONSUMER          : 'accounts_from_account_counsumer',
+	DEFAULT_DRIVER_FIELD                 : 'account',
+	OOB_EXTENSION_POINT                  : 'CSQueryExtensionPoint',
+	ACCESS_CONTEXT_EXTENSION_POINT       : 'CSMAccessContext',
+	
+	/*
+	* Use Extension point feature to allow users to add their own Role constants.
+	*/
+	getRoleContentPool: function(param){		
+		var result = {}; 
+		var ep = new GlideScriptedExtensionPoint().getExtensions(this.OOB_EXTENSION_POINT);
+		
+		//If there is any other new extension instance other than the OOB one, concat them together
+		//The extension instance with higher order number would overwrite the one with lower order number
+		for(var i = 0; i &lt; ep.length; i ++){
+			var point = ep[i];				
+
+			if(param == 'permission')
+                result = this.extendObj(result, point.getRolePermissionPool());	
+			else if(param == 'condition')
+				result = this.extendObj(result, point.getRoleConditionPool());
+		}
+		
+		return result;
+	},
+	
+	/*
+	* Concat the  JSON Object src to obj 
+	*/
+    extendObj: function(obj, src) {
+        Object.keys(src).forEach(function(key) { 
+			obj[key] = src[key]; 
+		});
+
+        return obj;
+    },
+	
+	/*
+	* Cache the CSM roles user has
+	*/	
+	getMyCSMRoles: function(){   
+		var key = 'my_csm_roles_' + gs.getUserID();
+		var results = gs.getSession().getClientData(key);
+
+		if (gs.nil(results) || results == 'NIL') {		
+			results = [];
+			var roles = gs.getUser().getRoles();
+
+			var CSMRoles = Object.keys(this.getRoleContentPool('permission'));
+			for(var i = 0; i &lt; CSMRoles.length; i ++){
+				var role = CSMRoles[i];	
+				if(roles.indexOf(role) &gt; -1)
+					results.push(role);
+			}
+
+			results  = (results.length &gt; 0) ? results.join(',') : 'NIL';	
+			gs.getSession().putClientData(key, results);
+		}
+
+		results = (gs.nil(results) || results == 'NIL') ? null : results.split(',');				  
+		return results;  		   
+	},
+	
+	
+	/*
+	* Cache the role details of login user has, field can be 'condition', 'access_context', or 'query';
+	*/	
+	getRoleAccessDetails : function(field, table){		       
+		var results = [];
+		var myRoles = this.getMyCSMRoles();
+		
+		if(!gs.nil(myRoles) &amp;&amp; myRoles.length &gt; 0){					   			   
+			var fieldVals = [];
+			for(var i = 0; i &lt; myRoles.length; i ++){
+				var pool = this.getRoleContentPool('permission');
+				var curRole = pool[myRoles[i]];
+				var obj = curRole[table];
+
+				if(obj.hasOwnProperty(field))
+					fieldVals = fieldVals.concat(obj[field]);
+			} 	
+			
+			var resultsCheck = {};
+            fieldVals.forEach(function(item) {
+                if (!gs.nil(item)) {
+                    var itemKey = item.toString();
+                    if (!(itemKey in resultsCheck)) {
+                        resultsCheck[itemKey] = true;
+                        results.push(item);
+                    }
+                }
+            });
+
+		}
+
+		return results;	
+	},
+	
+	/*
+	* Cache the accessible accounts that login user has .
+	*/
+	getMyAccessibleAccounts: function(tableName, skipMyAccount) {
+		/*
+		* As part of the refactoring done on this function. This function is changed to accept two Parameter instead of single Parameter.
+		* Handling Defaulting of these parameters as Follows
+		* If single Parameter passed and is a Boolean type assuming that the assigning the parameter passed to SkipMyAccount and setting the table to Account Table
+		* If single Parameter passed and is a String type then setting the table to the parameter passed and defaulting SkipMyAccount to false
+		* If two parameter passed and both are boolean, considering the second parameter to the SkipMyAccount and then setting the table to Account table as String is expected as 1st parameter.
+	        */
+		
+		var table = tableName;
+		if(gs.nil(tableName) || typeof tableName === "boolean"){
+			table = this.TABLE_ACCOUNT;
+		}
+		if(!gs.nil(tableName) &amp;&amp; typeof tableName === "boolean" &amp;&amp; gs.nil(skipMyAccount)){ 
+			skipMyAccount = tableName;
+		}
+		skipMyAccount = skipMyAccount || false;
+		var key = 'my_accessible_accounts_' + table + '_' + skipMyAccount + '_' + gs.getUserID();
+		var accounts = gs.getSession().getClientData(key);
+		var useSessionCache = true;
+
+		// Not in session cache and 'use_accounts_private_cache' property is enabled
+		var cacheUtil = new global.AccountsCacheUtil();
+		if (gs.nil(accounts) &amp;&amp; cacheUtil.isPrivateCachingEnabledForAccounts()) {
+			var cacheName = 'MY_ACCESSIBLE_ACCOUNTS';
+			key = 'my_accessible_accounts_' + gs.getUser().getCompanyID();
+			cacheUtil.initPrivateCache(cacheName);
+			if (cacheUtil.isInPrivateCache(cacheName, key) || cacheUtil.useAccountsPrivateCache(table)) {
+				useSessionCache = false;
+				accounts = GlideCacheManager.get(cacheName, key);
+			}
+		}
+
+		if (gs.nil(accounts) || gs.hasRole('sn_acct_consumer.consumer')) {	
+			accounts = [];
+			var context_types = this.getRoleAccessDetails('access_context', table);	
+			var accts = [];
+			if(!gs.nil(context_types) &amp;&amp; context_types.length != 0){	
+				for(var i = 0; i &lt; context_types.length; i ++){				
+					var context = context_types[i];
+					// The following methods handle the access context defined for each role in CSQueryBRUtilConstants.
+					if(!skipMyAccount &amp;&amp; context == this.MY_ACCOUNT)
+						accts = accts.concat(gs.getUser().getCompanyID());
+
+					else if(context == this.SUB_ACCOUNTS)
+						accts = accts.concat(this.getSubAccounts());
+
+					else if(context == this.ACCTS_FROM_CONTACT_RELATIONSHIP)
+						accts = accts.concat(this.getAccountsFromContactRelationship());
+
+					else if(context == CSQueryBRUtilOOBConstants.ACCTS_WITHOUT_CONTACT_RESTRICT_ACCESS)
+						accts = accts.concat(new global.Account().getMyAccountsWithoutManagedAccess());
+
+					else if(context == this.ACCTS_FROM_ACCTS_RELATIONSHIP)
+						accts = accts.concat(this.getAccountsFromAccountRelationship());
+					else if(context == this.ACCTS_FROM_ACCOUNT_CONSUMER)
+						accts = accts.concat(this.getAccountsFromAccountConsumer());
+
+					else if(context == 'not_applicable')
+						accts = accts.concat('-1');
+
+					else if(context == 'all_accounts')
+						accts = accts.concat('all');	
+
+					else if(context == 'all_account_access')
+						accts = accts.concat('all_account_access');
+					else
+						accts = accts.concat(this.getAdditionalAccessibleAccounts(context)); 
+				}
+			} else if(( gs.nil(context_types) || context_types.length == 0) &amp;&amp; (table == this.TABLE_ACCOUNT) &amp;&amp; gs.hasRole("sn_customerservice.unified_consumer") &amp;&amp; !gs.hasRole("admin")){
+				/*
+				For a normal unified consumer persona, as the role access details are not configured, context_types will be empty when trying to fetch accessible accounts.
+				Handling this scenario so that accts is set to "-1" (Behavior now matches with consumer).
+				*/
+				accts = accts.concat('-1');
+			} 
+			
+            var accountsCheck = {};
+            accts.forEach(function(item) {
+                if (!gs.nil(item)) {
+                    var itemKey = item.toString();
+                    if (!(itemKey in accountsCheck)) {
+                        accountsCheck[itemKey] = true;
+                        accounts.push(item);
+                    }
+                }
+            });
+			
+			accounts  = (accounts.length &gt; 0) ? accounts.join(',') : 'NIL';
+			if (!useSessionCache)
+                                GlideCacheManager.put("MY_ACCESSIBLE_ACCOUNTS", key, accounts);
+                        else
+                                gs.getSession().putClientData(key, accounts);
+		}	
+		accounts = (gs.nil(accounts) || accounts == 'NIL') ? null : accounts;
+		return accounts;
+	},
+	
+	/*
+	* If any additional Access Context is defined in Extension Point consider those.
+	*/
+	getAdditionalAccessibleAccounts: function(context){
+		var accounts = []; 
+		var ep = new GlideScriptedExtensionPoint().getExtensions(this.ACCESS_CONTEXT_EXTENSION_POINT);
+		
+		for(var i = 0; i &lt; ep.length; i ++){
+			var point = ep[i];
+			accounts = point.getAccessibleAccount(context,accounts);	
+		}
+		
+		return accounts;
+	},
+	
+	getValue: function(value) {
+		if(value == 'my_userId')
+			return gs.getUserID();
+
+		if(value == 'my_consumerId') {
+			var consumerId = new global.CSManagementUtils().getConsumerId();
+			return consumerId == null ? '' : consumerId;
+		}
+
+		if(value == 'my_companyId')
+			return gs.getUser().getCompanyID();
+		
+		if (gs.tableExists(global.CSMBaseConstants.SOLD_PRODUCT)) {
+			var IBUtil =  new sn_install_base.InstallBaseUtil();
+			if (value == 'my_consumerOwnedProducts')
+				return IBUtil.getConsumerSoldProducts(global.CSMRelationshipConstants.ACCESS.FULL);
+			if (value == 'my_AdditionalIBs')
+				return IBUtil.getMyInstallBaseItems();
+			if (value == 'my_contactIBs')
+				return IBUtil.getMyInstallBaseItemsForSPContact();
+			if (value == 'my_contactSPs')
+				return IBUtil.getMySPsFromPrimaryContacts();
+			if(value == 'my_contactAdditionalSPs')
+				return IBUtil.getMySPsFromAdditionalContacts();
+			if(value == 'my_contactAdditionalSPsForCase')
+				return IBUtil.getMySPsFromAdditionalContacts(CSMRelationshipConstants.ACCESS.FULL);
+			if (value == 'my_consumerAdditionalSPs')
+				return IBUtil.getConsumerSoldProducts();
+			if (value == 'my_consumerSPs')
+				return IBUtil.getMyPrimaryConsumerSPs();
+			
+		}
+		if(value == 'my_related_party_cases'){
+			return new global.CSMRelationshipUtils().getRelatedPartyCases();
+		}
+		
+		return '';
+	},
+	
+	/*
+	* QBR queries can be used in each entity's QBR functions based on Conditions
+	*/
+	getQBRConditionQueries: function(current,tableName,skipEncodedQuery){
+		var query = null;
+		var entity = gs.nil(tableName) ? current.getTableName() : tableName;
+		var conditions = this.getRoleAccessDetails('condition', entity);	
+        if(!gs.nil(conditions)){
+			var queryStr = '';
+			for(var i = 0; i &lt; conditions.length; i++){	
+				var pool = this.getRoleContentPool('condition');
+				var conditionPair = pool[conditions[i]];	  
+				// For conditions based on script or methods.		
+				if (gs.nil(conditionPair['query'])) {
+					if (!this._isValidField(entity, conditionPair['key']))
+						continue;
+					var op = conditionPair['operator'];
+					if (gs.nil(op)) {
+						if (gs.nil(query))
+							query = current.addQuery(conditionPair['key'], this.getValue(conditionPair['value']));
+						else
+							query.addOrCondition(conditionPair['key'], this.getValue(conditionPair['value']));
+					} else if (op == CSQueryBRUtilOOBConstants.OPERATOR_IN || op == global.CSQueryBRUtilOOBConstants.OPERATOR_CONTAINS) {
+						if (gs.nil(query))
+							query = current.addQuery(conditionPair['key'], op, this.getValue(conditionPair['value']));
+						else
+							query.addOrCondition(conditionPair['key'], op, this.getValue(conditionPair['value']));
+					}
+				}
+				// For encoded conditions				
+				else {
+					if(gs.nil(queryStr))
+						queryStr = conditionPair['query'];
+					else
+						queryStr = queryStr + '^OR' + conditionPair['query'];	
+				}  
+			}
+			
+			if(!gs.nil(queryStr)){
+				// Handle some corner cases
+				if(queryStr.indexOf('accountISEMPTY^contactISEMPTY') &gt; -1 &amp;&amp; queryStr.indexOf('consumerISEMPTY') &gt; -1 &amp;&amp; queryStr.indexOf('^OR') &gt; -1)
+					return null;
+				if(!skipEncodedQuery)
+					query = current.addEncodedQuery(queryStr);
+			
+			}
+			
+		}	
+		
+		return query;
+	},
+	
+	
+	getQueries: function(current,tableName){
+		var queryStr = '';
+		var entity = gs.nil(tableName) ? current.getTableName() : tableName;
+		var conditions = this.getRoleAccessDetails('condition', entity);	
+        if(!gs.nil(conditions)){
+			var pool = this.getRoleContentPool('condition');
+			for(var i = 0; i &lt; conditions.length; i++){	
+				var conditionPair = pool[conditions[i]];	  	
+				if(!gs.nil(conditionPair['query'])){
+                  	if(gs.nil(queryStr))
+						queryStr = conditionPair['query'];
+					else
+					   queryStr = queryStr + '^OR' + conditionPair['query'];	
+				}
+				
+			}
+			
+		}	
+		
+		return queryStr;
+	},
+	
+	
+	/*
+	* If a role has a condition in roles' POOL, then it should pass this condition validation.
+	*/
+	checkRoleConditions : function(current,tableName) {	
+		var entity = gs.nil(tableName)? current.getTableName(): tableName;
+		var conditions = this.getRoleAccessDetails('condition', entity);
+		
+		if(!gs.nil(conditions)){
+			for(var i = 0; i &lt; conditions.length; i++){
+				var pool = this.getRoleContentPool('condition');
+				var conditionPair = pool[conditions[i]];
+				if(!gs.nil(conditionPair['key'])){
+					//Logic to Handle Dot walking functionality in Condition Block.
+					var conditionList = conditionPair['key'].split(".");
+					var tempObj = current;
+					var currValue = '';
+					for( var j =0 ;j&lt;conditionList.length; j++){
+						if(!gs.nil(tempObj)){
+							tempObj = tempObj[conditionList[j]];
+
+							if(tempObj == undefined){
+								//To Hanlde List Layout Issue of evaluating Script Properly based on the Key Value Pair even if the Key is not present in the List layout
+								var gr = new GlideRecord(tableName);
+								if(gr.isValidField(conditionList[j])){
+									gr.get(current.sys_id);
+									tempObj = gr[conditionList[j]];
+								}
+							}
+							currValue = tempObj;
+						}
+					}
+					var op = conditionPair['operator'];
+					var value = this.getValue(conditionPair['value']);
+					if (op == global.CSQueryBRUtilOOBConstants.OPERATOR_IN) {
+						if (value &amp;&amp; value.indexOf(currValue + '') &gt; -1)
+							return true;
+					} else if (op == global.CSQueryBRUtilOOBConstants.OPERATOR_CONTAINS) {
+						if (currValue &amp;&amp; (currValue + "").indexOf(value) &gt; -1 )
+							return true;
+					} else if (currValue == value)
+						return true;
+				}
+			}
+		}
+		return false;
+	},
+	
+	/*
+	* If a role has an access context related in roles' POOL, then it should pass this function
+	* to get the access to a specific access context, such as an account.
+	*/
+	checkRoleAccessCxt: function(current, driver_field, skipMyAccount,tableName) {
+		skipMyAccount = skipMyAccount || false;	
+		var entity = gs.nil(tableName)? current.getTableName(): tableName;
+		var access_contexts = this.getMyAccessibleAccounts(entity, skipMyAccount);
+		//For consumer 
+		if (access_contexts == '-1' )
+			return false; //For Consumers default access based on Account will be false as they are not dependent on Account Access
+
+		//For customer
+		if(!gs.nil(driver_field)){
+			var access_id = current.getValue(driver_field);
+			if (!gs.nil(access_id) &amp;&amp; !gs.nil(access_contexts) &amp;&amp; access_contexts.indexOf(access_id) != -1)
+				return true;
+		}
+
+		//For agents
+		if(gs.nil(driver_field) &amp;&amp; !gs.nil(access_contexts) &amp;&amp; access_contexts.includes('all'))
+			return true;
+
+		//For Requestor
+		if(!gs.nil(driver_field) &amp;&amp; !gs.nil(access_contexts) &amp;&amp; access_contexts.includes('all_account_access')){
+			return true;
+		}
+		
+		return false;
+	},
+	
+
+	addProductCategoryQueryBR: function(current) {
+		var that = this;
+		var category_sys_ids = '';
+		if(gs.getProperty('csm_cmdb_model.customer_visible_flag')=='true') {
+			
+			var key ='cmdb_product_category_'+gs.getUserID();
+			var cmdb_category = gs.getSession().getClientData(key);
+			
+			if(gs.nil(cmdb_category)) {
+				var gr = new GlideAggregate(that.TABLE_PRODUCT);
+				gr.addAggregate('count');
+				gr.groupBy('cmdb_model_category');
+				gr.addQuery('customer_visible', true);
+				gr.query();
+				while(gr.next()){
+					if(category_sys_ids!=''){
+						category_sys_ids += ',';
+					}
+					category_sys_ids +=gr.cmdb_model_category;
+				}
+				gs.getSession().putClientData(key, category_sys_ids ? category_sys_ids:'NIL');
+				
+			} else {
+				category_sys_ids = cmdb_category !='NIL'? cmdb_category:'';
+			}
+			
+			if(category_sys_ids!='') {
+				var category = new GlideRecord(that.TABLE_PRODUCT_CATEGORY);
+				category.addQuery('sys_id', 'IN', category_sys_ids);
+				var q = category.getEncodedQuery();
+				
+				current.addEncodedQuery(q);
+			}
+		}
+		
+		return current;
+	},
+	
+	addProductQueryBR: function(current) {
+		var that = this;
+		if(gs.getProperty('csm_cmdb_model.customer_visible_flag')=='true') {
+			var query = null;
+			var gr = new GlideRecord(that.TABLE_PRODUCT);
+			gr.addQuery('customer_visible', 'true');
+			var q = gr.getEncodedQuery();
+			if (!gs.nil(q))
+				current.addEncodedQuery(q);
+		}
+		return current;
+	},
+	
+	addQueryBR: function(current,table) {
+		var tableName = gs.nil(table) ? current.getTableName():table;
+		var accounts = this.getMyAccessibleAccounts(tableName, false);
+		var query = this.getQBRConditionQueries(current,tableName);
+		/*
+		* In the getQBRConditionQueries function, The value of query return as undefined if the condition is not a key-value pair in the extension point. This is handled in the if..else block below
+		*/		
+		if(!gs.nil(query)){
+			query.addOrCondition('account', 'IN', accounts);	
+		}
+		else
+			current.addQuery('account', 'IN', accounts);
+		return current;
+	},
+	
+
+	addOrderQueryBR: function(current) {
+		return this.addQueryBR(current,this.TABLE_ORDER);
+	},
+
+	addOrderQueryForConsumer: function(currrent) {
+		var query = new global.CSQueryBRUtil().getReferenceTableQueryForConsumer(current.getTableName());
+		if (!gs.nil(query))
+			current.addEncodedQuery(query);
+		return current;
+	},
+
+	
+	addAccountQueryBR: function(current) {
+		var query = this.getReferenceTableQueryForCustomer(this.TABLE_ACCOUNT, 'sys_id');
+		if (!gs.nil(query))
+			current.addEncodedQuery(query);
+		
+		return current;
+	},
+	
+	addEntitlementQueryBR: function(current) {
+		var query = this.getReferenceTableQueryForCustomer(this.TABLE_SERVICE_ENTITLEMENT);
+		if (!gs.nil(query))
+			current.addEncodedQuery(query);
+
+		return current;
+	},
+	
+	addContractQueryBR: function(current) {
+		var query = this.getReferenceTableQueryForCustomer(this.TABLE_AST_CONTRACT);
+		if (!gs.nil(query))
+			current.addEncodedQuery(query);
+
+		return current;
+	},
+	
+	addAssetQueryBR: function(current) {
+		var useM2MAssetContact = gs.getProperty('sn_customerservice.use_asset_contact_relationship', 'false');
+	
+		if (useM2MAssetContact == 'false' || this.canOverrideM2MProperty()) {
+			var query = this.getReferenceTableQueryForCustomer(this.TABLE_ALM_ASSET);
+			if (!gs.nil(query))
+				current.addEncodedQuery(query);
+		} else {
+			var grSQ = current.addJoinQuery('sn_customerservice_m2m_asset_contact', 'sys_id', 'asset');
+			grSQ.addCondition('contact', gs.getUserID());
+		}
+		
+		return current;			
+	},
+	
+	addSoldProductQueryBRForConsumer: function(current, tableName){
+		
+		var util = new sn_install_base.SoldProductAndInstallBaseFilter();
+		var userConsumerID = new global.CSManagementUtils().getConsumerId();
+		var list = util.getValidSoldProducts(userConsumerID, global.CSMRelationshipConstants.CONSUMER_SOLD_PRDOUCT_VIEWER);
+		
+		tableName = gs.nil(tableName) ? current.getTableName():tableName;
+		var query = this.getQBRConditionQueries(current,tableName);
+		/*
+		* In the getQBRConditionQueries function, The value of query return as undefined if the condition is not a key-value pair in the extension point. This is handled in the if..else block below
+		*/		
+		if(!gs.nil(query)){
+			query.addOrCondition('sys_id', 'IN', list);	
+		}
+		else
+			current.addQuery('sys_id', 'IN', list);
+		return current;
+		
+	},
+	
+	addInstallBaseQueryBRForConsumer: function(current, tableName){
+		var tableName = gs.nil(tableName) ? current.getTableName():tableName;
+		this.addQueryBR(current, tableName);
+	},
+	
+	/*
+		* The method support query in below format
+		* queryStr ^ (query ^OR accounts)
+		*	query: key-value condition
+		*	queryStr: query string from query paramater in condition
+		*	accounts: accessible accounts of user
+	*/
+	addInstallBaseQueryBR: function(current, tableName){
+		var tableName = gs.nil(tableName) ? current.getTableName():tableName;
+		var accounts = this.getMyAccessibleAccounts(tableName, false);
+		var query = this.getQBRConditionQueries(current,tableName,true);
+		var queryStr = this.getQueries(current, tableName);
+		
+		if (!gs.nil(query) &amp;&amp; !gs.nil(accounts)) {
+			query.addOrCondition('account', 'IN', accounts);
+		} else if (!gs.nil(accounts))
+			current.addQuery('account', 'IN', accounts);
+		
+		current.addEncodedQuery(queryStr);
+
+		return current;
+	},
+
+	
+	addInstallBaseQueryBRForAgent: function(current, tableName){
+		var tableName = gs.nil(tableName) ? current.getTableName():tableName;
+	    this.addQueryforAgent(current, tableName);
+	},
+	
+	addSoldProductCoveredQueryBRForAgent: function(current, tableName){
+		var tableName = gs.nil(tableName) ? current.getTableName():tableName;
+	    this.addQueryforAgent(current, tableName);
+	},
+	
+	addInstallBaseQueryBRForM2M: function(current, tableName) {
+        tableName = gs.nil(tableName) ? current.getTableName() : tableName;
+        var accounts = this.getMyAccessibleAccounts(tableName, false);
+        var queryStr = this.getQueries(current, tableName);
+		
+        if (!gs.nil(queryStr) &amp;&amp; !gs.nil(accounts)) 
+            current.addEncodedQuery(queryStr + '^ORinstall_base_item.accountIN' + accounts);
+        else if(!gs.nil(queryStr))
+			current.addEncodedQuery(queryStr);
+		else if(!gs.nil(accounts))
+            current.addEncodedQuery('install_base_item.accountIN' + accounts);
+
+    },
+	
+	addSoldProductCoveredQueryBRForM2M: function(current, tableName) {
+        tableName = gs.nil(tableName) ? current.getTableName() : tableName;
+        var accounts = this.getMyAccessibleAccounts(tableName, false);
+        var queryStr = this.getQueries(current, tableName);
+		
+        if (!gs.nil(queryStr) &amp;&amp; !gs.nil(accounts)) 
+            current.addEncodedQuery(queryStr + '^ORsold_product.accountIN' + accounts);
+        else if(!gs.nil(queryStr))
+			current.addEncodedQuery(queryStr);
+		else if(!gs.nil(accounts))
+            current.addEncodedQuery('sold_product.accountIN' + accounts);
+    },
+
+    addInstallBaseQueryBRForM2MForConsumer: function(current) {
+        current.addEncodedQuery('install_base_item.consumer=' + this.getValue('my_consumerId'));
+    },
+	
+	addSoldProductCoveredQueryBRForM2MForConsumer: function(current) {
+        current.addEncodedQuery('sold_product.consumer=' + this.getValue('my_consumerId'));
+    },
+	
+	// A special case for customer admin to override M2MAsset property. Not common for all entities.
+	canOverrideM2MProperty: function(){
+		return gs.hasRole('sn_customerservice.customer_admin') &amp;&amp; !gs.hasRole('sn_customerservice.partner_admin');
+	},
+	
+	addContactQueryBR: function(current) {
+		var gr = new GlideRecord(this.TABLE_CONTACT);
+
+		//add login user
+		var query = gr.addQuery('sys_id', gs.getUserID());
+		var accounts = this.getMyAccessibleAccounts(this.TABLE_CONTACT, false);
+
+		if (!gs.nil(accounts))
+			query.addOrCondition('account', 'IN', accounts);
+			
+		var q = gr.getEncodedQuery();
+		if (!gs.nil(q))
+			current.addEncodedQuery(q);
+		
+		// 		gs.info("contact query :" + gr.getEncodedQuery());
+		return current;
+	},
+
+		
+	addCaseQueryBR: function(current) {		
+		return this.addQueryBR(current,this.TABLE_CS_CASE);
+	},
+
+
+	getReferenceTableQueryForCustomer: function(table, driver_field) {
+		driver_field = driver_field || 'account';
+		var query = null;
+		var accounts = this.getMyAccessibleAccounts(table, false);
+		
+		var gr = new GlideRecord(table);
+		if (!gs.nil(accounts))
+			query = gr.addQuery(driver_field, 'IN', accounts);
+		
+		return gr.getEncodedQuery();
+	},
+	
+	
+	getAccountPath: function(account) {
+		account = account || gs.getUser().getCompanyID();
+		var key = "accounts_path_" + account;
+		var path = gs.getSession().getClientData(key);
+		if (gs.nil(path)) {
+			var gr = new GlideRecord(this.TABLE_ACCOUNT);
+			gr.setWorkflow(false);
+			if (gr.get(account))
+				path = gr.getValue('account_path');
+			gs.getSession().putClientData(key, gs.nil(path) ? 'NIL' : path);
+		}
+		return path == 'NIL' ? null : path;
+	},
+	
+	getAccountsFromContactRelationship: function() {
+		//account from contact relationship
+		var accounts = [];
+		var ac =  new GlideRecord(this.TABLE_CONTACT_RELATIONSHIP);
+		ac.addQuery('contact', gs.getUserID());
+		ac.setWorkflow(false);
+		ac.query();
+		while(ac.next())
+			accounts.push(ac.getValue('company'));
+		return accounts;
+	},
+	
+	getAccountsFromAccountConsumer : function(){
+	var consumerId  = new global.CSManagementUtils().getConsumerId();
+		var accounts = [];
+		if(consumerId){
+			var aco = new GlideRecord(this.TABLE_ACCOUNT_CONSUMER);
+			aco.addQuery('consumer',consumerId);
+			aco.addActiveQuery();
+			aco.setWorkflow(false);
+			aco.query();
+			while(aco.next())
+				accounts.push(aco.getValue('account'));
+		}
+
+		return accounts;
+	},
+
+	getAccountsFromAccountRelationship: function() {
+		//account from account relationship
+		var accounts = [];
+		var ar = new GlideRecord(this.TABLE_ACCOUNT_RELATIONSHIP);
+		ar.addQuery('reverse_relationship', false);
+		ar.addQuery('from_company', gs.getUser().getCompanyID());
+		ar.setWorkflow(false);
+		ar.query();
+		while(ar.next())
+			accounts.push(ar.getValue("to_company"));
+		return accounts;
+	},
+	
+	generateCreateCaseHiddenValue: function(company) {
+		company = company || gs.getUser().getCompanyID();
+		var value = "company-" + company;
+		var gr = new GlideRecord('customer_account');
+		if (gr.get(company)) {
+			value += "#isCustomer-" + gr.customer;
+			value += "#isPartner-" + gr.partner;
+			
+			var count = new GlideAggregate('customer_account');
+			count.addQuery('account_path', 'STARTSWITH', gr.account_path + '/');
+			count.addAggregate('COUNT');
+			count.setWorkflow(false);
+			count.query();
+			if (count.next())
+				value += "#hasSubAccounts-" + (count.getAggregate('COUNT') &gt; 0);
+			
+			var ar = new GlideAggregate('sn_customerservice_contact_relationship');
+			ar.addQuery('contact', gs.getUserID());
+			ar.addAggregate('COUNT');
+			ar.setWorkflow(false);
+			ar.query();
+			if (ar.next())
+				value += "#hasAccountContactRelation-"  + (ar.getAggregate('COUNT') &gt; 0);
+		}
+		// 		gs.info("generateCreateCaseHiddenValue --&gt;" + value);
+		return value;
+	},
+	
+	// functions for consumers and consumer agents
+	
+	getConsumer: function(){
+		return new global.CSManagementUtils().getConsumerId();
+	},
+	
+	getReferenceTableQueryForConsumer: function(table, field) {
+		var consumer = this.getConsumer();
+		if (gs.nil(consumer))
+			return null;
+
+		var gr = new GlideRecord(table);
+		
+		//check if base extension plugin is active
+		if (gs.tableExists('sn_customer_rel_consumer_to_consumer')) {
+			
+            field = gs.nil(field)? "consumer":"sys_id";
+			
+			var encodedQuery = new sn_cs_base_ext.AuthorizedRepUtil().getConsumersforConsumerEQ(consumer, table, field);
+			//check if household plugin is active
+			if (gs.tableExists('csm_household_member') ) {
+				
+				var householdquery = new sn_csm_household.HouseHoldUtils().getConsumersforConsumerEQ(consumer, table, field );
+				if(!gs.nil(householdquery))
+					encodedQuery =  gs.nil(encodedQuery)? householdquery : encodedQuery + '^OR' + householdquery;
+			}
+			
+			gr.addEncodedQuery(encodedQuery);
+	
+			
+		} else {
+			if (gs.nil(field))
+				field = 'consumer';
+			else if (field == 'user')
+				consumer = gs.getUserID();
+			
+			gr.addQuery(field, consumer);
+		}
+
+		return gr.getEncodedQuery();
+	},
+	
+	addConsumerQueryforConsumer: function(current) {
+		var query = this.getReferenceTableQueryForConsumer(this.TABLE_CSM_CONSUMER, 'user');
+		if (!gs.nil(query))
+			current.addEncodedQuery(query);
+		
+		return current;
+	},
+	
+	/*
+	 * Query eg: consumer IS loogedInConsumerId or sold_product IN consumers sold products
+	*/
+	addCaseQueryforConsumer: function(current) {
+		var query = this.getReferenceTableQueryForConsumer(this.TABLE_CS_CASE);
+		var caseGR = new GlideRecord(this.TABLE_CS_CASE);
+		this.addQueryBR(caseGR);
+		var caseEncQueryWithQBR = caseGR.getEncodedQuery();
+		if (!gs.nil(caseEncQueryWithQBR))
+			query = (gs.nil(query)) ? caseEncQueryWithQBR : query + "^OR" + caseEncQueryWithQBR;
+		
+		if (!gs.nil(query))
+			current.addEncodedQuery(query);
+		
+		return current;
+	},
+	
+	addQueryforAgent: function(current,table){	
+		var tableName = gs.nil(table)? current.getTableName(): table;
+		var query = this.getQBRConditionQueries(current,tableName);				
+		if(!gs.nil(query))
+			current.addEncodedQuery(query);
+
+		return current;			
+	},
+
+	addCaseQueryforAgent: function(current){
+		return this.addQueryforAgent(current,this.TABLE_CS_CASE);		
+	},
+	
+	/*
+	* Called from the BQBR to filter the cases a user with either the svc_location roles or relationship_agent or both 
+	* roles can see.
+	* 1. Location manager - Can see both consumer &amp; account cases of all hierarchies of IBLs he/she is the manager of.
+	* 2. Location consumer agent - Can only see cases assigned to orgs he/she belongs to and account and contact are not set.
+	* 3. Location agent - Can only see cases assigned to orgs he/she belongs to and consumer and household are not set.
+	* 4. Relationship agent - Can see cases for Account/Consumer/Household for which he is account or relationship manager of
+	* Here's the combinations the below method generates the query for
+	* 1, 2, 3, 4, 1&amp;4, 2&amp;3.
+	* Location Manager role is a superset of both the location agent personas.
+	*
+	*/
+	addCaseQueryForLocationAndRelationshipPersonas: function(current){
+		var myRoles = gs.getUser().getRoles();
+		var encodedQuery = 'assigned_to=' + gs.getUserID();
+		var isRelationshipAgent = false;
+		
+		// Relationship personas.
+		if(myRoles.indexOf('sn_customerservice.relationship_agent') &gt; -1){
+			var accountManagerQuery = new sn_cs_base_ext.AccountManagerRelationshipUtil().getAccessibleAccountsQuery(gs.getUserID());
+			var consumerManagerQuery = new sn_cs_base_ext.RelationshipManagerUtil().getAccessibleConsumersQuery(gs.getUserID());
+			var householdManagerQuery = gs.tableExists('csm_household_member') ? new sn_cs_base_ext.RelationshipManagerUtil().getAccessibleHouseholdsQuery(gs.getUserID()) : '';
+			isRelationshipAgent = !gs.nil(accountManagerQuery) || !gs.nil(consumerManagerQuery) || !gs.nil(householdManagerQuery);
+			
+			if(!gs.nil(accountManagerQuery))
+				encodedQuery += '^OR' + accountManagerQuery;
+			if(!gs.nil(consumerManagerQuery))
+				encodedQuery += '^OR' + consumerManagerQuery;
+			if(!gs.nil(householdManagerQuery))
+				encodedQuery += '^OR' + householdManagerQuery;
+		}
+		
+		// Location personas
+		if(gs.tableExists('sn_csm_business_location_internal')) {
+			var myOrgPaths = new global.ServiceOrganizationUtil().getUserServiceOrgPaths(gs.getUserID());
+			// Location Manager gets to see the cases from all his/her location hierarchies
+			if(myRoles.indexOf('sn_customerservice.svc_location_manager') &gt; -1){
+				for(var i = 0; i &lt; myOrgPaths.length;i++){
+					encodedQuery += '^ORservice_organization.service_organization_pathSTARTSWITH' + myOrgPaths[i];
+				    encodedQuery += '^ORrequesting_service_organization.service_organization_pathSTARTSWITH' + myOrgPaths[i];
+				}
+			} else {
+				// Location and location consumer agents can see cases assigned to their location(s) only.
+				if(myRoles.indexOf('sn_customerservice.svc_location_agent') &gt; -1 || myRoles.indexOf('sn_customerservice.svc_location_consumer_agent') &gt; -1){
+					for(var i = 0; i &lt; myOrgPaths.length;i++){
+						encodedQuery += '^ORservice_organization.service_organization_path=' + myOrgPaths[i];
+						encodedQuery += '^ORrequesting_service_organization.service_organization_path=' + myOrgPaths[i];
+					}
+					
+					// Add the account vs consumer filter only if the logged in user is not a relationship agent and is either a location agent or a location consumer agent but not both.
+					// Cannot write a simple query that satisfies both the conditions.
+					if(!isRelationshipAgent &amp;&amp; !(myRoles.indexOf('sn_customerservice.svc_location_agent') &gt; -1 &amp;&amp; myRoles.indexOf('sn_customerservice.svc_location_consumer_agent') &gt; -1)){
+						if(myRoles.indexOf('sn_customerservice.svc_location_agent') &gt; -1){
+							encodedQuery += "^consumerISEMPTY";
+							if(gs.tableExists('csm_household_member'))
+								encodedQuery += "^householdISEMPTY";
+						} else {
+							encodedQuery += "^accountISEMPTY^contactISEMPTY";
+						}
+					}
+				}
+			}
+		}
+		
+		if(!gs.nil(encodedQuery))
+			current.addEncodedQuery(encodedQuery);
+		return current;
+	},
+	
+	addEntitlementQueryforConsumer: function(current) {
+		var query = this.getReferenceTableQueryForConsumer(this.TABLE_SERVICE_ENTITLEMENT);
+		if (!gs.nil(query))
+			current.addEncodedQuery(query);
+		
+		return current;
+	},
+	
+	addEntitlementQueryforAgent: function(current){
+		return this.addQueryforAgent(current,this.TABLE_SERVICE_ENTITLEMENT);
+	},
+	
+	addContractQueryforConsumer: function(current) {
+		var query = this.getReferenceTableQueryForConsumer(this.TABLE_AST_CONTRACT);
+		if (!gs.nil(query))
+			current.addEncodedQuery(query);
+		
+		return current;
+	},
+	
+	addContractQueryforAgent: function(current) {
+		var query = this.getQBRConditionQueries(current,this.TABLE_AST_CONTRACT);		
+		return current;
+	},
+	
+	addAssetQueryforConsumer: function(current) {
+		var query = this.getReferenceTableQueryForConsumer(this.TABLE_ALM_ASSET);
+		if (!gs.nil(query))
+			current.addEncodedQuery(query);
+		
+		return current;
+	},
+	
+	addAssetQueryforAgent: function(current) {	
+		return this.addQueryforAgent(current,this.TABLE_ALM_ASSET);
+	},
+	
+	canAgentReadCase: function (current,tableName) {
+		var entity = gs.nil(tableName) ? current.getTableName() : tableName;
+
+		if(this.checkRoleConditions(current,entity))
+            return true;
+		
+		return false;
+	},
+		
+    /*
+	* Get the sub accounts of an account
+	*/
+	getSubAccounts : function() {  
+		var accounts = [];
+		var path = this.getAccountPath();
+		if (!gs.nil(path)) {  //PRB1329711: DO not Query Account for Sub Accounts if the Path is Nil.
+			var gr = new GlideRecord(this.TABLE_ACCOUNT);
+			gr.addQuery("account_path", path).addOrCondition("account_path", 'STARTSWITH', path+'/');
+			gr.query();
+
+			while(gr.next())
+				accounts = accounts.concat(gr.getValue('sys_id'));
+		}
+		return accounts;
+	},		
+
+	canESMUserReadCase: function (current, tableName) {	
+		var entity = gs.nil(tableName) ? current.getTableName() : tableName;
+
+		if( this.checkRoleConditions(current,entity) || this.checkRoleAccessCxt(current, this.DEFAULT_DRIVER_FIELD,false,entity))	
+			return true;
+		else
+			return current.contact == gs.getUser().getID();	
+	},
+
+	canESMUserReadEntitlement: function(current,tableName) {	
+		if (gs.nil(current))
+			return false;
+		
+		var account_id = current.getValue('account');
+		var companyId = gs.getUser().getCompanyID();
+		
+		if(gs.nil(account_id) &amp;&amp; !gs.nil(current.product)) {
+			var asset = new GlideRecord("alm_asset");
+			asset.addQuery("account", companyId);
+			asset.addQuery("model", current.product);
+			asset.query();
+			if(asset.next())
+				return true;
+		}
+		
+		if(gs.nil(account_id) &amp;&amp; !gs.nil(current.asset))
+			account_id = current.asset.account;
+		
+		if(gs.nil(account_id) &amp;&amp; !gs.nil(current.contract))
+			account_id = current.contract.account;
+		
+		if(gs.nil(account_id))
+			return false;
+		
+		//if my account entitlement
+		if(companyId == account_id)
+			return true;	
+		
+		var entity = gs.nil(tableName) ? current.getTableName() : tableName;
+
+		return this.checkRoleAccessCxt(current, this.DEFAULT_DRIVER_FIELD, true, entity);
+		
+	},
+	
+	canESMUserReadAccount: function(current,tableName){
+		if (gs.nil(current))
+			return false;
+		
+		if(current.sys_id == gs.getUser().getCompanyID())
+			return true;	
+		
+		var entity = gs.nil(tableName) ? current.getTableName() : tableName;
+
+		return this.checkRoleAccessCxt(current, 'sys_id', true,entity);
+	},
+	
+	canESMUserReadContact: function(current,tableName){
+		if (gs.nil(current))
+			return false;
+		
+		if(current.sys_id == gs.getUser().getID())
+			return true;
+		
+		var entity = gs.nil(tableName) ? current.getTableName() : tableName;
+
+		return this.checkRoleAccessCxt(current, this.DEFAULT_DRIVER_FIELD, false, entity);
+	},
+	
+	canESMUserReadAsset: function(current,tableName){
+		if (gs.nil(current))
+			return false;
+		
+		var useM2MAssetContact = gs.getProperty('sn_customerservice.use_asset_contact_relationship', 'false');
+		if (useM2MAssetContact == 'true') {
+			var gr = new GlideRecord('sn_customerservice_m2m_asset_contact');
+			gr.addQuery('asset', current.sys_id);
+			gr.addQuery('contact', gs.getUser().getID());
+			gr.query();
+			return gr.next();
+		}		
+
+		var entity = gs.nil(tableName) ? current.getTableName() : tableName;
+
+		return this.checkRoleConditions(current,entity) || this.checkRoleAccessCxt(current, this.DEFAULT_DRIVER_FIELD,false,entity);	
+
+	},
+
+	canESMUserReadContract: function(current, tableName){
+		if (gs.nil(current))
+			return false;	
+
+		var entity = gs.nil(tableName) ? current.getTableName() : tableName;
+
+		return this.checkRoleAccessCxt(current, this.DEFAULT_DRIVER_FIELD,false,entity);	
+	},
+
+	canConsumerReadAsset: function(current,tableName){
+		if (gs.nil(current))
+			return false;
+		var entity = gs.nil(tableName) ? current.getTableName() : tableName;
+		return this.checkRoleConditions(current,entity);	 //Check for Role Condition rather than Account Access Context for Consumers            
+	},
+
+	canConsumerReadContract: function(current,tableName){
+		if (gs.nil(current))
+			return false;
+		var entity = gs.nil(tableName) ? current.getTableName() : tableName;
+
+		return this.checkRoleConditions(current,entity);
+	},
+	
+	canConsumerReadEntitlement: function(current,tableName){
+		if (gs.nil(current))
+			return false;
+		var entity = gs.nil(tableName) ? current.getTableName() : tableName;
+
+		return this.checkRoleConditions(current,entity);
+	},
+	
+	canConsumerReadRecord: function(current,tableName){
+		if (gs.nil(current))
+			return false;
+		
+		var entity = gs.nil(tableName) ? current.getTableName() : tableName;
+
+		return this.checkRoleConditions(current,entity);
+		
+	},
+		
+	canUserReadRecord: function(current,tableName){
+		if (gs.nil(current))
+			return false;
+		
+		var entity = gs.nil(tableName) ? current.getTableName() : tableName;
+		return this.checkRoleConditions(current,entity) || this.checkRoleAccessCxt(current, this.DEFAULT_DRIVER_FIELD,false,entity);
+	},
+	
+	canUserReadRecordFromQueries: function(current,tableName){
+		if (gs.nil(current))
+			return false;
+		var tableName = gs.nil(tableName) ? current.getTableName():tableName;
+		var queryStr = this.getQueries(current, tableName);
+		return GlideFilter.checkRecord(current, queryStr);
+	},
+	
+	canAgentReadRecord: function(current,tableName){
+		if (gs.nil(current))
+			return false;
+		var tableName = gs.nil(tableName) ? current.getTableName():tableName;
+		var queryStr = this.getQueries(current, tableName);
+		return GlideFilter.checkRecord(current, queryStr);
+	},
+	
+	addIPQueryBRForConsumer: function(current, tableName) {
+		if (gs.nil(current) || !current.isValid())
+			return;
+		var tableName = gs.nil(tableName) ? current.getTableName() : tableName;
+		var queryStr = this.getQueries(current, tableName);
+		if (!gs.nil(queryStr))
+			current.addEncodedQuery(queryStr);
+	},
+	
+	_isValidField: function(entity, key) {
+		if (!entity || !key)
+			return;
+		var entityGR = new GlideRecord(entity);
+		var fields = key.split(".");
+		for (var i = 0, len = fields.length; i &lt; len; i++) {
+			if (!entityGR.isValid() || !entityGR.isValidField(fields[i]))
+				return;
+			entityGR = entityGR.getElement(fields[i]).getRefRecord();
+		}
+		return true;
+	},
+	
+	addAdditionalContactQueryBR: function(current, tableName) {
+		this._addEncodedQueryFromQueries(current, tableName);
+	},
+	
+	addAdditionalConsumerQueryBR: function(current, tableName) {
+		this._addEncodedQueryFromQueries(current, tableName);
+	},
+	
+	_addEncodedQueryFromQueries: function(current, tableName) {
+		if (gs.nil(current) || !current.isValid())
+			return;
+		tableName = gs.nil(tableName) ? current.getTableName() : tableName;
+		var queryStr = this.getQueries(current, tableName);
+		if (!gs.nil(queryStr))
+			current.addEncodedQuery(queryStr);
+	},
+	
+	type: 'CSQueryBRUtil'
+});]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2016-01-19 05:01:02&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;234859e1c3011200b12d9f2974d3ae32&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;1327&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;CSQueryBRUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Customer Service Base Entities" source="com.snc.cs_base"&gt;4f2cce6b47664210cd4e1ce4316d43a4&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_234859e1c3011200b12d9f2974d3ae32&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-10-26 05:30:27&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:11</sys_created_on>
+        <sys_id>acf0f05983b01210c6695855eeaad303</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>CSQueryBRUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_acf0f05983b01210c6695855eeaad303</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:11</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

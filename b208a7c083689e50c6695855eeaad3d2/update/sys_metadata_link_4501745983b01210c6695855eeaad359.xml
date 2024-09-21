@@ -1,0 +1,501 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>25b1076a77d38110033a902f8c5a99f2</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.PDUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;PDUtils&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var PDUtils = Class.create();
+PDUtils.prototype = {
+    initialize: function() {},
+
+    type: 'PDUtils'
+};
+PDUtils.camelcaseToSnakecase = function(value) {
+    if (!value)
+        return;
+
+    return value.split(/(?=[A-Z])/).join('_').toLowerCase();
+};
+
+PDUtils.convertTopLevelObjectKeysToSnakeCase = function(obj) {
+    var result = {};
+    for (var key in obj) {
+        var snakeCaseKey = PDUtils.camelcaseToSnakecase(key);
+        result[snakeCaseKey] = obj[key];
+    }
+    return result;
+};
+
+PDUtils.getFieldReturnValue = function(gr, fieldName) {
+    return {
+        value: gr.getValue(fieldName),
+        display_value: gr.getDisplayValue(fieldName)
+    };
+};
+// @param gr - GlideRecord
+// @param fields - array of field names OR
+//                 object = { name:String, hasDisplayValue:boolean }
+PDUtils.grToObject = function(gr, fields) {
+    return fields.reduce(function(result, field) {
+        if (typeof field === 'object' &amp;&amp; field.name &amp;&amp; field.hasDisplayValue) {
+            result[field.name] = {
+                value: gr.getValue(field.name),
+                display_value: gr.getDisplayValue(field.name)
+            };
+        } else if (typeof field === 'string') {
+            result[field] = gr.getValue(field);
+        }
+        return result;
+    }, {});
+};
+
+PDUtils.makeActivityStartRuleRefQualQuery = function(schema_version) {
+    var query = 'nameIN';
+    if (schema_version &lt; 2)
+        query = query + PADConstants.kanbanStartRuleNames.join(',');
+    else
+        query = query + PADConstants.v2ActivityStartRuleNames.join(',');
+
+    return query;
+};
+
+PDUtils.makeLaneStartRuleRefQualQuery = function(schema_version) {
+    var query = 'nameIN';
+    if (schema_version &lt; 2)
+        query = query + PADConstants.v1LaneStartRuleNames.join(',');
+    else
+        query = query + PADConstants.v2LaneStartRuleNames.join(',');
+
+    return query;
+};
+
+PDUtils.notEmptyArray = function(arr) {
+    return Array.isArray(arr) &amp;&amp; arr.length &gt; 0;
+};
+
+PDUtils.processAfterSpecificStartRuleVar = function(opts) {
+    opts = opts || {};
+    var current = opts.current;
+    var table = opts.table;
+    var varField = opts.varField;
+    var parentField = opts.parentField;
+    var results = {
+        hasInvalidVar: false
+    };
+
+    var ge = current.getElement(varField);
+    if (!ge)
+        return results;
+    var items = ge.getValue().split(',');
+    if (!items.length)
+        return results;
+    // Ensure start rule var doesn't have duplicates
+    var dedupedArray = Object.keys(
+        items.reduce(function(map, id) {
+            map[id] = true;
+            return map;
+        }, {})
+    );
+    // Also ensures var doesn't reference self
+    var filteredArray = items.filter(function(id) {
+        return id !== current.getUniqueValue();
+    });
+    if (
+        dedupedArray.length !== items.length ||
+        filteredArray.length !== items.length
+    ) {
+        results.hasInvalidVar = true;
+        return results;
+    }
+    var itemsGr = new GlideRecord(table);
+    // Also ensures var has actual records
+    itemsGr.addQuery(PDConstants.FIELDS.SYS_ID, 'IN', items.join(','));
+    // Also ensures var has records with same parent record
+    itemsGr.addQuery(parentField, current.getValue(parentField));
+    itemsGr.query();
+    if (itemsGr.getRowCount() !== items.length) {
+        results.hasInvalidVar = true;
+        return results;
+    }
+    results.itemsGr = itemsGr;
+    return results;
+};
+
+PDUtils.newGlideRecordWithSkipProcessUpdate = function(tablename) {
+    var gr = new GlideRecord(tablename);
+    gr.skipProcessUpdate = true;
+    return gr;
+};
+
+PDUtils.setParentProcessUpdatedOn = function(processId, updatedOn) {
+    var pdScopeSwitcher = new PDScopeSwitcher();
+
+    try {
+        var gr = new GlideRecord(PDConstants.TABLES.PD_PROCESS_DEFINITION);
+        if (!gr.get(processId))
+            return;
+
+        var scopeId = gr.getValue(PDConstants.FIELDS.SYS_SCOPE);
+        pdScopeSwitcher.switchScope(scopeId);
+
+        var gdtNextUpdatedOn = new GlideDateTime();
+        if (updatedOn)
+            // Param is assumed to be UTC time
+            gdtNextUpdatedOn.setValue(updatedOn);
+        var gdtProcessUpdatedOn = new GlideDateTime(
+            // gr.getValue returns UTC time
+            gr.getValue(PDConstants.FIELDS.SYS_UPDATED_ON));
+        // Check GlideDateTime compareTo docs. If gdtNextUpdatedOn is
+        // greater than gdtProcessUpdatedOn this would yield 1
+        if (gdtNextUpdatedOn.compareTo(gdtProcessUpdatedOn) &lt; 1)
+            return;
+        gr.autoSysFields(false);
+        // Do not use gr.sys_updated_on = newTime, newTime will
+        // be assumed to be local time instead of UTC
+        gr.setValue(PDConstants.FIELDS.SYS_UPDATED_ON, gdtNextUpdatedOn.getValue());
+        gr.update();
+    } finally {
+        pdScopeSwitcher.resetScope();
+    }
+};
+
+PDUtils.setParentProcessUpdatedOnScheduled = function(processId, updatedOn) {
+    if (!processId)
+        return;
+    GlideRunScriptJob.scheduleScript(
+        'PDUtils.setParentProcessUpdatedOn("' + processId + '", "' + (updatedOn || '') + '");'
+    );
+};
+
+PDUtils.shallowClone = function(obj) {
+    obj = obj || {};
+    var shallowClonedObj = {};
+    for (var key in obj)
+        shallowClonedObj[key] = obj[key];
+    return shallowClonedObj;
+};
+
+PDUtils.isEmptyObject = function(obj, excludeKeys) {
+    var shallowClonedObj = PDUtils.shallowClone(obj);
+    (excludeKeys || []).forEach(function(key) {
+        delete shallowClonedObj[key];
+    });
+    return Object.keys(shallowClonedObj).length === 0;
+};
+
+PDUtils.removeInvalidStartRuleVars = function(obj) {
+    var sysId = obj.sysId;
+    var itemType = obj.itemType;
+    var laneId = obj.laneId || '';
+    var processDefinition = obj.processDefinition;
+    var tableName = itemType === PDConstants.FIELDS.ACTIVITY ? PDConstants.TABLES.PD_ACTIVITY : PDConstants.TABLES.PD_LANE;
+    var gr = new GlideRecord(tableName);
+    gr.addQuery(PDConstants.TABLES.PD_PROCESS_DEFINITION, processDefinition);
+    if (itemType === PDConstants.FIELDS.LANE)
+        gr.addQuery(PDConstants.FIELDS.START_RULE, PDConstants.START_RULES.AFTER_LANES);
+    if (itemType === PDConstants.FIELDS.ACTIVITY) {
+        gr.addQuery(PDConstants.FIELDS.LANE, laneId);
+        gr.addQuery(PDConstants.FIELDS.START_RULE, PDConstants.START_RULES.AFTER_ACTIVITIES);
+    }
+    gr.query();
+
+    while (gr.next()) {
+        var ge = (itemType === PDConstants.FIELDS.LANE) ? gr.getElement(PDConstants.FIELDS.START_RULE_VAR_AFTER_LANES) : gr.getElement(PDConstants.FIELDS.START_RULE_VAR_AFTER_ACTIVITIES);
+        if (!ge)
+            continue;
+        var items = ge.getValue().split(',');
+        if (!items.length)
+            continue;
+        var filteredArr = items.filter(function(startRuleVar) {
+            return startRuleVar != sysId;
+        });
+        ge.setValue(filteredArr);
+        gr.update();
+    }
+};
+
+PDUtils.cleanUpOrderOnDelete = function(obj) {
+    var laneId = obj.laneId;
+    var processDefinition = obj.processDefinition;
+    if (PDUtils.getProcessSchemaVersion(processDefinition) &lt; 2)
+        return;
+
+    var deletedOrder = obj.deletedOrder;
+    var itemType = obj.itemType;
+    var tableName = itemType === PDConstants.FIELDS.ACTIVITY ? PDConstants.TABLES.PD_ACTIVITY : PDConstants.TABLES.PD_LANE;
+    var gr = new GlideRecord(tableName);
+    if (itemType === PDConstants.FIELDS.ACTIVITY) {
+        var activityStartRules = PDConstants.START_RULES.AFTER_ACTIVITIES + "," + PDConstants.START_RULES.IMMEDIATE;
+        gr.addQuery(PDConstants.FIELDS.LANE, laneId);
+        gr.addQuery(PDConstants.FIELDS.PROCESS_DEFINITION, processDefinition);
+        gr.addQuery(PDConstants.FIELDS.START_RULE, "IN", activityStartRules);
+        gr.orderBy(PDConstants.FIELDS.ORDER);
+    }
+    if (itemType === PDConstants.FIELDS.LANE) {
+        var laneStartRules = PDConstants.START_RULES.AFTER_LANES + "," + PDConstants.START_RULES.LANE_IMMEDIATELY;
+        gr.addQuery(PDConstants.FIELDS.PROCESS_DEFINITION, processDefinition);
+        gr.addQuery(PDConstants.FIELDS.START_RULE, "IN", laneStartRules);
+        gr.orderBy(PDConstants.FIELDS.ORDER);
+    }
+    gr.query();
+
+    while (gr.next()) {
+        var itemOrder = gr.getValue(PDConstants.FIELDS.ORDER);
+        if (itemOrder &gt; deletedOrder) {
+            gr.setValue(PDConstants.FIELDS.ORDER, itemOrder - 1);
+            gr.setWorkflow(false); // not to run other BR that runs on record update
+            gr.update();
+        }
+    }
+};
+
+PDUtils.getProcessSchemaVersion = function(sysId) {
+    var gr = new GlideRecord(PDConstants.TABLES.PD_PROCESS_DEFINITION);
+    var process = gr.get(sysId);
+    if (process) {
+        var schemaVersion = gr.getValue(PDConstants.FIELDS.SCHEMA_VERSION);
+        if (gs.nil(schemaVersion))
+            return 0;
+        return schemaVersion;
+    }
+    return null;
+};
+
+PDUtils.getGlideVariablesMetadata = function(variablesRecord) {
+    var result = [];
+    try {
+        Object.keys(variablesRecord).forEach(function(variableName) {
+            if (
+                !variableName ||
+                variableName === PDConstants.FIELDS.SYS_META ||
+                variableName === PDConstants.FIELDS.SYS_ID
+            )
+                return;
+            var variable = variablesRecord[variableName];
+            var internalType = variable.getED().getInternalType();
+            // DEF0348150 Inconsistent empty values
+            var value = variable.getValue() || '';
+            var displayValue = variable.getDisplayValue();
+
+            var displayValuesWithPath = [];
+            if (internalType == 'field_list') {
+                displayValuesWithPath = PDUtils.getDisplayValuesWithPath(variable);
+            }
+            // DEF0348150 Inconsistent empty values
+            if (internalType == 'boolean')
+                value = displayValue;
+            result.push({
+                value: value,
+                variableValue: value,
+                displayValue: displayValue,
+                internalType: internalType,
+                label: variable.getLabel(),
+                variableName: variable.getName(),
+                variableMapping: variable.getValueMapping(),
+                canRead: variable.canRead(),
+                canWrite: variable.canWrite(),
+                isMandatory: variable.getED().isMandatory(),
+                displayValuesWithPath: displayValuesWithPath
+            });
+        });
+    } catch (err) {
+        return result;
+    }
+    return result;
+};
+
+PDUtils.getDisplayValuesWithPath = function(inputVariableElement) {
+    var dependentOnField = inputVariableElement.getED().getDependent(); // inputs.table
+    var dependentOnFieldName = dependentOnField.substring(
+        dependentOnField.lastIndexOf('.') + 1
+    ); // table
+    var dependentOnFieldValue = inputVariableElement
+        .getGlideRecord()
+        .getElement(dependentOnFieldName)
+        .getValue(); // incident
+    if (gs.nil(dependentOnField) || gs.nil(dependentOnFieldValue)) return [];
+
+    var referenceGR = new GlideRecord(dependentOnFieldValue);
+    var elementValue = inputVariableElement.getValue();
+    if (gs.nil(elementValue)) return [];
+
+    var valuesArray = elementValue.split(',');
+    var fullDisplayValue = [];
+    for (var i = 0; i &lt; valuesArray.length; i++) {
+        var value = valuesArray[i];
+        if (value.contains('.')) {
+            var compositeElement = new GlideCompositeElement(
+                value,
+                dependentOnFieldValue
+            );
+            if (gs.nill(compositeElement)) return [];
+
+            fullDisplayValue.push(
+                PDUtils.getFullLabelWithSeparator(dependentOnFieldValue, value, '&gt;')
+            );
+        } else {
+            var fieldGlideElement = referenceGR.getElement(value);
+            fullDisplayValue.push(fieldGlideElement.getLabel());
+        }
+    }
+    return fullDisplayValue;
+};
+
+PDUtils.getFullLabelWithSeparator = function(tableName, fieldName, separator) {
+    var fieldDescription = SNC.TableAndFieldDescription.getFieldDescription(
+        tableName,
+        fieldName
+    );
+    if (gs.nil(fieldDescription)) return;
+
+    var fieldLabel = fieldDescription.getFieldLabel();
+    var fieldLabelWithSeparator = fieldLabel.replace('.', separator);
+    return fieldLabelWithSeparator;
+};
+
+PDUtils.updateStartWithDelay = function(startDelay) {
+    if (!startDelay.timerAttributes.sysId) {
+        startDelay = PDUtils.deleteStartWithDelay(startDelay.timerAttributes);
+    } else if (startDelay.timerAttributes) {
+        startDelay = PDUtils.saveStartWithDelay(startDelay.timerAttributes);
+    }
+    return startDelay;
+};
+
+PDUtils.saveStartWithDelay = function(timerAttributes) {
+    var mappingFields = ['timer_duration', 'timer_relative_duration_datetime', 'timer_percentage', 'percentage_timer_input_datetime'];
+    var normalFields = ['duration_type', 'timer_relative_duration_operator', 'timer_schedule'];
+
+    var timerAttributesGr = new GlideRecord('sys_pd_timer_attributes');
+    if (!timerAttributesGr.canCreate())
+        return;
+
+    var input = PDUtils.convertTopLevelObjectKeysToSnakeCase(timerAttributes);
+
+    if (!timerAttributesGr.get(input.sys_id)) {
+        // Get current record of Timer Attribute for mutation
+        timerAttributesGr.setNewGuidValue(input.sys_id);
+    }
+    // This is a new record, set up the reference fields
+    timerAttributesGr.process_definition = input.process_definition;
+    timerAttributesGr.source = input.source;
+    timerAttributesGr.source_type = input.source_type;
+
+    normalFields.forEach(function(name) {
+        timerAttributesGr[name] = input[name] ? input[name] : "";
+    });
+
+    mappingFields.forEach(function(name) {
+        timerAttributesGr[name] = input[name] ? input[name].value : "";
+        var mappingValue = input[name] ? input[name].variableMapping : "";
+        timerAttributesGr.getElement(name).setValueMapping(mappingValue);
+    });
+
+
+    var updatedRecordSysId = timerAttributesGr.update();
+
+    var updatedRecordGr = new GlideRecord('sys_pd_timer_attributes');
+    updatedRecordGr.get(updatedRecordSysId);
+
+    return {
+        sys_id: updatedRecordGr.getValue('sys_id'),
+        duration_type: updatedRecordGr.getValue('duration_type'),
+        process_definition: updatedRecordGr.getValue('process_definition'),
+        source: updatedRecordGr.getValue('source'),
+        source_type: updatedRecordGr.getValue('source_type'),
+        percentage_timer_input_datetime: PDUtils.getFieldReturnValue(updatedRecordGr, 'percentage_timer_input_datetime'),
+        timer_percentage: PDUtils.getFieldReturnValue(updatedRecordGr, 'timer_percentage'),
+        timer_relative_duration_datetime: PDUtils.getFieldReturnValue(updatedRecordGr, 'timer_relative_duration_datetime'),
+        timer_relative_duration_operator: updatedRecordGr.getValue('timer_relative_duration_operator'),
+        timer_schedule: PDUtils.getFieldReturnValue(updatedRecordGr, 'timer_schedule'),
+        timer_duration: PDUtils.getFieldReturnValue(updatedRecordGr, 'timer_duration')
+    };
+};
+
+PDUtils.deleteStartWithDelay = function(timerAttributes) {
+    var sourceValue = timerAttributes.source;
+
+    var timerAttributesGr = new GlideRecord('sys_pd_timer_attributes');
+
+    timerAttributesGr.addQuery('source', sourceValue);
+    timerAttributesGr.query();
+
+    while (timerAttributesGr.next()) {
+        timerAttributesGr.deleteRecord();
+    }
+
+    return {};
+};
+
+PDUtils.setGlideRecordFieldValue = function(gr, field, value) {
+    if (!gr || !field)
+        return;
+    if (PDUtils.isDisplayableStringValue(value))
+        value = value.value;
+    // Required when resetting a field to empty
+    if (value === undefined || value === null)
+        value = '';
+    gr.setValue(field, value);
+};
+
+PDUtils.isDisplayableStringValue = function(value) {
+    return ((value || {}).hasOwnProperty('value'));
+};
+
+PDUtils.isNowAssistForPlaybookPluginActive = function() {
+    return GlidePluginManager().isActive(PADConstants.PLUGINS.NOW_ASSIST_FOR_PLAYBOOK);
+};
+
+
+PDUtils.isPlaybookGenerationEnabledForUser = function() {
+    if (this.isNowAssistForPlaybookPluginActive()) {
+		var pdNowAssistUtils = new PDNowAssistUtils();
+        return pdNowAssistUtils.isPlaybookGenerationEnabledForUser();
+    }
+    return false;
+};
+
+
+PDUtils.userHasRole = function(roleName) {
+    if (gs.nil(roleName)) return false;
+    var roles = gs.getUser().getRoles() || [];
+    return roles.indexOf(roleName) &gt;= 0;
+};
+]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-05-09 17:39:33&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;25b1076a77d38110033a902f8c5a99f2&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;144&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;PDUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Process Automation Designer Core - Model" source="com.glide.pad.core.model"&gt;0ae817db47220210cd4e1ce4316d431f&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_25b1076a77d38110033a902f8c5a99f2&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-02-21 17:45:10&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:29</sys_created_on>
+        <sys_id>4501745983b01210c6695855eeaad359</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>PDUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_4501745983b01210c6695855eeaad359</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:29</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

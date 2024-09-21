@@ -1,0 +1,324 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules">
+    <x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>false</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection/>
+        <condition>current.agent.startsWith("mid.server.") &amp;&amp; current.queue == "output" &amp;&amp; current.topic != 'HeartbeatProbe' &amp;&amp; !current.topic.startsWith('queue.') &amp;&amp; current.source != "cancel_discovery"</condition>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>Insert Discovery Affinity &amp; Cred Aliases</name>
+        <order>200</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[/**
+ * Service-now.com
+ *
+ * Description: Insert credential affinity ID into the probe that runs.
+ * Additionally, insert credential aliases from a discovery schedule into the probe.
+ *
+ * Note: Make sure this BR runs after cluster management so that the MID server is chosen ahead time
+ */
+
+var g_agent;
+var payload = current.payload;
+runIt();
+
+function runIt() {
+ if (JSUtil.nil(payload) || !getAgent())
+  return;
+
+ insertDiscoveryCredentialAliases();
+ insertCredentialAffinities();
+ if (current.topic == "SSHCommand" || current.topic == "MultiProbe" ||
+  ((current.topic == "ServiceDiscoveryProbe" || current.topic == "PatternDebuggerProbe" || current.topic == "HorizontalDiscoveryProbe") &&
+   JSUtil.notNil(current.source)))
+  insertPrivAffinity(queryPrivAffinity());
+ addAllParametersToPayload();
+}
+
+function parseParameter(name, textnode) {
+ var pattern = textnode ?
+  "/<textnode_parameter name=\""+name+"\">(.*?)<\\/textnode_parameter>/" :
+  "/<parameter name=\""+name+"\" value=\"(.*?)\"\\/>/";
+ var regex = new SNC.Regex(pattern);
+ var match = regex.match(payload);
+ return match ? match[1]: null;
+}
+
+function addParameter(name, value) {
+ // Check for existing parameter and update if it exists, otherwise insert new parameter
+ var pattern = "/<parameter name\\s*=\\s*\""+name+"\" value\\s*=\\s*\"(.*?)\"\\s*\\/>/";
+ var regex = new SNC.Regex(pattern);
+ var match = regex.match(payload);
+ if (match)
+  do {
+   payload = payload.replace("<parameter name=\""+name+"\" value=\""+match[1]+"\"/>","<parameter name=\""+name+"\" value=\""+value+"\"/>");
+   match = regex.match();
+  } while(match);
+ else {
+  pattern = "/<\\/parameters>((?!<\\/probe>).*)(?:<\\/probes>)*/";
+  var replacementStr = "<parameter name=\"" + name + "\" value=\"" + value + "\"/>$0";
+  regex = new SNC.Regex(pattern);
+  payload = regex.replaceAll(payload, replacementStr);
+ }
+}
+
+function addAllParametersToPayload() {
+ current.payload = payload;
+}
+
+function insertCredentialAffinities() {
+ if (!current.source.equals('No Source')) {
+  if (current.topic == "Shazzam" && !SNC.IPAddress.get(current.source))
+   insertCredentialIDForShazzam();
+  else
+   insertCredentialID();
+ }
+}
+
+function insertDiscoveryCredentialAliases() {
+ if (!current.agent_correlator || current.agent_correlator.startsWith("rba."))
+  return;
+
+ var aliasSysIds = getAliasesSysIds();
+ if (!aliasSysIds)
+  return;
+
+ var aliasNames = getAliasNames(aliasSysIds);
+ if (!aliasNames)
+  return;
+
+ addParameter("credential_tag", aliasNames.toString());
+}
+
+function getAliasNames(aliasSysIds) {
+ var aliasTags = [];
+ aliasSysIds.forEach(function(aliasSysId) {
+  var alias_gr = new GlideRecord("sys_alias");
+  alias_gr.get('sys_id', aliasSysId);
+  // DEF0177248: Using id instead of name to fix the issue
+  // when white space or special characters are used in Alias name
+  // as id is getting retrieved with Credential record.
+  var aliasTag = alias_gr.getValue("id");
+  if (aliasTag)
+   aliasTags.push(aliasTag);
+ });
+ return aliasTags;
+}
+
+function getAliasesSysIds() {
+ var scheduleSysId = (function(statusSysId) {
+  var status_gr = new GlideRecord('discovery_status');
+  status_gr.get('sys_id', statusSysId);
+  return status_gr.getValue("dscheduler");
+ })(current.agent_correlator);
+ if (gs.nil(scheduleSysId))
+  return null;
+
+ schedule_gr = new GlideRecord('discovery_schedule');
+ schedule_gr.get('sys_id', scheduleSysId);
+ var commaSeperatedAliasSysIds = schedule_gr.getValue('credential_aliases');
+ if (!commaSeperatedAliasSysIds)
+  return null;
+
+ return commaSeperatedAliasSysIds.split(",");
+}
+
+function getAgent() {
+ var agentName = current.agent + "";
+ var midName = agentName.substr("mid.server.".length, agentName.length);
+ var agentCache = new SNC.ECCAgentCache();
+ g_agent = agentCache.getByName(midName);
+ return g_agent;
+}
+
+function insertCredentialID() {
+ // We current do not handle hostnames for finding credentials. Stick to IP addresses.
+ var target = current.source;
+ if (!SncIPAddress.validate(target))
+  return;
+
+ var credClass = (function() {
+  var pattern = "/<parameter name=\"probe\" value=\"(.*?)\"\/>/";
+  var regex = new SNC.Regex(pattern);
+  var match = regex.match(payload);
+  if (JSUtil.nil(match) || JSUtil.nil(match[1]))
+   return;
+
+  var probeSysId = match[1];
+  var gr = new GlideRecord("probe_credential_class");
+  gr.addQuery("probe", probeSysId);
+  gr.query();
+  return gr.next() ? gr.classification + "" : null;
+ })();
+
+ if (JSUtil.nil(credClass))
+  return;
+
+ var credential_id = findCredentialID(target, credClass);
+ if (JSUtil.nil(credential_id))
+  addParameter("credential_id", "");
+ else
+  addParameter("credential_id", credential_id);
+}
+
+function insertCredentialIDForShazzam() {
+ var dr, start, end, i, address, addressAsLong,
+  ipCredObj = {};
+ try {
+  if (parseParameter("json_ranges", false) == "true")
+   dr = SNC.DiscoveryRanges.fromJSON(parseParameter("range", true));
+  else
+   dr = SNC.DiscoveryRanges.fromXML(GlideStringUtil.unEscapeHTML(parseParameter("range", false)));
+  i = dr.iterator();
+  while (i.hasNext()) {
+   address = i.next() + '';
+   if (SncIPAddress.isV6(address))
+    processIPv6Address(address);
+   else {
+    // For IPv4 try to optimize the query: If we find a range of contiguous addresses we'll
+    // make a single query for affinities in the range.
+    addressAsLong = SncAddress32Bit(address).getAddressAsLong();
+    if (addressAsLong == start + 1)
+     end = addressAsLong;
+    else {
+     processV4IPs();
+     start = end = addressAsLong;
+    }
+   }
+  }
+  processV4IPs();
+  addAffinity(ipCredObj);
+ } catch (e) {
+  // do nothing - we'll just continue without inserting affinity
+ }
+
+ function processIPv6Address(address) {
+  var gr = new GlideRecord("dscy_credentials_affinity");
+  gr.addQuery("type", "IN", "snmp,snmpv3");
+  gr.addQuery("agent", g_agent.sys_id);
+  gr.addQuery('ip_address', address);
+  gr.query();
+  if (gr.next())
+   ipCredObj[address] = gr.credential_id + '';
+ }
+
+ function processV4IPs() {
+  if (!start)
+   return;
+  var gr = new GlideRecord("dscy_credentials_affinity");
+  gr.addQuery("type", "IN", "snmp,snmpv3");
+  gr.addQuery("agent", g_agent.sys_id);
+
+  // If start == end we could just query for ip_address_decimal == start
+  // but that adds code and doesn't improve performance (I think).
+  gr.addQuery("ip_address_decimal", ">=", start);
+  gr.addQuery("ip_address_decimal", "<=", end);
+  gr.query();
+  while (gr.next())
+   ipCredObj[gr.ip_address + ""] = gr.credential_id + "";
+ }
+}
+
+function addAffinity(ipCredObj) {
+ var doc = GlideXMLUtil.newDocument("ip_address_credential");
+ var root = doc.getDocumentElement();
+ var hasCredIP = false;
+ for (var ip in ipCredObj) {
+  hasCredIP = true;
+  var ipElement = doc.createElement("parameter");
+  ipElement.setAttribute("name", ip);
+  ipElement.setAttribute("value", ipCredObj[ip]);
+  root.appendChild(ipElement);
+ }
+ // Don't bother if there's no credential available...
+ if (!hasCredIP)
+  return;
+ addParameter("credential_id", GlideStringUtil.escapeHTML(GlideXMLUtil.toFragmentString(doc) + ''));
+}
+
+function findCredentialID(target, credType) {
+ var gr = new GlideRecord("dscy_credentials_affinity");
+ gr.addQuery("agent", g_agent.sys_id);
+ gr.addQuery("ip_address", SncIPAddress.canonicalize(target + ''));
+ gr.addQuery("type", "STARTSWITH", credType);
+ gr.query();
+ return gr.next() ? gr.credential_id + "" : "";
+}
+
+
+
+function queryPrivAffinity() {
+ // source can be IP Address or hostname
+ var source = current.source + '';
+ // if we can't validate as IP, see if it is a resolvable hostname
+ // if it is not resolvable return null value in source
+ if (!SncIPAddress.validate(source)) {
+  source = (function(hostName) {
+   var gr = new GlideRecord('cmdb_ip_address_dns_name');
+   gr.addQuery('dns_name.name', hostName);
+   gr.query();
+   if (!gr.next())
+    return null;
+
+   var ip = (SncIPAddress.validate(gr.ip_address.ip_address + '')) ?
+    gr.ip_address.ip_address + '' :
+    null;
+   return ip;
+  })(source);
+  if (JSUtil.nil(source))
+   // source will be returned as null if not valid IP
+   return source;
+ }
+
+ var gr = new GlideRecord("dscy_priv_command_affinity");
+ gr.addQuery("mid_server", g_agent.sys_id);
+ gr.addQuery("ip_address", SncIPAddress.canonicalize(source));
+ gr.query();
+ var command = gr.next() ? gr.command : null;
+ return command;
+}
+
+function insertPrivAffinity(command) {
+ if (command == null)
+  return;
+
+ addParameter("privileged_command_affinity", command);
+}]]></script>
+        <sys_class_name>x_938076_now_utils_now_utils_business_rules</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:49:09</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>5bab601583701210c6695855eeaad3c2</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Insert Discovery Affinity &amp; Cred Aliases</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>x_938076_now_utils_now_utils_business_rules_5bab601583701210c6695855eeaad3c2</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:49:09</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </x_938076_now_utils_now_utils_business_rules>
+    <sys_translated_text action="delete_multiple" query="documentkey=5bab601583701210c6695855eeaad3c2"/>
+</record_update>

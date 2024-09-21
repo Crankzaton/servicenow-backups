@@ -1,0 +1,189 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0ee594ce73402010e6b632e954f6a734</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_nlu_workbench.NLUImprovementAnalysis&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Utilities to execute the clustering analysis on unsupported utterances&lt;/description&gt;
+        &lt;name&gt;NLUImprovementAnalysis&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var NLUImprovementAnalysis = Class.create();
+
+(function() {
+
+    var constants = {
+        DATE_RANGE_QUERIES: {
+            '30': 'sys_created_on&gt;javascript:gs.beginningOfLast30Days()',
+            '60': 'sys_created_on&gt;javascript:gs.beginningOfLast60Days()',
+            '90': 'sys_created_on&gt;javascript:gs.beginningOfLast90Days()',
+	    'custom': function(dateRange) {
+		return "sys_created_onBETWEENjavascript:gs.dateGenerate('" + dateRange[0] + "','start')@javascript:gs.dateGenerate('" + dateRange[1] + "','end')";
+	    }
+        },
+
+        ML_CAPABILITY_DEFINITION_CLUSTERING: 'ml_capability_definition_clustering',
+        ML_SOLUTION: 'ml_solution',
+        OPEN_NLU_PREDICT_INTENT_FEEDBACK: 'open_nlu_predict_intent_feedback',
+        GLIDE_NLU_FEEDBACK_SOLUTION_NAME: 'ml_sn_sn_nlu_workbench_global_feedback',
+        SOLUTION_COMPLETE: 'solution_complete'
+    };
+    NLUImprovementAnalysis.prototype = {
+        initialize: function() {
+            this.solutionName = constants.GLIDE_NLU_FEEDBACK_SOLUTION_NAME;
+        },
+
+        getClusteringSolution: function() {
+            var result = {};
+            try {
+                if (gs.nil(this.solutionName) ||
+                    !(result.solution = sn_ml.ClusteringSolutionStore.get(this.solutionName)))
+                    return null;
+            } catch (e) {
+                gs.debug('Error in retrieving fuzzy matcher solution: ' + e.message);
+                return null;
+            }
+            return result;
+        },
+
+        getStatus: function() {
+            var latestSolution = {};
+            try {
+                if (!this.solutionName) {
+                    return {
+                        status: 'success'
+                    };
+                }
+                var solutionObj = this.getClusteringSolution();
+                if (!solutionObj) {
+                    return {
+                        status: 'failure',
+                        message: gs.getMessage('Solution object not found!')
+                    };
+                }
+                var solution = solutionObj.solution;
+                var latestSolutionVersion = solution.getLatestVersion();
+                var latestSolutionStatus = JSON.parse(latestSolutionVersion.getStatus());
+                if (latestSolutionStatus.hasJobEnded === 'false')
+                    latestSolution.state = 'training';
+                else if (latestSolutionStatus.state === constants.SOLUTION_COMPLETE)
+                    latestSolution.state = 'success';
+                else
+                    latestSolution.state = 'failure';
+                latestSolution.solutionVersion = latestSolutionVersion.getVersionNumber();
+                latestSolution.solutionName = this.solutionName;
+            } catch (e) {
+                gs.debug('Error in fetching status for improvement analysis : ' + e.message);
+            }
+            return {
+                status: 'success',
+                solution: latestSolution
+            };
+        },
+
+        cancel: function() {
+            var result = {};
+            try {
+                var clusteringSolution = this.getClusteringSolution();
+                if (!clusteringSolution)
+                    throw new Error(gs.getMessage('Solution object not found!'));
+                clusteringSolution.solution.cancelTrainingJob();
+                result.status = 'success';
+            } catch (e) {
+                gs.debug('NLU Lookup cancelTraining error' + e.message);
+                result.status = 'failure';
+                result.message = e.message;
+            }
+            return result;
+        },
+
+        run: function(dateRange) {
+	    var dateRangeQuery = Array.isArray(dateRange) ? constants.DATE_RANGE_QUERIES.custom(dateRange) : constants.DATE_RANGE_QUERIES[dateRange];
+            var encodedQuery = 'nlu_provider=64c023c17300330021a044764df6a70e^' + dateRangeQuery;
+            var fieldNames = ['utterance', 'selected', 'prediction', 'confidence', 'audit_log', 'auto_selected', 'current_intent'];
+            try {
+                var result = {
+                    solution: {}
+                };
+                var defaults = {
+                    dataset: new sn_ml.DatasetDefinition({
+                        tableName: constants.OPEN_NLU_PREDICT_INTENT_FEEDBACK,
+                        fieldNames: fieldNames,
+                        encodedQuery: encodedQuery
+                    }),
+                    inputFieldNames: ['utterance'],
+                    minRowCount: 0,
+                    advancedParams: {
+                        HDBSCAN: '',
+                    },
+                    preprocessingPipeline: [{
+                        type: 'nlu_feedback_labeling_preprocess',
+                        label: 'group and dedup for feedback labeling',
+                        fieldNames: fieldNames,
+                        option: 'default'
+                    }],
+                    label: 'feedback'
+                };
+                var solution = new sn_ml.ClusteringSolution(defaults);
+                if (!this.getClusteringSolution()) {
+                    sn_ml.ClusteringSolutionStore.add(solution);
+                } else sn_ml.ClusteringSolutionStore.update(this.solutionName, solution);
+
+                var solutionVersion = solution.submitTrainingJob();
+
+                var solutionVersionProperties = JSON.parse(solutionVersion.getProperties());
+                var solutionStatus = JSON.parse(solutionVersion.getStatus());
+
+                if (solutionStatus.hasJobEnded === 'false')
+                    result.solution.state = 'training';
+                else if (solutionStatus.state === constants.SOLUTION_COMPLETE)
+                    result.solution.state = 'success';
+                else
+                    result.solution.state = 'failure';
+                result.solution.solutionVersion = solutionVersion.getVersionNumber();
+                result.solution.solutionName = solutionVersionProperties.name;
+                result.status = 'success';
+            } catch (e) {
+                result.status = 'failure';
+                result.message = e.message;
+            }
+
+            return result;
+        },
+
+        type: 'NLUImprovementAnalysis'
+    };
+})();]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-10-25 10:04:38&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0ee594ce73402010e6b632e954f6a734&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;66&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;NLUImprovementAnalysis&lt;/sys_name&gt;
+        &lt;sys_package display_value="NLU Workbench - Advanced Features" source="sn_nlu_workbench"&gt;31f5f491c3a710100bf407720f40ddf4&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="NLU Workbench - Advanced Features"&gt;31f5f491c3a710100bf407720f40ddf4&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0ee594ce73402010e6b632e954f6a734&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2020-12-14 07:15:45&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:10:06</sys_created_on>
+        <sys_id>0e707c9583b01210c6695855eeaad3d2</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>NLUImprovementAnalysis</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_0e707c9583b01210c6695855eeaad3d2</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:10:06</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

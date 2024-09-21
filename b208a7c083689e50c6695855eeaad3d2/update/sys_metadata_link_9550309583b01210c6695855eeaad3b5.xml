@@ -1,0 +1,392 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>081f61199357120064f572edb67ffb8b</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.RequestedAllocation&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;RequestedAllocation&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var RequestedAllocation = Class.create();
+RequestedAllocation.prototype = {
+	initialize: function(gr) {
+		this.gr = gr;
+		this.resourceManagementApi = new SNC.ResourceManagementAPI();
+	},
+	
+	doesNotOverlap: function(dateRange) {
+		return this.dateRange().doesNotOverlap(dateRange);
+	},
+	//to be deprecated
+	getCostForDateRange: function(dateRange) {
+		var hoursInDateRange = this._requestedHoursInDateRange(dateRange.start, dateRange.end);
+		var hourlyRate = this._getHourlyRate(dateRange.start);
+		var cost = hourlyRate * hoursInDateRange;
+		return cost;
+	},
+	
+	dateRange: function() {
+		if (gs.nil(this._dateRange)) {
+			var allocationStart = new GlideDate();
+			allocationStart.setValue(this.gr.getValue('start_date'));
+			var allocationEnd = new GlideDate();
+			allocationEnd.setValue(this.gr.getValue('end_date'));
+			this._dateRange = new RMDateRange(allocationStart, allocationEnd);
+		}
+		return this._dateRange;
+	},	
+	
+	updateRequestedCost: function(workflow, currencyCode) {
+		var requestedCost = ResourceManagementUtils.rollUpFromTableByFields('requested_allocation_daily', ['cost'], this.gr);
+		this.gr.requested_cost = currencyCode + ';' + requestedCost['cost'];
+		if (!JSUtil.nil(workflow) &amp;&amp; !workflow)
+			this.gr.setWorkflow(false);
+		this.gr.update();
+	},
+	
+	calculateAndSetEstimatedCost: function(currencyCode) {
+		if(!currencyCode)
+			currencyCode = this.gr.requested_cost.getReferenceCurrencyCode();
+        if (this.gr.requested_hours == 0) {
+            this.gr.requested_cost = currencyCode + ';' + 0;
+            return;
+        }
+        var cost = this._getCost();
+        this.gr.requested_cost = currencyCode + ';' + cost;
+    },
+	
+	calculateAndSetManDaysAndRequestedHoursFromFte: function() {
+		var requestedHours = this._fteToHours(this.gr.fte);
+		this.gr.requested_hours = ResourceManagementUtils.roundOffBasedOnCalendarEventProperty(requestedHours);
+		this.gr.man_days = this._hoursToManDays(requestedHours);
+	},
+
+	calculateAndSetFteAndRequestedHoursFromManDays: function() {
+		var requestedHours = this._manDaysToHours(this.gr.man_days);
+		this.gr.requested_hours = ResourceManagementUtils.roundOffBasedOnCalendarEventProperty(requestedHours);
+		this.gr.fte = this._hoursToFte(requestedHours);
+	},
+	
+	calculateAndSetManDaysAndFteFromRequestedHours: function() {
+		this.gr.requested_hours = ResourceManagementUtils.roundOffBasedOnCalendarEventProperty(this.gr.requested_hours);
+		this.gr.man_days = this._hoursToManDays(this.gr.requested_hours);
+		this.gr.fte = this._hoursToFte(this.gr.requested_hours);
+	},
+	
+	rollupFromRequestedDailies: function(currencyCode) {
+		var requestedHours = this._calculateRequestedHoursFromDailies();
+		this.gr.requested_hours = requestedHours;
+		this.calculateAndSetManDaysAndFteFromRequestedHours();
+		this.calculateAndSetEstimatedCost(currencyCode);
+	},
+	
+	_getCost: function() {
+        var total = 0;
+        var allocations = new GlideAggregate('requested_allocation_daily');
+        allocations.addQuery('requested_allocation', this.gr.getValue('sys_id'));
+        allocations.addAggregate('SUM', 'cost');
+		allocations.setGroup(false);
+        allocations.query();
+        if(allocations.next()) {
+            var sum = parseFloat(allocations.getAggregate('SUM', 'cost'));
+            if (JSUtil.notNil(sum) &amp;&amp; !isNaN(sum))
+				total = sum;
+        }
+        return total;
+    },
+	
+	_calculateRequestedHoursFromDailies: function() {
+		var ga = new GlideAggregate('requested_allocation_daily');
+		ga.addQuery('requested_allocation', this.gr.getValue('sys_id'));
+		ga.addAggregate('SUM', 'hours');
+		ga.setGroup(false);
+		ga.query();
+
+		var allocatedHours = 0;
+		while(ga.next()){
+			if (JSUtil.notNil(ga.getAggregate('SUM', 'hours')))
+				allocatedHours = parseFloat(ga.getAggregate('SUM', 'hours'));
+		}
+		return allocatedHours;
+	},
+	
+	_fteToHours: function(fte) {
+		var averageDailyFte = this._resourceAverageDailyFte();
+		var workingDays = this._getWorkingDays();
+		var requestedHours = averageDailyFte * workingDays[0] * fte;
+		return requestedHours;
+	},
+	
+	_manDaysToHours: function(manDays) {
+		var averageDailyFte = this._resourceAverageDailyFte();
+		var requestedHours = averageDailyFte * manDays;
+		return requestedHours;
+	},
+	
+	_hoursToFte: function(hours) {
+		var fte = 0;
+		if(hours &gt; 0){
+		var averageDailyFte = this._resourceAverageDailyFte();
+		var workingDays = this._getWorkingDays();
+		if (workingDays &gt; 0 &amp;&amp; averageDailyFte &gt; 0)
+			fte = hours/(averageDailyFte * workingDays[0]);
+		}
+		return fte;
+	},
+
+	_hoursToManDays: function(hours) {
+		var manDays = 0;
+		if(hours &gt; 0){
+			var averageDailyFte = this._resourceAverageDailyFte();
+			if (averageDailyFte &gt; 0)
+				manDays = hours/averageDailyFte;
+		}
+		return manDays;
+	},
+	
+	_getWorkingDays: function() {
+		var scheduledHours = this._getScheduledHours();
+		var allocationDateRange = [new RMDateRange(this.gr.start_date.getGlideObject(), this.gr.end_date.getGlideObject())];
+		var rmAggregator = new RMHoursAggregator();
+		var workingDays = rmAggregator.calculateWorkingDaysByDateRange(allocationDateRange, scheduledHours);
+		return workingDays;
+	},
+	
+	calculateAndSetRequestedHoursFromPercentCapacity: function() {
+		var capacity = this._getCapacity();
+		var requestedHours = ResourceManagementUtils.roundOffBasedOnCalendarEventProperty(this.gr.percent_capacity * capacity/100);
+		this.gr.requested_hours = requestedHours;
+	},
+	
+	calculateAndSetPercentCapacityFromRequestedHours: function() {
+		var capacity = this._getCapacity();
+		var percentCapacity = 0;
+		var roundedRequestedHours = ResourceManagementUtils.roundOffBasedOnCalendarEventProperty(this.gr.getValue('requested_hours'));
+		this.gr.setValue('requested_hours', roundedRequestedHours);
+		if (capacity &gt; 0)
+			percentCapacity = (Number(this.gr.getValue('requested_hours'))/capacity) * 100;
+		this.gr.percent_capacity = percentCapacity;
+	},
+	
+	_getCapacity: function() {
+		var rmResource;
+		var planRecord = this._getPlanRecord();
+		if (this._isUserPlan())
+			rmResource = new ResourceManagementUser(planRecord.getValue('user_resource'));
+		else {
+			rmResource = new ResourceManagementGroup(planRecord.getValue('group_resource'));
+			var allocationEngine = new ResourceAllocationEngine(planRecord);
+			var users = allocationEngine.findUsersToAllocate();
+			if (users.length == 0) {
+				gs.addErrorMessage(gs.getMessage('No users found to allocate for the resource plan'));
+				return false;
+			}
+			rmResource.setUsersFilter(users);
+		}
+        var planDateRange = [new RMDateRange(this.gr.start_date.getGlideObject(), this.gr.end_date.getGlideObject())];
+		rmResource.setLookupRanges(planDateRange);
+		var capacity = rmResource.getCapacity()[0];
+		return capacity;
+	},
+	//to be deprecated
+	_requestedHoursInDateRange: function(startDate, endDate) {
+		var allocator = RMAllocatorFactory.createFromAllocation(this.gr);
+		var hoursToAllocatePerDay = allocator.hoursToAllocateByDay();
+		
+		var lookupDateRange = new RMDateRange(startDate.getDate(), endDate.getDate());
+		var allocationDateRange = this.dateRange();
+		
+		var latestStart = lookupDateRange.start;
+		var earliestEnd = lookupDateRange.end;
+		if(allocationDateRange.startsAfter(lookupDateRange.start))
+			latestStart = allocationDateRange.start;
+		if(allocationDateRange.endsBefore(lookupDateRange.end))
+			earliestEnd = allocationDateRange.end;
+		
+		var dateRangesOverlapStart = GlideDateTime.subtract(allocationDateRange.start, latestStart).getDayPart();
+		var dateRangesOverlapEnd = GlideDateTime.subtract(allocationDateRange.start, earliestEnd).getDayPart();
+		var totalRequestedHours = 0;
+		
+		for (var i = dateRangesOverlapStart; i &lt;= dateRangesOverlapEnd; ++i) {
+			totalRequestedHours += hoursToAllocatePerDay[i];
+		}
+		return totalRequestedHours;		
+	},
+	
+	_getScheduleId: function() {
+		if (JSUtil.nil(this._scheduleId)) {
+			var resource = this._getPlanResource();
+			if (resource.isValidField('schedule') &amp;&amp; !resource.schedule.nil())
+				this._scheduleId = resource.getValue('schedule');
+			else
+				this._scheduleId = ResourceManagementUtils.getRelevantSchedule(this._getPlanRecord());
+		}
+		return this._scheduleId;
+	},
+	
+	_getTimeZone: function() {
+		if (JSUtil.nil(this._timeZone)) {
+			var resource = this._getPlanResource();
+			if (resource.isValidField('time_zone') &amp;&amp; !resource.time_zone.nil())
+				this._timeZone = resource.time_zone;
+			else
+				this._timeZone = gs.getSession().getTimeZoneName();
+		}
+		return this._timeZone;
+	},
+	
+	_getPlanResource: function() {
+		if (JSUtil.nil(this._planResource)) {
+			var resourcePlan = this._getPlanRecord();
+			var userResourcePlan = resourcePlan.getValue('resource_type') == 'user';
+			if (userResourcePlan)
+				this._planResource = resourcePlan.user_resource.getRefRecord();
+			else
+				this._planResource = resourcePlan.group_resource.getRefRecord();
+		}
+		return this._planResource;
+	},
+	
+	_getPlanRecord: function() {
+		if (JSUtil.nil(this._planRecord))
+			this._planRecord = this.gr.resource_plan.getRefRecord();
+		
+		return this._planRecord;
+	},
+	//to be deprecated
+	_getHourlyRate: function() {
+		if (JSUtil.nil(this._hourlyRate)) {
+			var resourcePlan = this._getPlanRecord();
+			var rmRates = new RMRates();
+			this._hourlyRate = rmRates.getPlannedHourlyRateForPlan(resourcePlan, this.gr.start_date);
+		}
+		return this._hourlyRate;
+	},
+	
+	_resourceAverageDailyFte: function() {
+		if (JSUtil.nil(this._averageDailyFte)) {
+			var averageDailyFte = this._getPlanResource().average_daily_fte;
+
+			if(gs.nil(averageDailyFte)){
+				var util = new ResourceManagementProperties();
+				averageDailyFte = util.getAverageDailyFTE();
+			}
+			
+			this._averageDailyFte = averageDailyFte;
+		}
+		return this._averageDailyFte;
+	},
+	
+	_isUserPlan: function() {
+		var planRecord = this._getPlanRecord();
+		return planRecord.getValue('resource_type') == 'user';
+	},
+	
+	_getScheduledHours: function() {
+		var scheduledHoursPerDay;
+        if(this._isUserPlan()) {
+			var dateRange = new RMDateRange(this.gr.start_date.getGlideObject(), this.gr.end_date.getGlideObject());
+			var rmUser = new ResourceManagementUser(this._getPlanRecord().getValue('user_resource'));
+			rmUser.setLookupRanges([dateRange]);
+			scheduledHoursPerDay = rmUser.getCapacityPerDay();
+		} else {
+			var scheduleId = this._getScheduleId();
+			var timeZone = this._getTimeZone();
+
+			scheduledHoursPerDay = this.resourceManagementApi.getScheduledHoursByDay(scheduleId, this.gr.getValue('start_date'), this.gr.getValue('end_date'), timeZone);
+		}
+		return scheduledHoursPerDay;
+	},
+	
+	type: 'RequestedAllocation'
+};
+
+RequestedAllocation.create = function(params) {
+	if (params['requested_hours'] &lt; 0)
+		return;
+	var requestedAllocation = new GlideRecord('requested_allocation');
+    requestedAllocation.resource_plan = params['resource_plan'];
+ 	requestedAllocation.setValue('start_date',params['start_date']);
+ 	requestedAllocation.setValue('end_date',params['end_date']);
+	requestedAllocation.sys_domain = params['sys_domain'];
+	requestedAllocation.percent_capacity = params['percent_capacity'];
+	requestedAllocation.man_days = params['man_days'];
+	requestedAllocation.fte = params['fte'];
+	requestedAllocation.requested_hours = params['requested_hours'];
+	if(params['demand_currency'])
+		requestedAllocation.setValue('demand_currency',params['demand_currency']);
+	else if(params['project_currency'])
+		requestedAllocation.setValue('project_currency',params['project_currency']);
+	requestedAllocation.setWorkflow(false);
+    return requestedAllocation.insert();
+};
+
+RequestedAllocation.find = function(rpId){
+		var reqAlloc = new GlideRecord('requested_allocation');
+		reqAlloc.addQuery('resource_plan',rpId);
+		reqAlloc.orderBy('start_date');
+		reqAlloc.query();
+		return reqAlloc;
+};
+
+RequestedAllocation.update = function(params){
+	var requestedAllocation = new GlideRecord('requested_allocation');
+	requestedAllocation.get(params['sys_id']);
+	requestedAllocation.resource_plan = params['resource_plan'];
+    requestedAllocation.start_date = params['start_date'];
+    requestedAllocation.end_date = params['end_date'];
+	requestedAllocation.sys_domain = params['sys_domain'];
+	requestedAllocation.percent_capacity = params['percent_capacity'];
+	requestedAllocation.man_days = params['man_days'];
+	requestedAllocation.fte = params['fte'];
+	requestedAllocation.requested_hours = params['requested_hours'];
+	requestedAllocation.setWorkflow(false);
+	return requestedAllocation.update();
+		
+};
+
+RequestedAllocation.deleteRecords = function(rpIds, encodedQuery, workflow) {
+	if(JSUtil.nil(rpIds))
+		return;
+	var requestedAllocation = new GlideRecord('requested_allocation');
+	requestedAllocation.addQuery('resource_plan', 'IN', rpIds);
+	if(JSUtil.notNil(encodedQuery))
+		requestedAllocation.addEncodedQuery(encodedQuery);
+	if(JSUtil.notNil(workflow) &amp;&amp; !workflow)
+		requestedAllocation.setWorkflow(workflow);
+	requestedAllocation.deleteMultiple();
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2016-05-09 08:32:28&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;081f61199357120064f572edb67ffb8b&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;116&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;RequestedAllocation&lt;/sys_name&gt;
+        &lt;sys_package display_value="Resource Management" source="com.snc.resource_management"&gt;7200da2b47e64210cd4e1ce4316d438e&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_081f61199357120064f572edb67ffb8b&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2021-04-23 07:17:23&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:30</sys_created_on>
+        <sys_id>9550309583b01210c6695855eeaad3b5</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>RequestedAllocation</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_9550309583b01210c6695855eeaad3b5</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:30</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

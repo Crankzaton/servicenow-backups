@@ -1,0 +1,590 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>20e773609f702200598a5bb0657fcf25</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.DemandToProjectCreationHelper&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;DemandToProjectCreationHelper&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var DemandToProjectCreationHelper = Class.create();
+var PLANNED_START_DATE = "start_date",
+    DEMAND_START_DATE = "start_date",
+    PLANNED_END_DATE = "end_date",
+    DUE_DATE = "requested_by",
+    DEMAND_APPROVED_START_DATE = "approved_start_date",
+    DEMAND_APPROVED_END_DATE = "approved_end_date",
+    DURATION = "duration",
+    DURATION_ONE_DAY = "01 00:00:00";
+DemandToProjectCreationHelper.prototype = {
+    initialize: function() {
+
+    },
+
+    _createSyncDemandBaseline: function(demand, project) {
+        var params = {};
+        params.name = demand.getValue('number') + " - " + project.getValue('number');
+        params.task = demand.getUniqueValue();
+        params.description = gs.getMessage('Created before conversion to project');
+        params.plan = "";
+        params.system = true;
+        //Call Sync Demand Baseline API
+        var demandBaseline = new DemandBaseline();
+        demandBaseline.createBaselineForPlan(params);
+    },
+
+    _createAsyncProjectBaseline: function(demand, project) {
+        var description = gs.getMessage('Created after conversion from demand');
+        var baseline = new GlideRecord("planned_task_baseline");
+        baseline.name = project.getValue('number') + " - " + demand.getValue('number');
+        baseline.top_task = project.getUniqueValue();
+        baseline.description = description;
+        baseline.enable_financial_baseline = true;
+        baseline.enable_task_baseline = false;
+        var baseId = baseline.insert();
+        if (baseId) {
+            //calling to schedule job
+            var pmFinancialBaseline = new PmFinancialBaseline();
+            pmFinancialBaseline.createFinancialBaseline(baseId);
+        }
+
+        // Sending demand as demand's investment object is used for project. 
+        // Newly created project starts pointing to demand's investment object in next step of create Project functionality.
+        this._createInvestmentBaseline(demand, baseline.name, description);
+    },
+
+    _createInvestmentBaseline: function(task, baselineName, baselineDescription) {
+        // Adding the baseline to the next experience
+        if (GlidePluginManager.isActive('sn_invst_pln') &amp;&amp; sn_invst_pln.FinancialsCoreInvestmentBaseline.prototype.hasOwnProperty('createBaselineForTaskItems')) {
+            var invstBaselineObj = new sn_invst_pln.FinancialsCoreInvestmentBaseline();
+            invstBaselineObj.createBaselineForTaskItems(task.sys_class_name, task.getUniqueValue(), baselineName, baselineDescription);
+        }
+    },
+
+    createProject: function(sysId, projClassName) {
+        var sys_id = sysId,
+            projId, projNumber, tableDisplayName;
+        var demand = new GlideRecord('dmn_demand');
+        demand.addQuery('sys_id', sys_id);
+        demand.query();
+        var isPmoPluginActive = GlidePluginManager.isActive('com.snc.financial_planning_pmo');
+
+        if (demand.next()) {
+            sys_id = demand.getValue("sys_id");
+            projId = demand.getValue("project");
+            var projectTable = projClassName;
+            if (GlidePluginManager.isActive('com.snc.project_management_v3') &amp;&amp; !projClassName) {
+                projectTable = SNC.PPMConfig.getProjectTable(demand.sys_class_name);
+            }
+            if (sys_id &amp;&amp; !projId) {
+                var demandCurrency = demand.getValue('demand_currency');
+                var project = new GlideRecord(projectTable);
+                project.initialize();
+                var fields = ['short_description', 'description', 'primary_program', 'business_case', 'sys_domain', 'investment_class', 'investment_type', 'risk_of_performing', 'risk_of_not_performing', 'enablers', 'barriers', 'in_scope', 'out_of_scope', 'assumptions', 'goals', 'primary_goal', 'strategic_objectives', 'business_unit', 'department', 'impacted_business_units', 'business_applications', 'business_capabilities',
+                    'cmdb_ci', 'company', 'priority', 'urgency', 'impact', 'rate_model', 'project_manager', 'project_currency', 'approved_start_date', 'approved_end_date', 'calculation_type'
+                ];
+
+                for (var index in fields) {
+                    var field = fields[index];
+                    if (project.isValidField(field)) {
+                        if (field === 'approved_start_date' || field === 'approved_end_date') {
+                            this._updateApprovedAndPlannedDates(project, demand, field);
+                        } else
+                            project.setValue(field, demand.getValue(field));
+                    }
+                }
+
+                var moreFields = {};
+                var extensionPointImpls = new GlideScriptedExtensionPoint().getExtensions('global.DemandConversionFieldMap');
+                if (extensionPointImpls) {
+                    for (var i = 0; i &lt; extensionPointImpls.length; i++) {
+                        var impl = extensionPointImpls[i];
+                        impl.process(moreFields);
+                    }
+                }
+				var projectFields = moreFields['pm_project'] || {}; // if fields are different for teamspaces,create a entry for resp. tsp table
+                for (var targetField in projectFields) {
+                    if (projectFields.hasOwnProperty(targetField)) { // This check ensures that you're only looping over the object's own properties
+                        var sourceField = projectFields[targetField];
+                        if (project.isValidField(targetField)) {
+                            project.setValue(targetField, demand.getValue(sourceField));
+                        }
+                    }
+                }
+
+                if (GlidePluginManager.isActive('com.snc.ppm_multicurrency') &amp;&amp; JSUtil.nil(demand.getValue('project_currency'))) {
+                    project.setValue("project_currency", new SNC.FMCurrency().getGlobalCurrencyCode());
+                    demand.project_currency = new SNC.FMCurrency().getGlobalCurrencyCode();
+                }
+                project.setValue("primary_portfolio", demand.getValue("portfolio"));
+                project.setValue("demand", sys_id);
+                var benefit = demand.financial_benefit;
+                if (JSUtil.notNil(benefit) &amp;&amp; JSUtil.notNil(benefit.getCurrencyValue())) {
+                    project.benefits = benefit.getCurrencyCode() + ';' + parseFloat(benefit.getCurrencyValue());
+                }
+
+                if (JSUtil.notNil(demand.getValue('model_id')))
+                    project.model_id = demand.model_id;
+                if (JSUtil.notNil(demand.getValue('software_model')))
+                    project.software_model = demand.software_model;
+
+                if (isPmoPluginActive) {
+                    var riskDerivationFunction = ScoreFactory.riskDerivationFunction();
+                    project.setValue('risk', riskDerivationFunction(demand.score_risk));
+                }
+                var resp = this._setProjectDatesAndDurationFromDemand(project, demand, projectTable);
+                if (resp.status == 'error')
+                    return {
+                        'sysId': null,
+                        'number': '',
+                        'label': 'Project',
+                        'error': resp.message
+                    };
+
+                if (new GlidePluginManager().isActive('com.snc.apm'))
+                    project.setValue("apm_idea_action", demand.getValue("apm_idea_action"));
+
+                projId = project.insert();
+                if (JSUtil.nil(projId)) {
+                    var allErrorMessages = j2js(gs.getErrorMessages());
+                    if (JSUtil.notNil(allErrorMessages) &amp;&amp; allErrorMessages.length &gt; 0)
+                        return {
+                            'sys_id': projId,
+                            'number': '',
+                            'label': 'Project',
+                            'error': allErrorMessages[0]
+                        };
+                    else
+                        return {
+                            'sys_id': projId,
+                            'number': '',
+                            'label': 'Project'
+                        };
+                }
+
+                if (isPmoPluginActive) {
+                    try {
+                        this._createSyncDemandBaseline(demand, project);
+                    } catch (e) {
+                        PMDebug.log("Could not create demand baseline." + JSON.stringify(e));
+                    }
+                }
+
+                GlideSysAttachment.copy(demand.sys_class_name, sys_id, projectTable, projId);
+                projNumber = project.getValue('number');
+                tableDisplayName = project.getClassDisplayValue();
+
+                if (JSUtil.nil(demand.related_records))
+                    demand.related_records = projId;
+                else
+                    demand.related_records = demand.related_records + "," + projId;
+                demand.project = projId;
+                demand.state = (demand.close_demand == 'on_creating_project') ? '9' : '8';
+                demand.stage = 'project';
+                demand.update();
+
+                var projectDomain = project.sys_domain;
+                var req = new GlideRecord("dmn_requirement");
+                req.addQuery("parent", sys_id);
+                req.query();
+                while (req.next()) {
+                    var sourceId = req.getUniqueValue();
+                    req.parent = projId;
+                    req.sys_domain = projectDomain;
+                    var newNumber = new NumberManager('dmn_requirement');
+                    req.number = newNumber.getNextObjNumberPadded();
+                    var reqId = req.insert();
+                    GlideSysAttachment.copy('dmn_requirement', sourceId, 'dmn_requirement', reqId);
+                    gs.log("Requirement created for Project " + project.number);
+                }
+
+                if (isPmoPluginActive) {
+                    this._updateFinancialRecords(sys_id, projId);
+                    var budgetPlanner = new ITFMBudgetPlanner();
+                    budgetPlanner.updateDemandBudgetKeysToProject(demand, projId);
+                    this._copyFinancialFieldsFromDemandToProject(demand, projId, projectTable);
+                }
+
+                var risk = new GlideRecord("risk");
+                risk.addQuery("task", sys_id);
+                risk.query();
+                while (risk.next()) {
+                    if (!risk.original_task)
+                        risk.original_task = sys_id;
+                    risk.task = projId;
+                    if (new GlidePluginManager().isActive('com.snc.program_management'))
+                        risk.top_task = projId;
+                    risk.sys_domain = projectDomain;
+                    risk.update();
+                }
+
+                var issue = new GlideRecord("issue");
+                issue.addQuery("parent", sys_id);
+                issue.query();
+                while (issue.next()) {
+                    if (!issue.original_parent)
+                        issue.original_parent = sys_id;
+                    issue.parent = projId;
+                    if (new GlidePluginManager().isActive('com.snc.program_management'))
+                        issue.top_task = projId;
+                    issue.sys_domain = projectDomain;
+                    issue.update();
+                }
+
+                var dec = new GlideRecord("dmn_decision");
+                dec.addQuery("parent", sys_id);
+                dec.query();
+                while (dec.next()) {
+                    if (!dec.original_parent)
+                        dec.original_parent = sys_id;
+                    dec.parent = projId;
+                    dec.sys_domain = projectDomain;
+                    dec.update();
+                }
+
+                var projectAction = new GlideRecord("project_action");
+                projectAction.addQuery("parent", sys_id);
+                projectAction.query();
+                while (projectAction.next()) {
+                    if (!projectAction.original_parent)
+                        projectAction.original_parent = sys_id;
+                    projectAction.parent = projId;
+                    projectAction.sys_domain = projectDomain;
+                    projectAction.update();
+                }
+
+                var pcr = new GlideRecord("project_change_request");
+                pcr.addQuery("parent", sys_id);
+                pcr.query();
+                while (pcr.next()) {
+                    if (!pcr.original_parent)
+                        pcr.original_parent = sys_id;
+                    pcr.parent = projId;
+                    pcr.sys_domain = projectDomain;
+                    pcr.update();
+                }
+
+                //RIDAC_m2m table records are updated  with project
+
+                var ridac = new GlideRecord('ridac_m2m');
+                ridac.addQuery('from_task', sys_id).addOrCondition('to_task', sys_id);
+                ridac.query();
+                while (ridac.next()) {
+                    if (ridac.getValue('from_task') == sys_id)
+                        ridac.from_task = projId;
+                    if (ridac.getValue('to_task') == sys_id)
+                        ridac.to_task = projId;
+                    ridac.setWorkflow(false);
+                    ridac.update();
+                }
+
+                //Copy stories on Demand to Project
+                var pluginManager = new GlidePluginManager();
+                if (pluginManager.isActive('com.snc.sdlc.agile.2.0') &amp;&amp; pluginManager.isActive('com.snc.project_portfolio_suite')) {
+                    var projectAgileApi = new ProjectWorkbenchAgile2Apis();
+                    projectAgileApi.copyStoriesFromDemandtoProject(sys_id, projId);
+                }
+
+                // Risk, Size and Value are copied over from demand
+                project = new GlideRecord(projectTable);
+                if (project.get(projId)) {
+                    project.score_risk = demand.getValue("score_risk");
+                    project.score_size = demand.getValue("score_size");
+                    project.score_value = demand.getValue("score_value");
+                    project.score = demand.getValue('score');
+                    project.setWorkflow(false);
+                    project.update();
+                    project = new GlideRecord(projectTable);
+                    project.get(projId);
+                }
+
+                //Delete stakeholders from project added by BR
+                if (pluginManager.isActive('com.snc.project_portfolio_suite')) {
+                    var stakeHolderRegister = new StakeHolderRegister('pm_m2m_project_stakeholder', 'project');
+                    stakeHolderRegister.deleteAllStakeHoldersInM2M(projId);
+
+                    //Copy stakeholders from demand to project
+                    var dmn_m2mGr = new GlideRecord('dmn_m2m_demand_stakeholder');
+                    dmn_m2mGr.addQuery('demand', sysId);
+                    dmn_m2mGr.query();
+
+                    while (dmn_m2mGr.next()) {
+                        stakeHolderRegister.copyStakeHoldersFromDemandToProject(projId, dmn_m2mGr);
+                    }
+                }
+
+                if (pluginManager.isActive('com.snc.goal_framework')) {
+
+                    //Copy secondary goals from demand to project
+                    var dmn_gf_m2mGr = new GlideRecord('sn_gf_goal_m2m_relationship');
+                    dmn_gf_m2mGr.addQuery('demand', sysId);
+                    dmn_gf_m2mGr.addQuery('is_primary_goal', false);
+                    dmn_gf_m2mGr.query();
+
+                    while (dmn_gf_m2mGr.next()) {
+                        var dmn_gf_m2m_prjGr = new GlideRecord('sn_gf_goal_m2m_relationship');
+                        dmn_gf_m2m_prjGr.initialize();
+                        dmn_gf_m2m_prjGr.setValue('goal', dmn_gf_m2mGr.getValue('goal'));
+                        dmn_gf_m2m_prjGr.setValue('project', projId);
+                        dmn_gf_m2m_prjGr.setValue('is_primary_goal', false);
+                        dmn_gf_m2m_prjGr.insert();
+                    }
+                }
+
+                //after all calculations
+                if (isPmoPluginActive) {
+                    try {
+                        project = new GlideRecord(projectTable);
+                        if (project.get(projId)) {
+                            this._createAsyncProjectBaseline(demand, project);
+                        }
+                    } catch (e) {
+                        PMDebug.log("Could not create demand baseline." + JSON.stringify(e));
+                    }
+                }
+
+                if (GlidePluginManager.isActive('com.snc.ppm_multicurrency')) {
+                    project = new GlideRecord(projectTable);
+                    if (project.get(projId)) {
+                        new ProjectCurrencyUtil().calculateProjectCurrencyFieldsOnConvertedProject(project, demandCurrency, demand.getValue("sys_id"));
+                    }
+                }
+            }
+        }
+        return {
+            'sys_id': projId,
+            'number': projNumber,
+            'label': tableDisplayName
+        };
+    },
+
+    _setProjectDatesAndDurationFromDemand: function(project, demand, projectTable) {
+        var defaultProjectScheduleId = '7aa3e10c8f70010040f82ab2f0f9234d';
+        var scheduleId = SNC.PPMConfig.getProperty('com.snc.project.default_schedule', projectTable, defaultProjectScheduleId);
+        var util = new ProjectTaskManagerUtil();
+        var projectStartDateTime = this._getDemandStartDate(demand, project, util, scheduleId);
+        project.setValue(PLANNED_START_DATE, projectStartDateTime);
+
+        PPMDebug.log("DemandToProjectCreationHelper: projectStartDateTime -&gt; " + projectStartDateTime.getDisplayValueInternal());
+        var isDueDateBeforeCurrentDate = this._endDateBeforeCurrentDate(demand, project, util, scheduleId);
+        var resp = this._getDemandDuration(demand, project, util, scheduleId, isDueDateBeforeCurrentDate);
+        if (resp.status != 'success') {
+            return resp;
+        }
+
+        project.setDisplayValue(DURATION, resp.duration);
+
+        resp = util.RecalculateEndDateFromAbsoluteDurationPerScheduleInternal(projectStartDateTime.getValue(), resp.duration, scheduleId);
+
+        resp = new JSON().decode(resp);
+        if (resp.status == 'success') {
+            project.setDisplayValue(PLANNED_END_DATE, resp.date);
+            PPMDebug.log("DemandToProjectCreationHelper: projectEndDateTime -&gt; " + resp.date);
+        }
+        return resp;
+    },
+
+    _endDateBeforeCurrentDate: function(demand, project, util, scheduleId) {
+        var result = false;
+        if ((gs.nil(demand.getValue(DEMAND_START_DATE))) &amp;&amp; !(gs.nil(demand.getValue(DUE_DATE)))) {
+            var date = new GlideDateTime();
+            var startDate = util.getStartDateInternalFromSchedule(scheduleId, date.getValue());
+            var currentDate = new GlideDateTime();
+            currentDate.setValue(startDate);
+            var enddate = new GlideDateTime(demand.getValue(DUE_DATE));
+            result = enddate.before(currentDate);
+        }
+        return result;
+    },
+
+    _getDemandDuration: function(demand, project, util, scheduleId, isDueDateBeforeCurrentDate) {
+        if (gs.nil(demand.getValue(DUE_DATE)) &amp;&amp; gs.nil(demand.getValue(DEMAND_APPROVED_END_DATE)) || isDueDateBeforeCurrentDate) {
+            return {
+                status: 'success',
+                duration: DURATION_ONE_DAY
+            };
+        }
+        var demandEnd = new GlideDateTime();
+        if (!gs.nil(demand.getValue(DUE_DATE)))
+            demandEnd = this.getGlideDateTime(demand.getValue(DUE_DATE), demand.getDisplayValue(DUE_DATE), true);
+        else if (!gs.nil(demand.getValue(DEMAND_APPROVED_END_DATE)))
+            demandEnd = this.getGlideDateTime(demand.getValue(DEMAND_APPROVED_END_DATE), demand.getDisplayValue(DEMAND_APPROVED_END_DATE), true);
+        var resp = util.RecalculateDurationFromEndDatePerScheduleInternal(project.getValue(PLANNED_START_DATE), demandEnd, scheduleId);
+
+        return new JSON().decode(resp);
+    },
+
+    _getDemandStartDate: function(demand, projForDefaultValue, util, scheduleId) {
+        var demandStart = new GlideDateTime();
+        if (!gs.nil(demand.getValue(DEMAND_START_DATE))) {
+            demandStart = this.getGlideDateTime(demand.getValue(DEMAND_START_DATE), demand.getDisplayValue(DEMAND_START_DATE), false);
+        } else if (!gs.nil(demand.getValue(DEMAND_APPROVED_START_DATE))) {
+            demandStart = this.getGlideDateTime(demand.getValue(DEMAND_APPROVED_START_DATE), demand.getDisplayValue(DEMAND_APPROVED_START_DATE), false);
+        }
+        var startDate = util.getStartDateInternalFromSchedule(scheduleId, demandStart.getValue());
+        var startGlideDateTime = new GlideDateTime();
+        startGlideDateTime.setValue(startDate);
+        return startGlideDateTime;
+    },
+
+    getGlideDateTime: function(date, displayDate, endTime) {
+        PPMDebug.log("DemandToProjectCreationHelper: getGlideDateTime - date -&gt; " + date + " | " + displayDate);
+        var dateTime = new GlideDateTime();
+        if (endTime) {
+            dateTime.setDisplayValueInternal(date + " 23:59:59");
+        } else {
+            dateTime.setDisplayValueInternal(date + " 00:00:00");
+        }
+        PPMDebug.log("DemandToProjectCreationHelper: getGlideDateTime - dateTime -&gt; " + dateTime.getValue() + " | " + dateTime.getDisplayValueInternal());
+        return dateTime;
+    },
+
+    _updateFinancialRecords: function(demandId, projectId) {
+        var project = new GlideRecord('pm_project');
+        project.get(projectId);
+
+        var costPlan = new GlideRecord("cost_plan");
+        costPlan.addQuery("task", demandId);
+        costPlan.setValue('task', projectId);
+        costPlan.setValue('top_task', projectId);
+        costPlan.setValue('sys_domain', project.sys_domain);
+        costPlan.setWorkflow(false);
+        costPlan.updateMultiple();
+
+        var costBreakdowns = new GlideRecord("cost_plan_breakdown");
+        costBreakdowns.addQuery("task", demandId);
+        costBreakdowns.setValue('task', projectId);
+        costBreakdowns.setValue('sys_domain', project.sys_domain);
+        costBreakdowns.setWorkflow(false);
+        costBreakdowns.updateMultiple();
+
+        var fundingRecs = new GlideRecord("project_funding");
+        fundingRecs.addQuery("task", demandId);
+        fundingRecs.setValue('task', projectId);
+        fundingRecs.setValue('sys_domain', project.sys_domain);
+        fundingRecs.setWorkflow(false);
+        fundingRecs.updateMultiple();
+
+        this.updateBenefitPlans(demandId, projectId);
+
+        //Update estimated and budget costs
+        new PlannedTaskEntityUpdater().updatePlannedTaskEstimatedCost(project);
+        new PPMTaskEntityUpdater().updateBudgetCost(project);
+    },
+
+    _copyFinancialFieldsFromDemandToProject: function(demand, projectId, projectTable) {
+        var project = new GlideRecord(projectTable);
+        if (project.get(projectId)) {
+            project.discount_rate = demand.getValue("discount_rate");
+            project.npv_value = demand.npv_value.getCurrencyString();
+            project.irr_value = demand.getValue("irr_value");
+            project.capex_cost = demand.capital_outlay.getCurrencyString();
+            project.opex_cost = demand.operational_outlay.getCurrencyString();
+            project.cost = demand.total_costs.getCurrencyString();
+            project.update();
+        }
+    },
+
+    _updateApprovedAndPlannedDates: function(project, demand, field) {
+        if (field === 'approved_start_date') {
+            if (!gs.nil(demand.getValue(DEMAND_APPROVED_START_DATE))) {
+                var demandApprovedStart = this.getGlideDateTime(demand.getValue(DEMAND_APPROVED_START_DATE), demand.getDisplayValue(DEMAND_APPROVED_START_DATE), false);
+                project.setValue(field, demandApprovedStart);
+            } else if (!gs.nil(demand.getValue(DEMAND_START_DATE))) {
+                var demandApprovedStart = this.getGlideDateTime(demand.getValue(DEMAND_START_DATE), demand.getDisplayValue(DEMAND_START_DATE), false);
+                project.setValue(field, demandApprovedStart);
+            }
+        } else if (field === 'approved_end_date') {
+            if (!gs.nil(demand.getValue(DEMAND_APPROVED_START_DATE))) {
+                var demandApprovedEndDate = this.getGlideDateTime(demand.getValue(DEMAND_APPROVED_END_DATE), demand.getDisplayValue(DEMAND_APPROVED_END_DATE), true);
+                project.setValue(field, demandApprovedEndDate);
+            } else if (!gs.nil(demand.getValue(DEMAND_START_DATE))) {
+                var demandApprovedEndDate = this.getGlideDateTime(demand.getValue(DUE_DATE), demand.getDisplayValue(DUE_DATE), true);
+                project.setValue(field, demandApprovedEndDate);
+            }
+        }
+    },
+
+    updateBenefitPlans: function(demandId, projectId) {
+        gs.print("Into updateBenefitPlans -&gt; " + demandId + " | " + projectId);
+        var project = new GlideRecord('pm_project');
+        project.get(projectId);
+
+        var benefitPlan = new GlideRecord("benefit_plan");
+        benefitPlan.addQuery("task", demandId);
+        benefitPlan.setValue('task', projectId);
+        benefitPlan.setValue('top_task', projectId);
+        benefitPlan.setValue('sys_domain', project.sys_domain);
+        benefitPlan.setWorkflow(false);
+        benefitPlan.updateMultiple();
+
+        var benefitBreakdowns = new GlideRecord("benefit_plan_breakdown");
+        benefitBreakdowns.addQuery("task", demandId);
+        benefitBreakdowns.setValue('task', projectId);
+        benefitBreakdowns.setValue('sys_domain', project.sys_domain);
+        benefitBreakdowns.setWorkflow(false);
+        benefitBreakdowns.updateMultiple();
+
+        var nmBenefitBreakdowns = new GlideRecord("nm_benefit_plan_breakdown");
+        nmBenefitBreakdowns.addQuery("task", demandId);
+        nmBenefitBreakdowns.setValue('task', projectId);
+        nmBenefitBreakdowns.setValue('sys_domain', project.sys_domain);
+        nmBenefitBreakdowns.setWorkflow(false);
+        nmBenefitBreakdowns.updateMultiple();
+
+        this.checkAndResetBenfitPlanOffset(projectId);
+    },
+
+    checkAndResetBenfitPlanOffset: function(projectId) {
+        var gr = new GlideRecord('benefit_plan');
+        gr.addNullQuery('offset');
+        gr.addQuery('task', projectId);
+        gr.addQuery('tracking_type', '!=', 'none');
+        gr.query();
+        while (gr.next()) {
+            var benefitPlan = new BenefitPlan(gr);
+            var offsetValue = benefitPlan.deriveOffsetFromStartFiscalPeriod();
+            if (JSUtil.notNil(offsetValue) &amp;&amp; offsetValue % 1 == 0)
+                gr.offset = offsetValue;
+            benefitPlan.deriveReferenceDateAndUpdate(false);
+            gr.setWorkflow(false);
+            gr.update();
+        }
+    },
+
+    type: 'DemandToProjectCreationHelper'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2016-07-21 00:04:53&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;20e773609f702200598a5bb0657fcf25&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;255&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;DemandToProjectCreationHelper&lt;/sys_name&gt;
+        &lt;sys_package display_value="Demand Management" source="com.snc.demand_management"&gt;82005a2b47e64210cd4e1ce4316d4346&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_20e773609f702200598a5bb0657fcf25&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-03-19 11:57:16&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:56</sys_created_on>
+        <sys_id>c9e03c1983b01210c6695855eeaad372</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>DemandToProjectCreationHelper</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_c9e03c1983b01210c6695855eeaad372</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:56</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

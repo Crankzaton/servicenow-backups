@@ -1,0 +1,254 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>2463f37653e11010bca8ddeeff7b12ca</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.AisGeniusResultUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;AisGeniusResultUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var AisGeniusResultUtil = Class.create();
+AisGeniusResultUtil.prototype = {
+    initialize: function() {},
+
+    createOrUpdateGRAByProfile: function(profileSysId) {
+        if (!profileSysId)
+            return;
+
+        var gr = new GlideRecord('ais_search_profile');
+        if (gr.get(profileSysId)) {
+            var profileGRA = gr.getValue('genius_result_assembly');
+            if (profileGRA &amp;&amp; sn_ml.GeniusSearchSolutionStore.get(profileGRA))
+                this.updateGRA(profileSysId, profileGRA);
+            else {
+                var gra = this.createGRA(profileSysId);
+                if (gra) {
+                    var msg = new sn_ais.AisUtil().updateProfileGeniusResultAssembly(gr.getUniqueValue(), gra);
+                    if (msg) {
+                        gs.error(msg);
+                    }
+                }
+            }
+        }
+    },
+
+    createOrUpdateGRAByConfiguration: function(configurationSysId) {
+        var gr = new GlideRecord('ais_search_profile_ais_genius_result_configuration_m2m');
+        gr.addQuery('genius_result_configuration', configurationSysId);
+        gr.addNotNullQuery('profile');
+        gr.query();
+        while (gr.next())
+            this.createOrUpdateGRAByProfile(gr.getValue('profile'));
+    },
+	
+	updateGRABySolutionName: function(solutionName) {
+		var models = NLUStudioService.getModelGroup(solutionName);
+		var modelSysIds = [];
+		for (var i = 0; i &lt; models.length; i++) {
+			modelSysIds.push(models[i]['id']);
+		}
+		
+		var m2m = new GlideRecord('ais_genius_result_configuration_sys_nlu_model_m2m');
+		m2m.addQuery('nlu_model', 'IN', modelSysIds);
+		m2m.query();
+		while (m2m.next()) {
+			this.createOrUpdateGRAByConfiguration(m2m.getValue('genius_result_configuration'));
+		}
+	},
+
+    // create GRA by calling ML api
+    createGRA: function(profileSysId) {
+        var solutionList = this.getSolutionListByProfile(profileSysId);
+        var sappmJson = this.getSappmJson(solutionList, profileSysId);
+        if (sappmJson) {
+            try {
+                // create a new genius search solution using SAPPM configuration
+                var geniusSearchSolution = new sn_ml.GeniusSearchSolution(sappmJson);
+
+                // Add the solution to the store to have it ready for use
+                return sn_ml.GeniusSearchSolutionStore.add(geniusSearchSolution);
+            } catch (e) {
+                gs.error("Failed to create GRA for profile: " + profileSysId + ", exception: " + e);
+            }
+        }
+
+        return null;
+    },
+
+    // update existing GRA by calling ML api
+    updateGRA: function(profileSysId, gra) {
+        if (!profileSysId || !gra)
+            return;
+
+        var solutionList = this.getSolutionListByProfile(profileSysId);
+        if (!this.shouldUpdateGRA(solutionList, gra))
+            return;
+
+        var sappmJson = this.getSappmJson(solutionList, profileSysId);
+        if (sappmJson) {
+            try {
+                // Create a GeniusSearchSolution with the new SAPPM Json string
+                var geniusSearchSolution = new sn_ml.GeniusSearchSolution(sappmJson);
+
+                // Update the genius assembly solution by calling store update
+                sn_ml.GeniusSearchSolutionStore.update(gra, geniusSearchSolution);
+            } catch (e) {
+                gs.error("Failed to update GRA: " + gra + " for profile: " + profileSysId + ", exception: " + e);
+            }
+        }
+    },
+
+    // check whether update is needed based on solution list
+    shouldUpdateGRA: function(solutionList, gra) {
+        var solutionNameMap = {};
+        for (var i = 0; i &lt; solutionList.length; i++)
+            solutionNameMap[solutionList[i]['name']] = solutionList[i]['name'];
+        try {
+            var graObj = sn_ml.GeniusSearchSolutionStore.get(gra);
+            var config = graObj.getConfig();
+            if (config &amp;&amp; config['mlsolutions'] &amp;&amp; config['mlsolutions'].length != solutionList.length)
+                return true;
+
+            for (var j = 0; j &lt; config['mlsolutions'].length; j++) {
+                var curSolutionNameFromConfig = config['mlsolutions'][j]['solutionName'];
+                if (!solutionNameMap[curSolutionNameFromConfig])
+                    return true;
+            }
+            return false;
+        } catch (e) {}
+
+        return true;
+    },
+
+    // get solution list with label and name for profile
+    getSolutionListByProfile: function(profileSysId) {
+        var configList = [];
+        var gr = new GlideRecord('ais_search_profile_ais_genius_result_configuration_m2m');
+        gr.addQuery('profile', profileSysId);
+        gr.addNotNullQuery('genius_result_configuration');
+        gr.addQuery('genius_result_configuration.active', true);
+        gr.addQuery('genius_result_configuration.trigger_condition', 'intent');
+        gr.query();
+        while (gr.next()) {
+            configList.push(gr.getValue('genius_result_configuration'));
+        }
+
+        var solutionList = [];
+        var solutionNameMap = {};
+        for (var i = 0; i &lt; configList.length; i++) {
+            var m2m = new GlideRecord('ais_genius_result_configuration_sys_nlu_model_m2m');
+            if (!m2m.isValid())
+                return [];
+
+            m2m.addQuery('genius_result_configuration', configList[i]);
+            m2m.addNotNullQuery('nlu_model');
+            m2m.orderByDesc('order');
+            m2m.setLimit(1);
+            m2m.query();
+            if (m2m.next()) {
+                var models = NLUStudioService.getModelGroupById(m2m.getValue('nlu_model'));
+                for (var j = 0; j &lt; models.length; j++) {
+                    var curModel = models[j];
+                    if (!("publishedVersion" in curModel) || curModel.publishedVersion &lt;= 0)
+                        continue;
+
+                    var label = curModel.displayName;
+                    var name = curModel.name;
+                    var language = curModel.language;
+                    if (!language)
+                        language = 'en';
+                    if (name &amp;&amp; !solutionNameMap[name]) {
+                        var mappedMLModelName = name.startsWith('ml_') ? name : 'ml_' + name;
+                        solutionNameMap[name] = mappedMLModelName;
+                        solutionList.push({
+                            'label': label,
+                            'name': mappedMLModelName,
+                            'language': language
+                        });
+                    }
+                }
+            }
+        }
+
+//         // add OOB search model by default since snippet search requires GRA to get encoding 
+//         if (solutionList.length == 0) {
+//             solutionList.push({
+//                 'label': 'Default AI Search Genius Results Model',
+//                 'name': 'ml_x_snc_global_global_6eedb38234bf5010f877396127c8ffee',
+//                 'language': 'en'
+//             });
+//         }
+
+        return solutionList;
+    },
+
+    // return SAPPM json string for GRA creation
+    getSappmJson: function(solutionList, profileSysId) {
+        if (!solutionList || solutionList.length == 0 || !profileSysId)
+            return null;
+
+        var label = 'ais_gra_' + profileSysId;
+        var sappmJson = {
+            "label": label.toString(),
+            "mlsolutions": [],
+            "formatters": [{
+                "name": "pass-thru",
+                "type": "pass-thru",
+                "options": {}
+            }],
+            "options": {}
+        };
+
+        for (var i = 0; i &lt; solutionList.length; i++) {
+            var solutionLabel = solutionList[i]['label'];
+            var solutionName = solutionList[i]['name'];
+            var language = solutionList[i]['language'];
+            sappmJson.mlsolutions.push({
+                "name": solutionLabel.toString(),
+                "solutionName": solutionName.toString(),
+                "options": {},
+                "application": {
+                    "language": language.toString()
+                }
+            });
+        }
+
+        return sappmJson;
+    },
+
+    type: 'AisGeniusResultUtil'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-06-26 03:42:37&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;2463f37653e11010bca8ddeeff7b12ca&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;7&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AisGeniusResultUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="AI Search" source="com.glide.ais"&gt;eb04fc283c31311068bcf327dfe37f93&lt;/sys_package&gt;
+        &lt;sys_policy&gt;protected&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_2463f37653e11010bca8ddeeff7b12ca&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2021-09-21 05:32:40&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:18</sys_created_on>
+        <sys_id>d6f0f05983b01210c6695855eeaad3e9</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AisGeniusResultUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_d6f0f05983b01210c6695855eeaad3e9</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:18</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

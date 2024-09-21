@@ -1,0 +1,1481 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>24a759e30a0a2c3960e024ad3b60d9e8</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.TaskSLAController&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Controller for the TaskSLA task
+- test the SLA conditions, and update the TaskSLA, and related workflows.
+- schedule an asynchronous job if property: com.snc.sla.engine.async == "true" (default true), otherwise complete the work synchronously
+
+// run the TaskSLAController for a GlideRecord, task
+new TaskSLAController(task).run();
+
+// run the TaskSLAController with a given task (or subclass) record sys_id, and subclass name
+new TaskSLAController(task_sys_id, sys_class_name).run();
+
+// optional methods:
+// -- set the task GlideRecord
+taskSLAController.setTaskGR(task);
+// -- get the current task GlideRecord
+var taskGR = taskSLAController.getTaskGR();
+// -- set a special flag, for "replaying" a task (to prevent insertion of fresh breach timers by TaskSLA)
+taskSLAController.setReplaying(true);
+
+// -- get task's associated task_sla records, as a GlideRecord result set
+var taskGRquery = taskSLAController.queryTaskSLAs();
+while (taskGRquery.next())
+   ...
+&lt;/description&gt;
+        &lt;name&gt;TaskSLAController&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var TaskSLAController = Class.create();
+
+TaskSLAController.prototype = {
+
+	// sys_properties
+	SLA_TASK_SLA_CONTROLLER_LOG: 'com.snc.sla.task_sla_controller.log',
+	SLA_TASK_SLA_CONTROLLER_TIMERS: 'com.snc.sla.task_sla_controller.timers',
+	SLA_TASK_SLA_DEFAULT_CONDITIONCLASS: 'com.snc.sla.default_conditionclass',
+	SLA_DATABASE_LOG: 'com.snc.sla.log.destination',
+	SLA_SERVICE_OFFERING: 'com.snc.service.offering.field',
+	SLA_GET_TASK_FROM_DB: 'com.snc.sla.get_task_from_db',
+	SLA_CONDTION_CLASS_CACHING: 'com.snc.sla.condition_class.caching.enabled',
+	SLA_CONDTION_CLASS_CACHING_LIMIT: 'com.snc.sla.condition_class.caching.limit',
+
+	// constants
+	BASE_CONDITIONCLASSNAME: 'SLAConditionBase',
+	RESET_ACTION_CANCEL: 'cancel',
+	RESET_ACTION_COMPLETE: 'complete',
+	DEFAULT_SLA_CONDITION_CLASS_KEY: 'DEFAULT_SLA_CONDITION_CLASS',
+
+	initialize : function(taskGR, taskType, modCount) {
+		this.taskSysId = null;
+		this.taskClass = null;
+		this.taskLatestModCount = -1;
+		this.taskGR = null;
+		this.taskHistoryWalker = null;
+		this.calledFromAsync = false;
+		this.asyncTaskWalked = false;
+		this.asyncModCount = null;
+		this.gScheduleRecordId = null;
+		this.getTaskFromDB = false;
+		this.taskWalked = false;
+
+		this.conditionClassCachingEnabled = gs.getProperty(this.SLA_CONDTION_CLASS_CACHING, 'false') + '' === 'true';
+		this.conditionClassCachingLimit = parseInt(gs.getProperty(this.SLA_CONDTION_CLASS_CACHING_LIMIT, 10));
+		if (isNaN(this.conditionClassCachingLimit) || this.conditionClassCachingLimit &lt; 1)
+			this.conditionClassCachingLimit = 10;
+
+		if (taskGR) {
+			if (!taskType)
+				// normal initialization
+				this.taskGR = taskGR;
+			else {
+				// entry point for Async sys_trigger execution
+				// (taskGR is a sys_id, and taskType is its sys_class)
+				this.taskGR = this._getTask(taskType, taskGR);
+				this.calledFromAsync = true;
+			}
+		}
+
+		// trace, debug, logging
+		this.timers = (gs.getProperty(this.SLA_TASK_SLA_CONTROLLER_TIMERS, 'false') == 'true');
+		this.lu = new GSLog(this.SLA_TASK_SLA_CONTROLLER_LOG, 'TaskSLAController');
+		this.lu.includeTimestamp();
+
+		if (gs.getProperty(this.SLA_DATABASE_LOG, "db") == "node")
+			this.lu.disableDatabaseLogs();
+
+		if (this.lu.atLevel(GSLog.DEBUG))
+			this.lu.logDebug('initialize: for Task ' + (this.taskGR !== null ? this.taskGR.getDisplayValue() : ""));
+
+		this.slaAsyncUtils = new SLAAsyncUtils();
+		this.slaAsyncQueue = new SLAAsyncQueue();
+		this.runningAsync = this.slaAsyncUtils.isAsyncProcessingActive();
+
+		if (this.taskGR !== null) {
+			this.taskClass = this.taskGR.getRecordClassName();
+			this.taskSysId = this.taskGR.getValue('sys_id');
+			this.taskLatestModCount = parseInt(this.taskGR.getValue('sys_mod_count'), 10);
+
+			/* If we're not running asynchronously check if our Task's type is in the system property that forces
+			certain task types to be fetched from the database instead of using "current" */
+			this.getTaskFromDBTables = gs.getProperty(this.SLA_GET_TASK_FROM_DB, '').split(",");
+			if (this.lu.atLevel(GSLog.DEBUG))
+				this.lu.logDebug('initialize: getTaskFromDBTables=' + this.getTaskFromDBTables);
+			this.getTaskFromDB = this.runningAsync === false &amp;&amp; this.getTaskFromDBTables.indexOf(this.taskClass) &gt;= 0;
+			if (this.lu.atLevel(GSLog.DEBUG))
+				this.lu.logDebug('initialize: getTaskFromDB=' + this.getTaskFromDB);
+
+			if (this.getTaskFromDB)
+				this.taskGR = this._getTask(this.taskClass, this.taskSysId);
+
+			if (this.calledFromAsync) {
+				this.asyncModCount = isNaN(modCount) ? this.taskLatestModCount : parseInt(modCount, 10);
+				if (typeof g_schedule_record !== "undefined" &amp;&amp; g_schedule_record.sys_id)
+					this.gScheduleRecordId = g_schedule_record.sys_id;
+			}
+		}
+
+		// SLAConditionClass default override
+		this.SLADefaultConditionClassName = gs.getProperty(this.SLA_TASK_SLA_DEFAULT_CONDITIONCLASS, 'SLAConditionBase');
+		// for TaskSLAreplay
+		this.replayingTask = false;
+		//Default Service Offering field
+		this.serviceOfferingField = gs.getProperty(this.SLA_SERVICE_OFFERING, 'cmdb_ci');
+		this.newSLADefIds = [];
+		if (this.lu.atLevel(GSLog.DEBUG))
+			this.lu.logDebug('newSLADefIds initialized to length=' + this.newSLADefIds.length);
+		this.slalogging = new TaskSLALogging();
+		this.slaContractUtil = new SLAContractUtil();
+		this.slaUtil = new SLAUtil();
+		this.breakdownsPluginActive = GlidePluginManager.isActive("com.snc.sla.breakdowns");
+		this.domainsPluginActive = GlidePluginManager.isActive("com.glide.domain");
+
+		this._slaConditionClassCache = {};
+	},
+
+	// run TaskSLAController once with the task's current state
+	run: function() {
+		if (this.runningAsync) {
+			this._queueAsync();
+
+			if (this.lu.atLevel(GSLog.INFO) &amp;&amp; this.slaAsyncUtils.isSLAAsyncOverride())
+				this.lu.logInfo("run: SLA Async override enabled so update number " + this.taskLatestModCount + " of " + this.taskGR.sys_meta.label + " " +
+								this.taskGR.getDisplayValue() + " will be processed asynchronously");
+
+			return;
+		}
+
+		if (this.slaAsyncQueue.isTaskQueued(this.taskSysId)) {
+			if (this.lu.atLevel(GSLog.INFO))
+				this.lu.logInfo("run: there are unprocessed records in the SLA Async queue for " + this.taskGR.sys_meta.label + " " +
+								this.taskGR.getDisplayValue() + " so this update (" + this.taskLatestModCount + ") will be processed asynchronously");
+			this._queueAsync();
+			return;
+		}
+
+		this.runNow();
+	},
+
+	// run once synchronously, even if the property says otherwise
+	runSync: function() {
+		this.runningAsync = false;
+		this.runNow();
+	},
+
+	// also called when running from asynchronous job
+	runNow: function() {
+		if (this.taskGR === null || !this.taskSysId || !this.taskClass) {
+			this.lu.logWarn('runNow: no Task supplied so TaskSLAController cannot continue');
+			return;
+		}
+
+		var sw;
+		if (this.timers)
+			sw = new GlideStopWatch();
+		if (this.lu.atLevel(GSLog.INFO))
+			this.lu.logInfo('runNow: starting now (sys_updated=' + this.taskGR.sys_updated_on.getDisplayValue() + ')');
+		if (this.lu.atLevel(GSLog.DEBUG)) {
+			this.lu.logDebug('runNow: ' + this.slalogging.getBusinessRuleStackMsg());
+			this.lu.logDebug('runNow: previous and current values\n' + this.slalogging.getRecordContentMsg(previous, '"previous"') + '\n' + this.slalogging.getRecordContentMsg(current, '"current"'));
+		}
+
+		var currentDomain = null;
+		if (this.domainsPluginActive)
+			currentDomain = gs.getSession().getCurrentDomainID();
+
+		try {
+			if (this.calledFromAsync) {
+				this.slaAsyncUtils.setSLAAsyncProcessing(true);
+				if (this.domainsPluginActive &amp;&amp; !this.taskGR.sys_domain.nil())
+					gs.getSession().setDomainID(this.taskGR.getValue("sys_domain"));
+			}
+
+			this._processNewSLAs();
+			this._processExistingSLAs();
+		} catch (e) {
+			if (this.lu.atLevel(GSLog.ERROR)) {
+				var stack = e.getStackTrace();
+				var stackErr = "";
+				for (var i = 0; i &lt; stack.length; i++)
+					stackErr += "\t" + stack[i] + "\n";
+
+				this.lu.logError("runNow: error occurred during SLA processing of task " + this.taskGR.getDisplayValue() + "\n" + e + "\n" + stackErr);
+			}
+		} finally {
+			if (this.calledFromAsync) {
+				this.slaAsyncUtils.setSLAAsyncProcessing(false);
+				if (this.domainsPluginActive)
+					gs.getSession().setDomainID(currentDomain);
+			}
+		}
+
+		if (this.lu.atLevel(GSLog.INFO))
+			this.lu.logInfo('runNow: finished');
+
+		if (this.timers)
+			sw.log('TaskSLAController.runNow complete');
+	},
+
+	setTaskGR: function(taskGR) {
+		this.taskGR = taskGR;
+	},
+
+	getTaskGR: function() {
+		return this.taskGR;
+	},
+
+	setReplaying: function(enable) {
+		this.replayingTask = enable;
+	},
+
+	// Enable Stopwatch timers
+	// (used for profiling performance)
+	setTimers: function(enable) {
+		this.timers = enable;
+	},
+
+	// return GlideRecord result set of task's active task_sla records
+	queryTaskSLAs: function() {
+		var taskSLAgr = new GlideRecord('task_sla');
+		taskSLAgr.addActiveQuery();
+		taskSLAgr.addDomainQuery(this.taskGR);
+		taskSLAgr.addQuery('task', this.taskGR.sys_id);
+		taskSLAgr.orderBy('sla.sys_id');
+		taskSLAgr.query();
+		if (this.lu.atLevel(GSLog.DEBUG))
+			this.lu.logDebug('queryTaskSLAs: #' + taskSLAgr.getRowCount());
+		return taskSLAgr;
+	},
+
+	queryContractSLAs: function() {
+		var contractSLAgr = new GlideRecord('contract_sla');
+		contractSLAgr.addDomainQuery(this.taskGR);
+		var taskSLAJoin = contractSLAgr.addJoinQuery('task_sla', 'sys_id', 'sla');
+		taskSLAJoin.addCondition('task', this.taskGR.sys_id);
+		taskSLAJoin.addCondition('active', true);
+		contractSLAgr.orderBy('sys_id');
+		contractSLAgr.query();
+		if (this.lu.atLevel(GSLog.DEBUG))
+			this.lu.logDebug('queryContractSLAs: #' + contractSLAgr.getRowCount());
+		return contractSLAgr;
+	},
+
+	/////////////////////////////
+
+	// mutex names
+	MUTEX_NEW: 'Process New SLAs Mutex ',
+	MUTEX_UPDATE: 'Process Existing SLAs Mutex ',
+
+	// internal methods
+
+	_queueAsync: function() {
+		var taskSLAGr = this.queryTaskSLAs();
+
+		if (!(new SLACacheManager().hasDefinitionForRecord(this.taskGR)) &amp;&amp; !taskSLAGr.hasNext()) {
+			if (this.lu.atLevel(GSLog.INFO))
+				this.lu.logInfo('_queueAsync: no active SLA definitions or active Task SLAs defined for this Task - ' + this.taskClass + ":" + this.taskSysId);
+			return;
+		}
+
+		this.slaAsyncQueue.queueTask(this.taskGR);
+	},
+
+	_processNewSLAs: function() {
+		if (this.lu.atLevel(GSLog.INFO))
+			this.lu.logInfo('_processNewSLAs');
+
+		if (!(new SLACacheManager().hasDefinitionForRecord(this.taskGR))) {
+			if (this.lu.atLevel(GSLog.INFO))
+				this.lu.logInfo('_processNewSLAs: no active SLA definitions defined for this Task - ' + this.taskClass + ":" + this.taskSysId);
+			return;
+		}
+
+		// if we've been called from a "sys_trigger" record because SLA processing is running asynchronously
+		// then we use HistoryWalker to get the Task record at the current update number so we've got the
+		// "changes" information for each field
+		if (this.calledFromAsync) {
+			var earlyReadGR = this._getSLAsQueryCheckingContracts(); // We need to do this for async and HW with Journal support
+			earlyReadGR.addDomainQuery(this.taskGR);
+			earlyReadGR.addQuery("adv_condition_type", "advanced_journal");
+			earlyReadGR.setLimit(1);
+			earlyReadGR.query();
+
+			this._walkTaskForAsync(earlyReadGR.hasNext());
+		}
+
+		var sw;
+		if (this.timers)
+			sw = new GlideStopWatch();
+
+		var slaGR = this._getSLAsQueryCheckingContracts();
+
+		SelfCleaningMutex.enterCriticalSectionRecordInStats(this.MUTEX_NEW + this.taskGR.sys_id, this.MUTEX_NEW, this, this._processNewSLAs_criticalSection, slaGR);
+		// TODO: optionally attach work-notes
+		if (this.timers)
+			sw.log('TaskSLAController: Finished _processNewSLAs part 1');
+
+		// and active Service Offering SLA definitions
+		// (TODO: merge this contract_sla query with the previous one, to process all of them in one go)
+		if (!this._allowProcessingServiceCommitment())
+			return;
+
+		var socGR = new GlideRecord('service_offering_commitment');
+		if (!socGR.isValid())
+			return;
+
+		var commitmentFieldTest = new GlideRecord('service_commitment');
+		if (!commitmentFieldTest.isValidField("sla"))
+			return;
+
+		if (this.timers)
+			sw = new GlideStopWatch();
+		// (using contract_sla GlideRecord to easily avoid
+		//  those that are currently active and assigned to the task)
+		slaGR.initialize();
+		slaGR.addActiveQuery();
+		slaGR.addQuery('collection', this.taskGR.getRecordClassName());
+		// service_commitment.type='SLA'
+		slaGR.addQuery('JOINcontract_sla.sys_id=service_commitment.sla!type=SLA');
+		// service_offering_commitment.service_offering=cmdb_ci
+		slaGR.addQuery('JOINservice_commitment.sys_id=service_offering_commitment.service_commitment!service_offering=' + this.taskGR.getValue(this.serviceOfferingField));
+
+		SelfCleaningMutex.enterCriticalSectionRecordInStats(this.MUTEX_NEW + this.taskGR.sys_id, this.MUTEX_NEW, this, this._processNewSLAs_criticalSection, slaGR);
+		// TODO: optionally attach more work-notes
+		if (this.timers)
+			sw.log('TaskSLAController: Finished _processNewSLAs part 2');
+	},
+
+	// (called after obtaining SelfCleaningMutex: '&lt;&lt;&lt;--Process New SLAs Mutex ' + this.taskGR.sys_id + '--&gt;&gt;&gt;')
+	// NB. adds to slaGR query, before executing it.
+	_processNewSLAs_criticalSection: function(slaGR) {
+		var newTaskSLA;
+		var newTaskSLAs = [];
+		this.fieldValuesLogged = false;
+		if (this.lu.atLevel(GSLog.INFO))
+			this.lu.logInfo('_processNewSLAs_criticalSection: ' + this.taskGR.sys_id);
+		var sw;
+		if (this.timers)
+			sw = new GlideStopWatch();
+
+		// Log the field values in the Task record
+		if (this.lu.atLevel(GSLog.DEBUG)) {
+			this.lu.logDebug('_processNewSLAs_criticalSection:\n' + this.slalogging.getRecordContentMsg(this.taskGR));
+			this.fieldValuesLogged = true;
+		}
+
+		// skip any active SLAs already (indirectly) attached to this task -- must be done inside of mutex
+		slaGR.addQuery('sys_id', 'NOT IN', this._getSLAsString(this.queryTaskSLAs()));
+		slaGR.addDomainQuery(this.taskGR);
+		slaGR.query();
+		while (slaGR.next()) {
+			var oldLogLevel = this.lu.getLevel();
+			// if enable logging has been checked on the SLA definition up the log level to "debug"
+			if (slaGR.enable_logging) {
+				this.lu.setLevel(GSLog.DEBUG);
+				if (!this.fieldValuesLogged) {
+					this.lu.logDebug('_processNewSLAs_criticalSection:\n' + this.slalogging.getRecordContentMsg(this.taskGR));
+					this.fieldValuesLogged = true;
+				}
+			}
+
+			newTaskSLA = this._checkNewSLA(slaGR);
+			if (newTaskSLA)
+				newTaskSLAs.push(newTaskSLA);
+
+			this.lu.setLevel(oldLogLevel);
+		}
+
+		if (newTaskSLAs.length &gt; 0) {
+			this._adjustPauseTime(newTaskSLAs);
+			for (var i = 0; i &lt; newTaskSLAs.length; i++) {
+				newTaskSLA = newTaskSLAs[i];
+				var taskSLAgr = newTaskSLA.taskSLA.getGlideRecord();
+				if (newTaskSLA.needsAdjusting &amp;&amp; !newTaskSLA.adjusted)
+					newTaskSLA.taskSLA.updateState(TaskSLA.STATE_IN_PROGRESS);
+				// if currently processing asynchronously we need to call breakdown processing as this is not handled by business rule "Process SLA Breakdowns"
+				if (this.calledFromAsync &amp;&amp; this.breakdownsPluginActive &amp;&amp; sn_sla_brkdwn.SLABreakdownProcessor.hasBreakdownDefinitions(taskSLAgr.getValue("sla")))
+					this._processSLABreakdowns(taskSLAgr, null, "insert");
+			}
+		}
+
+		if (this.timers)
+			sw.log('TaskSLAController._processNewSLAs_criticalSection complete');
+	},
+
+	// Gets the SLA definitions to process taking the contracts into account
+	_getSLAsQueryCheckingContracts: function() {
+		var collection = this.taskGR.getRecordClassName();
+		// if contract is not active for this table, we process all SLAs
+		if (this.slaContractUtil.ignoreContract(collection))
+			return this.slaContractUtil.getAllSLAsQuery(collection);
+
+		var contractGR = this.taskGR.contract;
+		// if the task has a contract attached we process the SLAs linked to the contract and, if enabled, the non-contractual SLAs
+
+		function isExtension(baseTable, extensionTable) {
+			var tu = new TableUtils(baseTable);
+			var tabArrLst = tu.getTableExtensions();
+			return tabArrLst.contains(extensionTable);
+		}
+
+		var contractGr = null;
+		var isASTService = false;
+		var isASTContract = false;
+
+		var hasContract = !this.taskGR.contract.nil();
+		if (hasContract) {
+			contractGr = new GlideRecord('ast_contract');
+			contractGr.setWorkflow(false);
+			if (contractGr.get(this.taskGR.getValue('contract'))) {
+				var className = contractGr.getRecordClassName() + "";
+				isASTService = className === "ast_service";
+				isASTContract = className === "ast_contract";
+				if (!isASTService &amp;&amp; !isASTContract) // Check for ast_service extensions
+					isASTService = isExtension("ast_service", className);
+				if (!isASTService &amp;&amp; !isASTContract) // Check for ast_contract extensions not in ast_service tree
+					isASTContract = isExtension("ast_contract", className);
+			} else
+				hasContract = false;
+		}
+
+		var processContract = false;
+		// Original behaviour.  If it has a contract as it's an ast_service (or extension) record, process the contract
+		if (hasContract &amp;&amp; isASTService)
+			processContract = true;
+
+		// New behaviour.  If it's an ast_contract (or extension which isn't in the ast_service branch)
+		// check the attach_sla field on the contract model
+		if (!processContract &amp;&amp; hasContract &amp;&amp; isASTContract) {
+			var contractModelGr = new GlideRecord('cmdb_contract_product_model');
+			contractModelGr.setWorkflow(false);
+
+			if (contractModelGr.get(contractGr.getValue('contract_model')) &amp;&amp; contractModelGr.attach_sla + "" === "true")
+				processContract = true;
+		}
+
+		if (processContract) {
+			var includeNonContractual = this.slaContractUtil.processNonContractualSLAs(contractGR);
+			var slaGR = this.slaContractUtil.getContractualSLAs(contractGR, collection, includeNonContractual);
+			return slaGR;
+		}
+
+		// if the task doesn't have a contract, we process non-contractual (but only if the contract table property doesn't exist to preserve legacy behavior)
+		if (!this.slaContractUtil.hasContractProperty())
+			return this.slaContractUtil.getNonContractualSLAs(collection);
+
+		// if nothing of the above matches, return an empty query
+		var emptySlaGR = new GlideRecord('contract_sla');
+		emptySlaGR.setLimit(0);
+		return emptySlaGR;
+	},
+
+	_allowProcessingServiceCommitment: function() {
+		var collection = this.taskGR.getRecordClassName();
+		// if contract does not allow to process non-contractual SLAs, Service Offering SLAs are not processed either
+		return this.slaContractUtil.ignoreContract(collection)
+		|| (!this.taskGR.contract &amp;&amp; !this.slaContractUtil.hasContractProperty())
+		|| this.slaContractUtil.processNonContractualSLAs(this.taskGR.contract);
+	},
+
+	/*
+	Check the Attach Conditions of the specified contract_sla (or service_offering_commitment) definition
+	If (SLACondition).attach returns true then attach it to this task
+
+	pre-conditions: by this point, we have confirmed that it isn't currently attached to the task,
+	and we have the Mutex for "Process New SLAs Mutex " + this.taskGR.sys_id) to prevent it being added by another TaskSLAController
+ 	*/
+	_checkNewSLA: function(slaGR) {
+		var sw;
+		if (this.timers)
+			sw = new GlideStopWatch();
+		var slac = this._newSLACondition(slaGR, this.taskGR);
+		var startMatches = slac.attach();
+		if (this.lu.atLevel(GSLog.DEBUG))
+			this.lu.logDebug('_checkNewSLA: checking ' + slaGR.name + ', start condition matched=' + startMatches);
+
+		if (!startMatches)
+			return null;
+
+		this.newSLADefIds.push(slaGR.getValue('sys_id'));
+		if (this.lu.atLevel(GSLog.DEBUG))
+			this.lu.logDebug('_checkNewSLA newSLADefIds=[' + this.newSLADefIds.join() + ']');
+
+		// this object will contain properties to indicate if this new Task SLA needs retroactive pause time calculated,
+		// if the adjust pause was succesful and also the TaskSLA object itself
+		var newTaskSLA = {
+			"needsAdjusting": false,
+			"adjusted": false
+		};
+
+		var taskSLA;
+		// Check if this TaskSLA needs retroactive pause calculation...
+		if (this._needsAdjustPause(slaGR)) {
+			/* If retroactive pause calculation is required we need to create a copy of the "contract_sla" record
+			   so we have a copy to pass as an argument when creating the TaskSLA object.
+			   We can't just use "slaGR" as this is changing as we next through it */
+			newTaskSLA.needsAdjusting = true;
+			newTaskSLA.contractSLAgr = this.slaUtil.copyContractSLA(slaGR);
+			taskSLA = new TaskSLA(newTaskSLA.contractSLAgr, this.taskGR, /* deferInsert */ true, {calledFromAsync: this.calledFromAsync});
+			this.slaUtil.setSLAUpdateSourceEngineParameter(taskSLA.getGlideRecord(), this.type);
+		} else {
+			// If there's no retroactive pause calculation we can just go ahead and create the Task SLA
+			taskSLA = new TaskSLA(slaGR, this.taskGR, /* deferInsert */ true, {calledFromAsync: this.calledFromAsync});
+			this.slaUtil.setSLAUpdateSourceEngineParameter(taskSLA.getGlideRecord(), this.type);
+			taskSLA.updateState(TaskSLA.STATE_IN_PROGRESS); // adds task_sla record, initiates model state machine, starts notification workflow
+			if (this.lu.atLevel(GSLog.INFO))
+				this.lu.logInfo('_checkNewSLA: added SLA "' + slaGR.name + '"');
+		}
+
+		// add the TaskSLA object to our exising newTaskSLA object
+		newTaskSLA.taskSLA = taskSLA;
+
+		if (this.timers)
+			sw.log('TaskSLAController: Finished _checkNewSLA');
+
+		return newTaskSLA;
+	},
+
+	_checkNewSLAsFromReset: function(resetSLAs) {
+		this._checkNewSLAsForDefs(resetSLAs);
+	},
+
+	_checkNewSLAsForDefs: function(slaDefIds) {
+		if (!slaDefIds || slaDefIds.length == 0)
+			return null;
+
+		var slaGR = new GlideRecord('contract_sla');
+		slaGR.addActiveQuery();
+		slaGR.addQuery('sys_id', slaDefIds);
+		slaGR.addDomainQuery(this.taskGR);
+		slaGR.query();
+
+		var newTaskSLAs = [];
+		var newTaskSLADefIds = [];
+		var newTaskSLA;
+		while (slaGR.next()) {
+			newTaskSLA = this._checkNewSLA(slaGR);
+			if (!newTaskSLA)
+				continue;
+			if (!newTaskSLA.contractSLAgr)
+				newTaskSLA.contractSLAgr = this.slaUtil.copyContractSLA(slaGR);
+			if (newTaskSLA) {
+				newTaskSLAs.push(newTaskSLA);
+				newTaskSLADefIds.push(slaGR.getValue('sys_id'));
+			}
+		}
+
+		// Perform the retroactive pause adjustment for the ones that need it
+		if (newTaskSLAs.length &gt; 0) {
+			this._adjustPauseTime(newTaskSLAs);
+			for (var i = 0; i &lt; newTaskSLAs.length; i++) {
+				newTaskSLA = newTaskSLAs[i];
+				var taskSLAgr = newTaskSLA.taskSLA.getGlideRecord();
+				var previousTaskSLAgr;
+				// if currently processing asynchronously we need to call breakdown processing as this is not handled by business rule "Process SLA Breakdowns"
+				var processBreakdowns = this.calledFromAsync &amp;&amp; this.breakdownsPluginActive &amp;&amp; sn_sla_brkdwn.SLABreakdownProcessor.hasBreakdownDefinitions(taskSLAgr.getValue("sla"));
+				if (newTaskSLA.needsAdjusting &amp;&amp; !newTaskSLA.adjusted)
+					newTaskSLA.taskSLA.updateState(TaskSLA.STATE_IN_PROGRESS);
+				if (processBreakdowns) {
+					previousTaskSLAgr = this.slaUtil.copyTaskSLA(taskSLAgr);
+					this._processSLABreakdowns(taskSLAgr, null, "insert");
+				}
+
+				// and just in case it should need to transition to Paused state immediately upon creation
+				// make sure the "updateTime" is correct as it may not be if we've been doing a retroactive calculation
+				newTaskSLA.taskSLA.setUpdateTime(this.taskGR.sys_updated_on);
+				var conditionResults = this._pauseUnpause(newTaskSLA.taskSLA, newTaskSLA.contractSLAgr);
+				if (processBreakdowns &amp;&amp; conditionResults.stageChangedTo)
+					this._processSLABreakdowns(taskSLAgr, null, "insert");
+			}
+		}
+
+		return newTaskSLADefIds;
+	},
+
+	// process all of a task's active, attached task_sla records
+	_processExistingSLAs: function() {
+		this.lu.logInfo('_processExistingSLAs');
+
+		// Get the current set of active Task SLAs for this record
+		var taskSLAgr = this.queryTaskSLAs();
+		if (!taskSLAgr.hasNext()) {
+			if (this.lu.atLevel(GSLog.INFO))
+				this.lu.logInfo('_processExistingSLAs: no active Task SLAs found for Task - ' + this.taskClass + ":" + this.taskSysId);
+			return;
+		}
+		var contractSLAgr = null;
+		if (GlidePluginManager.isActive("com.glide.domain"))
+			contractSLAgr = this.queryContractSLAs();
+
+		SelfCleaningMutex.enterCriticalSectionRecordInStats(this.MUTEX_UPDATE + this.taskGR.sys_id, this.MUTEX_UPDATE, this, this._processExistingSLAs_criticalSection, taskSLAgr, contractSLAgr);
+	},
+
+	// (called after obtaining SelfCleaningMutex MUTEX_UPDATE: '&lt;&lt;&lt;--Process Existing SLAs Mutex ' + this.taskGR.sys_id + '--&gt;&gt;&gt;',
+	// to prevent simultaneous/overlapping updates of the task_sla records)
+	_processExistingSLAs_criticalSection: function(taskSLAgr, contractSLAgr) {
+		this.fieldValuesLogged = false;
+		if (this.lu.atLevel(GSLog.INFO))
+			this.lu.logInfo('_processExistingSLAs_criticalSection: ' + this.taskGR.sys_id);
+		var sw;
+		if (this.timers)
+			sw = new GlideStopWatch();
+
+		// if we've been called from a "sys_trigger" record because SLA processing is running asynchronously
+		// then we use HistoryWalker to get the Task record at the current update number so we've got the
+		// "changes" information for each field
+		if (this.calledFromAsync) {
+			var withJournal = false;
+			var withSysFields = false;
+			var withVariables = false;
+
+			if (contractSLAgr !== null) { //Domains is active and we should have records to iterate over
+				while ((!withJournal || !withSysFields || !withVariables) &amp;&amp; contractSLAgr.next()) {
+					if (this.slaUtil.hasAdvancedJournalCondition(contractSLAgr))
+						withJournal = true;
+					if (this.slaUtil.hasAdvancedSysFieldCondition(contractSLAgr))
+						withSysFields = true;
+					if (this.slaUtil.hasVariablesCondition(contractSLAgr))
+						withVariables = true;
+				}
+				contractSLAgr.setLocation(-1);
+			} else {
+				while ((!withJournal || !withSysFields || !withVariables) &amp;&amp; taskSLAgr.next()) {
+					var tempContractSLARecord = taskSLAgr.sla.getRefRecord();
+					if (this.slaUtil.hasAdvancedJournalCondition(tempContractSLARecord))
+						withJournal = true;
+					if (this.slaUtil.hasAdvancedSysFieldCondition(tempContractSLARecord))
+						withSysFields = true;
+					if (this.slaUtil.hasVariablesCondition(tempContractSLARecord))
+						withVariables = true;
+				}
+				taskSLAgr.setLocation(-1);
+			}
+
+			this._walkTaskForAsync(withJournal, withSysFields, withVariables);
+		}
+
+		// Log the field values in the Task record
+		if (this.lu.atLevel(GSLog.DEBUG)) {
+			this.lu.logDebug('_processExistingSLAs_criticalSection:\n' + this.slalogging.getRecordContentMsg(this.taskGR));
+			this.fieldValuesLogged = true;
+		}
+
+		var resetTaskSLAs = [];
+		var contractSLA;
+		var taskSLA;
+		var conditionResults;
+		var previousTaskSLAGr;
+
+		while (taskSLAgr.next()) {
+			var hasBreakdowns = this.breakdownsPluginActive &amp;&amp; sn_sla_brkdwn.SLABreakdownProcessor.hasBreakdownDefinitions(taskSLAgr.getValue("sla"));
+
+			// if we need to process breakdowns that create our own "previous" copy of the Task SLA record
+			if (hasBreakdowns)
+				previousTaskSLAGr = this.slaUtil.copyTaskSLA(taskSLAgr);
+
+			contractSLA = this._getContractSLA(taskSLAgr, contractSLAgr);
+
+			if (this.getTaskFromDB) {
+				var slaConditionClass = this._newSLACondition(contractSLA, this.taskGR, taskSLAgr);
+				if (typeof slaConditionClass.hasAdvancedConditions !== "function" || slaConditionClass.hasAdvancedConditions()) {
+					if (this.lu.atLevel(GSLog.DEBUG))
+						this.lu.logDebug("_processExistingSLAs_criticalSection: getTaskFromDB is true and SLA Definition \"" + contractSLA.getDisplayValue() + "\" has advanced conditions");
+					this._walkTaskToLatest(this.slaUtil.hasAdvancedJournalCondition(contractSLA), this.slaUtil.hasAdvancedSysFieldCondition(contractSLA), this.slaUtil.hasVariablesCondition(contractSLA));
+				}
+			}
+
+			var oldLogLevel = this.lu.getLevel();
+			// if enable logging has been checked on the SLA definition up the log level to "debug"
+			if (contractSLA.enable_logging) {
+				this.lu.setLevel(GSLog.DEBUG);
+				if (!this.fieldValuesLogged) {
+					this.lu.logDebug('_processExistingSLAs_criticalSection:\n' + this.slalogging.getRecordContentMsg(this.taskGR));
+					this.fieldValuesLogged = true;
+				}
+			}
+
+			taskSLA = this._getTaskSLA(taskSLAgr, contractSLA);
+			this.slaUtil.setSLAUpdateSourceEngineParameter(taskSLA.getGlideRecord(), this.type);
+			conditionResults = this._checkExistingSLA(taskSLA, contractSLA);
+			if (this.lu.atLevel(GSLog.DEBUG))
+				this.lu.logDebug("Condition results for Task SLA " + contractSLA.getDisplayValue() + " on task " + this.taskGR.number +
+								":\n" + JSON.stringify(conditionResults));
+
+			if (conditionResults.stopCancel.reset)
+				resetTaskSLAs.push(taskSLAgr.getValue('sla'));
+
+			// SLA Breakdown processing
+			if (hasBreakdowns) {
+				/* if we're running synchronously and the stage hasn't changed on the Task SLA and it's not one we've just created
+				   then call breakdown processing in case a breakdown field on the Task has changed */
+				if ((!this.calledFromAsync &amp;&amp; !conditionResults.stageChangedTo &amp;&amp; this.newSLADefIds.indexOf(taskSLAgr.getValue("sla") &lt; 0))
+					||
+					(this.calledFromAsync &amp;&amp; (this.newSLADefIds.indexOf(taskSLAgr.getValue("sla") &lt; 0) || conditionResults.stageChangedTo)))
+					this._processSLABreakdowns(taskSLA.getGlideRecord(), previousTaskSLAGr, "update");
+			}
+
+			/* if we're running asynchronously but nothing changed on the Task SLA for this update and there are no records in the
+			   async queue for this task then call SLACalculator to make sure all the values are up to date including "has_breached" */
+			if (this.calledFromAsync &amp;&amp; !conditionResults.stageChangedTo &amp;&amp; taskSLA.getCurrentState() === TaskSLA.STATE_IN_PROGRESS &amp;&amp;
+				!(this.slaAsyncQueue.isTaskQueued(taskSLAgr.getValue("task"), null, ["ready", "queued"])))
+				SLACalculatorNG.calculateSLA(taskSLA.getGlideRecord(), false, new GlideDateTime(), taskSLA.getContractSLA());
+
+			this.lu.setLevel(oldLogLevel);
+		}
+
+		if (resetTaskSLAs.length &gt; 0)
+			SelfCleaningMutex.enterCriticalSectionRecordInStats(this.MUTEX_NEW + this.taskGR.sys_id, this.MUTEX_NEW,
+				this, this._checkNewSLAsFromReset, resetTaskSLAs);
+
+		if (this.timers)
+			sw.log('TaskSLAController._processExistingSLAs_criticalSection complete');
+	},
+
+	_getTaskSLA: function(taskSLAgr, slaDefGR) {
+		return new TaskSLA(taskSLAgr, this.taskGR, null, {calledFromAsync: this.calledFromAsync}, slaDefGR);
+	},
+
+	_processSLABreakdowns: function(currentTaskSLAGr, previousTaskSLAGr, operationOverride) {
+		var gru = new GlideRecordUtil();
+		var fields1 = {};
+		var fields2 = {};
+		if (previousTaskSLAGr)
+			gru.populateFromGR(fields1, previousTaskSLAGr);
+		gru.populateFromGR(fields2, currentTaskSLAGr);
+
+		var breakdownProcessor = new sn_sla_brkdwn.SLABreakdownProcessor(currentTaskSLAGr, previousTaskSLAGr);
+		if (operationOverride)
+			breakdownProcessor.setTaskSLAOperationOverride(operationOverride);
+		breakdownProcessor.setTaskGr(this.taskGR);
+		breakdownProcessor.setUpdateTime(this.taskGR.sys_updated_on);
+		breakdownProcessor.processBreakdowns();
+	},
+
+	_checkExistingSLA: function(taskSLA, contractSLA) {
+		var sw;
+		if (this.timers)
+			sw = new GlideStopWatch();
+
+		if (this.lu.atLevel(GSLog.DEBUG))
+			this.lu.logDebug('_checkExistingSLA: ' + taskSLA.getGlideRecord().sys_id);
+
+		if (this.replayingTask)
+			taskSLA.setBreachTimer(false); // disable breach timers on the task_sla, for replay
+
+		var conditionResults = {
+			stopCancel: {
+
+			},
+			pauseResume: {
+
+			}
+		};
+
+		// (stop/cancel takes precedence over pause/unpause also matching in the same update to the task record)
+		conditionResults.stopCancel = this._stopCancel(taskSLA, contractSLA);
+
+		if (!conditionResults.stopCancel.conditionMatched)
+			conditionResults.pauseResume = this._pauseUnpause(taskSLA, contractSLA);
+
+		conditionResults.stageChangedTo = conditionResults.stopCancel.stageChangedTo || conditionResults.pauseResume.stageChangedTo;
+
+		// TODO: work-notes
+		if (this.timers)
+			sw.log('TaskSLAController: Finished _checkExistingSLA');
+		return conditionResults;
+	},
+
+	_pauseUnpause: function(taskSLA, contractSLA) {
+		var conditionResults = {};
+
+		var taskSLAgr = taskSLA.getGlideRecord();
+
+		if (!contractSLA)
+			contractSLA = taskSLAgr.sla;
+
+		if (this.lu.atLevel(GSLog.DEBUG))
+			this.lu.logDebug('_pauseUnpause: task = ' + this.taskGR.getValue("number") + ", sla = " + contractSLA.getDisplayValue());
+
+		// a "relative-duration" SLA cannot pause, whatever conditions might be in the SLA Definition record
+		if (contractSLA.duration_type != '')
+			return conditionResults;
+
+		var slaConditionClass = this._newSLACondition(contractSLA, this.taskGR, taskSLAgr);
+
+		conditionResults.pause = slaConditionClass.pause();
+		conditionResults.resume = slaConditionClass.resume();
+		conditionResults.conditionMatched = conditionResults.pause || conditionResults.resume;
+
+		if (this.lu.atLevel(GSLog.DEBUG)) {
+			this.lu.logDebug('_pauseUnpause: current SLA state=' + taskSLA.getCurrentState() + ', pause condition matched=' + conditionResults.pause);
+			this.lu.logDebug('_pauseUnpause: current SLA state=' + taskSLA.getCurrentState() + ', resume condition matched=' + conditionResults.resume);
+		}
+
+		if (taskSLA.getCurrentState() == TaskSLA.STATE_IN_PROGRESS &amp;&amp; conditionResults.pause &amp;&amp; !conditionResults.resume) {
+			if (this.lu.atLevel(GSLog.DEBUG))
+				this.lu.logDebug('_pauseUnpause: Pausing SLA ' + taskSLAgr.getUniqueValue());
+			conditionResults.stageChangedTo = TaskSLA.STATE_PAUSED;
+			taskSLA.updateState(TaskSLA.STATE_PAUSED);
+		}
+		else if (taskSLA.getCurrentState() == TaskSLA.STATE_PAUSED &amp;&amp; !conditionResults.pause &amp;&amp; conditionResults.resume) {
+			if (this.lu.atLevel(GSLog.DEBUG))
+				this.lu.logDebug('_pauseUnpause: Resuming SLA ' + taskSLAgr.getUniqueValue());
+			conditionResults.stageChangedTo = TaskSLA.STATE_IN_PROGRESS;
+			taskSLA.updateState(TaskSLA.STATE_IN_PROGRESS);
+		}
+
+		return conditionResults;
+	},
+
+	_stopCancel: function(taskSLA, contractSLA) {
+		var conditionResults = {
+			conditionMatched: true
+		};
+
+		var taskSLAgr = taskSLA.getGlideRecord();
+
+		if (!contractSLA)
+			contractSLA = taskSLAgr.sla;
+
+		if (this.lu.atLevel(GSLog.DEBUG))
+			this.lu.logDebug('_stopCancel: task = ' + this.taskGR.getValue("number") + ", sla = " + contractSLA.getDisplayValue());
+
+		var slaConditionClass = this._newSLACondition(contractSLA, this.taskGR, taskSLAgr);
+
+		conditionResults.complete = slaConditionClass.complete();
+		conditionResults.reset = slaConditionClass.reattach(this.newSLADefIds);
+
+		if (this.lu.atLevel(GSLog.DEBUG)) {
+			this.lu.logDebug('_stopCancel: current SLA state=' + taskSLA.getCurrentState() + ', stop condition matched=' + conditionResults.complete);
+			this.lu.logDebug('_stopCancel: current SLA state=' + taskSLA.getCurrentState() + ', reset condition matched=' + conditionResults.reset);
+		}
+
+		if (conditionResults.complete) {
+			taskSLA.updateState(TaskSLA.STATE_COMPLETED);
+			conditionResults.stageChangedTo = TaskSLA.STATE_COMPLETED;
+			return conditionResults; // state was changed
+		}
+
+		// Re-evaluate conditions for this specific taskSLA,
+		//      to allow a 'Complete and reapply' mode of operation
+		if (conditionResults.reset) {
+			var resetExistingSLATo = contractSLA.reset_action == this.RESET_ACTION_CANCEL ? TaskSLA.STATE_CANCELLED : TaskSLA.STATE_COMPLETED;
+			taskSLA.updateState(resetExistingSLATo);
+			conditionResults.stageChangedTo = resetExistingSLATo;
+			taskSLA.isReset = true; //flag to detect reset in the taskSLA object
+			return conditionResults; // state was changed
+		} else {
+			conditionResults.cancel = slaConditionClass.cancel();
+			if (this.lu.atLevel(GSLog.DEBUG))
+				this.lu.logDebug('_stopCancel: ' + taskSLA.getCurrentState() + ', cancel condition matched=' + conditionResults.cancel);
+			if (conditionResults.cancel) {
+				taskSLA.updateState(TaskSLA.STATE_CANCELLED);
+				conditionResults.stageChangedTo = TaskSLA.STATE_CANCELLED;
+				return conditionResults; // state was changed
+			}
+		}
+
+		conditionResults.conditionMatched = false;
+		return conditionResults;
+	},
+
+	// method to assist overriding the SLA Condition class
+	// -- returns an instance of an SLA Condition script include
+	_newSLACondition: function(slaGR, taskGR, taskSLAgr) {
+		var conditionClassCacheKey = this.DEFAULT_SLA_CONDITION_CLASS_KEY;
+		if (!JSUtil.nil(slaGR) &amp;&amp; !slaGR.condition_class.nil())
+			conditionClassCacheKey = slaGR.getValue("condition_class");
+	
+		return this._getConditionClassFromCache(conditionClassCacheKey, slaGR, taskGR, taskSLAgr);
+	},
+
+	/* creates, if necessary, and then returns the appropriate SLA condition class object
+	   from the cache (object "this._slaConditionClassCache")
+	   
+	   if the object contains an instance of the associated script include then this is returned
+	   otherwise we fall back to the old behaviour of creating a new instance of the script include
+	   and returning it */
+	_getConditionClassFromCache: function(cacheKey, slaGR, taskGR, taskSLAgr) {
+		if (JSUtil.nil(cacheKey))
+			cacheKey = this.DEFAULT_SLA_CONDITION_CLASS_KEY;
+
+		if (!this._slaConditionClassCache.hasOwnProperty(cacheKey))
+			this._cacheSLAConditionClass(cacheKey);
+
+		var slaConditionClass = this._slaConditionClassCache[cacheKey];
+		// if this slaConditionClass object is marked as inactive or invalid we'll use the default instead
+		if (!slaConditionClass.active || !slaConditionClass.valid)
+			slaConditionClass = this._slaConditionClassCache[this.DEFAULT_SLA_CONDITION_CLASS_KEY];
+
+		/* if the slaConditionClass already has an instance of the script include we can set just
+		   set the SLA Definition, Task and Task SLA records in it and return it for condition testing */
+		if (slaConditionClass.scriptIncludeInstance !== null) {
+			slaConditionClass.scriptIncludeInstance.setSLA(slaGR, taskGR);
+			slaConditionClass.scriptIncludeInstance.setTask(taskGR);
+			slaConditionClass.scriptIncludeInstance.setTaskSLA(taskSLAgr);
+			return slaConditionClass.scriptIncludeInstance;
+		}
+
+		// ...otherwise we have to simply create a new instance of the script include and return it
+		return new slaConditionClass.scriptInclude(slaGR, taskGR, taskSLAgr);
+	},
+
+	_cacheSLAConditionClass: function(cacheKey) {
+		// if no cache key provided assume the default one
+		if (JSUtil.nil(cacheKey))
+			cacheKey = this.DEFAULT_SLA_CONDITION_CLASS_KEY;
+
+		// initially set the script include name to be the default one...
+		var scriptIncludeName = this.SLADefaultConditionClassName;
+		// ...but check if our cache key is the sys_id of a condition class record
+		if (cacheKey !== this.DEFAULT_SLA_CONDITION_CLASS_KEY) {
+			/* if we can't get the SLA Condition Class record or it doesn't reference a valid script include
+			   fall back to the default condition class */
+			var slaConditionClassGR = new GlideRecord("sla_condition_class");
+			if (!slaConditionClassGR.get(cacheKey) || slaConditionClassGR.class_name.nil())
+				cacheKey = this.DEFAULT_SLA_CONDITION_CLASS_KEY;
+			var scriptIncludeGR = slaConditionClassGR.class_name.getRefRecord();
+			if (!scriptIncludeGR.isValidRecord())
+				cacheKey = this.DEFAULT_SLA_CONDITION_CLASS_KEY;
+			
+			// otherwise we now have the name of the script include referenced by the SLA Condition Class
+			scriptIncludeName = scriptIncludeGR.getValue("name");
+		}
+
+		// if we've had to revert back to the default check to see if it's already cached
+		if (this._slaConditionClassCache.hasOwnProperty(cacheKey))
+			return;
+		
+		// Fetch the script include object from the global scope
+		var slaConditionClass = this._getConditionClassScriptInclude(scriptIncludeName);
+		
+		/* if we're caching the default make sure the default is valid by checking for required methods
+		   (this is the script include name specified in system property "com.snc.sla.default_conditionclass")
+		   if invalid we'll use a fixed value of "SLAConditionBase" */
+		if (cacheKey === this.DEFAULT_SLA_CONDITION_CLASS_KEY &amp;&amp; !this._isValidSLAConditionClass(slaConditionClass)) {
+			this.SLADefaultConditionClassName = this.BASE_CONDITIONCLASSNAME;
+			slaConditionClass = this._getConditionClassScriptInclude(this.SLADefaultConditionClassName);
+		}
+		
+		/* if we've got a valid SLA Condition Class record and associated script include create a cache entry
+		   using the values from the condition class record...
+		   
+		   ...otherwise we're storing the default class which has fixed values */
+		if (cacheKey !== this.DEFAULT_SLA_CONDITION_CLASS_KEY) {
+			var isActive = slaConditionClassGR.active + "";
+			var isValid = this._isValidSLAConditionClass(slaConditionClass);
+			this._createSLAConditionClassCacheEntry(
+				slaConditionClassGR.getUniqueValue(),
+				slaConditionClassGR.getValue("name"),
+				isActive,
+				isValid,
+				slaConditionClass
+			);
+
+			// if this cache entry is inactive or invalid create the default one as it will be needed instead
+			if (!isValid || !isActive)
+				this._cacheSLAConditionClass(this.DEFAULT_SLA_CONDITION_CLASS_KEY);
+		} else {
+			this._createSLAConditionClassCacheEntry(
+				this.DEFAULT_SLA_CONDITION_CLASS_KEY,
+				"",
+				true,
+				true,
+				slaConditionClass
+			);			
+
+			// "this._SLADefaultConditionClass" has always pointed to the default condition class script include 
+			this._SLADefaultConditionClass = slaConditionClass;			
+		}
+	},
+
+	/* add a new object to "this._slaConditionClassCache" object with a reference of the supplied cacheKey
+	   the object created will contain details of SLA Condition rule along with a copy of the script include that it references.
+	   If this script include has the newer methods of "setSLA", "setTask" and "setTaskSLA", an instance of the script include
+	   will be created and stored within the new object to allow for re-use of this during condition testing */
+	_createSLAConditionClassCacheEntry: function(cacheKey, conditionClassName, active, isValid, scriptIncludeObject) {
+		/* if system property "com.snc.sla.condition_class.caching.enabled" doesn't exist or is not set to true then caching
+		   of instances of each condition class script include is disabled so return without storing it 
+
+		   this effectively reverts back to the previous behaviour of creating a new instance of the appropriate 
+		   SLA condition class script include for each SLA Definition being tested */
+		if (!this.conditionClassCachingEnabled)
+			return;
+		
+		if (JSUtil.nil(cacheKey))
+			return;
+
+		// Before we create a new cache entry check if we've reached the limit and if so remove one (excluding the default cache entry)
+		var existingCacheKeys = Object.keys(this._slaConditionClassCache).filter(function(key) {
+			 return key !== this.DEFAULT_SLA_CONDITION_CLASS_KEY;
+			 }, this);
+		if (existingCacheKeys.length &gt;= this.conditionClassCachingLimit)
+			delete this._slaConditionClassCache[existingCacheKeys[0]];
+
+		isValid = isValid + "" === "true";
+		active = active + "" === "true";
+
+		this._slaConditionClassCache[cacheKey] = {
+			"className": conditionClassName,
+			"scriptIncludeType": scriptIncludeObject.prototype.type,
+			"scriptInclude": scriptIncludeObject,
+			"scriptIncludeInstance": null,
+			"active": active,
+			"valid": isValid
+		};
+
+		if (this._SLAConditionClassHasSetMethods(this._slaConditionClassCache[cacheKey].scriptInclude))
+			this._slaConditionClassCache[cacheKey].scriptIncludeInstance = new this._slaConditionClassCache[cacheKey].scriptInclude();
+	},
+
+	_getConditionClassScriptInclude: function(scriptIncludeName) {
+		if (JSUtil.nil(scriptIncludeName))
+			return null;
+
+		// Make sure we only fetch the Global scope once
+		if (!this._outerScope)
+			this._outerScope = JSUtil.getGlobal();
+
+		return this._outerScope[scriptIncludeName];
+	},
+
+	// does klass look valid as an SLAConditionClass?
+	_isValidSLAConditionClass: function(klass) {
+		return this._doesClassHaveMethods(klass, ['attach', 'pause', 'complete', 'reattach', 'cancel']);
+	},
+
+	_SLAConditionClassHasSetMethods: function(klass) {
+		return this._doesClassHaveMethods(klass, ['setSLA', 'setTask', 'setTaskSLA']);
+	},
+
+	_doesClassHaveMethods: function(klass, methods) {
+		if (JSUtil.nil(klass) || !(klass.hasOwnProperty("prototype")))
+			return false;
+
+		if (JSUtil.nil(methods))
+			return true;
+
+		if (!Array.isArray(methods))
+			methods = [methods];
+
+		return methods.every(function(method) {
+			return klass.prototype.hasOwnProperty(method);
+		});
+	},
+
+	// methods to manipulate the task's associated task_sla and contract_sla records.
+
+	_getContractSLA: function(taskSLAgr, contractSLAgr) {
+		if (!taskSLAgr || !taskSLAgr.isValidRecord()) {
+			if (this.lu.atLevel(GSLog.DEBUG))
+				this.lu.logDebug('_getContractSLA: taskSLAgr is not valid -&gt; taskSLAgr=' + (taskSLAgr === null ? 'null' : taskSLAgr));
+
+			return null;
+		}
+
+		/* if domains isn't active then we won't have contractSLAgr and can just use "getRefRecord"
+		   to get the SLA Definition */
+		if (!this.domainsPluginActive) {
+			var sla = taskSLAgr.sla.getRefRecord();
+
+			if (this.lu.atLevel(GSLog.DEBUG))
+				this.lu.logDebug('_getContractSLA: domains is not installed -&gt; this.domainsPluginActive=' + this.domainsPluginActive + ', sla=' + (sla === null ? 'null' : sla.getUniqueValue()));
+
+			return sla;
+		}
+
+		/* if we haven't got a "contractSLAgr" for some reason fall back to returning the GlideElement
+		   for the SLA Definition from the "task_sla" record - then SLAConditionBase will take care of
+		   fetching the SLA Definition from the DB */
+		if (!contractSLAgr || !contractSLAgr.isValid()) {
+			if (this.lu.atLevel(GSLog.DEBUG))
+				this.lu.logDebug('_getContractSLA: contractSLAgr is not a vaid GlideRecord -&gt; contractSLAgr=' + (contractSLAgr === null ? 'null' : contractSLAgr) + ', taskSLAgr.sla=' + taskSLAgr.sla);
+
+			return taskSLAgr.sla;
+		}
+
+		/* Otherwise get the next record from "contractSLAgr" which should match the "sla" value in the
+		   "taskSLAgr" as they should be in synch with each other */
+		if (this.lu.atLevel(GSLog.DEBUG))
+			this.lu.logDebug('_getContractSLA: contractSLAgr.getEncodedQuery()= ' + contractSLAgr.getEncodedQuery() + ', contractSLAgr.getUniqueValue()=' + contractSLAgr.getUniqueValue());
+
+		// if "contractSLAgr" is already the correct record then use it
+		if (taskSLAgr.getValue('sla') === contractSLAgr.getUniqueValue()) {
+			if (this.lu.atLevel(GSLog.DEBUG))
+				this.lu.logDebug('_getContractSLA: taskSLAgr sla value and contract SLA match -&gt; taskSLAgr.getValue(\'sla\')=' + taskSLAgr.getValue('sla') + ', contractSLAgr.getUniqueValue()=' + contractSLAgr.getUniqueValue());
+
+			return contractSLAgr;
+		}
+
+		// if we don't have any more records, again fall back to the "sla" element in taskSLAgr
+		if (!contractSLAgr.next()) {
+			if (this.lu.atLevel(GSLog.DEBUG))
+				this.lu.logDebug('_getContractSLA: no more records in contractSLAgr -&gt; taskSLAgr.getValue(\'sla\')=' + taskSLAgr.getValue('sla') + ', contractSLAgr.getUniqueValue()=' + contractSLAgr.getUniqueValue());
+
+			return taskSLAgr.sla;
+		}
+
+		/* finally just check the 2 record sets are in synch in terms of the SLA definition and if not
+		   use the "sla" GlideElement */
+		if (taskSLAgr.getValue('sla') !== contractSLAgr.getUniqueValue()) {
+			if (this.lu.atLevel(GSLog.DEBUG))
+				this.lu.logDebug('_getContractSLA: taskSLAgr sla value and contract SLA are NOT in sync -&gt; taskSLAgr.getValue(\'sla\')=' + taskSLAgr.getValue('sla') + ', contractSLAgr.getUniqueValue()=' + contractSLAgr.getUniqueValue());
+
+			return taskSLAgr.sla;
+		}
+
+		if (this.lu.atLevel(GSLog.DEBUG))
+			this.lu.logDebug('_getContractSLA: taskSLAgr and contract SLA are in sync -&gt; taskSLAgr.getValue(\'sla\')=' + taskSLAgr.getValue('sla') + ', contractSLAgr.getUniqueValue()=' + contractSLAgr.getUniqueValue());
+
+		// If we've got to here we've got the correct SLA Definition
+		return contractSLAgr;
+	},
+
+	// return comma-separated list of contract_sla sys_ids, given GlideRecord result set from taskSLAgr.query()
+	// suitable for 'sys_idIN' or 'sys_idNOT IN' queries
+	_getSLAsString: function(taskSLAgr) {
+		var slaList = [];
+		//taskSLAgr.query();
+		while (taskSLAgr.next())
+			slaList.push(taskSLAgr.getValue("sla"));
+		var queryString = slaList.join(',');
+		return queryString;
+	},
+
+	_needsAdjustPause: function(slaGR) {
+		// nothing to adjust for, as the task can have no previous updates
+		if (this.taskGR.operation() === 'insert')
+			return;
+
+		// relative duration SLAs, and those without pause conditions, cannot pause
+		if (slaGR.duration_type != '' || !slaGR.pause_condition)
+			return false;
+
+		// (shouldn't have been called for a non retroactive pause SLA)
+		if (!slaGR.retroactive || !slaGR.retroactive_pause)
+			return false;
+
+		return true;
+	},
+
+	// generate &amp; replay task history, to adjust pause duration, pause time of retroactive-start SLAs
+	// (runs from within the _processNewSLAs_criticalSection)
+	_adjustPauseTime: function(slasToAdjust) {
+		if (this.lu.atLevel(GSLog.INFO))
+			this.lu.logInfo('_adjustPauseTime: Adjusting pause time for retroactive SLAs on ' + this.taskGR.number);
+
+		if (!slasToAdjust || slasToAdjust.length === 0) {
+			this.lu.logWarning('There are no SLAs to be adjusted');
+			return;
+		}
+
+		// nothing to adjust for, as the task can have no previous updates
+		if (this.taskGR.operation() === 'insert') {
+			if (this.lu.atLevel(GSLog.DEBUG))
+				this.lu.logDebug("_adjustPauseTime: ends - task is being inserted so there can't be any retroactive pauses");
+			return;
+		}
+
+		if (this.taskGR.isNewRecord()) {
+			this.lu.logWarning('Cannot adjust SLA pause time on a new task record');
+			return;
+		}
+
+		if (!(new GlideAuditor(this.taskGR.getTableName(), null).auditTable())) {
+			if (this.lu.atLevel(GSLog.ERR))
+				this.lu.logError('Cannot adjust SLA pause time for a retroactive start - auditing not enabled on ' + this.taskGR.getTableName());
+			return;
+		}
+
+		if (this.lu.atLevel(GSLog.INFO))
+			this.lu.logInfo('_adjustPauseTime: at ' + this.taskGR.getValue("sys_updated_on"));
+
+		var hasRetroSLAs = false;
+		for (var i = 0; i &lt; slasToAdjust.length; i++) {
+			if (slasToAdjust[i].needsAdjusting) {
+				hasRetroSLAs = true;
+				break;
+			}
+		}
+
+		if (!hasRetroSLAs) {
+			if (this.lu.atLevel(GSLog.DEBUG))
+				this.lu.logDebug("_adjustPauseTime: ends - there are no retroactive Task SLAs requiring retroactive pause time calculation");
+			return;
+		}
+
+		var taskSLA;
+		var contractSLA;
+		var withJournals = false;
+		var withSysFields = false;
+		var withVariables = false;
+
+		// Do we need to add journal or system fields to the history walker?
+		for (var i = 0; (i &lt; slasToAdjust.length &amp;&amp; (!withJournals || !withSysFields || !withVariables)); i++) {
+			if (!slasToAdjust[i].needsAdjusting)
+				continue;
+
+			taskSLA = slasToAdjust[i].taskSLA;
+			contractSLA = slasToAdjust[i].contractSLAgr;
+			if (!contractSLA)
+				contractSLA = taskSLA.getGlideRecord().sla;
+
+			if (this.slaUtil.hasAdvancedJournalCondition(contractSLA))
+				withJournals = true;
+
+			if (this.slaUtil.hasAdvancedSysFieldCondition(contractSLA))
+				withSysFields = true;
+
+			if (this.slaUtil.hasVariablesCondition(contractSLA))
+				withVariables = true;
+		}
+
+		var hw = this.slaUtil.getHistoryWalker(
+			this.taskGR.getRecordClassName(),
+			this.taskGR.getValue('sys_id'),
+			/*recordLevelSecurity*/ false,
+			/*fieldLevelSecurity*/ false,
+			/*withVariables*/ withVariables,
+			/*walkToFirstUpdate*/ true,
+			/*withJournalFields*/ withJournals,
+			/*withSysFields*/ withSysFields
+		);
+
+		if (!hw) {
+			this.lu.logError("_adjustPauseTime: failed getting HistoryWalker to initial update");
+			return;
+		}
+
+		// save a reference to the current task record before we start stepping through the updates
+		var originalTaskGR = this.taskGR;
+
+		var initialUpdateProcessed = false;
+		var taskSLAgr;
+		var walkedRecordUpdatedOnMs;
+		var startTimeMs;
+
+		var currentModCount = this.taskGR.getValue('sys_mod_count');
+		do {
+			this.taskGR = hw.getWalkedRecord();
+			if (this.taskGR.getValue('sys_mod_count') == currentModCount)
+				break;
+
+			walkedRecordUpdatedOnMs = this.taskGR.sys_updated_on.dateNumericValue();
+
+			if (this.lu.atLevel(GSLog.DEBUG))
+				this.lu.logDebug('_adjustPauseTime: [' + this.taskGR.getValue('sys_mod_count') + '] history update time: ' + this.taskGR.getValue('sys_updated_on'));
+
+			for (var j = 0; j &lt; slasToAdjust.length; j++) {
+				if (!slasToAdjust[j].needsAdjusting)
+					continue;
+
+				taskSLA = slasToAdjust[j].taskSLA;
+				contractSLA = slasToAdjust[j].contractSLAgr;
+				if (!contractSLA)
+					contractSLA = taskSLA.getGlideRecord().sla;
+
+				if (!initialUpdateProcessed) {
+					slasToAdjust[j].adjusted = true;
+					taskSLA.setRetroactiveAdjusting(true);
+					taskSLA.updateState(TaskSLA.STATE_IN_PROGRESS);
+					taskSLA.starting = false;
+				}
+
+				taskSLAgr = taskSLA.getGlideRecord();
+				startTimeMs = taskSLAgr.start_time.dateNumericValue();
+				if (startTimeMs &lt;= walkedRecordUpdatedOnMs)
+					taskSLA.setUpdateTime(this.taskGR.getValue('sys_updated_on'));
+				else
+					taskSLA.setUpdateTime(taskSLAgr.getValue('start_time'));
+
+				var conditionResults = this._pauseUnpause(taskSLA, contractSLA);
+
+				if (this.lu.atLevel(GSLog.DEBUG)) {
+					this.lu.logDebug("Condition Results for Task SLA " + contractSLA.getDisplayValue() + ": " + JSON.stringify(conditionResults));
+					this.lu.logDebug("Business elapsed: " + taskSLAgr.business_duration.getDurationValue() + ", Pause duration: " + taskSLAgr.pause_duration.getDurationValue() +
+									", Pause time: " + taskSLAgr.pause_time.getDisplayValue());
+				}
+			}
+
+			initialUpdateProcessed = true;
+		} while (hw.walkForward());
+
+		for (var k = 0; k &lt; slasToAdjust.length; k++) {
+			if (!slasToAdjust[k].adjusted)
+				continue;
+
+			taskSLA = slasToAdjust[k].taskSLA;
+			contractSLA = slasToAdjust[k].contractSLAgr;
+			if (!contractSLA)
+				contractSLA = taskSLA.getGlideRecord().sla;
+
+			//If current taskSLA stage is In Progress then keep the duration fields up to date with now timesamp
+			if(taskSLA.getCurrentState() === TaskSLA.STATE_IN_PROGRESS)
+				taskSLA.calculate(true, new GlideDateTime());
+
+			taskSLA.starting = true;
+			taskSLA.setRetroactiveAdjusting(false);
+			if (this.lu.atLevel(GSLog.INFO)) {
+				taskSLAgr = taskSLA.getGlideRecord();
+				this.lu.logInfo('Finished adjusting pause time for retroactive SLA ' + contractSLA.name + ' on ' + this.taskGR.getDisplayValue() + ': pause_duration=' + taskSLAgr.pause_duration + ', pause_time='
+				+ taskSLAgr.pause_time.getDisplayValue());
+			}
+			if (this.lu.atLevel(GSLog.DEBUG))
+				this.lu.logDebug('taskSLA: starting=' + taskSLA.starting);
+		}
+
+		// set back to the real task
+		this.taskGR = originalTaskGR;
+
+		return;
+	},
+
+	_walkTaskToUpdate: function(updateNumber, withJournalFields, withSysFields, withVariables) {
+		if (this.lu.atLevel(GSLog.INFO))
+			this.lu.logInfo("_walkTaskToUpdate: update number: " + updateNumber);
+
+		if (isNaN(updateNumber)) {
+			if (this.lu.atLevel(GSLog.ERR))
+				this.lu.logError("_walkTaskToUpdate: invalid update number requested: " + updateNumber);
+			return false;
+		}
+
+		if (!this.taskHistoryWalker) {
+			this.taskHistoryWalker = this.slaUtil.getHistoryWalker(
+				this.taskGR.getRecordClassName(),
+				this.taskGR.getValue('sys_id'),
+				/*recordLevelSecurity*/ false,
+				/*fieldLevelSecurity*/ false,
+				/*withVariables*/ withVariables,
+				/*walkToFirstUpdate*/ false,
+				/*withJournalFields*/ withJournalFields,
+				/*withSysFields*/ withSysFields
+			);
+
+			if (!this.taskHistoryWalker) {
+				if (this.lu.atLevel(GSLog.ERR))
+					this.lu.logError("_walkTaskToUpdate: failed to get HistoryWalker");
+				return false;
+			}
+		}
+
+		if (!this.taskHistoryWalker.walkTo(parseInt(updateNumber, 10)))
+			return false;
+
+		this.taskGR = this.taskHistoryWalker.getWalkedRecord();
+
+		if (this.lu.atLevel(GSLog.DEBUG))
+			this.lu.logDebug("_walkTaskToUpdate: " + this.taskGR.sys_meta.label + " " + this.taskGR.getDisplayValue() + " walked to update number " + this.taskGR.getValue("sys_mod_count"));
+
+		return true;
+	},
+
+	_walkTaskForAsync: function(withJournalFields, withSysFields, withVariables) {
+		// if we've already walked the Task to the latest update no need to do it again
+		if (this.asyncTaskWalked)
+			return;
+
+		if (this._walkTaskToUpdate(this.asyncModCount, withJournalFields, withSysFields, withVariables))
+			this.asyncTaskWalked = true;
+	},
+
+	_walkTaskToLatest: function(withJournalFields, withSysFields, withVariables) {
+		// if we've already walked the Task to the latest update no need to do it again
+		if (this.taskWalked)
+			return;
+
+		if (this._walkTaskToUpdate(this.taskLatestModCount, withJournalFields, withSysFields, withVariables))
+			this.taskWalked = true;
+	},
+
+	_getTask: function(taskType, taskSysId) {
+		if (this.lu.atLevel(GSLog.INFO))
+			this.lu.logInfo("_getTask: called with taskType=" + taskType + ", taskSysId=" + taskSysId);
+
+		if (!taskType || !taskSysId) {
+			if (this.lu.atLevel(GSLog.ERR))
+				this.lu.logError("_getTask: either task type or sys_id where not provided");
+
+			return null;
+		}
+
+		if (!GlideTableDescriptor.isValid(taskType)) {
+			if (this.lu.atLevel(GSLog.ERR))
+				this.lu.logError("_getTask: invalid task type requested \"" + taskType + "\"");
+
+			return null;
+		}
+
+		// Try and retrieve the Task from the supplied task table
+		var taskGR = new GlideRecord(taskType);
+		if (taskGR.get(taskSysId))
+			return taskGR;
+
+		// If we didn't find it log a warning...
+		if (this.lu.atLevel(GSLog.WARNING))
+			this.lu.logWarning("_getTask: failed to retrieve record from table \"" + taskType + " with sys_id \"" + taskSysId + "\"");
+
+		/* ... and then see if a Task with this sys_id exists as it may exist but in a different task extension
+			because "sys_class_name" has changed */
+		taskGR = new GlideRecord("task");
+		if (!taskGR.get(taskSysId)) {
+			this.lu.logError("_getTask: Task record with sys_id " + taskSysId + " does not exist");
+			return null;
+		}
+
+		// If we've managed to find a Task then we expect it to have a different Task Type so fetch the record from that table
+		var taskTypeInDB = taskGR.getValue("sys_class_name");
+		if (this.lu.atLevel(GSLog.WARNING))
+			this.lu.logWarning("_getTask: expected Task type is \"" + taskType + "\" but actual is \"" + taskTypeInDB +
+								".  Task will be fetched from \"" + taskTypeInDB + "\"");
+
+		taskGR = new GlideRecord(taskTypeInDB);
+		if (taskGR.get(taskSysId))
+			return taskGR;
+		else {
+			if (this.lu.atLevel(GSLog.ERR))
+				this.lu.logError("_getTask: failed to retrieve record from table \"" + taskTypeInDB + " with sys_id \"" + taskSysId + "\"");
+
+			return null;
+		}
+	},
+
+	type: 'TaskSLAController'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;james.grinter&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2011-02-14 14:51:10&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;24a759e30a0a2c3960e024ad3b60d9e8&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;680&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;TaskSLAController&lt;/sys_name&gt;
+        &lt;sys_package display_value="Service level management" source="com.snc.sla"&gt;e2d7bc6c3cb1311068bcf327dfe37f1f&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_24a759e30a0a2c3960e024ad3b60d9e8&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-08-21 14:04:54&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:21</sys_created_on>
+        <sys_id>c3f0345983b01210c6695855eeaad33f</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>TaskSLAController</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_c3f0345983b01210c6695855eeaad33f</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:21</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

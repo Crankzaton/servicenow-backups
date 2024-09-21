@@ -1,0 +1,832 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0d49ed2d0ba323008401818393673ae2</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.NotifyUtilSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;NotifyUtilSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var NotifyUtilSNC = Class.create();
+NotifyUtilSNC.prototype = Object.extendsObject(global.NotifyUtils, {
+
+	TABLES : {
+		NOTIFY_CONFERENCE_CALL :  "notify_conference_call",
+		NOTIFY_NUMBER : "notify_number",
+		NOTIFY_GROUP : "notify_group",
+		NOTIFY_GROUP_SELECTOR : "notify_group_selector",
+		NOTIFY_GROUP_SELECTOR_CHOICE : "notify_group_selector_choice",
+		TASK : "task",
+		COMM_TASK : "comm_task",
+		INCIDENT_ALERT_TASK : "incident_alert_task"
+	},
+	
+	COLUMNS : {
+		DESCRIPTION : "description",
+		CONFERENCE_TITLE : "conference_title",
+		NUMBER : "number",
+		NAME : "name",
+		DEFAULT_GROUP : "default_group",
+		MANUAL_SELECTION : "manual_selection",
+		SOURCE_TABLE : "source_table",
+		ORDER : "order",
+		NOTIFY_GROUP: "notify_group",
+		NOTIFY_GROUP_SELECTOR: "notify_group_selector",
+		NUMBER_OWNER: "owner",
+		SOURCE : "source",
+		CONFERENCE_PROVIDER : "conference_provider",
+		HAS_SMS_OUT: "has_sms_out",
+		SHORT_CODE: "short_code"
+	},
+
+	EXTN_POINT_NOTIFY_JS_DRIVER: "global.NotifyJsTelephonyDriver",
+	DEFAULT_TELEPHONY_SERVICE_PROVIDER: "Telephony",
+	CTX_WAIT_TIME: gs.getProperty('com.snc.notify.ctx_wait_time', 500),
+	CTX_MAX_TRIES: gs.getProperty('com.snc.notify.ctx_max_tries', 4),
+
+	initialize: function() {
+		global.NotifyUtils.prototype.initialize.call(this);
+		this.resetResult();
+	},
+
+	resetResult : function () {
+		this._result = {status: true, errorMessages: []};
+	},
+
+	_addErrorMessage: function (message) {
+		this._result.status = false;
+		this._result.errorMessages.push(message);
+	},
+
+	getResult: function () {
+		return this._result;
+	},
+
+	/*
+	 * @returns {array} providers
+	 */
+	getTelephonyProviders: function () {
+		var providers = [];
+		var drivers = new GlideScriptedExtensionPoint().getExtensions(this.EXTN_POINT_NOTIFY_JS_DRIVER);
+		for (var i in drivers) {
+			providers.push(drivers[i].getName());
+		}
+		return providers;
+	},
+
+	getConferenceDescription: function(confId) {
+		if (confId) {
+			var confGr = new GlideRecord(this.TABLES.NOTIFY_CONFERENCE_CALL);
+			if (confGr.get(confId))
+				return confGr.getDisplayValue(this.COLUMNS.DESCRIPTION);
+		}
+	},
+	
+	// Conference title defaulted initially and on conference initiation value taken from db
+	getConferenceTitle: function(data) {
+		var title = '';
+		if (!gs.nil(data.confId)) {
+			var confGr = new GlideRecord(this.TABLES.NOTIFY_CONFERENCE_CALL);
+			if (confGr.get(data.confId))
+				title = confGr.getDisplayValue(this.COLUMNS.CONFERENCE_TITLE);
+		} else if (GlideDBObjectManager.get().isInstanceOf(data.table, this.TABLES.COMM_TASK)) {
+			var handlerInstance = new sn_comm_management.CommunicationManagementBridgeSNC().getHandlerInstance(data.table, this.TABLES.COMM_TASK);
+			title = handlerInstance.getConferenceDefaultTitle(data);
+		} else {
+			var gr = new GlideRecord(data.table);
+			if (gr.get(data.sysId)) {
+				if (gr.isValidField('number') &amp;&amp; gr.isValidField('short_description'))
+					title = gr.number + ' - ' + gr.short_description;
+				else
+					title = gr.getDisplayValue();
+			}		
+		}
+			
+		return title;
+	},
+
+	_debugStampExtPointName: function (items, ext) {
+		if (this.__isDebugging()) {
+			var self = this;
+			items.forEach(function (c) {
+				c.name += " - " + ext.type;
+				if (c.users &amp;&amp; Array.isArray(c.users))
+					self._debugStampExtPointName(c.users, ext);
+			});
+			this.log.debug(ext.type + ": " + JSON.stringify(items));
+		}
+	},
+
+	/**
+	 * @returns {Array&lt;any&gt;}
+	 * Returns an array of contacts, can be group too.
+	*/
+	getConferenceContacts: function (ctxRecordTable, ctxRecordSysId, type) {
+		var self = this;
+		var exPoints = this.__getConfExtensionPoints();
+		/**
+		 * @type {Array&lt;any&gt;}
+		*/
+		var contacts = [];
+		var ctx = {table:ctxRecordTable, sysId:ctxRecordSysId};
+		for (var i = 0; i &lt; exPoints.length; i++) {
+			if (!this._isFunction(exPoints[i].getContacts))
+				continue;
+			exPoints[i].initialize();
+			var thisContacts = [];
+			try {
+				thisContacts = exPoints[i].getContacts(ctx, contacts, type);
+				if (Array.isArray(thisContacts)) {
+					this._debugStampExtPointName(thisContacts, exPoints[i]);
+					contacts = contacts.concat(thisContacts);
+					// making sure other extension instances will always get unique items.
+					contacts = this.filterDuplicateContacts(contacts);
+				}
+			} catch (e) {
+				this._addErrorMessage(gs.getMessage("Some contacts fetching failed due to exception {0}", [e]));
+				gs.error("Error in " + exPoints[i].type + ".getContacts: " + e + " for parameters "
+					+ JSON.stringify({ctxRecordTable:ctxRecordTable, ctxRecordSysId:ctxRecordSysId, type:type}));
+			}
+		}
+		// Resolve users of group contacts
+		contacts.forEach(function (c) {
+			if (c.users) { // Means this is group
+				if (c.id)
+					c = self._extend(c, self.getConferenceGroupDetails(c.id, ctxRecordTable, ctxRecordSysId, type,
+																		c /* For backwards compatibility we allow
+																		eager groups to users resolution by getContacts API itself
+																		however that is discouraged and unnecessary.*/));
+			}
+		});
+		return this.filterDuplicateContacts(contacts);
+	},
+
+	/**
+	* Returns a JSON with details about the group. The 'users' field is guranteed but other fields may or may not exist.
+	*/
+	getConferenceGroupDetails: function (groupId, ctxRecordTable, ctxRecordSysId, type, /*Optional*/ alreadyGotGroupDetails) {
+		var exPoints = this.__getConfExtensionPoints();
+		var groupDetails = {users: []};
+		var ctx = {table:ctxRecordTable, sysId:ctxRecordSysId};
+		for (var i = 0; i &lt; exPoints.length; i++) {
+			if (!this._isFunction(exPoints[i].getGroupDetails))
+				continue;
+			exPoints[i].initialize();
+			var grpDetails;
+			try {
+				// Information from all extension points are composited together.
+				// Field values get overwritten if also returned by a later extension, except
+				// for 'users' field, who values get appended.
+				grpDetails = exPoints[i].getGroupDetails(groupId, ctx, groupDetails, type);
+				if (!groupDetails.users)
+					groupDetails.users = [];
+				if (grpDetails) {
+					if (Array.isArray(grpDetails.users)) {
+						this._debugStampExtPointName(grpDetails.users, exPoints[i]);
+						groupDetails.users = groupDetails.users.concat(grpDetails.users);
+						// making sure other extension instances will always get unique users.
+						groupDetails.users = this.filterDuplicateContacts(groupDetails.users);
+					}
+					groupDetails = this._extend(groupDetails, grpDetails, ['users']);
+					if (groupDetails.name &amp;&amp; this.__isDebugging())
+						groupDetails.name += " - " + exPoints[i].type;
+				}
+			} catch (e) {
+				this._addErrorMessage(gs.getMessage("Some group member contacts fetching failed due to exception {0}", [e]));
+				gs.error("Error in " + exPoints[i].type + ".getGroupDetails: " + e + " for parameters "
+					+ JSON.stringify({groupId:groupId, ctxRecordTable:ctxRecordTable, ctxRecordSysId:ctxRecordSysId, type:type, alreadyGotGroupDetails:alreadyGotGroupDetails}));
+			}
+		}
+		groupDetails.users = this.filterDuplicateContacts(groupDetails.users);
+		return groupDetails;
+	},
+
+	getNotifyNumber: function (ctxRecordTableOrCtxGr, ctxRecordSysId) {
+		if (typeof ctxRecordTableOrCtxGr === 'string' &amp;&amp; typeof ctxRecordSysId === 'string') {
+			var gr = new GlideRecord(ctxRecordTableOrCtxGr);
+			if (gr.get(ctxRecordSysId))
+				ctxRecordTableOrCtxGr = gr;
+		}
+		// get notify number
+		var notifyNumber = null;
+		var isNumberSet = false;
+		try {
+			if (ctxRecordTableOrCtxGr) {
+				var exPoints = this.__getConfExtensionPoints();
+				for (var i = 0; i &lt; exPoints.length; i++) {
+					if (!this._isFunction(exPoints[i].getNotifyNumber))
+						continue;
+					exPoints[i].initialize();
+					var num = null;
+					try {
+						num = exPoints[i].getNotifyNumber(ctxRecordTableOrCtxGr);
+						if (typeof num === 'string') { // Empty num value is allowed
+							notifyNumber = num;
+							isNumberSet = true;
+							break;
+						}
+					} catch (e) {
+						this._addErrorMessage(gs.getMessage('Notify Number retrieval failed ({0}) ', [e]));
+					}
+				}
+			}
+			if (!isNumberSet)
+				notifyNumber = this.getNotifyOnTaskOutboundPhoneNumber();
+		} catch (e) {
+			this._addErrorMessage(gs.getMessage('Default Notify Number retrieval failed ({0})', [e]));
+		}
+		return notifyNumber;
+	},
+
+	getListOfNotifyNumbersAndProviders: function(sourceTable, sourceSysId, notifyGroupSelectorSysId, /*Optional*/ filterSMSCapableNums, /*Optional*/ enrichConfProviders) {
+		if (!sourceTable || !sourceSysId)
+			return {numbers: [], errors: [gs.getMessage('Source record information is not provided')]};
+		var response = {};
+		var numberList = [];
+		var errorList = [];
+		var choiceMap = {};
+		
+		if (notifyGroupSelectorSysId)
+			choiceMap = this._getSelectorChoicesForSelector(notifyGroupSelectorSysId);
+		else
+			choiceMap = this._getSelectorChoicesForTable(sourceTable, sourceSysId);
+
+		var defaultNumber = '';
+		try {
+			defaultNumber = (this._getDefaultNotifyNumberFromProperty_throws(sourceTable, sourceSysId) + '').trim();
+		} catch(e)  {
+			errorList.push(e.errorMessages);
+		}
+
+		if (defaultNumber) {
+			//Check if default number exists in notify number
+			var defaultNumberGr = new GlideRecord(this.TABLES.NOTIFY_NUMBER);
+			defaultNumberGr.addActiveQuery();
+			defaultNumberGr.addQuery(this.COLUMNS.NUMBER, defaultNumber);
+			defaultNumberGr.query();
+			if (!defaultNumberGr.hasNext()) {
+				errorList.push(gs.getMessage("Notify number {0} does not exist.", defaultNumber));
+			}
+			response.errors = errorList;	
+		}
+
+		var numberGr = new GlideRecord(this.TABLES.NOTIFY_NUMBER);
+		numberGr.addActiveQuery();
+		var qc = numberGr.addQuery(this.COLUMNS.NUMBER, defaultNumber);
+		if (choiceMap.notifyGroups.length &gt; 0)
+			qc.addOrCondition(this.COLUMNS.NOTIFY_GROUP, 'IN', choiceMap.notifyGroups.join());
+		if (filterSMSCapableNums)
+			numberGr.addQuery(this.COLUMNS.HAS_SMS_OUT, 'yes');
+		numberGr.query();
+		while (numberGr.next()) {
+			var number = {};
+			number['name'] = numberGr.getValue(this.COLUMNS.NAME);
+			number['sysId'] = numberGr.getUniqueValue();
+			number['number'] = numberGr.getValue(this.COLUMNS.NUMBER);
+			number['defaultFlag'] = (numberGr.getValue(this.COLUMNS.NUMBER) + '' === defaultNumber) ? true : false;
+			number['shortCode'] = (numberGr.getValue(this.COLUMNS.SHORT_CODE)) ? true : false;
+			number['order'] = 0;
+			numberList.push(number);
+		}
+		response.numbers = numberList;
+		if (Array.isArray(choiceMap.confProviders) &amp;&amp; choiceMap.confProviders.length &gt; 0) {
+			// remove duplicates
+			var confProviders = choiceMap.confProviders.filter(function(ele, idx) {
+				return idx === choiceMap.confProviders.indexOf(ele);
+			});
+			if(enrichConfProviders) {
+				response.confProviders = confProviders.map(function(confProvider) {
+					var name = confProvider;
+					confProvider = {};
+					confProvider['name'] = name;
+					confProvider['order'] = 1;
+					return confProvider;
+				});
+			} else
+				response.confProviders = confProviders;
+		}
+		return response;
+	},
+	
+	getOrderedListOfNotifyNumbersAndProviders: function(sourceTable, sourceSysId, notifyGroupSelectorSysId, /*Optional*/ filterSMSCapableNums) {
+		
+		var response = this.getListOfNotifyNumbersAndProviders(sourceTable, sourceSysId, notifyGroupSelectorSysId, filterSMSCapableNums, true);
+		var numbersAndConfProvidersList = [];
+	
+		if(typeof response.numbers !== 'undefined') {
+			response.numbers.forEach(function(number) {
+				number['type'] = 'number';
+				numbersAndConfProvidersList.push(number);
+			});
+		}
+		if(typeof response.confProviders !== 'undefined') {
+			response.confProviders.forEach(function(confProvider) {
+				confProvider['type'] = 'confProvider';
+				numbersAndConfProvidersList.push(confProvider);
+			});
+		}
+		
+		var sortNumbersAndConfProvidersList = numbersAndConfProvidersList.map(function(sp, index){
+			return {sp: sp, index: index};
+		});
+		sortNumbersAndConfProvidersList.sort(function(item1, item2) {
+			if (item1.sp.order &lt; item2.sp.order) return -1;
+			if (item1.sp.order &gt; item2.sp.order) return 1;
+			return item1.sp.index - item2.sp.index;
+		});
+		numbersAndConfProvidersList = sortNumbersAndConfProvidersList.map(function(item){
+			return item.sp;
+		});
+		
+		delete response.numbers;
+		delete response.confProviders;
+		response.orderedNumbersAndProviders = numbersAndConfProvidersList;
+		
+		return response;
+	},
+
+	getDefaultSelectorChoices: function() {
+		var notifyGroups = [], confProviders = [], choiceMap = {};
+		var selectorGr = new GlideRecord(this.TABLES.NOTIFY_GROUP_SELECTOR);
+		selectorGr.addActiveQuery();
+		selectorGr.addQuery(this.COLUMNS.DEFAULT_GROUP, true);
+		selectorGr.query();
+		if (selectorGr.next()) {
+			var choiceGr = new GlideRecord(this.TABLES.NOTIFY_GROUP_SELECTOR_CHOICE);
+			choiceGr.addQuery(this.COLUMNS.NOTIFY_GROUP_SELECTOR, selectorGr.getUniqueValue());
+			choiceGr.query();
+			while (choiceGr.next()) {
+				if (choiceGr.getValue(this.COLUMNS.NOTIFY_GROUP))
+					notifyGroups.push(choiceGr.getValue(this.COLUMNS.NOTIFY_GROUP));
+				if (choiceGr.getValue(this.COLUMNS.CONFERENCE_PROVIDER))
+					confProviders.push(choiceGr.getValue(this.COLUMNS.CONFERENCE_PROVIDER));
+			}
+		}
+		choiceMap.notifyGroups = notifyGroups;
+		choiceMap.confProviders = confProviders;
+		return choiceMap;
+	},
+
+	_getSelectorChoicesForTable: function(table, sysId) {
+		var notifyGroups = [], confProviders = [], choiceMap = {};
+		var tableGr = new GlideRecord(table);
+		if (!tableGr.get(sysId))
+			return choiceMap;
+		var mapGr = new GlideRecord(this.TABLES.NOTIFY_GROUP_SELECTOR);
+		mapGr.addActiveQuery();
+		mapGr.addQuery(this.COLUMNS.SOURCE_TABLE, table);
+		mapGr.addQuery(this.COLUMNS.MANUAL_SELECTION, false);
+		mapGr.orderBy(this.COLUMNS.ORDER);
+		mapGr.query();
+		while (mapGr.next()) {
+			var match = GlideFilter.checkRecord(tableGr, mapGr.getValue('condition'));
+			if (match) {
+				var choiceGr = new GlideRecord(this.TABLES.NOTIFY_GROUP_SELECTOR_CHOICE);
+				choiceGr.addQuery(this.COLUMNS.NOTIFY_GROUP_SELECTOR, mapGr.getUniqueValue());
+				choiceGr.query();
+				while (choiceGr.next()) {
+					if (choiceGr.getValue(this.COLUMNS.NOTIFY_GROUP))
+						notifyGroups.push(choiceGr.getValue(this.COLUMNS.NOTIFY_GROUP));
+					if (choiceGr.getValue(this.COLUMNS.CONFERENCE_PROVIDER))
+						confProviders.push(choiceGr.getValue(this.COLUMNS.CONFERENCE_PROVIDER));
+				}
+				break;
+			}
+		}
+		if (notifyGroups.length === 0 &amp;&amp; confProviders.length === 0) 
+			choiceMap = this.getDefaultSelectorChoices();
+		else {
+			choiceMap.notifyGroups = notifyGroups;
+			choiceMap.confProviders = confProviders;
+		}
+		return choiceMap;
+	},
+
+	_getSelectorChoicesForSelector: function(selectorSysId) {
+		var notifyGroups = [], confProviders = [], choiceMap = {};
+		if (!selectorSysId)
+			return choiceMap;
+		var selectorGr = new GlideRecord(this.TABLES.NOTIFY_GROUP_SELECTOR);
+		if (selectorGr.get(selectorSysId)) {
+			var choiceGr = new GlideRecord(this.TABLES.NOTIFY_GROUP_SELECTOR_CHOICE);
+			choiceGr.addQuery(this.COLUMNS.NOTIFY_GROUP_SELECTOR, selectorSysId);
+			choiceGr.query();
+			while (choiceGr.next()) {
+				if (choiceGr.getValue(this.COLUMNS.NOTIFY_GROUP))
+					notifyGroups.push(choiceGr.getValue(this.COLUMNS.NOTIFY_GROUP));
+				if (choiceGr.getValue(this.COLUMNS.CONFERENCE_PROVIDER))
+					confProviders.push(choiceGr.getValue(this.COLUMNS.CONFERENCE_PROVIDER));
+			}
+		}
+		choiceMap.notifyGroups = notifyGroups;
+		choiceMap.confProviders = confProviders;
+		return choiceMap;
+	},
+
+	/**
+	 * @typedef {{name?: string, id?: string, phoneNumber?: string, email?: string}} Item
+	 * @param {Array&lt;Item &amp; {users?:Array&lt;Item&gt;}&gt;} items
+	*/
+	filterDuplicateContacts: function (items) {
+		var self = this;
+		/**
+		 * @param {{name?: string, id?: string, phoneNumber?: string, email?: string}} item
+		 */
+		function getValidId(item) {
+			/**
+			 * @type {string|number|null|undefined}
+			 */
+			var id = item.id || item.phoneNumber || item.email;
+			var idType = typeof id;
+
+			if (idType == 'number')
+				return id;
+			if (idType == 'string') {
+				if (id.length &gt; 0)
+					return id;
+			}
+			// just returns if it is boolean, function or object.
+			if (idType != 'undefined')
+				return;
+
+			if (Array.isArray(item.users))
+				return; // if it is a group and doesn't have an id, we can do nothing.
+			if (self._isValidPhoneNumber(item.phoneNumber))
+				return item.phoneNumber; // now we can safely assume phoneNumber is Id.
+		}
+		var cache = {};
+		var result = [];
+		var id;
+		if (!Array.isArray(items))
+			return items;
+		for (var i = 0; i &lt; items.length; i++) {
+			var isGroup = Array.isArray(items[i].users);
+			if (!isGroup || (isGroup &amp;&amp; items[i].showGroupName)) {
+				id = getValidId(items[i]);
+				if (!id)
+					continue;
+				if (cache[id])
+					continue;
+				cache[id] = true;
+				items[i].id = id;
+				result.push(items[i]);
+				continue;
+			}
+			for (var j = 0; j &lt; items[i].users.length;) {
+				id = getValidId(items[i].users[j]);
+				if (cache[id] || !id) {
+					items[i].users.splice(j, 1);
+					continue;
+				}
+				cache[id] = true;
+				items[i].users[j].id = id;
+				j++;
+			}
+			if (!items[i].message &amp;&amp; items[i].users.length == 0)
+				continue;
+			result.push(items[i]);
+		}
+
+		return result;
+	},
+
+	/*
+	 * @param {string} sourceRecSysId
+	 * @returns {boolean}
+	 */
+	hasActiveConferenceCalls: function (sourceRecSysId) {
+		var confGr = new GlideRecordSecure(this.TABLES.NOTIFY_CONFERENCE_CALL);
+		confGr.addActiveQuery();
+		confGr.addQuery(this.COLUMNS.SOURCE, sourceRecSysId);
+		confGr.query();
+		return confGr.hasNext();
+	},
+
+	_getDefaultNotifyNumberFromProperty_throws : function(table, sysId) {
+		var number = this.getNotifyNumber(table, sysId);
+		if (!number) {
+		var result = this.getResult();
+			if (!result.status)
+					throw result;
+		}
+		return number;
+	},
+
+	_isFunction: function (val) {
+		return typeof val === 'function';
+	},
+
+	/**
+	 * @param {string} phoneNumber
+	 * @returns {boolean}
+	 */
+	_isValidPhoneNumber: function (phoneNumber) {
+		if (typeof phoneNumber != 'string')
+			return false;
+		if (phoneNumber.length == 0)
+			return false;
+		return this.validatePhoneNumber(phoneNumber);
+	},
+
+	_extend: function (dst, src, ignoreProps) {
+		if (!ignoreProps)
+			ignoreProps = [];
+		for (var p in src)
+			if (ignoreProps.indexOf(p) === -1)
+				dst[p] = src[p];
+		return dst;
+	},
+	hasVoiceCapableNumber: function () {
+		var numberGr = new GlideRecord('notify_number');
+		numberGr.addActiveQuery();
+		numberGr.addQuery("has_voice_out", "IN", "yes,unknown");
+		numberGr.setLimit(1);
+		numberGr.query();
+		return numberGr.hasNext();
+	},
+
+	isVoiceCapableNumber: function (number) {
+		var numberGr = new GlideRecord('notify_number');
+		numberGr.addActiveQuery();
+		numberGr.addQuery("number", number);
+		numberGr.addQuery("has_voice_out", "IN", "yes,unknown");
+		numberGr.setLimit(1);
+		numberGr.query();
+		return numberGr.hasNext();
+	},
+	/**
+	 * @param {string} email
+	 */
+	getUserIdByEmail: function (email) {
+		var user = GlideUser.getUserByEmail(email);
+		if (user)
+			return user.getID();
+		return '';
+	},
+	/**
+	 * @param {NotifyParticipantGR} currentGR
+	 * @param {NotifyParticipantGR} previousGR
+	 */
+	populateParticipantGRFromBeforeBR: function (currentGR, previousGR) {
+		var userId = currentGR.user + '';
+		// if user field is null , but phone number is populated
+		if (currentGR.user.nil() &amp;&amp; !currentGR.phone_number.nil())
+			userId = this.getUserByNumber(currentGR.phone_number + '');
+		if (currentGR.email.nil()) {
+			// if email field is empty, but have user Id
+			if (userId) {
+				var user = GlideUser.getUserByID(userId);
+				if (user)
+					currentGR.email = user.getEmail();
+			}
+		} else {
+			// user field is null but email is available.
+			if (!userId)
+				userId = this.getUserIdByEmail(currentGR.email + '');
+		}
+		// Assign userId  from email or phone number if user is already null and found userId from previous steps.
+		if (currentGR.user.nil() &amp;&amp; userId)
+			currentGR.user = userId;
+		// Assign host  from email or phone number if host is already null and found userId from previous steps.
+		if (currentGR.host.nil() &amp;&amp; userId) {
+			if (this.isConferenceLeaderInternal(currentGR, userId))
+				currentGR.host = true;
+		}
+		/**
+		 * initiator is the one who started (i.e created the conference record) the conference.
+		 * case #1. User started the confernece with participants including  himself
+		 * case #2. User started the conference with other participants excluding himself.
+		 * 	1. He himself joined after some time via addParticpants or self-join action.
+		 *  2. Another conference leader added him via add participant action.
+		 * case #3. Hopped-in user started the conference ( with case#1 and #2). gs.getUserID() may return null.
+		 */
+		var participantUserGR = new GlideRecord('sys_user');
+		if (userId &amp;&amp; participantUserGR.get(userId)) {
+			if (!currentGR.initiator &amp;&amp; !currentGR.notify_conference_call.nil()) {
+				if (('' + currentGR.notify_conference_call.sys_created_by) === participantUserGR.getValue('user_name'))
+					currentGR.initiator = true;
+			}
+		}
+
+		if (!currentGR.notify_conference_call.nil() &amp;&amp; ('' + currentGR.notify_conference_call.service_provider === 'Telephony'))
+			currentGR.service_provider_user_name = currentGR.phone_number.getDisplayValue();
+	},
+
+	/**
+ 	 * @param {string} actionName
+ 	 * @param {GlideRecord} sourceGr
+	 * @param {string} userId
+ 	 */
+	isActionAllowed: function (actionName, sourceGr, /* Optional */ userId) {
+		var extnPoints = this.__getConfExtensionPoints();
+		for (var i = 0; i &lt; extnPoints.length; i++) {
+			if (typeof extnPoints[i].isActionAllowed !== 'function')
+				continue;
+			extnPoints[i].initialize();
+			try {
+				var ret = extnPoints[i].isActionAllowed(actionName, sourceGr, userId) + '';
+				if (ret === 'true')
+					return true;
+				else if (ret === 'false')
+					return false;
+			} catch (e) {
+				gs.error("Error in " + extnPoints[i].type + ".isActionAllowed: " + e);
+			}
+		}
+		return false;
+	},
+
+	getConferenceProviderChoiceList: function () {
+		var servProviders = new NotifyConferenceUtils().getServiceProviderList();
+		var choiceList = new GlideChoiceList();
+		var value, label;
+		for (var i = 0; i &lt; servProviders.length; i++) {
+			if (servProviders[i] === this.DEFAULT_TELEPHONY_SERVICE_PROVIDER)
+				continue;
+			value = label = servProviders[i];
+			choiceList.add(value, label);
+		}
+		return choiceList;
+	},
+
+	isActiveSMSCapableNotifyNumberConfigured: function (sourceGr) {
+		var notifyNumbers = this.getListOfNotifyNumbersAndProviders(sourceGr.getTableName(), sourceGr.getUniqueValue(), '').numbers;
+		if (notifyNumbers) {
+			for (var item in notifyNumbers) {
+				var num = notifyNumbers[item].number;
+				var numberGr = new GlideRecord(this.TABLES.NOTIFY_NUMBER);
+				numberGr.addActiveQuery();
+				numberGr.addQuery(this.COLUMNS.NUMBER, num);
+				numberGr.addQuery(this.COLUMNS.HAS_SMS_OUT, "IN", "yes,unknown");
+				numberGr.query();
+				if (numberGr.hasNext()) 
+					return true;
+			}
+		}
+		return false;
+	},
+
+	getTelephonyProviderDrivers: function () {
+		var drivers = new GlideScriptedExtensionPoint().getExtensions(this.EXTN_POINT_NOTIFY_JS_DRIVER);
+		var driversMap = {};
+		for (var i = 0; i &lt; drivers.length; i++) {
+			driversMap[drivers[i].getName()] = drivers[i];
+		}
+		return driversMap;
+	},
+
+	/**
+	 * @param {string} notifyNumber or {GlideRecord} notifyNumberGr
+	 */
+	getTelephonyDriverFromNotifyNumber: function (notifyNumberOrGr) {
+		var driversMap = this.getTelephonyProviderDrivers();
+		var notifyNumberGr;
+		if (typeof notifyNumberOrGr === "string") {
+			notifyNumberGr = new GlideRecord(this.TABLES.NOTIFY_NUMBER);
+			notifyNumberGr.addQuery(this.COLUMNS.NUMBER, notifyNumberOrGr);
+			notifyNumberGr.addActiveQuery();
+			notifyNumberGr.query();
+			notifyNumberGr.next();
+		} else {
+			if ((typeof notifyNumberOrGr === "object" &amp;&amp; notifyNumberOrGr["isValidRecord"]) &amp;&amp; notifyNumberOrGr.isValidRecord() &amp;&amp; (notifyNumberOrGr.active + '' === 'true'))
+				notifyNumberGr = notifyNumberOrGr;
+		}
+		if (notifyNumberGr &amp;&amp; notifyNumberGr.isValidRecord()) {
+			var numberOwner = notifyNumberGr.getValue(this.COLUMNS.NUMBER_OWNER);
+			var driverForGivenNotifyNumber = driversMap[numberOwner];
+			return driverForGivenNotifyNumber ? driverForGivenNotifyNumber : null;
+		} else {
+			gs.error("[getTelephonyDriverFromNotifyNumber] : Invalid parameter.");
+		}
+	},
+
+	getMaxSizeForBulkSMS: function(driver, fromNum) {
+		if (!driver) {
+			gs.error("[getMaxSizeForBulkSMS]: driver is not provided.");
+			return;
+		}
+		if (!driver.supportsAutonomousBulkSms(fromNum))
+			return 0;
+		if (!driver.hasOwnProperty("getMaxSizeForBulkSMS"))
+			return 1;
+		return driver.getMaxSizeForBulkSMS(fromNum);
+	},
+	
+	getEmptyConferenceExpiryAge: function(){
+		return parseInt(gs.getProperty("glide.notify.empty_conference_expiry_age", 60));
+	},
+	
+	waitForContextReady: function(attrs, ctxId) {
+        if (!attrs)
+            return true;
+        if (!ctxId)
+            return false;
+        var numTries = 0,
+            lastCheckedArg = 0,
+            numAttrsFound = 0;
+        var allAttrsFound = false;
+        while (numTries &lt; this.CTX_MAX_TRIES &amp;&amp; !allAttrsFound) {
+            var baseCtx = new sn_context.BaseApiContext.get(ctxId);
+            var dataJson = baseCtx.getExtraData();
+            dataJson = dataJson.data ? dataJson.data : {};
+            for (var i = lastCheckedArg; i &lt; attrs.length; i++) {
+                if (dataJson.hasOwnProperty(attrs[i])) {
+                    numAttrsFound++;
+                } else {
+                    numTries++;
+                    gs.sleep(this.CTX_WAIT_TIME);
+                    lastCheckedArg = i;
+                    break;
+                }
+            }
+            if (numAttrsFound === attrs.length)
+                allAttrsFound = true;
+        }
+        if (!allAttrsFound &amp;&amp; gs.getProperty('glide.notify.debug') === 'true')
+            gs.warn("Could not find attributes on the context for ctxId:" + ctxId + ", even after rounds of wait");
+        return allAttrsFound;
+    },
+	
+	_hasAccessToUiActions: function() {
+		return gs.hasRole('notify_view, notify_admin') &amp;&amp; ( GlideStringUtil.notNil(gs.getProperty('glide.notify.task.phone_number', '')) || (gs.getProperty('glide.enable.notify_on_task', '') === 'true') );
+	},
+
+	hasAccessToCalls: function() {
+		return this._hasAccessToUiActions();
+	},
+	
+	canAccessStartConferenceCall: function(current) {
+		return this._hasAccessToUiActions() &amp;&amp; current.active;
+	},
+	
+	canAccessManageConferenceCalls: function(current) {
+		return this._hasAccessToUiActions() &amp;&amp; this.hasActiveConferenceCalls(current.getUniqueValue());
+	},
+	
+	canAccessSendSms: function(current) {
+		return this._hasAccessToUiActions() &amp;&amp; this.isActiveSMSCapableNotifyNumberConfigured(current) &amp;&amp; (current.active == true);
+	},
+
+	sleep: function(time) {
+		var allowedScopes = [];
+		var extInstanceGr = new GlideRecord("sys_extension_instance");
+		extInstanceGr.addEncodedQuery("point=global.NotifyJsTelephonyDriver^ORpoint=global.NotifyJSConferenceDriver^sys_scope.scope!=global");
+		extInstanceGr.query();
+		while(extInstanceGr.next()) {
+			allowedScopes.push(extInstanceGr.sys_scope.scope + "");
+		}
+		var callerScope = gs.getCallerScopeName();
+		if ( allowedScopes.indexOf(callerScope) !== -1 ) {
+			gs.sleep(time);
+		}
+	},
+	
+    // @returns JSON contains tables to roles mapping used to define conference leader for individual table
+    getTableNamesWithRolesForConferenceLeader: function() {
+        var tableRoles = {
+            "incident": ["itil", "sn_incident_write"],
+            "incident_task": ["itil", "sn_incident_write"],
+            "change_request": ["itil", "sn_change_write"],
+            "change_task": ["itil", "sn_change_write"],
+            "problem": ["itil", "sn_problem_write"],
+            "problem_task": ["itil", "sn_problem_write"]
+        };
+        return tableRoles;
+    },
+
+    type: 'NotifyUtilSNC'
+});]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2019-02-10 17:51:54&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0d49ed2d0ba323008401818393673ae2&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;183&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;NotifyUtilSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Notify" source="com.snc.notify"&gt;f0dfd45447320210cd4e1ce4316d4394&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0d49ed2d0ba323008401818393673ae2&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-10-03 13:13:21&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:58</sys_created_on>
+        <sys_id>4070789583b01210c6695855eeaad3e2</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>NotifyUtilSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_4070789583b01210c6695855eeaad3e2</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:58</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

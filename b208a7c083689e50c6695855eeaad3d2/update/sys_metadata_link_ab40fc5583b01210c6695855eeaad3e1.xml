@@ -1,0 +1,227 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>06b080c073002300d144234ffff6a74b</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.cxs_MLSearchHelper&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;cxs_MLSearchHelper&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var cxs_MLSearchHelper = Class.create();
+cxs_MLSearchHelper.prototype = Object.extendsObject(cxs_BaseMLHelper, {
+	DEFAULT_THRESHOLD: 1,
+	TABLE_ML_SOLUTION_DEFINITION: 'ml_capability_definition_base',
+	
+	processSearch: function () {
+		var inputs = JSON.parse(arguments[0]);
+
+		//Initialize
+		if (!inputs['tableName'] || !inputs['solutionDefinition'])
+			return;
+
+		this.threshold = this.DEFAULT_THRESHOLD;
+		this.solutionName = this.getSolutionName(inputs['solutionDefinition'].toString());
+		this.tableName = inputs['tableName'].toString();
+		this.count = Number(inputs['count'] ? inputs['count'].toString() : this.DEFAULT_COUNT) + 1;
+		if (inputs['tableConfiguration'])
+			this.tableConfigurationId = inputs['tableConfiguration'].toString();
+
+		//Cannot do ML search if there are no form details
+		if (!this.request.formId || !this.request.formTable || !this.solutionName)
+			return;
+
+		var formGr = this.getFormGr();
+
+		//Invalid form details
+		if (!formGr)
+			formGr = new GlideRecord(this.request.formTable);
+
+		formGr = this.updateSearchText(formGr);
+		// Empty search text for now should not go to ML API
+		if (!formGr)
+			return;
+
+		//Call ML serivce
+		var MLResults = this.callMLService(formGr);
+
+		while (this.response.results.length &lt; this.count) {
+			//Return if no results
+			if (!MLResults || MLResults.length &lt;= 0)
+				return;
+			
+			//Process results from ML predictions
+			this.processResults(MLResults);
+		}
+	},
+
+	updateSearchText: function (formGr) {
+		var searchText = this.getSearchText();
+		if (!searchText)
+			return null;
+
+		var fieldGr = !this.tableConfigurationId ? this.getTableConfigDefaultField() : this.getDefaultField(this.tableConfigurationId);
+		var currentSearchField = this.getCurrentSearchField();
+
+		if (currentSearchField &amp;&amp; formGr.isValidField(currentSearchField))
+			formGr.setValue(currentSearchField, searchText);
+		else if (fieldGr &amp;&amp; fieldGr.field &amp;&amp; formGr.isValidField(fieldGr.field))
+			formGr.setValue(fieldGr.field, searchText);
+
+		return formGr;
+	},
+
+	getSearchText: function () {
+		return this.request.query &amp;&amp; this.request.query.freetext ? this.request.query.freetext : '';
+	},
+
+	getTableConfigDefaultField: function () {
+		var tableConfig = this.getTableConfig();
+		if (tableConfig) {
+			return this.getDefaultField(tableConfig.sys_id);
+		}
+		return '';
+	},
+
+	getCurrentSearchField: function () {
+		return this.request.meta &amp;&amp; this.request.meta['sourceField'];
+	},
+
+	getSolutionName: function(defn) {
+		var gr = new GlideRecord(this.TABLE_ML_SOLUTION_DEFINITION);
+		if (gr.get(defn)) {
+			return gr.getValue('solution_name');
+		}
+		return null;
+	},
+
+	getFormGr: function () {
+		var gr = new GlideRecord(this.request.formTable);
+		if (gr.get(this.request.formId)) {
+			return gr;
+		}
+		return null;
+	},
+
+	callMLService: function (formGr) {
+		var predictor = new MLPredictor();
+		var info = "";
+		var solution = predictor.findActiveSolution(this.solutionName);
+		if (!solution)
+			return;
+		var outcomeArray = predictor.getPredictions(formGr, solution); //Threshold is default which is 1
+		return outcomeArray;
+	},
+
+	processResults: function (results) {
+		var currentSetResults = results.splice(0, this.count+1);
+		var formatedResults = this.formatResults(currentSetResults);
+		//var formatedResults = this.formatResultsDummyData(); //Until ML API is available
+		var sysIdsInOrder = formatedResults.sysIdsInOrder;
+		if (sysIdsInOrder &amp;&amp; sysIdsInOrder.length &gt; 0) {
+			// Get records that are readable by the user
+			var resultsGr = this.getResultsGr(sysIdsInOrder);
+			if (resultsGr.hasNext()) {
+				// Assimilate response
+				this.assimilateResults(formatedResults.resultsJson, resultsGr, sysIdsInOrder);
+			} 
+		}
+	},
+
+	formatResults: function (results) {
+		var resultsJson = {};
+		var sysIdsInOrder = [];
+		if (results) {
+			for (var i=0; i&lt; results.length; i++) {
+				if (results[i].hasPrediction()) {
+					var predictionObj = {};
+					var sysId = results[i].predictedValue().length === 32 ? results[i].predictedValue(): results[i].predictedValueSysId();
+					predictionObj['predictedValue'] = results[i].predictedValue(); //int/case number
+					predictionObj['predictedValueSysId'] = sysId; //sys_id for similarity
+					predictionObj['confidence'] = results[i].confidence(); //similarity score
+					resultsJson[sysId] = predictionObj;
+					sysIdsInOrder.push(sysId);
+				}
+			}
+		}
+		return {'sysIdsInOrder': sysIdsInOrder, 'resultsJson': resultsJson};
+	},
+
+	getResultsGr: function (sysIds) {
+		var gr = new GlideRecordSecure(this.tableName);
+		gr.addQuery('sys_id', 'IN', sysIds);
+		gr.query();
+		return gr;
+	},
+
+	assimilateResults: function (formatedResults, resultsGr, sysIdsInOrder) {
+		if (!formatedResults)
+			return;
+
+		var combinedResults = {};
+		while (resultsGr.next()) {
+			var sysId = resultsGr.getUniqueValue();
+			if (sysId === this.request.formId)
+				continue;
+
+			var srdc = new SNC.SearchResultDisplayConfiguration(resultsGr.getTableName(), this.request.getUiType(), this.request.getFormTable());
+			var res = new SNC.SearchResult();
+			res[this.RESULT_TITLE] = srdc.getCardTitle(resultsGr);
+			res[this.RESULT_SNIPPET] = SNC.SearchService.snippet(this.getSearchText(), srdc.getCardSnippet(resultsGr));
+			res[this.ID] = resultsGr.getTableName() + ':' + resultsGr.getUniqueValue();
+			if(resultsGr.getTableName() === 'kb_knowledge')
+				res[this.RESULT_LINK] = "kb_view.do?sysparm_article="+resultsGr.getValue('number');
+			else 
+				res[this.RESULT_LINK] = resultsGr.getLink();
+			res.meta[this.META_SCORE] = -1;
+			res.meta[this.CONFIDENCE] = formatedResults[this.CONFIDENCE];
+			res.meta.setDisplayConfiguration(srdc, resultsGr);
+			combinedResults[sysId] = res;
+		}
+
+		for (var i = 0; i &lt; sysIdsInOrder.length; i ++) {
+			if (sysIdsInOrder[i] === this.request.formId)
+				continue;
+
+			var searchResult = combinedResults[sysIdsInOrder[i]];
+			this.response.results.push(searchResult);
+			if (this.response.results.length &gt;= this.count)
+				break;
+		}
+	},
+
+	type: 'cxs_MLSearchHelper'
+});]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2018-08-15 21:18:06&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;06b080c073002300d144234ffff6a74b&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;137&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;cxs_MLSearchHelper&lt;/sys_name&gt;
+        &lt;sys_package display_value="Contextual Search" source="com.snc.contextual_search"&gt;67c7786c3cb1311068bcf327dfe37f57&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_06b080c073002300d144234ffff6a74b&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-01-16 13:15:38&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:23</sys_created_on>
+        <sys_id>ab40fc5583b01210c6695855eeaad3e1</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>cxs_MLSearchHelper</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_ab40fc5583b01210c6695855eeaad3e1</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:23</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,547 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0923b5ee0ab30150007c408f74342949</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.DiscoveryStatus&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Encapsulates the notion of a Discovery status record. &lt;/description&gt;
+        &lt;name&gt;DiscoveryStatus&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[/**
+ * 
+ * Encapsulates the notion of a Discovery status record.  Instances where isValid() returns true have the following
+ * properties initialized:
+ *
+ * sysID:           sys_id of the Discovery Status record
+ * number:          number of this record (e.g., "DIS10186")
+ * scheduleID:      sys_id of the associated Discovery Schedule record
+ * jobID:           sys_id of the associated job (sys_trigger) record
+ * discover:        what to discover: 'CIs', 'IPs', or 'Nets'
+ * includeAlive:    boolean, true if include alive was checked
+ * logStateChanges: boolean, true to log state changes
+ * source:          How discovery is triggered 
+ *
+ */
+var DiscoveryStatus = Class.create();
+
+DiscoveryStatus.shouldRunClusterManagementForDiscoveryType = function(discoveryType) {
+	return DiscoveryStatus.isNotServerlessDiscovery(discoveryType) &amp;&amp; 
+		DiscoveryStatus.isNotSubnetDiscovery(discoveryType);
+};
+
+DiscoveryStatus.isNotServerlessDiscovery = function(discover) {
+	return (discover != 'Hostless');
+};
+
+DiscoveryStatus.isNotSubnetDiscovery = function(discover) {
+	return (discover != 'Subnet');
+};
+
+DiscoveryStatus.isNotCloudDiscovery = function(discover) {
+	return (discover != 'Cloud Resources');
+};
+
+DiscoveryStatus.isStatusWaitingForDependency = function(statusGlideRecord) {
+	return Object.keys(DiscoveryStatusExternalDependencies).some(function(key) {
+		var doesDependencyhaveJobLeftOnStatus = DiscoveryStatusExternalDependencies[key];
+		return doesDependencyhaveJobLeftOnStatus(statusGlideRecord);
+	});	
+}
+
+DiscoveryStatus.updateStatusStartedCount = function(statusId, num) {
+	this.updateStatusCount(statusId, num, 'started');
+};
+
+DiscoveryStatus.updateStatusCompletedCount = function(statusId, num) {
+	this.updateStatusCount(statusId, num, 'completed');
+};
+
+DiscoveryStatus.updateStatusCount = function(statusId, num, type) {
+	if (JSUtil.nil(num))
+		num = 1;
+	
+    // increment started &amp; completed counts
+		var mu = GlideMultipleUpdate("discovery_status");
+		mu.setIncrement(type, num);
+		mu.addQuery("sys_id", statusId);
+    mu.addQuery('state', '!=', 'Canceled');
+		mu.execute();
+
+    if (gs.getProperty('glide.discovery.count.use_optimized_counter', 'true') == 'true') {
+        // Trigger the BR 'Discovery - Set Status' to set state='Active'
+        if (type == 'started') {
+            var gr = GlideRecord("discovery_status");
+            gr.addQuery('sys_id', statusId);
+            gr.addQuery('state', 'Starting');
+            gr.query();
+            if (gr.next()) {
+                gr.setForceUpdate(true);
+                gr.update();
+            }
+        }
+
+        // Trigger the BRs 'Discovery - Complete' &amp; 'Discovery - Change Phase' 
+        if (type == 'completed') {
+            gr = GlideRecord("discovery_status");
+            gr.addQuery('sys_id', statusId);
+            gr.addQuery('completed', 'SAMEAS', 'started');
+            gr.addQuery('state', 'Active');
+            gr.query();
+            if (gr.next()) {
+                gr.setForceUpdate(true);
+                gr.update();
+            }
+        }
+    } else {
+        // Retaining old behavior as a failsafe in case of unexpected problems due to the new code on a customer instance
+
+		// workaround to force trigger of business rules until we have a real fix.
+		var gr = new GlideRecord("discovery_status");
+        if (!gr.get('sys_id', statusId))
+            return;
+
+        if (gr.state == 'Canceled' || gr.scratchpad.cancel)
+            return;
+
+		// Generate a guid to ensure there will be an update. Previously used the gs.now(), but there could be collision of the same value with multiple threads
+		gr.scratchpad.unique = gs.generateGUID();
+		gr.update();
+		}
+};
+
+DiscoveryStatus.prototype = Object.extend(new AbstractDBObject(), {
+	/*
+ 	* Retrieves or creates the status record, using the given source, and initializes this instance with the
+ 	* information in that record. If the qualifier is a DiscoveryJob instance, then this method either finds the
+ 	* existing status record (for a "Discover Now") or creates a new one (for a scheduled Discovery). If the qualifier
+ 	* is a schedule record, then a new status record is created. Otherwise the qualifier is treated as a discovery
+ 	* status GlideRecord or string instance containing a sysID for the desired status record.
+ 	*/
+	initialize: function(type, description, source) {
+		this.valid = false;
+		var gr = null;
+		if (type instanceof DiscoveryJob)
+			gr = this._findOrCreate(type, description, source);
+		else if (type instanceof DiscoverySchedule) {
+			this.schedule = type;
+			gr = this._create(type, null, description, source);
+		} else if (type instanceof GlideRecord) {
+			if (type.getTableName() == 'discovery_status') {
+				gr = type;
+				this.valid = true;
+			}
+		} else {
+			gr = new GlideRecord('discovery_status');
+			if (gr.get('sys_id', type))
+				this.valid = true;
+		}
+		
+		if (!this.valid)
+			return;
+		
+		// everything's cool, so save our values...
+		this.sysID = gr.getValue('sys_id');
+		this.number = gr.getValue('number');
+		this.scheduleID = gr.getValue('dscheduler');
+		this.jobID = gr.getValue('scheduler_job');
+		this.discover = gr.getValue('discover');
+		this.include = gr.getValue('include');
+		this.description = gr.getValue('description');
+		this.createdOn = gr.getValue('sys_created_on');
+		this.updatedOn = gr.getValue('sys_updated_on');
+		this.useSnmpVersion  = gr.getValue('use_snmp_version');
+		this.source = gr.getValue('source');
+		this.priority = gr.getValue('priority');
+		this.includeAlive = JSUtil.getBooleanValue(gr, 'include_alive');
+		this.logStateChanges = JSUtil.getBooleanValue(gr, 'log_state_changes');
+		this.scratchpad = gr.scratchpad;
+	},
+
+	/*
+ 	* Returns a GlideRecord instance initialized to this status record, or null if none.
+ 	*/
+	getGlideRecord: function() {
+		if (!this.valid)
+			return null;
+
+		var gr = new GlideRecord('discovery_status');
+		gr.get('sys_id', this.sysID);
+		return gr;
+	},
+	
+	/*
+ 	* Returns the current phase for the given behavior, or null if none has been recorded.  Note that the behavior
+ 	* phase is stored in the scratchpad as variable named "behavior:&lt;sys_id&gt;", where &lt;sys_id&gt; is the sys_id of the
+ 	* behavior.
+ 	*
+ 	* behavior: the DiscoveryBehaviorRecord instance for the behavior whose phase is being queried.
+ 	* returns:  the integer phase number for this behavior, or null if none has been recorded.
+ 	*/
+	getPhase: function(behavior) {
+		var phase = this.scratchpad[this.getBehaviorPhaseKey(behavior)];
+		return (phase == null) ? null : (phase - 0);
+	},
+	
+	/*
+ 	* Sets the current phase for the given behavior.  Note that the behavior phase is stored in the scratchpad as
+ 	* variable named "behavior:&lt;sys_id&gt;", where &lt;sys_id&gt; is the sys_id of the behavior.
+ 	*/
+	setPhase: function(behavior, phase) {
+		var gr = this.getGlideRecord();
+		if (!gr)
+			return;
+		
+		gr.scratchpad[this.getBehaviorPhaseKey(behavior)] = (phase - 0);
+		gr.setWorkflow(false);  // stomp on a totally useless recursive business rule...
+		gr.update();
+		this.scratchpad = gr.getValue( 'scratchpad' );
+	},
+	
+	/*
+ 	* Returns the behavior phase key for the given behavior.
+ 	*
+ 	* behavior: the DiscoveryBehaviorRecord instance a key is needed for.
+ 	*/
+	getBehaviorPhaseKey: function(behavior) {
+		return 'behavior:' + behavior.sysID;
+	},
+	
+	/*
+ 	* Find or create this status record in the database.
+ 	*
+ 	* job: the DiscoveryJob instance for the job associated with this status record.
+ 	*/
+	_findOrCreate: function(job, description, source) {
+		if (!job.isValid())
+			return null;
+		
+		// if we've got a "run once" job, then it was triggered by "Discover Now" and we may already have a status
+		// record...
+		var gr = new GlideRecord('discovery_status');
+		if (job.isRunOnce()) {
+			gr.addQuery('scheduler_job', job.sysID);
+			gr.orderByDesc('sys_created_on');
+			gr.query();
+			if (gr.next()) {
+				this.valid = true;
+				return gr;
+			}
+		}
+		
+		// otherwise this is a scheduled job, and we need to create a new status record...
+		var sched = new DiscoverySchedule(job.scheduleID);
+		return this._create(sched, job.sysID, description, source);
+	},
+	
+	calculateAvgProbeCount: function(schedule) {
+		var rowLimit = 2;
+		var numberOfRecords = 0;
+		var sum = 0;
+		var result = 0;
+		var gr = new GlideRecord('discovery_status');
+		gr.addQuery('dscheduler', schedule);
+		gr.addQuery('state', 'Completed');
+		gr.addQuery('estimated_probe_count', '&gt;=', 0);
+		gr.orderByDesc('sys_created_on');
+		gr.setLimit(rowLimit);
+		gr.query();
+		while (gr.next()) {
+			sum = sum + parseInt(gr.getValue('completed'));
+			numberOfRecords++;
+		}
+		if (numberOfRecords &gt; 0) {
+			result = sum/numberOfRecords;
+		}
+		return result;
+	},
+	
+	_create: function(schedule, jobID, description, source) {
+		var gr = new GlideRecord('discovery_status');
+		gr.initialize();
+		gr.setValue('dscheduler',        schedule ? schedule.sysID : 'NULL'         );
+		gr.setValue('scheduler_job',     jobID                                      );
+		gr.setValue('description',       !!description ? description : 'Unknown'    );
+		gr.setValue('discover',          schedule ? schedule.discover : 'CIs'       );
+		gr.setValue('log_state_changes', schedule ? schedule.logStateChanges : false);
+		gr.setValue('include_alive',     schedule ? schedule.includeAlive : false   );
+		gr.setValue('max_run',           schedule ? schedule.maxRun : null          );
+		gr.setValue('use_snmp_version',  schedule ? schedule.useSnmpVersion : 'all' );
+		gr.setValue('estimated_probe_count', description != 'Discover CI' ? this.calculateAvgProbeCount(schedule.sysID) : 0);
+		gr.setValue('source',            source);
+		gr.setValue('priority',          this._getPriorityFromSource(source));
+		gr.insert();
+		this.valid = true;
+		return gr;
+	},
+	
+	_getPriorityFromSource: function(source) {
+		var priority = '2';       // Standard
+		
+		switch(source) {
+			case 'PatternDesigner':
+				priority = '0';  // Interactive
+				break;
+			case 'Discover_now_ci':
+			case 'Quick_Discovery':
+			case 'ServiceWatch':
+				priority = '1';  // Expedited
+				break;
+		}
+		
+		return priority;
+	},
+	
+	discoverCIs: function() {
+		return this.discover == 'CIs';
+	},
+	
+	discoverIPs: function() {
+		return this.discover == 'IPs';
+	},
+	
+	discoverNets: function() {
+		return this.discover == 'Nets';
+	},
+	
+	discoverWebService: function() {
+		return this.discover == 'Web Service';
+	},
+	
+	discoverService: function() {
+		return this.discover == 'Service';
+	},
+	
+	isFromErrorRetry: function() {
+		return (JSUtil.notNil(this.description) &amp;&amp; this.description.startsWith('Retry Discovery'));
+	},
+	
+	getIPFromRetryDiscovery: function() {
+		var ipAddress = null;
+		
+		// Re-discovery spawned from an active error has a status with the description 'Retry Discovery &lt;ip_address&gt;'
+		var tokens = this.description.split(' ');
+		
+		if (tokens.length == 3)
+			ipAddress = tokens[2];
+		
+		return ipAddress;
+	},
+		
+	/*
+	* Sets the IP Address of the CI being discovered in the scratchpad as this information may not be available in the 
+	* status if discovery is triggered from the CI form and the associated IP is part of a discovery schedule that uses 
+	* a multi-phase behavior.
+	*/
+    setIPFromCI: function(ip) {
+        var gr = this.getGlideRecord();
+        if (!gr)
+            return;
+
+        gr.scratchpad.discoverNowIp = ip;
+        gr.setWorkflow(false);
+        gr.update();
+    },
+
+	/*
+	* Returns IP address of the CI being discovered if it was stored in the scratchpad
+	*/
+    getIPFromCI: function() {
+        var gr = this.getGlideRecord();
+        if (!gr)
+            return;
+
+        var ip = gr.scratchpad.discoverNowIp;
+        if (!ip)
+            return;
+
+        return '' + ip;
+    },
+
+    getSchedule: function() {
+        return this.schedule;
+    },
+
+	setSchedule: function(schedule) {
+        this.schedule = schedule;
+    },
+
+	type: 'DiscoveryStatus'
+});
+
+DiscoveryStatus.getDiscoveryType = function(statusId) {
+	var discoveryStatusGlideRecord = new GlideRecord('discovery_status');
+
+	if (discoveryStatusGlideRecord.get('sys_id', statusId))
+		return discoveryStatusGlideRecord.discover + '';
+};
+
+DiscoveryStatus.countInputsPerOutputReportMismatch = function(statusGlideRecord) {
+	var countReport = {},
+		countingSummary = DiscoveryStatus.getExpectedAndActualInputsPerOutput(statusGlideRecord);
+	
+	if (!countingSummary) {
+		countReport.message = gs.getMessage('{0}: No inputs found for status', [statusGlideRecord.number]);
+		return countReport;
+	}
+
+	for (var outputSysId in countingSummary.expectedInputsData) {
+		var expectedInputsDataForOutput = countingSummary.expectedInputsData[outputSysId];
+		var actualInputsCountForOutput = countingSummary.actualInputsCount[outputSysId];
+
+		if (expectedInputsDataForOutput.pagingType == 'orchestrator') {
+			/*
+			 * For orchestrator, we have no idea how many pages we should get,
+			 * however the last page should have a probe parameter indicating
+			 * that it is the last page
+			 */
+			var lastRecievedOrchestratorPage = new GlideRecord('ecc_queue');
+			lastRecievedOrchestratorPage.addQuery('sys_created_on', '&gt;=', statusGlideRecord.sys_created_on + '');
+			lastRecievedOrchestratorPage.addQuery('agent_correlator', statusGlideRecord.sys_id + '');
+			lastRecievedOrchestratorPage.addQuery('response_to', outputSysId);
+			lastRecievedOrchestratorPage.addQuery('name', 'CONTAINS', 'Orchestrator Page ' +  actualInputsCountForOutput);
+			lastRecievedOrchestratorPage.setNoCount();
+			lastRecievedOrchestratorPage.query();
+
+			if (!lastRecievedOrchestratorPage.next() || EccPayload(lastRecievedOrchestratorPage).getProbeParameters()[0].is_last_page == 'false') {
+				var message = gs.getMessage('{0}: Missing orchestrator page for output {1}. \
+				Counted {2} inputs, however page #{2} doesn\'t have "is_last_page" probe parameter set to "true"', [statusGlideRecord.number, outputSysId, actualInputsCountForOutput + '']);
+				
+				countReport.mismatch = {
+					pagingType: expectedInputsDataForOutput.pagingType,
+					outputSysId: outputSysId,
+					numOfExpectedInputs: -1,
+					numOfActualInputs: actualInputsCountForOutput
+				};
+				countReport.message = message;
+				break;
+			}
+		} else {
+			if (actualInputsCountForOutput != expectedInputsDataForOutput.counting) {
+				var message = gs.getMessage('{0}: count mismatch for output {1}. \
+				Counted {2} inputs, expected {3}', [statusGlideRecord.number, outputSysId, actualInputsCountForOutput + '', expectedInputsDataForOutput.counting + '']);
+	
+				countReport.mismatch = {
+					pagingType: expectedInputsDataForOutput.pagingType,
+					outputSysId: outputSysId,
+					numOfExpectedInputs: expectedInputsDataForOutput.counting,
+					numOfActualInputs: actualInputsCountForOutput
+				};
+				countReport.message = message;
+				break;
+			}
+		}
+	}
+
+	if (recievedAllExpectedInputs())
+		countReport.message = gs.getMessage('{0}: All inputs accounted for', [statusGlideRecord.number]);
+	return countReport;
+
+	function recievedAllExpectedInputs() {
+		return !countReport.mismatch;
+	}
+};
+
+DiscoveryStatus.getExpectedAndActualInputsPerOutput = function(statusGlideRecord) {
+	var responseTo, expectedInputsData = {}, actualInputsCount = {},
+		orchestratorRegex = /orchestrator page (\d+)/i,
+		multipageRegex = /multipage (\d+) of (\d+)$/i;
+	var eccGlideRecord = new GlideRecord('ecc_queue');
+	eccGlideRecord.addQuery('sys_created_on', '&gt;=', statusGlideRecord.sys_created_on + '');
+	eccGlideRecord.addQuery('agent_correlator', statusGlideRecord.sys_id + '');
+	eccGlideRecord.addQuery('queue', 'input');
+	eccGlideRecord.query();
+	if (!eccGlideRecord.hasNext())
+		return;
+	while (eccGlideRecord.next()) {
+		responseTo = eccGlideRecord.response_to + '';
+		expectedInputsData[responseTo] = expectedInputsData[responseTo] || { counting: -1, pagingType: 'single_page'};
+		var orchestratorMatch = orchestratorRegex.exec(eccGlideRecord.name + '');
+		if (orchestratorMatch)
+			expectedInputsData[responseTo].pagingType = 'orchestrator';
+		var multipageMatch = multipageRegex.exec(eccGlideRecord.name + '');
+		if (multipageMatch) {
+			expectedInputsData[responseTo].counting = +(multipageMatch[2]);
+			expectedInputsData[responseTo].pagingType = 'multipage';
+		} else if (gs.nil(orchestratorMatch)) {
+			expectedInputsData[responseTo].counting = 1;
+		}
+		actualInputsCount[responseTo] = (actualInputsCount[responseTo] || 0) + 1;
+	}
+	return {
+		expectedInputsData: expectedInputsData,
+		actualInputsCount: actualInputsCount
+	}
+};
+
+DiscoveryStatus.allRecordsProcessed = function(statusGlideRecord) {
+	var outputEccProcessing = new GlideRecord('ecc_queue');
+	outputEccProcessing.addQuery('sys_created_on', '&gt;=', statusGlideRecord.sys_created_on + '');
+	outputEccProcessing.addQuery('agent_correlator', statusGlideRecord.sys_id + '');
+	outputEccProcessing.addQuery('topic', '!=', 'SystemCommand');
+	outputEccProcessing.addQuery('state', 'IN', ['processing', 'ready']);
+	outputEccProcessing.setNoCount();
+	outputEccProcessing.setLimit(1);
+	outputEccProcessing.query();
+
+	return !outputEccProcessing.hasNext();
+};
+
+DiscoveryStatus.stillProcessingEccQueues = function(statusGlideRecord) {
+	var eccGlideRecord = new GlideRecord('ecc_queue');
+	eccGlideRecord.addQuery('sys_created_on', '&gt;=', statusGlideRecord.sys_created_on + '');
+	eccGlideRecord.addQuery('agent_correlator', statusGlideRecord.sys_id + '');
+	eccGlideRecord.addQuery('topic', '!=', 'SystemCommand');
+	eccGlideRecord.addQuery('state', 'processing');
+	eccGlideRecord.setNoCount();
+	eccGlideRecord.setLimit(1);
+	eccGlideRecord.query();
+
+	return eccGlideRecord.hasNext();
+};
+
+DiscoveryStatus.anyEccUpdatedAtOrAfterStaleTime = function(statusGlideRecord, dateTimeConsideredStale) {
+	var eccGlideRecord = new GlideRecord('ecc_queue');
+	eccGlideRecord.addQuery('sys_created_on', '&gt;=', statusGlideRecord.sys_created_on + '');
+	eccGlideRecord.addQuery('agent_correlator', statusGlideRecord.sys_id + '');
+	eccGlideRecord.addQuery('sys_updated_on', '&gt;=', dateTimeConsideredStale + '');
+	eccGlideRecord.addQuery('topic', '!=', 'SystemCommand');
+	eccGlideRecord.setNoCount();
+	eccGlideRecord.setLimit(1);
+	eccGlideRecord.query();
+
+	return eccGlideRecord.hasNext();
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;glide.maint&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2009-01-24 14:56:11&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0923b5ee0ab30150007c408f74342949&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;66&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;DiscoveryStatus&lt;/sys_name&gt;
+        &lt;sys_package display_value="Core Automation" source="com.snc.core.automation"&gt;6ca7f42c3cb1311068bcf327dfe37f6a&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0923b5ee0ab30150007c408f74342949&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;now.discovery_infra&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-10-24 15:44:54&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:35</sys_created_on>
+        <sys_id>2e50349583b01210c6695855eeaad336</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>DiscoveryStatus</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_2e50349583b01210c6695855eeaad336</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:35</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

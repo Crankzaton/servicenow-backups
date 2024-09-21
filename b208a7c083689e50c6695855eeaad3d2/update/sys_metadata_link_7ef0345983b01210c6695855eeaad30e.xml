@@ -1,0 +1,270 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>2495841273633300e289235f04f6a797</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.TaskSLAFlowSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Control the Flows for a Task&amp;#13;
+&amp;#13;
+Expects to run after the Task SLA record exists and the record has been updated.&lt;/description&gt;
+        &lt;name&gt;TaskSLAFlowSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var TaskSLAFlowSNC = Class.create();
+
+TaskSLAFlowSNC.prototype = {
+
+	// sys_properties
+	SLA_FLOW_LOG: 'com.snc.sla.flow.log',
+	SLA_FLOW_RUN_FOR_BREACHED: 'com.snc.sla.flow.run_for_breached',
+	SLA_DATABASE_LOG: 'com.snc.sla.log.destination',
+
+	initialize: function(taskSLAGr, slaDefGr) {
+		this.taskSLAGr = taskSLAGr;
+		this.slaDefGr = null;
+		this.repairMode = false;
+		this.runForBreached = (gs.getProperty(this.SLA_FLOW_RUN_FOR_BREACHED, 'false') == 'true');
+		this.slaUtil = new SLAUtil();
+		this.slaDurationMs = null;
+
+		if (slaDefGr &amp;&amp; slaDefGr.isValidRecord())
+			this.slaDefGr = slaDefGr;
+		else if (taskSLAGr &amp;&amp; taskSLAGr.isValidRecord())
+			this.slaDefGr = this.slaUtil.getSLADefFromTaskSLA(taskSLAGr);
+
+		this.lu = new GSLog(this.SLA_FLOW_LOG, this.type);
+		this.lu.includeTimestamp();
+		if (gs.getProperty(this.SLA_DATABASE_LOG, "db") == "node")
+			this.lu.disableDatabaseLogs();
+
+		// if enable logging has been checked on the SLA definition up the log level to "debug"
+		if (this.slaDefGr &amp;&amp; this.slaDefGr.enable_logging)
+			this.lu.setLevel(GSLog.DEBUG);
+
+		if (this.lu.atLevel(GSLog.INFO))
+			this.lu.logInfo('initialize: with task_sla ' + taskSLAGr.getUniqueValue());
+	},
+
+	setRepairMode: function(trueFalse) {
+		this.repairMode = "" + trueFalse === "true";
+	},
+
+	setSLADuration: function(slaDurationMs) {
+		if (isNaN(slaDurationMs) || slaDurationMs === 0)
+			return;
+
+		this.slaDurationMs = parseInt(slaDurationMs);
+	},
+
+	getFlowData: function() {
+		var hasFlows = false;
+		var hasMultipleFlows = false;
+		var flowId = "";
+
+		if (!this.taskSLAGr || !this.taskSLAGr.isValidRecord())
+			return {
+				hasFlows: hasFlows,
+				hasMultipleFlows: hasMultipleFlows,
+				flowId: flowId,
+				flowQuery: ""
+			};
+
+		var flowsGr = this._getFlowsByState();
+		if (flowsGr.next()) {
+			hasFlows = true;
+			if (!flowsGr.hasNext())
+				flowId = flowsGr.getUniqueValue();
+			else
+				hasMultipleFlows = true;
+		}
+
+		return {
+			hasFlows: hasFlows,
+			hasMultipleFlows: hasMultipleFlows,
+			flowId: flowId,
+			flowQuery: flowsGr.getEncodedQuery()
+		};
+	},
+
+	start: function() {
+		if (!this.taskSLAGr || !this.taskSLAGr.isValidRecord()) {
+			this.lu.logError('start: no Task SLA record supplied');
+			return;
+		}
+
+		if (!this.slaDefGr) {
+			this.lu.logError('start: no SLA definition supplied');
+			return;
+		}
+
+		if (this.slaDefGr.flow.nil()) {
+			if (this.lu.atLevel(GSLog.INFO))
+				this.lu.logInfo('start: no Flow specified on SLA Definition ' + this.slaDefGr.getDisplayValue());
+			return;
+		}
+
+		// If the SLA has already breached then unless the appropriate property has been set true don't run the Flow
+		if (this.taskSLAGr.has_breached &amp;&amp; !this.runForBreached) {
+			if (this.lu.atLevel(GSLog.INFO))
+				this.lu.logInfo('start: SLA has already breached so Flow will not be started for ' + this.slaDefGr.name);
+			return;
+		}
+
+		var flowId = this.slaDefGr.getValue("flow");
+
+		var flowGr = new GlideRecord("sys_hub_flow");
+		if (!flowGr.get(flowId)) {
+			this.lu.logError('Failed to find a Flow with sys_id: ' + flowId);
+			return;
+		}
+
+		var scopeName = flowGr.getValue("sys_scope");
+		if (scopeName !== "global")
+			scopeName = "" + flowGr.sys_scope.scope;
+		var flowName = scopeName + "." + flowGr.getValue("internal_name");
+		try {
+			sn_flow_trigger.FlowTriggerAPI.fireSlaTaskTrigger(flowName, this.taskSLAGr, this._getSLADefFlowInput());
+			if (this.lu.atLevel(GSLog.INFO))
+				this.lu.logInfo('start: copy of Flow ' + this.slaDefGr.flow + ' started for ' + this.slaDefGr.name);
+		} catch(e) {
+			this.lu.logWarning('start: failed to start Flow "' + flowGr.getDisplayValue() + '" for Task SLA ' + this.taskSLAGr.getUniqueValue() + ':\n' + e);
+		}
+	},
+
+	pause: function() {
+		if (!this.taskSLAGr) {
+			this.lu.logError('pause: no Task SLA supplied');
+			return;
+		}
+
+		if (this.lu.atLevel(GSLog.INFO))
+			this.lu.logInfo('pause: instance of Flow "' + this.slaDefGr.flow + '" paused for ' + this.slaDefGr.name);
+
+		this._sendActionToRunningFlows("pause");
+	},
+
+	resume: function() {
+		if (!this.taskSLAGr) {
+			this.lu.logError('resume: no Task SLA supplied');
+			return;
+		}
+
+		if (this.lu.atLevel(GSLog.INFO))
+			this.lu.logInfo('resume: instance of Flow "' + this.slaDefGr.flow + ' resumed for ' + this.slaDefGr.name);
+
+		this._sendActionToRunningFlows("resume");
+	},
+
+	cancel: function() {
+		if (!this.taskSLAGr) {
+			this.lu.logError('cancel: no Task SLA supplied');
+			return;
+		}
+
+		var runningFlowsGr = this._getRunningFlows();
+		while (runningFlowsGr.next()) {
+			if (this.lu.atLevel(GSLog.INFO))
+				this.lu.logInfo('cancel: cancelling flow ' + runningFlowsGr.getValue("sys_id") + ' [' + runningFlowsGr.getDisplayValue() + ']');
+
+			try {
+				sn_fd.FlowAPI.cancel(runningFlowsGr.getValue("sys_id"), "SLA stage is " + this.taskSLAGr.getValue("stage"));
+			} catch(e) {
+				this.lu.logWarning('cancel: failed to cancel Flow context ' + runningFlowsGr.getUniqueValue() + ':\n' + e);
+			}
+	}
+	},
+
+	_getSLADefFlowInput: function() {
+		var slaDefFlowInput = {};
+
+		if (!this.taskSLAGr)
+			return slaDefFlowInput;
+
+		if (this.slaDurationMs === null)
+			this.slaDurationMs = this.slaUtil.getSLADurationInMs(this.taskSLAGr, this.slaDefGr);
+
+		var slaDurationGDT = new GlideDateTime();
+		slaDurationGDT.setNumericValue(this.slaDurationMs);
+
+		slaDefFlowInput = {
+			name: this.slaDefGr.getValue("name"),
+			duration_type: this.slaDefGr.getValue("duration_type"),
+			duration: "" + slaDurationGDT,
+			relative_duration_works_on: this.slaDefGr.getValue("relative_duration_works_on"),
+			is_repair: this.repairMode
+		};
+
+		return slaDefFlowInput;
+	},
+
+	_sendActionToRunningFlows: function(action) {
+		var flowContextGr = this._getRunningFlows();
+
+		while (flowContextGr.next()) {
+			try {
+				new sn_ph.FDSLATimer(flowContextGr.getUniqueValue())[action]();
+			} catch(e) {
+				this.lu.logWarning('_sendActionToRunningFlows: failed to send action "' + action + '" to Flow context ' + flowContextGr.getUniqueValue() + ':\n' + e);
+			}
+		}
+	},
+
+	_getRunningFlows: function() {
+		return this._getFlowsByState(["WAITING", "IN_PROGRESS", "QUEUED", "CONTINUE_SYNC"]);
+	},
+
+	_getFlowsByState: function(states) {
+		if (this.lu.atLevel(GSLog.INFO))
+			this.lu.logInfo('_getFlowsByState: called with states = ' + states);
+
+		var flowContextGr = new GlideRecord("sys_flow_context");
+		flowContextGr.addQuery("source_table", "task_sla");
+		flowContextGr.addQuery("source_record", this.taskSLAGr.getUniqueValue());
+		if (states)
+			flowContextGr.addQuery("state", states);
+		flowContextGr.query();
+
+		if (this.lu.atLevel(GSLog.INFO)) {
+			this.lu.logInfo('_getFlowsByState: "sys_flow_context" table queried with:\n' + flowContextGr.getEncodedQuery());
+			if (!flowContextGr.hasNext())
+				this.lu.logInfo('_getFlowsByState: no flows found');
+		}
+
+		return flowContextGr;
+	},
+
+	type: 'TaskSLAFlowSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2019-08-30 14:37:44&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;2495841273633300e289235f04f6a797&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;41&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;TaskSLAFlowSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Service level management" source="com.snc.sla"&gt;e2d7bc6c3cb1311068bcf327dfe37f1f&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_2495841273633300e289235f04f6a797&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-10-05 09:04:29&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:20</sys_created_on>
+        <sys_id>7ef0345983b01210c6695855eeaad30e</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>TaskSLAFlowSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_7ef0345983b01210c6695855eeaad30e</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:20</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

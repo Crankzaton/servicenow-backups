@@ -1,0 +1,325 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>6fc76994c7533010408bc8d6f2c260b1</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_fix"&gt;
+    &lt;sys_script_fix action="INSERT_OR_UPDATE"&gt;
+        &lt;before&gt;false&lt;/before&gt;
+        &lt;description&gt;Migrate data in sn_app_eng_studio_environment and sn_app_eng_studio_pipeline tables to corresponding table in Pipeline plugin in sn_deploy_pipeline scope.&lt;/description&gt;
+        &lt;name&gt;Migrate AES pipeline data into Pipeline&lt;/name&gt;
+        &lt;record_for_rollback&gt;false&lt;/record_for_rollback&gt;
+        &lt;script&gt;&lt;![CDATA[(function() {
+    var logPrefix = "Deployment Pipeline: Migrate App Engine Studio pipeline data to Pipeline tables: \n";
+    var migrationLog = {};
+    var environmentsMigrationMap = {}; // initialize environment map {aes_sys_id: pipeline_sys_id}
+
+    var AES_CONSTANTS = {
+        PIPELINE_TABLE: "sn_app_eng_studio_pipeline",
+        ENV_TABLE: "sn_app_eng_studio_environment",
+        PIPELINE_COLUMNS: {
+            ACTIVE: "active",
+            DEV_ENV: "dev_environment",
+            TEST_ENV: "test_environment",
+            PROD_ENV: "prod_environment"
+        }
+    };
+
+    var status = startMigration();
+    gs.info(logPrefix + "\n" + status);
+
+    function startMigration() {
+        // Check for AES tables
+        var grAESPipelines = new GlideRecord(AES_CONSTANTS.PIPELINE_TABLE);
+        var grAESEnvironments = new GlideRecord(AES_CONSTANTS.ENV_TABLE);
+
+        if (!grAESPipelines.isValid() || !grAESEnvironments.isValid()) {
+            return "Skipping migration as required AES tables are not found.";
+        }
+
+        // Check for Pipeline tables
+        var grPipelineEnvironment = new GlideRecord(DeploymentPipelineConstants.pipeline.tables.ENVIRONMENT);
+        var grPipelines = new GlideRecord(DeploymentPipelineConstants.pipeline.tables.PIPELINE);
+        var grPipelineEnvironmentOrder = new GlideRecord(
+            DeploymentPipelineConstants.pipeline.tables.PIPELINE_ENVIRONMENT_ORDER);
+
+        if (!grPipelineEnvironment.isValid() || !grPipelines.isValid() || !grPipelineEnvironmentOrder.isValid()) {
+            return "Skipping migration as required Pipeline tables are not found.";
+        }
+
+        grAESPipelines.orderByDesc(AES_CONSTANTS.PIPELINE_COLUMNS.ACTIVE);
+        grAESPipelines.query();
+        grAESEnvironments.query();
+
+        var originalPipelineCount = grAESPipelines.getRowCount();
+        var originalEnvironmentsCount = grAESEnvironments.getRowCount();
+
+        if (!originalPipelineCount &amp;&amp; !originalEnvironmentsCount) {
+            return "No data to be migrated";
+        }
+
+        // migrate pipelines starting with active
+        // This migrates the environments in the pipeline as well
+        // Active pipeline becomes the source of truth for environment type
+        while (grAESPipelines.next()) {
+            migrateAESPipeline(grAESPipelines);
+        }
+
+        // migrate environments not related to pipelines
+        while (grAESEnvironments.next()) {
+            createPipelineEnvironment(grAESEnvironments);
+        }
+
+        var migratedPipelineCount = getCompletedMigrationCount(AES_CONSTANTS.PIPELINE_TABLE);
+        var migratedEnvironmentsCount = getCompletedMigrationCount(AES_CONSTANTS.ENV_TABLE);
+
+        // Get how many pipelines and environments were successfully migrated
+        var pipelineCountLog = migratedPipelineCount + " out of " + originalPipelineCount + " pipelines migrated successfully.";
+        var environmentCountLog = migratedEnvironmentsCount + " out of " + originalEnvironmentsCount + " environments migrated successfully.";
+
+        // Validate environment connection async
+        startValidateConnection(Object.keys(environmentsMigrationMap).map(function(sysId) {
+            return environmentsMigrationMap[sysId];
+        }));
+
+        // Log everything combined
+        return pipelineCountLog + "\n" + environmentCountLog + "\n\n" + "Please see details below.\n\n" + JSON.stringify(migrationLog, null, "\t");
+    }
+
+    function migrateAESPipeline(aesPipeline) {
+        var aesDevEnvironment = getPipelineEnvironmentByType(aesPipeline, AES_CONSTANTS.PIPELINE_COLUMNS.DEV_ENV);
+        var aesTestEnvironment = getPipelineEnvironmentByType(aesPipeline, AES_CONSTANTS.PIPELINE_COLUMNS.TEST_ENV);
+        var aesProdEnvironment = getPipelineEnvironmentByType(aesPipeline, AES_CONSTANTS.PIPELINE_COLUMNS.PROD_ENV);
+
+        var migratedDevEnvSysId, migratedTestEnvSysId, migratedProdEnvSysId;
+
+        // We start with migrating the dev environment
+        // This becomes the source environment in new pipeline
+        if (aesDevEnvironment) {
+            migratedDevEnvSysId = createPipelineEnvironment(aesDevEnvironment);
+        }
+
+        var migratedPipelineSysId = createPipeline(aesPipeline, migratedDevEnvSysId);
+
+        // Then we check for test and prod environments
+        // If found, they are added to the migrated pipeline's pipeline environment order records.
+        if (aesTestEnvironment) {
+            migratedTestEnvSysId = createPipelineEnvironment(
+                aesTestEnvironment,
+                DeploymentPipelineConstants.pipeline.instanceTypes.TEST
+            );
+
+            // If the above migration was not successful, add logs and deactivate pipeline
+            if (!createPipelineEnvironmentOrder(migratedPipelineSysId, migratedTestEnvSysId, 100)) {
+                updateMigrationLog(aesPipeline, false, "Could not migrate test environment for pipeline");
+                updatePipeline(migratedPipelineSysId, false);
+            }
+        }
+
+        if (aesProdEnvironment) {
+            // prod environment from active pipeline is controller
+            migratedProdEnvSysId = createPipelineEnvironment(
+                aesProdEnvironment,
+                DeploymentPipelineConstants.pipeline.instanceTypes.PROD,
+                aesPipeline.getValue(AES_CONSTANTS.PIPELINE_COLUMNS.ACTIVE)
+            );
+
+            // If the above migration was not successful, add logs and deactivate pipeline
+            if (!createPipelineEnvironmentOrder(migratedPipelineSysId, migratedProdEnvSysId, 200)) {
+                updateMigrationLog(aesPipeline, false, "Could not migrate production environment for pipeline");
+                updatePipeline(migratedPipelineSysId, false);
+            }
+        }
+    }
+
+    function createPipelineEnvironment(aesEnvironment, type, isController) {
+        if (!aesEnvironment) {
+            return null;
+        }
+        var aesSysId = aesEnvironment.getUniqueValue();
+
+        // Do not migrate environment if previously migrated
+        if (environmentsMigrationMap[aesSysId]) {
+            return environmentsMigrationMap[aesSysId];
+        }
+
+        var environmentType = type || DeploymentPipelineConstants.pipeline.instanceTypes.DEV;
+        var grPipelineEnvironment = new GlideRecord(DeploymentPipelineConstants.pipeline.tables.ENVIRONMENT);
+        grPipelineEnvironment.initialize();
+        grPipelineEnvironment.setValue("name", aesEnvironment.getValue("name"));
+        grPipelineEnvironment.setValue("instance_url", aesEnvironment.getValue("instance_url"));
+        grPipelineEnvironment.setValue("instance_credential", aesEnvironment.getValue("instance_credential"));
+        grPipelineEnvironment.setValue("instance_type", environmentType);
+        grPipelineEnvironment.setValue("instance_id", "change_me_" + aesSysId);
+
+        // First insert environment as non-controller
+        // Then check what was passed and update
+        // This is so that migration of the record doesn't fail if there is an existing controller record
+        grPipelineEnvironment.setValue("is_controller", false);
+
+        if (grPipelineEnvironment.insert()) {
+            environmentsMigrationMap[aesSysId] = grPipelineEnvironment.getUniqueValue();
+            addMigrationLog(aesEnvironment, grPipelineEnvironment);
+
+            if (isController) {
+                grPipelineEnvironment.get(grPipelineEnvironment.getUniqueValue());
+                grPipelineEnvironment.setValue("is_controller", true);
+                if (!grPipelineEnvironment.update()) {
+                    // if failed to set as controller mark the migration not completed
+                    updateMigrationLog(aesEnvironment, false, "Failed to save controller record with message: " + grPipelineEnvironment.getLastErrorMessage());
+                }
+            }
+
+            return grPipelineEnvironment.getUniqueValue();
+        }
+
+        addMigrationLog(aesEnvironment, grPipelineEnvironment, grPipelineEnvironment.getLastErrorMessage());
+        return null;
+    }
+
+    function createPipeline(aesPipeline, sourceEnvSysId) {
+        var grPipelinePipeline = new GlideRecord(DeploymentPipelineConstants.pipeline.tables.PIPELINE);
+
+        if (!sourceEnvSysId) {
+            addMigrationLog(aesPipeline, grPipelinePipeline, "Dev environment not found. Failed to migrate record");
+            return null;
+        }
+        grPipelinePipeline.initialize();
+        grPipelinePipeline.setValue("name", aesPipeline.getValue("name"));
+        grPipelinePipeline.setValue("active", aesPipeline.getValue("active"));
+        grPipelinePipeline.setValue("source_environment", sourceEnvSysId);
+        grPipelinePipeline.setValue("pipeline_type", DeploymentPipelineConstants.APPLICATION_DEPLOYMENT_TYPE_SYS_ID);
+
+        if (grPipelinePipeline.insert()) {
+            addMigrationLog(aesPipeline, grPipelinePipeline);
+            return grPipelinePipeline.getUniqueValue();
+        }
+
+        addMigrationLog(aesPipeline, grPipelinePipeline, grPipelinePipeline.getLastErrorMessage());
+        return null;
+    }
+
+    function updatePipeline(sysId, isActive) {
+        var grPipelinePipeline = new GlideRecord(DeploymentPipelineConstants.pipeline.tables.PIPELINE);
+        if (grPipelinePipeline.get(sysId)) {
+            grPipelinePipeline.setValue("active", isActive);
+            grPipelinePipeline.update();
+        }
+    }
+
+    function createPipelineEnvironmentOrder(pipelineSysId, environmentSysId, order) {
+        if (!pipelineSysId || !environmentSysId) {
+            return null;
+        }
+
+        var grPipelineEnvironmentOrder = new GlideRecord(
+            DeploymentPipelineConstants.pipeline.tables.PIPELINE_ENVIRONMENT_ORDER
+        );
+        grPipelineEnvironmentOrder.initialize();
+        grPipelineEnvironmentOrder.setValue("pipeline", pipelineSysId);
+        grPipelineEnvironmentOrder.setValue("environment", environmentSysId);
+        grPipelineEnvironmentOrder.setValue("order", order);
+
+        if (grPipelineEnvironmentOrder.insert()) {
+            return grPipelineEnvironmentOrder.getUniqueValue();
+        }
+
+        return null;
+    }
+
+    function getPipelineEnvironmentByType(aesPipeline, type) {
+        var environment = aesPipeline[type];
+
+        if (!environment) {
+            return null;
+        }
+
+        return aesPipeline[type].getRefRecord();
+    }
+
+    function startValidateConnection(migratedEnvironmentSysIds) {
+        var inputs = {};
+        inputs["environment_sys_ids"] = migratedEnvironmentSysIds;
+
+        var subflowResult = sn_fd.FlowAPI.getRunner()
+            .subflow("sn_pipeline.validate_environments_and_set_instance_id")
+            .inBackground()
+            .withInputs(inputs)
+            .run();
+    }
+
+    function addMigrationLog(aesRecord, pipelineRecord, message) {
+        var aesTableName = aesRecord.getTableName();
+        var tableLogs = migrationLog[aesTableName] || {};
+        var recordLogs = tableLogs[aesRecord.getUniqueValue()] || {};
+        var recordMessages = recordLogs.messages || [];
+
+        if (message) {
+            recordMessages.push(message);
+        }
+
+        recordLogs = {
+            table: aesTableName,
+            sysId: aesRecord.getUniqueValue(),
+            migrationComplete: pipelineRecord.isValidRecord(),
+            messages: recordMessages,
+            migratedSysId: pipelineRecord ? pipelineRecord.getUniqueValue() : null,
+            migratedToTable: pipelineRecord.getTableName(),
+            linkToMigratedRecord: gs.getProperty('glide.servlet.uri') + pipelineRecord.getLink()
+        };
+
+        tableLogs[aesRecord.getUniqueValue()] = recordLogs;
+        migrationLog[aesTableName] = tableLogs;
+    }
+
+    function updateMigrationLog(aesRecord, migrationComplete, message) {
+        var aesTableName = aesRecord.getTableName();
+        var tableLogs = migrationLog[aesTableName] || {};
+        var recordLogs = tableLogs[aesRecord.getUniqueValue()] || {};
+        var recordMessages = recordLogs.messages || [];
+        recordMessages.push(message);
+        recordLogs.messages = recordMessages;
+        recordLogs.migrationComplete = migrationComplete;
+    }
+
+    function getCompletedMigrationCount(tableName) {
+        var tableLogs = migrationLog[tableName] || {};
+        var tableSysIds = Object.keys(tableLogs);
+        var filteredSysIds = tableSysIds.filter(function(sysId) {
+            return tableLogs[sysId].migrationComplete;
+        });
+
+        return filteredSysIds.length;
+    }
+
+})();]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_fix&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-10-15 15:07:59&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;6fc76994c7533010408bc8d6f2c260b1&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;5&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;Migrate AES pipeline data into Pipeline&lt;/sys_name&gt;
+        &lt;sys_package display_value="Deployment Pipeline" source="sn_deploy_pipeline"&gt;bb67ed7253e83010b846ddeeff7b1204&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Deployment Pipeline"&gt;bb67ed7253e83010b846ddeeff7b1204&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_fix_6fc76994c7533010408bc8d6f2c260b1&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2021-10-18 16:32:07&lt;/sys_updated_on&gt;
+        &lt;unloadable&gt;false&lt;/unloadable&gt;
+    &lt;/sys_script_fix&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:21:51</sys_created_on>
+        <sys_id>1a23789d83b01210c6695855eeaad36f</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Migrate AES pipeline data into Pipeline</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_1a23789d83b01210c6695855eeaad36f</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:21:51</sys_updated_on>
+        <tablename>sys_script_fix</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,378 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules">
+    <x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>false</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection/>
+        <condition>!current.isActionAborted() &amp;&amp; !VariableAcceleratorUtil.hasExistingPrompt(current) &amp;&amp; !VariableAcceleratorUtil.isDeleteAction(action)</condition>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>Generate variable and prompt</name>
+        <order>100</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function executeRule(current, previous /*null when async*/) {
+ 
+ var send_to_modal = GlideTransaction.get().getRequestParameter("sysparm_close_on_success");
+ send_to_modal = send_to_modal == "true";
+ 
+ var topic_var;
+ if (shouldMakeVariable(current))
+  topic_var = makeVariable(current);
+
+ if (shouldMakeVariable(current) && !topic_var) {
+  gs.addInfoMessage(gs.getMessage("Unable to insert variable."));
+  current.setAbortAction(true);
+  return;
+ }
+
+ if (topic_var.getValue("internal_type") == "choice") {
+  if (!current.choices.nil())
+   makeAndInsertChoices(JSON.parse(current.getValue("choices")), topic_var);
+ }
+ 
+ if (current.getValue("var_only") == 1) {
+  if (send_to_modal) {
+   gs.setRedirect("/cb_close_modal.do?sysparm_direct=true");
+   return;
+  }
+  
+  //we aren't making a new prompt, didn't ask for the modal, so redirect to the list
+  gs.setRedirect("/topic_variable_list.do?sysparm_query=model=" + current.getValue("topic"));
+  return;
+ }
+ 
+ var prompt;
+ if (shouldMakePrompt(current))
+  prompt = makeRegularPrompt(current, topic_var);
+ 
+ if (!prompt) {
+  gs.addInfoMessage(gs.getMessage("Unable to insert prompt"));
+  current.setAbortAction(true);
+  return;
+ }
+
+ if (send_to_modal) {
+  gs.setRedirect("/cb_close_modal.do?sysparm_direct=true");
+  return;
+ }
+ 
+ //reload the prompt to fetch an accurate scope
+ var prompt_id = prompt.getUniqueValue();
+ prompt.initialize();
+ prompt.get(prompt_id);
+ 
+ var prompt_url = gs.generateURL("sys_cb_prompt", prompt_id);
+ prompt_url += "&sysparm_transaction_scope=" + prompt.getValue("sys_scope");
+ 
+ //we're done, we didn't send to modal, so send them to the prompt
+ gs.setRedirect(prompt_url);
+ 
+ 
+ 
+ function shouldMakeVariable(current) {
+  return current.getValue("type") != "output";
+ }
+ 
+ function shouldMakePrompt(current) {
+  return current.getValue("var_only") != 1;
+ }
+ 
+ function makeVariable(current) {
+  if (current.getValue("type") == "output")
+   return null;
+  
+  if (variableNameExists(current)) {
+   current.setAbortAction(true);
+   gs.addInfoMessage(gs.getMessage("That variable name is not available. Please choose a different name."));
+   return null;
+  }
+  
+  //generate the variable
+  gs.debug("Creating new variable of type {0}", getInternalType(current.getValue("type")));
+  
+  var topic_var = new GlideRecord("topic_variable");
+  topic_var.newRecord();
+  topic_var.setValue("internal_type", getInternalType(current.getValue("type")));
+  topic_var.setValue("model", current.getValue("topic"));
+  topic_var.setValue("model_id", current.getValue("topic"));
+  topic_var.setValue("name", "var__m_topic_variable_" + current.getValue("topic"));
+  topic_var.setValue("element", current.getValue("column"));
+  topic_var.setValue("label", current.getValue("name"));
+  
+  if (needsMaxLength(current.getValue("type")))
+   topic_var.setValue("max_length", getMaxLengthForType(current.getValue("type")));
+  
+  if (needsReference(current.getValue("type"))) {
+   gs.debug("Setting reference to {0}, qual to {1}",
+      current.getValue("table"),
+      current.getValue("reference_condition")
+   );
+   
+   topic_var.setValue("reference", current.getValue("table"));
+   topic_var.setValue("use_reference_qualifier", "simple");
+   topic_var.setValue("limit", current.getValue("limit"));
+   
+   if (current.reference_condition.hasMapping()) {
+    topic_var.reference_qual_condition.setValueMapping(
+     current.reference_condition.getValueMapping()
+    );
+    gs.debug("ValueMapping set to {0}", current.reference_condition.getValueMapping());
+   } else {
+    topic_var.setValue("reference_qual_condition",
+     current.getValue("reference_condition")
+    );
+    gs.debug("Regular value. Setting to {0}", current.getValue("reference_condition"));
+   }
+  }
+  
+  if (!current.default_value.nil()) {
+   gs.debug("Setting default_value to {0}", current.getValue("default"));
+   topic_var.setValue("default_value", current.getValue("default_value"));
+  }
+  
+  if (current.getValue("type") == "choice") {
+   gs.debug("Setting choice to {0}", current.getValue("choice_type"));
+   topic_var.setValue("choice", current.getValue("choice_type")); 
+  }
+  
+  if (current.getValue("type") == "url") {
+   gs.debug("Adding query parameters to the URL");
+   if (current.query_parameters.hasMapping()) {
+    topic_var.query_parameters.setValueMapping(
+     current.query_parameters.getValueMapping()
+    );
+    gs.debug("ValueMapping set to {0}", current.query_parameters.getValueMapping());
+   } else {
+    topic_var.setValue("query_parameters", current.getValue("query_parameters"));
+    gs.debug("Regular value set to {0}", current.getValue("query_parameters"));
+   }
+  }
+ 
+  gs.debug("Inserting new variable with type {0} and name {1} and label {2}",
+     topic_var.getValue("internal_type"),
+     topic_var.getValue("element"),
+     topic_var.getValue("label")
+  );
+ 
+  if (topic_var.insert())
+   return topic_var;
+  
+  return null;
+ }
+ 
+ function variableNameExists(current) {
+  var name = current.getValue("column");
+  var topic = current.getValue("topic");
+  var type = current.getValue("type");
+  
+  if (type == "output")
+   return false;
+  
+  var topic_var = new GlideRecord("topic_variable");
+  topic_var.addQuery("model", topic);
+  topic_var.addQuery("element", name);
+  topic_var.query();
+  
+  return topic_var.hasNext();
+ }
+ 
+ function getInternalType(type) {
+  if(type == "boolean")
+   type = "bool";
+  
+  var map = {
+   string : "string",
+   reference : "reference",
+   integer : "integer",
+   ph_number : "ph_number",
+   bool : "boolean",
+   glide_date_time : "glide_date_time",
+   email : "email",
+   url : "url",
+   user_image : "user_image",
+   glide_list : "glide_list",
+   guid : "guid",
+   choice : "choice"
+  };
+ 
+  if (map.hasOwnProperty(type))
+   return map[type];
+  
+  return "string"; 
+ }
+
+ function needsMaxLength(type) {
+  var map = {
+   "reference" : true,
+   "glide_list" : true,
+   "string" : true
+  };
+  
+  if (map.hasOwnProperty(type))
+   return true;
+  
+  return false;
+ }
+
+ function needsReference(type) {
+  if (type == "reference" || type == "glide_list")
+   return true;
+  
+  return false;
+ }
+ 
+ function getMaxLengthForType(type) {
+  gs.debug("Getting max_length for type {0}", type);
+  var default_value = 250;
+  var map = {
+   string : 250,
+   reference : 32,
+   glide_list : 32,
+   defaultValue : 250
+  };
+  
+  if (map.hasOwnProperty(type))
+   return map[type];
+  
+  return defaultValue;
+ }
+
+ function makeAndInsertChoices(choices, new_variable) {
+  gs.debug("Creating choices for {0}", choices);
+  var i = 0;
+  for (var key in choices) {
+   if (choices.hasOwnProperty(key)) {
+    gs.debug("Making choice {0}", key);
+    if (makeChoice(key, choices[key], new_variable, i))
+     i++;
+    else
+     gs.addInfoMessage(gs.getMessage("Unable to create choice {0} {1}", [key, choices[key]]));
+   }
+  }
+ }
+
+ function makeChoice(label, value, new_variable, idx) {
+  gs.debug("Making choice {0} with value {1} for variable {2}",
+     label, value, new_variable.getValue("label")
+  );
+  var newChoice = new GlideRecord("sys_choice");
+  newChoice.setValue("element", new_variable.getValue("element"));
+  newChoice.setValue("name", new_variable.getValue("name"));
+  newChoice.setValue("label", label);
+  newChoice.setValue("value", value);
+  newChoice.setValue("sequence", idx);
+  
+  return newChoice.insert();
+ }
+
+ function needsDefaultValue(type, choice_type) {
+  gs.debug("Checking if {0} (choice type {1}) needs a default value", type, choice_type);
+  if (type == "choice" && choice_type == "3")
+   return true;
+  
+  if (type == "url")
+   return true;
+  
+  return false;
+ }
+ 
+ function makeRegularPrompt(current, topic_var) {
+  gs.debug("Making a regular prompt");
+  
+  var prompt = new GlideRecord("sys_cb_prompt");
+  prompt.newRecord();
+  prompt.setValue("topic_goal", current.getValue("topic_goal"));
+  prompt.setValue("parent", current.getValue("parent"));
+  prompt.setValue("optional", current.getValue("optional"));
+  
+  if (topic_var)
+   prompt.setValue("variable", topic_var.getValue("element"));
+ 
+  if (current.getValue("prompt_label"))
+   prompt.setValue("name", current.getValue("prompt_label"));
+  else if (current.getValue("prompt_msg"))
+   prompt.setValue("name", current.getValue("prompt_msg"));
+  else if (current.getValue("acknowledge_msg"))
+   prompt.setValue("name", current.getValue("acknowledge_msg"));
+  else
+   prompt.setValue("name", "(blank)");
+  
+  if (current.prompt_msg.hasMapping()) {
+   gs.debug("Prompt has a mapping value, so setting that to {0}", current.prompt_msg.getValueMapping());
+   prompt.prompt_msg.setValueMapping(current.prompt_msg.getValueMapping());
+  } else {
+   gs.debug("Prompt does not have a mapping value, so setting that to {0}", current.getValue("prompt_msg"));
+   prompt.setValue("prompt_msg", current.getValue("prompt_msg"));
+  }
+  
+  if (current.acknowledge_msg.hasMapping()) {
+   gs.debug("Acknowledge has a mapping value, so setting that to {0}",
+      current.acknowledge_msg.getValueMapping()
+   );
+   prompt.acknowledge_msg.setValueMapping(current.acknowledge_msg.getValueMapping());
+  } else {
+   gs.debug("Acknowledge does not have a mapping value, so setting that to {0}",
+      current.getValue("acknowledge_msg")
+   );
+   prompt.setValue("acknowledge_msg", current.getValue("acknowledge_msg"));
+  }
+  
+  if (current.reference_nil.hasMapping()) {
+   gs.debug("Ref nil has a mapping value, so setting that to {0}",
+      current.reference_nil.getValueMapping()
+   );
+   prompt.reference_nil.setValueMapping(current.reference_nil.getValueMapping());
+  } else {
+   gs.debug("Ref nil does not have a mapping value, so setting that to {0}",
+      current.getValue("reference_nil")
+   );
+   prompt.setValue("reference_nil", current.getValue("reference_nil"));
+  }
+  
+  if (current.getValue("type") == "choice" && current.getValue("choice_type") == "1")
+   prompt.setValue("optional", true);
+  
+  if (prompt.insert())
+   return prompt;
+   
+  return null;
+ }
+
+})(current, previous);]]></script>
+        <sys_class_name>x_938076_now_utils_now_utils_business_rules</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:53:27</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>0eac689983701210c6695855eeaad3ad</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Generate variable and prompt</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>x_938076_now_utils_now_utils_business_rules_0eac689983701210c6695855eeaad3ad</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:53:27</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </x_938076_now_utils_now_utils_business_rules>
+    <sys_translated_text action="delete_multiple" query="documentkey=0eac689983701210c6695855eeaad3ad"/>
+</record_update>

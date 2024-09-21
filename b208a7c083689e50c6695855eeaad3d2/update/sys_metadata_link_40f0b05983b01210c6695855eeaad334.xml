@@ -1,0 +1,381 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>22f6a8235352201055eeddeeff7b124f</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.VAAISearchHelper&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;VAAISearchHelper&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var VAAISearchHelper = Class.create();
+
+VAAISearchHelper.REGULAR_SEARCH_DISPLAY_MAX_LIMIT = 3;
+
+VAAISearchHelper.filterResultsForLoggedInUser = function(searchResults, vaSystem, loggingContext) {
+	var logger = VAAISearchHelper.getLogger(loggingContext);
+	logger.debug("Search results: {0}", searchResults);
+
+	var results = JSON.parse(searchResults);
+
+	if (gs.isLoggedIn())
+		return results;
+
+	try {
+		logger.debug('User is not logged in for conversation {0}, people results will not be shown',
+				vaSystem.getConversationId());
+
+		var executionResult = results.result[0].executionResult;
+
+		// Filter out people genius results
+		var geniusResultItems = executionResult.geniusResultsTemplates.items;
+		var filteredGeniusResultItems = geniusResultItems.filter(function(geniusResultItem) {
+			if (geniusResultItem.template !== 'sn-va-genius-person-card')
+				return geniusResultItem;
+		});
+		executionResult.geniusResultsTemplates.items = filteredGeniusResultItems;
+
+		// Filter out people search results
+		var searchResultItems = executionResult.searchResultsTemplates.items;
+		var filteredSearchResultItems = searchResultItems.filter(function(searchResultItem) {
+			if (searchResultItem.propValues.model.table !== "sys_user")
+				return searchResultItem;
+		});
+		executionResult.searchResultsTemplates.items = filteredSearchResultItems;
+
+		results.result[0].executionResult = executionResult;
+
+	} catch(ex){
+		logger.error('VAAISearchHelper: Error filter va search results for non-logged in user: {0}', ex);
+		results.result[0].status = 422;
+	}
+
+	logger.debug('Filtered search results: {0}', JSON.stringify(results));
+	return results;
+};
+
+VAAISearchHelper.isSearchSuccessful = function(searchResults) {
+	var results = JSON.parse(searchResults);
+	return results.result[0].status === 200;
+};
+
+VAAISearchHelper.processResults = function(searchResults, vaSystem, vaInputs, vaVars) {
+
+	var results =  JSON.parse(searchResults);
+	vaSystem.setAtlasSearchPerformed();
+
+	var result = results.result[0];
+
+	var executionResult = result.executionResult;
+
+	var geniusSearchResults = null;
+	var nonGeniusResults = null;
+
+	var searchMetadata = {};
+	searchMetadata.click_metrics = {};
+	searchMetadata.glide_signals = executionResult.searchMetadata;
+
+	var anyGeniusResults = executionResult.geniusResultsTemplates.items.length &gt; 0;
+	if (anyGeniusResults)
+		geniusSearchResults = executionResult.geniusResultsTemplates.items[0];
+
+	var items = executionResult.searchResultsTemplates.items.slice(0, VAAISearchHelper.REGULAR_SEARCH_DISPLAY_MAX_LIMIT);
+	if (items.length &gt; 0)
+		nonGeniusResults = items;
+
+	searchMetadata.search_result_count
+		= executionResult.geniusResultsTemplates.items.length + executionResult.searchResultsTemplates.items.length;
+
+	// the time taken reported by the payload.
+	searchMetadata.execution_time = result.executionTime;
+
+	var searchMetadataStr = !gs.nil(searchMetadata) ? JSON.stringify(searchMetadata) : null ;
+	var geniusResultsStr = !gs.nil(geniusSearchResults) ? JSON.stringify(geniusSearchResults) : null ;
+	var nonGeniusResultsStr = !gs.nil(nonGeniusResults) ? JSON.stringify(nonGeniusResults) : null;
+
+	return {
+		searchMetadata: searchMetadataStr,
+		geniusSearchResults: geniusResultsStr,
+		searchResults: nonGeniusResultsStr
+	};
+};
+
+/**
+* Collects search results metrics and sends them out for relevancy training and VA dashboard
+*/
+VAAISearchHelper.processSearchResultMetrics = function(searchMetadata, geniusSearchResults, regularSearchResults, vaSystem, vaInputs, vaVars, async) {
+
+	// check if AI search click metrics is enabled or not.
+	if (!VAClickMetrics.isAISearchClickMetricsAllowed())
+		return {};
+
+	// handle genius search results.
+	var collector = new AISearchResultMetricCollector(searchMetadata, vaSystem, vaInputs, vaVars);
+
+	if (!gs.nil(geniusSearchResults))
+		collector.collect(AISearchResultMetricCollector.GENIUS_RESULT_TYPE, geniusSearchResults);
+
+	if (!gs.nil(regularSearchResults)) {
+		// handle regular search results.
+		var maxResults = VAAISearchHelper.getRegularSearchDisplaySize(regularSearchResults);
+
+		for(i = 0; i &lt; maxResults &amp;&amp; i &lt; regularSearchResults.length; i++)
+			collector.collect(AISearchResultMetricCollector.REGULAR_RESULT_TYPE, regularSearchResults[i]);
+	}
+
+	collector.sendOutMetrics(async);
+
+	//returns the payload for verification
+	return collector.getPayload();
+};
+
+VAAISearchHelper.shouldDisplayGeniusResult = function(geniusSearchResults, loggingContext) {
+	try {
+		if(gs.nil(geniusSearchResults))
+			return false;
+
+		var searchResponse = JSON.parse(geniusSearchResults);
+		var model = searchResponse.propValues.model;
+
+		if(searchResponse.template === 'sn-va-genius-person-card') {
+			return !gs.nil(model["columns.table"]) &amp;&amp; !gs.nil(model["columns.sys_id"]);
+		} else if(searchResponse.template === 'sn-va-genius-qa-card' || searchResponse.template === 'sn-va-genius-catalog-card'){
+			var header = searchResponse.propValues.identifier;
+			var description = searchResponse.propValues.description;
+			var table = model["columns.table"];
+			var sys_id = model["columns.sys_id"];
+			return (!gs.nil(table) &amp;&amp; !gs.nil(sys_id)) || !gs.nil(header) || !gs.nil(description);
+		}
+		else {
+			return false;
+		}
+	} catch(ex){
+		VAAISearchHelper.getLogger(loggingContext).error(
+			'VAAISearchHelper: Error calculating whether to show genius result: {0}', ex);
+		return false;
+	}
+};
+
+VAAISearchHelper.generateGeniusCardResponse = function(searchMetadata, geniusSearchResults, vaSystem, vaInputs, vaVars) {
+	var metadata = JSON.parse(searchMetadata);
+	var searchResponse = JSON.parse(geniusSearchResults);
+	var index = 0;
+	VAAISearchHelper.getLogger(vaVars.loggingContext).info('Generating genius result');
+	return global.VASearchCardCreatorFactory.getCreator(metadata, searchResponse, vaSystem, vaInputs, vaVars, index).createCard();
+};
+
+VAAISearchHelper.generateSearchResultsResponse = function(searchMetadata, searchResults, header, vaSystem, vaInputs, vaVars) {
+	var logger = VAAISearchHelper.getLogger(vaVars.loggingContext);
+	logger.info('Generating search result response');
+	try {
+		var metadata = JSON.parse(searchMetadata);
+		var response = JSON.parse(searchResults);
+		var url;
+
+		var groupedLinksOutMsg = new sn_cs.GroupedPartsOutMsg();
+		groupedLinksOutMsg.setHeader(header);
+
+		// Only show first three search results - GroupedPartsOutMsg is limited to 3
+		var maxResults = VAAISearchHelper.getRegularSearchDisplaySize(response);
+
+		for (i = 0; i &lt; maxResults; i++) {
+
+			var searchResult = response[i];
+			var propValues = searchResult.propValues;
+			var model = propValues.model;
+			
+			if (!gs.nil(propValues.clickAction) &amp;&amp; !gs.nil(propValues.clickAction.actionPayload)) {
+				var actionName = propValues.clickAction.name;
+				var actionPayload = propValues.clickAction.actionPayload;
+				url = VAAISearchHelper.correctURLIfRequired(url);
+				url = !gs.nil(url) ? url : vaSystem.applyLinkTemplate(actionPayload.sysId, actionPayload.table, actionName);
+			}
+			else
+				url = vaSystem.applyLinkTemplate(model.sysId, model.table);
+
+			var context = VAAISearchHelper.buildSearchContext(propValues);
+			var title = VAAISearchHelper.buildSearchTitle(propValues);
+			var description = propValues.description;
+			logger.debug('Adding search result to response: title={0}, url={1}, description={2}, context={3}',
+				title, url, description, context);
+
+			groupedLinksOutMsg.addLinkPart(title, url, description, context);
+		}
+		return groupedLinksOutMsg;
+	} catch(ex) {
+		logger.error('VAAISearchHelper: Error generating search response: {0}', ex);
+		// Return any links that have been successfully generated
+		return groupedLinksOutMsg;
+	}
+};
+
+// Create a context using the EVAM convention
+VAAISearchHelper.buildSearchContext = function(props){
+	var contextParts = [];
+	var contextFields = [
+		'contextEmoji',
+		'contextSeparator1',
+		'context1',
+		'contextSeparator2',
+		'context2',
+		'contextSeparator3',
+		'context3'
+	];
+
+	for (var i in contextFields) {
+		var contextField = contextFields[i];
+		var contextFieldValue = props[contextField];
+		if (!gs.nil(contextFieldValue))
+			contextParts.push(contextFieldValue);
+	}
+
+	var context = contextParts.join(' ');
+	return VAAISearchHelper.stripHighlightTags(context);
+};
+
+VAAISearchHelper.buildSearchTitle = function(props) {
+	var titleParts = [];
+	var titleFields = [
+		"titleEmoji",
+		"title"
+	];
+
+	for (var i in titleFields) {
+		var titleField = titleFields[i];
+		var titleFieldValue = props[titleField];
+		if (!gs.nil(titleFieldValue))
+			titleParts.push(titleFieldValue);
+	}
+	var title = titleParts.join(" ");
+
+	return VAAISearchHelper.stripHighlightTags(title);
+};
+
+VAAISearchHelper.stripHighlightTags = function(text) {
+	text = text.replaceAll("&lt;highlight&gt;", "");
+	text = text.replaceAll("&lt;/highlight&gt;", "");
+	return text;
+};
+
+/**
+* Returns the display size for the regular search response.
+* @param results : regular search results
+* @return the allowed max search result number to display.
+*/
+VAAISearchHelper.getRegularSearchDisplaySize = function(results) {
+	//Only show first three search results - GroupedPartsOutMsg is limited to 3
+	var resultSize = gs.nil(results)? 0 : results.length;
+	return Math.min(resultSize, VAAISearchHelper.REGULAR_SEARCH_DISPLAY_MAX_LIMIT);
+};
+
+/**
+* Returns the search application configuration Id found by search profile Id.
+* @param profileId : the search profile Id. null is not allowed.
+* @return the found search configuration id. null if not found.
+*/
+VAAISearchHelper.getSearchApplicationConfigurationIdBySearchProfileId = function(profileId) {
+	var gr = new GlideRecord('sys_cs_context_profile_search');
+	gr.addQuery('context_profile', profileId);
+	gr.query();
+
+	return gr.next()? gr.getValue('search_context_config'): null;
+};
+
+VAAISearchHelper.isSearchEnabled = function(loggingContext) {
+	var logger = VAAISearchHelper.getLogger(loggingContext);
+	var api = new sn_ais.StatusApi();
+
+	if (!api.isAisEnabled()){
+		logger.warn('AI Search is not enabled');
+		return false;
+	}
+
+	return true;
+}
+
+/**
+ * Creates a ScriptableGlideLogger instance with the passed context or creates a context using vaSystem
+ * @param vaSystem
+ * @param context
+ * @returns {sn_log.GlideLogger}
+ */
+VAAISearchHelper.getLogger = function(context) {
+	if (typeof context === 'string')
+		context = JSON.parse(context);
+
+	var context = context || VAAISearchHelper.getLoggingContext();
+	return new sn_log.GlideLogger('sn_cs.ai_search', context, Object.keys(context));
+};
+
+/**
+ * Creates a context map to be used by AI Search loggers
+ * @param vaSystem
+ * @returns {{app: string, track: string}}
+ */
+VAAISearchHelper.getLoggingContext = function(vaSystem) {
+
+	var context = {
+		app: 'CI',
+		track: 'AI Search'
+	};
+
+	if (gs.nil(vaSystem))
+		return context;
+
+	context.conversation = vaSystem.getConversationId();
+	context.interaction = vaSystem.getInteractionSysId();
+	return context;
+};
+
+/*
+* If the passed URL has any potential issues, this method will correct the URL
+*/
+VAAISearchHelper.correctURLIfRequired = function(url) {
+	
+	if(gs.nil(url))
+		return url;
+	
+	if (url.indexOf(" ") == -1)
+		return url;
+		
+	// if contains any empty string, encode the spaces.
+	return encodeURL(url);
+}
+
+function encodeURL(url) {
+	return url.replaceAll(" ",  encodeURI(" "));
+}
+]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-02-19 00:57:41&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;22f6a8235352201055eeddeeff7b124f&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;321&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;VAAISearchHelper&lt;/sys_name&gt;
+        &lt;sys_package display_value="Virtual Agent Platform Topic Blocks" source="com.glide.cs.topic_blocks"&gt;289d7c203c75311068bcf327dfe37f6e&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_22f6a8235352201055eeddeeff7b124f&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-06-02 18:17:08&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:09</sys_created_on>
+        <sys_id>40f0b05983b01210c6695855eeaad334</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>VAAISearchHelper</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_40f0b05983b01210c6695855eeaad334</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:09</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

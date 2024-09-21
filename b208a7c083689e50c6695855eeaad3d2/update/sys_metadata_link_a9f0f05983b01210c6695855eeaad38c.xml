@@ -1,0 +1,198 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>23dd674421531110da6a9589bbcb02f2</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_uibtk_api.UIBTemplate&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;UIBTemplate&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[const UIBTemplate = Class.create();
+UIBTemplate.prototype = Object.extendsObject(BuilderToolkitAPIBase, {
+    TABLE: 'sys_uib_template',
+    FIELDS: ['label', 'description', 'type', 'macroponent', 'image', 'order', 'associated_types', 'optional_properties', 'required_properties', 'macroponent_config'],
+    /**
+     * @param fields {string[]}
+     */
+    initialize: function(fields) {
+        BuilderToolkitAPIBase.prototype.initialize.call(this, this.TABLE, fields || this.FIELDS);
+    },
+
+    /**
+     * Overrides parent class function to inject special fields
+     * @param acc {object} the accumulator object
+     * @param field {GlideElement} the field element we are currently working on
+     */
+    getFieldValues: function(acc, field) {
+        acc = BuilderToolkitAPIBase.prototype.getFieldValues.call(this, acc, field);
+        const fieldName = field.getName();
+        if (fieldName === 'associated_types') {
+            acc['associatedTypes'] = field.getDisplayValue();
+        } else if (fieldName === 'macroponent') {
+            acc['layout'] = this.parseJSON(field.layout.toString(), {
+                sysId: acc.sysId,
+                field: 'layout'
+            });
+
+            // Get all component and DB defs for display in "learn more"
+            const {
+                componentDefinitions,
+                dataBrokerDefinitions
+            } = this.getTemplateComponentsAndDataBrokers(field.getRefRecord());
+            acc['componentDefinitions'] = componentDefinitions;
+            acc['dataBrokerDefinitions'] = dataBrokerDefinitions;
+        } else if (fieldName === 'image') {
+            acc['image'] = field.getDisplayValue();
+        } else if (fieldName === 'required_properties' || fieldName === 'optional_properties') {
+            const camelCaseFieldName = this._toCamelCase(fieldName);
+            const properties = acc[camelCaseFieldName] ?? [];
+            const testValues = properties.reduce(this.getTestValues, {});
+            const enrichedProperties = properties.map((property) =&gt; {
+                return {
+                    ...property,
+                    testValue: testValues[property?.name] ?? null
+                };
+            });
+            acc[camelCaseFieldName] = enrichedProperties;
+        }
+        return acc;
+    },
+
+    /**
+     * @param acc the accumulator that is gathering test values in a reduce
+     * @param name {string} the name of the urlParam
+     * @param testValue {string|number|boolean} a default test value to use if we can't get another
+     * @param generator {string} the type of generator to use: gr (fetches from table), javascript (arbitrary script to execute)
+     */
+    getTestValues: function(acc, {
+        name,
+        testValue = null,
+        generator = null
+    }) {
+        acc[name] = testValue;
+        if (generator !== null) {
+            const segments = generator.split(':');
+            switch (segments[0]) {
+                case 'gr':
+                    if (segments.length !== 1) {
+                        const recordLookup = new GlideRecord(segments[1]);
+                        recordLookup.addQuery('active', 'true');
+                        recordLookup.query();
+                        if (recordLookup.next()) {
+                            acc[name] = recordLookup.getUniqueValue();
+                        }
+                    }
+                    break;
+                case 'javascript':
+                    if (segments.length !== 1) {
+                        acc[name] = this.evaluateScript(segments[1]);
+                    }
+                    break;
+            }
+        }
+        return acc;
+    },
+
+    /**
+     * Gets all legacy template records (macroponents with associated type "shared page")
+     */
+    getLegacyTemplateRecords: function() {
+        const macroponentHandler = new Macroponent();
+        const legacyTemplateGRs = macroponentHandler.getRecordsByQuery(BuilderToolkitConstants.LEGACY_TEMPLATE_QUERY, '', true);
+        const legacyTemplates = [];
+        if (legacyTemplateGRs) {
+            while (legacyTemplateGRs.next()) {
+                //const macroponentValues = macroponentHandler.getValuesFromGlideRecord(legacyTemplateGRs);
+                // Get all component and DB defs for display in "learn more"
+                const {
+                    componentDefinitions,
+                    dataBrokerDefinitions
+                } = this.getTemplateComponentsAndDataBrokers(legacyTemplateGRs);
+                legacyTemplates.push({
+                    name: legacyTemplateGRs.getValue('name'),
+                    sysId: legacyTemplateGRs.getValue('sys_id'),
+                    description: legacyTemplateGRs.getValue('description'),
+                    componentDefinitions,
+                    dataBrokerDefinitions
+                });
+            }
+        }
+        return legacyTemplates;
+    },
+
+    /**
+     * Gets all component and data resource definitions used within a template macroponent
+     * @param macroponentGR {GlideRecord} the macroponent we are getting from
+     */
+    getTemplateComponentsAndDataBrokers: function(macroponentGR) {
+        const {
+            mcpIds
+        } = new Macroponent().getCompositionReferenceIds(this.parseJSON(macroponentGR.getValue('composition'), {
+            field: 'composition',
+            sysId: macroponentGR.getUniqueValue()
+        }));
+        const componentsToDisplayQuery = '^macroponent.categoryINcomponent,primitives,shared^ORsys_scope.nameLIKE@servicenow';
+        return {
+            componentDefinitions: new ComponentDefinitions().getComponentDefinitions(mcpIds, false, componentsToDisplayQuery),
+            dataBrokerDefinitions: this.getDataBrokersAndControllers(macroponentGR)
+        };
+    },
+
+    /**
+     * Gets all data broker definitions  and controller definitions used within a template macroponent
+     * @param macroponentGR {GlideRecord} the macroponent we are getting from
+     */
+    getDataBrokersAndControllers: function(macroponentGR) {
+        const dataBrokerDefinitions = new DataBrokerDefinitions().getMacroponentDataBrokerDefinitions(macroponentGR);
+        var controllerDefinitions = {};
+        if (!macroponentGR.data.nil()) {
+            controllerDefinitions = new Controller().getControllersFromData(this.parseJSON(macroponentGR.data, {
+                sysId: macroponentGR.getUniqueValue() || macroponentGR.sysId,
+                field: 'data'
+            })).reduce((acc, definition) =&gt; {
+                acc[definition.sysId] = definition;
+                return acc;
+            }, {});
+        }
+        return {
+            ...dataBrokerDefinitions,
+            ...controllerDefinitions
+        };
+    },
+
+    type: 'UIBTemplate'
+});]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;maint&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-11-16 22:37:33&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;23dd674421531110da6a9589bbcb02f2&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;31&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;UIBTemplate&lt;/sys_name&gt;
+        &lt;sys_package display_value="@devsnc/uibtk-api" source="sn_uibtk_api"&gt;cdfd3bed43321110e70583020cb8f28e&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="@devsnc/uibtk-api"&gt;cdfd3bed43321110e70583020cb8f28e&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_23dd674421531110da6a9589bbcb02f2&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-05 18:17:13&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:14</sys_created_on>
+        <sys_id>a9f0f05983b01210c6695855eeaad38c</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>UIBTemplate</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_a9f0f05983b01210c6695855eeaad38c</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:14</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,420 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1553fea4235123002ff2cb0a56bf65a3</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.FSMMobileUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Util class which contains utility methods for Field Service Mobile feature&lt;/description&gt;
+        &lt;name&gt;FSMMobileUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var FSMMobileUtil = Class.create();
+FSMMobileUtil.prototype = {
+	initialize: function() {
+	},
+	/**
+	 * This method sets the offline device timestamp once the offline data is synced to the server
+	 *
+	 * @param GlideRecord
+	 * @return Boolean: is the offline device Ts value set correctly
+	 */
+	setOfflineDeviceTs : function (taskGR, offlineDeviceTs) {
+		if (offlineDeviceTs &amp;&amp; taskGR &amp;&amp; taskGR.isValidRecord()) {
+			var offlineDeviceTsColumn = taskGR.getAttribute('offline_timestamp_field');
+			if(offlineDeviceTsColumn) {
+				taskGR.setValue(offlineDeviceTsColumn, offlineDeviceTs);
+				return true;
+			}
+		}
+		return false;
+	},
+	/**
+	 * getAssignmentGroupforAgent
+	 * 
+	 * @param agentID log in agent in mobile app
+	 * @param wot work order task record created from work order
+	 * Find the assignment groups the agent is in. 
+	 * find the assignment groups the wot location and the agent are belong together
+	 * return the best match assignment group or null.  
+	 */
+	getAssignmentGroupforAgent: function(agentId, wot){
+		var agentAGs = global.FSMUtil.getAssignmentGroupForAgent(agentId, true).records;
+		if (gs.nil(agentAGs) || agentAGs.length &lt;= 0){
+			return "";
+		} else {
+			var best = this.findAssignmentGroupMatchAgentAndLocation(wot, agentAGs);
+			return best;
+		}
+
+	},
+
+	/**
+	 * @param wot wot work order task record created from work order
+	 * @param agentAGs agent's assignment group
+	 * Find the assignment groups the wot's location and agent are belong to
+	 */
+	findAssignmentGroupMatchAgentAndLocation: function(wot,agentAGs){
+		var result = "";
+		var location = wot.getValue("location") +"";
+		var notFound = true;
+		while(location &amp;&amp; !gs.nil(location) &amp;&amp; notFound){
+			var groupLocationRec = new GlideRecord("sys_group_covers_location");
+			groupLocationRec.addQuery("location", location);
+			groupLocationRec.addQuery("group", "IN", agentAGs.join(","));
+			groupLocationRec.query();
+			while(groupLocationRec.next()){
+				result = groupLocationRec.getValue("group");
+				notFound = false;
+
+				break;
+			}
+			var loc = new GlideRecord("cmn_location");
+			if (loc.get(location + "") ){
+				location = loc.getValue("parent");
+			}
+		}
+		return result;
+	},
+
+	/**
+	 * getDispatchGroupfromAssignmentGroupOrLocation
+	 * @param: assignmentGroup assignment group agent is in
+	 * @param: wot newly created work order task
+	 * 
+	 * Return the dispatch group the assignment group is in.  
+	 * If no assignment group, return the dispatch group the location is in.  the tasks is not going to be in My group tasks
+	 * In this case, the task will not show up in My group task because the task is not in the assignment group the agent is in.
+	 * If there's no dispatch group found, the task will be in draft state.
+	 */		
+	getDispatchGroupfromAssignmentGroupOrLocation: function(assignmentGroup, wot){
+		if (gs.nil(assignmentGroup)){
+			return this.getDispatchGroupByLocation(wot.getUniqueValue());
+		}
+		var groups = global.FSMUtil.getCoveredDispatchGroups([assignmentGroup]);
+
+		if(!gs.nil(groups) &amp;&amp; groups.length &gt; 0){
+			return groups[0];
+		}
+
+		return "";
+
+		//gs.info("No dispatch group found for agent.");
+
+	},
+	/**
+	 * Get dispatch group by location, if location is not covered, then query by agent
+	 * @param wot sys_id, user sys_id
+	 * @return ans dispatch_group sys_id
+	 */
+	 getDispatchGroupforWOT : function(wot, user){
+		var ans;
+        ans = this.getDispatchGroupByLocation(wot);
+        if(gs.nil(ans)){
+            ans = this.getDispatchGroupByAgent(user);
+        }
+        return ans;
+	},
+
+    /**
+	 * Get dispatch group for a wot based on its location
+	 * @param wot sys_id
+	 * @return ans dispatch_group sys_id
+	 */
+	 getDispatchGroupByLocation : function(wot){
+		var ans;
+		var findGroup = true;
+		var wotRec = new GlideRecord("wm_task");
+		wotRec.get(wot);
+		var location = wotRec.getValue("location") + "";
+		var dispatchType = "59e22fb137032000158bbfc8bcbe5d52";
+        // quit the loop once found a dispatch group is covering the location
+		 while(location &amp;&amp; findGroup){
+			var groupLocationRec = new GlideRecord("sys_group_covers_location");
+			groupLocationRec.addQuery("location", location);
+	        groupLocationRec.addQuery("group.type", "CONTAINS", dispatchType);
+			groupLocationRec.query();
+			while(groupLocationRec.next()){
+				ans = groupLocationRec.getValue("group");
+				findGroup = false;
+				break;
+			}
+            // if no dispatch group found, query its parent
+            // ex : 101 Main Street =&gt; San Diego =&gt; California			
+			var loc = new GlideRecord("cmn_location");
+			if (loc.get(location + "") ){
+				location = loc.getValue("parent");
+			}
+
+		}
+		return ans;
+	},
+
+    /**
+	 * Get dispatch group for a wot based on agent's group
+	 * @param user sys_id
+	 * @return ans dispatch_group sys_id
+	 */
+    getDispatchGroupByAgent : function(user){
+        var assignmentGroup, ans;
+        var memberGroupRec = new GlideRecord("sys_user_grmember");
+        memberGroupRec.addQuery("user", user)
+        memberGroupRec.query();
+        var groupRec = new GlideRecord("sys_user_group");
+        // quit the loop when a dispatch group is found
+        var continueLoop = true;
+        // Query from agent =&gt; assignment group =&gt; dispatch group
+        while(continueLoop &amp;&amp; memberGroupRec.next()){
+            var group = memberGroupRec.getValue("group");
+            groupRec.get(group);
+            // check if the group type is assignment_group
+            if("87245e061b13200050fdfbcd2c0713cc" === groupRec.getValue("type")){
+                assignmentGroup = groupRec.getValue("sys_id");
+                var groupDependencyRec = new GlideRecord("sm_m2m_group_dependency");
+                groupDependencyRec.addQuery("assignment_group", assignmentGroup);
+                groupDependencyRec.setLimit(1);
+                groupDependencyRec.query();
+                if(groupDependencyRec.next()){
+                    ans = groupDependencyRec.getValue("dispatch_group");
+                    continueLoop = false;
+                }
+            }
+        }
+
+        return ans;
+    },
+	
+	/**
+	 * This method calls the storeGeoHistory API in GeoHistoryUtils
+	 */
+	storeGeolocationHistory : function (input, action, locationTimestamp) {
+		if (input.Coordinate) {
+			var coord = input.Coordinate.split(',');
+			if  (coord.length == 2) {
+				var user_id = gs.getUserID();
+				var wot_id = input.sys_id;
+				new global.GeolocationUtils().storeGeolocationHistory(user_id, coord[0], coord[1], action, wot_id, locationTimestamp);
+			}
+		}
+	},
+	/**
+	 * This method gets the offline device timestamp for the record
+	 *
+	 * @param GlideRecord
+	 * @return Date/Time {String}: offline device timestamp
+	 */
+	getOfflineDeviceTs : function (taskGR) {
+		if (taskGR &amp;&amp; taskGR.isValidRecord()) {
+			var offlineDeviceTsColumn = taskGR.getAttribute('offline_timestamp_field');
+			if(offlineDeviceTsColumn) {
+				return taskGR.getValue(offlineDeviceTsColumn);
+			}
+		}
+		return null;
+	},
+	getUserSchedule : function(user) {
+		var personalScheduleId = "";
+		if (JSUtil.nil(user)){
+			user = gs.getUserID();
+		}
+		var agentScheduleUtil = new AgentScheduleUtil();
+		var personalScheduleGR = agentScheduleUtil.getAgentPersonalSchedule(user);
+		if (personalScheduleGR &amp;&amp; personalScheduleGR.hasNext()) {
+			personalScheduleGR.next();
+			personalScheduleId = personalScheduleGR.getValue("personal_schedule");
+		} else {
+			personalScheduleId = agentScheduleUtil.createPersonalSchedule(user);
+		}
+		return personalScheduleId;
+	},
+
+	/**
+	 * Check if the button is qualified by checking its parent and questionnaire.
+	 *
+	 * @param parentRecord gliderecord   parent of wm_task
+	 * @param taskid string   record id from wm_task
+	 * @param close_before string  record id from sys_choice
+	 * @return boolean
+	 */
+    verifyButtonQualification: function(parentRecord, taskid, close_before){
+        var ans = this.checkParentConditions(parentRecord);
+		// continue to check the questionniare only if the parent are correct
+        if(ans){
+			// if no unfinished mandatory questionnaire, return true;
+            ans = !(this.hasUnfinishedMandatoryQuestionnaire(taskid, close_before));
+        }
+        return ans;
+    },
+	/**
+	 * Hide Questionnaire Footer button if there are 3 buttons based on PM's requirement
+	 *
+	 * @param GlideRecord/wotRecord
+	 * @return boolean
+	 */
+	hideQuestionnaireBtn: function(wotRecord){
+		// check if the WOT is in Accepted state, since Accpeted wot has 2 buttons Start work and Start travel
+		// Then check if any unfnished madatory questionnaire is close before Close complete or Close incomplete
+		if (wotRecord.state == 17 &amp;&amp; (this.hasUnfinishedMandatoryQuestionnaire(wotRecord.sys_id, "f7a620f9c3921200467f10c422d3aeee") || this.hasUnfinishedMandatoryQuestionnaire(wotRecord.sys_id, "b3a620f9c3921200467f10c422d3aeef"))){
+			return false;
+		}
+		return true;
+	},
+
+	/**
+	 * Check if the task has an unfinished mandatory questionnaire 
+	 *
+	 * @param taskid string   record id from wm_task
+	 * @param close_before string  record id from sys_choice
+	 * @return boolean
+	 */
+    hasUnfinishedMandatoryQuestionnaire: function(taskid, close_before){
+	   // get metrics of all unfinished questionnaires
+        var metricIDs = "";
+        var assessmentGR = new GlideRecord("asmt_assessment_instance");
+        assessmentGR.addQuery("metric_type.active", true);
+		assessmentGR.addQuery("metric_type.publish_state", "published");
+		assessmentGR.addQuery("preview", false);
+		assessmentGR.addQuery("metric_type.evaluation_method", "!=", "attestation_v2");
+		assessmentGR.addQuery("metric_type.evaluation_method", "!=", "risk_assessment");
+		assessmentGR.addEncodedQuery("stateINready,wip");
+        assessmentGR.addQuery("task_id.sys_id", taskid);
+        assessmentGR.query();
+        while(assessmentGR.next()){
+            metricIDs += "," + assessmentGR.getValue("metric_type");
+        }
+     // check if there is a mandatory in untaken questionnaires
+        var questionnaireGR = new GlideRecord("wm_questionnaire")
+        questionnaireGR.addQuery("questionnaire_definitionIN" + metricIDs)
+        questionnaireGR.addQuery("mandatory", true);
+		if(close_before){
+			questionnaireGR.addQuery("close_before", close_before);
+		}
+        questionnaireGR.setLimit(1);
+        questionnaireGR.query();
+        if(questionnaireGR.hasNext()){
+            return true;
+        }
+        return false;
+    },
+	
+	hasQuestionnaireForthisRecord: function (taskid) {
+		var gr = this.getRecordQuestionnaire(taskid);
+		return 	gr.hasNext();
+	},
+	
+	getRecordQuestionnaire: function (taskid) {
+		var gr = new GlideRecord("asmt_assessment_instance");
+		gr.addQuery("metric_type.active", true);
+		gr.addQuery("metric_type.publish_state", "published");
+		gr.addQuery("preview", false);
+		gr.addQuery("metric_type.evaluation_method", "!=", "attestation_v2");
+		gr.addQuery("metric_type.evaluation_method", "!=", "risk_assessment");
+		gr.addEncodedQuery("stateINready,wip,complete");
+		gr.addQuery("task_id.sys_id", taskid);
+		gr.setLimit(1);
+		gr.query();
+		return 	gr;
+	},
+	getLoggedInUserEvents: function(){
+		var backMonthsRange = gs.getProperty('sn_fsm_mobile.calendar_months_backward_range');
+		var forwardMonthsRange = gs.getProperty('sn_fsm_mobile.calendar_months_forward_range');
+		backMonthsRange = backMonthsRange ? parseInt(backMonthsRange) : global.FSMMobileConstants.CALENDAR_MONTHS_BACKWARD_RANGE;
+		forwardMonthsRange = forwardMonthsRange ? parseInt(forwardMonthsRange) : global.FSMMobileConstants.CALENDAR_MONTHS_FORWARD_RANGE;
+		var gdt = new GlideDateTime();
+		gdt.addMonthsLocalTime(-1 * backMonthsRange);
+		gdt.setDayOfMonthLocalTime(1);
+		var startDate = gdt.getValue().split(' ')[0] + " 00:00:00";
+		gdt = new GlideDateTime();
+		gdt.addMonthsLocalTime(forwardMonthsRange + 1);
+		gdt.setDayOfMonthLocalTime(1);
+		gdt.addDaysLocalTime(-1);
+		var endDate = gdt.getValue().split(' ')[0] + " 00:00:00";
+		var util = new global.AgentScheduleUtil();
+		var isWfoActive = new global.FSMWFOUtil().enableFsmWfoLogic();
+		if (isWfoActive) {
+			var timeSpans = new sn_fsm_shift_schdl.AgentScheduleWFOUtil().getSchedulesForUser([gs.getUserID()], startDate, endDate);
+			return timeSpans[gs.getUserID()];
+		}
+		else {
+			var timeSpans = util.getScheduleEventsForUser(gs.getUserID(), startDate, endDate);
+			return timeSpans;
+		}
+	},
+	getGlideDateFromIntDateStr: function(intDateStr){
+		var intDate = new GlideIntegerDate();
+		intDate.setValue(intDateStr);
+		var glideDateTime = new GlideDateTime(intDate.getDisplayValue());
+		return glideDateTime.getDate();
+	},
+	
+	/**
+	 * This method is used to delete a Transfer Order
+	 *
+	 * @param toSysId Transfer Order SysId
+	 * @return Boolean: true if delete was successful / false otherwise
+	 */	
+	deleteTO: function(toSysId) {
+		var transferOrderGR = new GlideRecord("alm_transfer_order");
+		if(transferOrderGR.get(toSysId)) {
+			return transferOrderGR.deleteRecord();
+		}
+		
+		return false;
+	},
+	
+	 deletePartRequirement : function(req_sysID){
+            var partReq = new GlideRecord("sm_part_requirement");
+            if(partReq.get(req_sysID)) {
+                return partReq.deleteRecord();
+            }
+    },
+    
+	checkParentConditions: function(parentRecord) {
+		if (JSUtil.nil(parentRecord)) {
+			return false;
+		}
+		var className = parentRecord.sys_class_name;
+		if (className != 'wm_order') {
+			return false;
+		}
+			
+		if (parentRecord.sla_suspended){
+			return false;
+		}
+		return true;
+	},
+	
+	type: 'FSMMobileUtil'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2018-10-19 00:16:06&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1553fea4235123002ff2cb0a56bf65a3&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;54&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;FSMMobileUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Field Service Management" source="com.snc.work_management"&gt;b66bd6bb4722c210cd4e1ce4316d4387&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1553fea4235123002ff2cb0a56bf65a3&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-11-04 19:47:20&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:10:43</sys_created_on>
+        <sys_id>df9078d583b01210c6695855eeaad38f</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>FSMMobileUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_df9078d583b01210c6695855eeaad38f</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:10:43</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

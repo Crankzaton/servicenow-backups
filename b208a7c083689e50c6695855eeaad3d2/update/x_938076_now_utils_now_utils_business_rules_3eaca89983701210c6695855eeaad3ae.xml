@@ -1,0 +1,226 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules">
+    <x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>true</action_delete>
+        <action_insert>false</action_insert>
+        <action_query>false</action_query>
+        <action_update>false</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection/>
+        <condition/>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>Decision Deleted - remove Outcomes</name>
+        <order>50</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function executeRule(current, previous /*null when async*/) {
+
+ if (current.isActionAborted())
+  return;
+ 
+ gs.debug("Deleting outcomes for Decision {0} ({1})", current.getValue("name"), current.getValue("sys_id"));
+ //Earlier validation rules should have prevented us removing the decision if appropriate
+ var parent = current.getValue("parent");
+ var outcome_ids = [];
+ var delayed_deletes = [];
+ 
+ var outcomes = new GlideRecord("sys_cb_outcome");
+ outcomes.addQuery("parent", current.getValue("sys_id"));
+ outcomes.query();
+
+ while(outcomes.next())
+  outcome_ids.push(outcomes.getValue("sys_id"));
+ 
+ gs.debug("Outcomes to delete {0}", outcome_ids.join(","));
+ 
+ outcomes.query();
+ while (outcomes.next()) {
+  gs.debug("Writing delete for outcome {0} ({1})",outcomes.getValue("name"), outcomes.getValue("sys_id"));
+  outcomes.setWorkflow(false);
+  outcomes.deleteRecord();
+  
+   delayed_deletes.push(cacheForDelete(outcomes));
+ }
+ 
+ cleanUpGrandkids(outcome_ids);
+ cleanUpAutomerges(outcome_ids);
+ deleteDelayedDeletes(delayed_deletes);
+ 
+ function cleanUpGrandkids(outcome_ids) {
+  gs.debug("Cleaning up grandkids of {0} ({1})", current.getValue("name"), current.getValue("sys_id"));
+  for (var i = 0; i<outcome_ids.length; i++) {
+   var id = outcome_ids[i];
+   var grandkid = new GlideRecord("sys_cb_node");
+   grandkid.addQuery("parent", id);
+   grandkid.query();
+   
+   while (grandkid.next())
+    reparentGrandkidToParent(grandkid, parent);
+  }
+ }
+ 
+ function reparentGrandkidToParent(grandkid, parent) {
+  gs.debug("Reparenting {0} ({1})", grandkid.getValue("name"), grandkid.getValue("sys_id"));
+  var siblings = new GlideRecord("sys_cb_node");
+  siblings.addQuery("parent", parent);
+  siblings.addQuery("sys_id", "!=", current.getValue("sys_id"));
+  siblings.addQuery("sys_id", "!=", grandkid.getValue("sys_id"));
+  siblings.query();
+  
+  if (siblings.hasNext()) {
+   //branch shouldn't have been deleted.
+   gs.debug("The Decision {0} ({1}) fails secondary delete decision. Outcomes have already been deleted. Manual intervention is necessary.", current.getValue("name"), current.getValue("sys_id"));
+   return;
+  }
+  
+  grandkid.setValue("parent", parent);
+  grandkid.setWorkflow(false);
+  grandkid.update();
+  (new GlideUpdateManager2()).saveRecord(grandkid);
+  
+ }
+ 
+ function cleanUpAutomerges(outcome_ids) {
+  var ids = outcome_ids.slice();
+  gs.debug("Cleaning up merge nodes whith parents {0}", ids.join(","));
+  
+  if (ids.length == 0)
+   return;
+  
+  var id = ids.pop();
+  var merges = new GlideRecord("sys_cb_collector");
+  var query = merges.addQuery("parent_nodes","CONTAINS", id + '');
+  while ((id = ids.pop()) != null)
+   query.addOrCondition("parent_nodes", "CONTAINS", id + '');
+  
+  merges.query();
+  
+  while(merges.next())
+   removeOrReparent(merges, outcome_ids, parent);
+ }
+ 
+ function removeOrReparent(collector, oldParents, newParent) {
+  gs.debug("Removing or reparenting {0} ({1})", collector.getValue("name"), collector.getValue("sys_id"));
+  var nodeUtil = new ConversationNodeUtil();
+  var parent_list = collector.getValue("parent_nodes").split();
+  
+  gs.debug("Parent list is {0}", parent_list.join(","));
+  
+  for (var i = 0; i < oldParents.length; i++) {
+   if (parent_list.indexOf(oldParents[i] >= 0))
+    parent_list.splice(parent_list.indexOf(oldParents[i]), 1);
+  }
+  gs.debug("Parent list is {0}", parent_list.join(","));
+  
+  if (parent_list.length == 0) {
+   var childToReparent = nodeUtil.getChildForNode(collector);
+   
+   if (childToReparent) {
+    gs.debug("Need to reparent {0} ({1}) to {2}", childToReparent.getValue("name"), childToReparent.getValue("sys_id"), newParent);
+    nodeUtil.reparentNode(childToReparent, newParent);
+    childToReparent.setWorkflow(false);
+    childToReparent.update();
+    (new GlideUpdateManager2()).saveRecord(childToReparent);
+   }
+   
+   gs.debug("Deleting collector {0} ({1})", collector.getValue("name"), collector.getValue("sys_id"));
+   collector.setWorkflow(false);
+   collector.deleteRecord();
+   
+   writeDelete(collector);
+  } else {
+   gs.debug("Updating collector {0} ({1})", collector.getValue("name"), collector.getValue("sys_id"));
+   parent_list.push(parent);
+   collector.setValue("parent_nodes", parent_list.join(","));
+   collector.setWorkflow(false);
+   collector.update();
+   (new GlideUpdateManager2()).saveRecord(collector);
+  }
+ }
+ 
+ function writeDelete(realRecord) {
+  var type = realRecord.getRecordClassName();
+  var id = realRecord.getUniqueValue();
+  var name = realRecord.getDisplayValue();
+  var name_field = realRecord.getDisplayName();
+  
+  var tempRecord = new GlideRecord(type);
+  tempRecord.setValue(name_field, name);
+  tempRecord.setNewGuidValue(id);
+  tempRecord.setWorkflow(false);
+  tempRecord.insert();
+  
+  tempRecord.initialize();
+  tempRecord.get(id);
+  tempRecord.deleteRecord();
+ }
+ 
+ function deleteDelayedDeletes(delayed_deletes) {
+  for (var i=0; i<delayed_deletes.length; i++) {
+   var recordObj = delayed_deletes[i];
+   
+   var record = new GlideRecord(recordObj.type);
+   record.newRecord();
+   record.setValue(recordObj.name_field, recordObj.name);
+   if (recordObj.hasOwnProperty("condition"))
+    record.setValue("condition", recordObj.condition);
+   
+   record.setNewGuidValue(recordObj.sys_id);
+   record.setWorkflow(false);
+   record.insert();
+   
+   record.initialize();
+   record.get(recordObj.sys_id);
+   record.deleteRecord();
+  }
+ }
+ 
+ function cacheForDelete(record) {
+  var obj = {
+   type : record.getRecordClassName(),
+   sys_id : record.getUniqueValue(),
+   name : record.getDisplayValue(),
+   name_field : record.getDisplayName()
+  };
+  
+  if (record.isValidField("condition"))
+   obj.condition = record.getValue("condition");
+  
+  return obj;
+ }
+
+})(current, previous);]]></script>
+        <sys_class_name>x_938076_now_utils_now_utils_business_rules</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:53:30</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>3eaca89983701210c6695855eeaad3ae</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Decision Deleted - remove Outcomes</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>x_938076_now_utils_now_utils_business_rules_3eaca89983701210c6695855eeaad3ae</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:53:30</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </x_938076_now_utils_now_utils_business_rules>
+    <sys_translated_text action="delete_multiple" query="documentkey=3eaca89983701210c6695855eeaad3ae"/>
+</record_update>

@@ -1,0 +1,248 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>23fc071773000010f84de1d28bf6a73f</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_km_ml.KBCurationProcessor&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;KBCurationProcessor&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var KBCurationProcessor = Class.create();
+KBCurationProcessor.prototype = {
+    initialize: function(configSysId) {
+		this.logger = sn_km_ml.KBCurationLogger.getLogger("KBCuration");
+		this._prepareConfigObj(configSysId);
+    },
+
+    _prepareConfigObj: function(configSysId) {
+        if (!configSysId) {
+            this.logger.error("Please provide sys_id of a configuration from kb_curation_configuration");
+            return;
+        }
+        var configGr = new GlideRecord(sn_km_ml.KBCurationConstants.CURATION_CONFIG);
+        configGr.get(configSysId);
+		this.config = {};
+		this.config.configSysId = configSysId;
+        this.config.taskTable = {};
+        this.config.taskTable.name = configGr.getValue("curation_table");
+		var fields = configGr.getValue("fields");
+		this.config.taskTable.fields = fields ? fields.split(',') : [];
+		var queryCond = configGr.getValue("query_condition");
+		if(queryCond &amp;&amp; queryCond!=null) 
+			queryCond = queryCond.substring(0,queryCond.length-3) + "^RLQUERYm2m_kb_task.task,=0^ENDRLQUERY^ORDERBYsys_id^EQ";
+		else
+			queryCond = "RLQUERYm2m_kb_task.task,=0^ENDRLQUERY^ORDERBYsys_id^EQ";
+        this.config.taskTable.queryCondition = queryCond;
+        this.config.simSolDef = configGr.sim_sol_def.solution_name.toString();
+        this.config.clusterSolDef = configGr.cluster_sol_def.solution_name.toString();
+        this.config.kbTable = {};
+        this.config.kbTable.name = sn_km_ml.KBCurationConstants.KB_KNOWLEDGE;
+        this.config.kbTable.regExp = this.getTableRegExPrefix(this.config.kbTable.name);
+        this.config.pageSize = sn_km_ml.KBCurationConstants.CURATION_PROCESSING_BATCH_SIZE;
+        this.logger.debug(JSON.stringify(this.config));
+    },
+
+	order: 1,
+	
+
+    process: function(){
+        //this is common for all
+        try{
+			this.logger.info(this.order++ + ' Started : Delete Task Knowledge Coverage Records for Curation Configuration:' + this.config.taskTable.name + " " + this.config.configSysId);
+			this._resetTaskKnowledgeCoverageRecords();
+			this._resetTaskKnowledgeCoverageSummaryRecords();
+			this.logger.info(this.order++ + ' Finished : Delete Task Knowledge Coverage Records for Curation Configuration:' + this.config.taskTable.name + " " + this.config.configSysId);
+			this.logger.info(this.order++ + ' Started : Mark Tasks that need knowledge coverage ');
+			var gr = new GlideRecord(this.config.taskTable.name);
+			if(this.config.taskTable.queryCondition &amp;&amp; this.config.taskTable.queryCondition != '')
+				gr.addEncodedQuery(this.config.taskTable.queryCondition);
+			gr.query();
+			while(gr.hasNext()){
+				var batchTasks = [];
+				var batchTasksMap = {};
+				
+				//build pipe of this.config.pageSize number of tasks at a time and keep passing it to process in m2m_kb_task and sys_journal_fields.
+				var i = this.config.pageSize;
+				while(i&gt;0 &amp;&amp; gr.next()){
+					var taskObj = {};
+					taskSysId = gr.getValue("sys_id");
+					taskObj["sys_id"] = taskSysId;
+					taskObj["number"] = gr.getValue("number");
+					taskObj["fieldValues"] = {};
+					if(!this._hasKBMentionInNonJournalFields(gr,taskObj)){
+						batchTasks.push(taskObj);
+						//map will only store the index for faster access.
+						batchTasksMap[taskSysId] = batchTasks.length-1;
+						i--;
+					}
+				}
+				batchTasks = this._lookForJournalEntries(batchTasks, batchTasksMap);
+				batchTasks = this._lookForSimilarArticles(batchTasks, batchTasksMap);
+				this._addToNeedKnowledgeCoverage(batchTasks);
+			}
+			this.logger.info(this.order++ + ' Finished : Mark Tasks that need knowledge coverage ');
+			this.logger.info(this.order++ + ' Started : Trigger Clustering Job on the Tasks that need knowledge coverage ');
+			this._processTasksNeedKnowledge();
+			this.logger.info(this.order++ + ' Finished : Triggered Clustering Job on the Tasks that need knowledge coverage. Wait for the clustering job ' + this.config.clusterSolDef + ' to complete.');
+
+        }catch(e){
+            this.logger.error("Error occurred!!! " + e + " " + e.message + " " + e.stack);
+        }
+	},
+	
+	getTableRegExPrefix: function(tableName){
+		var gr = new GlideRecord(sn_km_ml.KBCurationConstants.SYS_NUMBER);
+		gr.get("category",tableName);
+		var tableNumberPrefix = gr.getValue('prefix');
+		return RegExp(tableNumberPrefix+'(\\d+)',"img");
+	},
+
+	_hasKBMentionInNonJournalFields: function(gr,taskObj){
+		var regExp = this.config.kbTable.regExp;
+		var fields = this.config.taskTable.fields;
+		for(var i in fields){
+			var ge = gr.getElement(fields[i]);
+			var ged = ge.getED();
+			var elemInternalType = ged.getInternalType();
+			if(elemInternalType != 'journal' &amp;&amp; elemInternalType != 'journal_input' &amp;&amp; elemInternalType != 'journal_list'){
+				taskObj["fieldValues"][fields[i]] = gr.getValue(fields[i]);
+			}
+				var fieldValue = gr.getValue(fields[i]);
+			if(fieldValue) {
+				var found = fieldValue.match(regExp);
+				if(found) {
+					return true;
+				}
+			}
+		}
+		return false;
+	},
+
+
+	_lookForJournalEntries: function(batchTasks, batchTasksMap){
+		var regExp = this.config.kbTable.regExp;
+		// Look for sys_journal_field records
+		var journalGr = new GlideRecord('sys_journal_field');
+
+		// That have associated Case records
+		var grSQ = journalGr.addJoinQuery(this.config.taskTable.name,'element_id','sys_id');
+
+		tasksList = batchTasks.map(function(task){ return task.sys_id;});
+		grSQ.addCondition("sys_id","IN",tasksList.join(','));
+
+		// Query
+		journalGr.query();
+		// Iterate and print results
+		var journalTaskIds = [];
+		while (journalGr.next()) {
+			var taskSysId = journalGr.getValue("element_id");
+			var fieldValue = journalGr.getValue("value");
+			if(fieldValue)
+				var found = fieldValue.match(regExp);
+			if(found &amp;&amp; batchTasksMap[taskSysId]){
+				delete batchTasksMap[taskSysId];
+				journalTaskIds.push(taskSysId);
+			}
+		}
+
+		return batchTasks.filter(function(task){ return task["sys_id"] in batchTasksMap; });
+
+	},
+
+	_lookForSimilarArticles: function(batchTasks, batchTasksMap){
+		var _this = this;
+		try{
+			if(!_this.errorDuringSimilarity){
+				var gr = new GlideRecord(this.config.taskTable.name);
+				gr.addQuery('sys_id', 'IN', batchTasks.map(function(task){
+					return task.sys_id;
+				}));
+				gr.query();
+				var kb = new global.KBKnowledge();
+				return kb.filterSimilarityPredictedTasks(this.config.simSolDef, gr, batchTasks, batchTasksMap);
+			}
+		}catch(e){
+			_this.errorDuringSimilarity = true;
+			this.logger.error("Exception while checking similar articles for tasks " + e + ' ' +e.message + ' ' + e.stack);
+		}
+
+	},
+	
+	_addToNeedKnowledgeCoverage: function(batchTasks){
+		var _this = this;
+		batchTasks.forEach(function(taskObj){
+			var gr = new GlideRecord(sn_km_ml.KBCurationConstants.TASK_KNOWLEDGE_COVERAGE);
+			//gr.initialize();
+			gr.setWorkflow(false);
+			gr.setValue('task',taskObj["sys_id"]);
+			gr.setValue('curation_config',_this.config.configSysId);
+			gr.insert();
+		});
+		
+	},	
+	
+	_resetTaskKnowledgeCoverageRecords: function(){
+		var markingTableGr = new GlideRecord(sn_km_ml.KBCurationConstants.TASK_KNOWLEDGE_COVERAGE);
+        markingTableGr.addEncodedQuery('curation_config='+this.config.configSysId);
+        markingTableGr.query();
+        markingTableGr.setWorkflow(false);
+        markingTableGr.deleteMultiple();
+	},
+	
+	_resetTaskKnowledgeCoverageSummaryRecords: function(){
+		var records = new GlideRecord(sn_km_ml.KBCurationConstants.TASK_KNOWLEDGE_COVERAGE_SUMMARY);
+        records.addQuery('kb_curation_config', this.config.configSysId);
+        records.query();
+        records.setWorkflow(false);
+        records.deleteMultiple();
+	},
+
+    _processTasksNeedKnowledge: function() {
+		try {
+			//post above, do the clustering
+			var kb = new global.KBKnowledge();
+			kb.processCapabilityClustering(this.config.clusterSolDef);
+		} catch(e) {
+			gs.error("Exception while processing Tasks Need Knowledge " + e + ' ' +e.message + ' ' + e.stack);
+			return false;
+		}
+
+		return true;
+	},
+	
+	type: 'KBCurationProcessor'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2019-09-28 04:14:29&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;23fc071773000010f84de1d28bf6a73f&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;27&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;KBCurationProcessor&lt;/sys_name&gt;
+        &lt;sys_package display_value="Knowledge Management - Machine Learning" source="sn_km_ml"&gt;b715410673dc330083511c86fbf6a74d&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Knowledge Management - Machine Learning"&gt;b715410673dc330083511c86fbf6a74d&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_23fc071773000010f84de1d28bf6a73f&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2020-06-17 09:32:35&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:16</sys_created_on>
+        <sys_id>f9f0f05983b01210c6695855eeaad39e</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>KBCurationProcessor</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_f9f0f05983b01210c6695855eeaad39e</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:16</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

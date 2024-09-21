@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>246f463d3b3e1010c24e870044efc4e4</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_nb_action.RuleServiceImpl&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;A service to manage rules and interact with rule handlers&lt;/description&gt;
+        &lt;name&gt;RuleServiceImpl&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var RuleServiceImpl = Class.create();
+RuleServiceImpl.prototype = {
+    initialize: function() {
+        this.nextBestActionDAO = sn_nb_action.NextBestActionUtil.getNextBestActionDAO();
+        this._log = new global.GSLog(sn_nb_action.Constants.PROP_LOG_LEVEL, this.type);
+    },
+
+    getBestActions: function(currentRecord, actionTypes, recommendationType, fields) {
+        var rules = {};
+        if (!actionTypes) {
+            actionTypes = this.nextBestActionDAO.loadActionTypesByTable();
+            if (!actionTypes) {
+                this._log.error("There are no action types defined.");
+                return false;
+            }
+        }
+        var rulesRecord = this.nextBestActionDAO.getRules(currentRecord, fields);
+        if (!rulesRecord) {
+            this._log.error("There are no rules defined or rules are inactive for table " + currentRecord.getTableName());
+            return false;
+        }
+        var currentActions = {};
+        var hasActions = false;
+        while (rulesRecord.next()) {
+            rules[rulesRecord.getUniqueValue()] = true;
+            var recommendedActionsArr = this._evaluateRule(currentRecord, rulesRecord, recommendationType);
+            if (recommendedActionsArr) {
+                var ruleActions = this._processActions(recommendedActionsArr, rulesRecord, currentActions, actionTypes);
+                if (ruleActions) {
+                    hasActions = true;
+                    currentActions = Object.extend(currentActions, ruleActions);
+                }
+            }
+        }
+        if (hasActions)
+            return {
+                'currentActions': currentActions,
+                'currentRules': rules
+            };
+
+        return {
+            'currentActions': false,
+            'currentRules': rules
+        };
+    },
+    _processActions: function(recommendedActionsArr, ruleRecord, currentActions, actionTypes) {
+        var ruleActions = {};
+        var hasActions = false;
+        for (var i = 0; i &lt; recommendedActionsArr.length; i++) {
+            var actionRecord = recommendedActionsArr[i].getAction();
+            if (!sn_nb_action.NextBestActionUtil.isValidRecord(actionRecord))
+                continue;
+            var actionSysId = actionRecord.getUniqueValue();
+            var actionTableName = actionRecord.getTableName();
+            var actionTypeDetail = actionTypes[actionTableName];
+            try {
+                if (actionTypeDetail) {
+                    var newActionDetailObj = sn_nb_action.ActionDetail.createFromRule(ruleRecord, actionTypeDetail, i + 1, recommendedActionsArr[i]);
+                    if (currentActions.hasOwnProperty(actionSysId) || ruleActions.hasOwnProperty(actionSysId))
+                        this._processEvaluatedAction(currentActions, ruleActions, newActionDetailObj, actionSysId, ruleRecord, i + 1, recommendedActionsArr[i]);
+                    else {
+                        ruleActions[actionSysId] = [newActionDetailObj];
+                        hasActions = true;
+                    }
+                } else
+                    this._log.error("Undefined action type " + [ruleRecord.getUniqueValue(), actionTableName, actionSysId]);
+            } catch (ex) {
+                this._log.error("Error processing recommended action: " + recommendedActionsArr[i].getHint() + " " + ex.message);
+            }
+        }
+        if (hasActions)
+            return ruleActions;
+        return false;
+    },
+    _processEvaluatedAction: function(currentActions, ruleActions, newActionDetailObj, actionSysId, ruleRecord, intraorder, recommendedAction) {
+        var processedActionDetArray, duplicateActionDetObject;
+        if (currentActions.hasOwnProperty(actionSysId)) {
+            processedActionDetArray = currentActions[actionSysId];
+            duplicateActionDetObject = sn_nb_action.NextBestActionUtil.getDuplicateActionDetail(processedActionDetArray, newActionDetailObj);
+            if (duplicateActionDetObject) {
+                //action detail with same action input was recommended by another rule
+                sn_nb_action.ActionDetail.updateFromRule(duplicateActionDetObject, ruleRecord, intraorder, recommendedAction);
+            } else
+                processedActionDetArray.push(newActionDetailObj);
+        } else { //same rule duplicate recommendation
+            processedActionDetArray = ruleActions[actionSysId];
+            duplicateActionDetObject = sn_nb_action.NextBestActionUtil.getDuplicateActionDetail(processedActionDetArray, newActionDetailObj);
+            if (!duplicateActionDetObject)
+                processedActionDetArray.push(newActionDetailObj);
+            else {
+				// update groups for the existing action from new action 
+                sn_nb_action.ActionDetail.updateFromRule(duplicateActionDetObject, ruleRecord, intraorder, recommendedAction);
+            }
+        }
+    },
+    _evaluateRule: function(currentRecord, ruleRecord, recommendationType) {
+        var ruleRoles = ruleRecord.getValue(sn_nb_action.Constants.COL_ROLES);
+        if (gs.nil(ruleRoles) || gs.hasRole(ruleRoles)) {
+            var ruleTableName = ruleRecord.getValue(sn_nb_action.Constants.COL_SYS_CLASS_NAME);
+            var ruleHandler = sn_nb_action.NextBestActionUtil.getRuleTypeHandler(ruleTableName);
+            if (ruleHandler &amp;&amp; typeof ruleHandler.evaluateRule == "function") {
+                try {
+                    var actualRuleRecord = new GlideRecord(ruleTableName);
+                    if (actualRuleRecord.get(ruleRecord.getUniqueValue())) {
+                        var recommendedActionsArr = ruleHandler.evaluateRule(currentRecord, actualRuleRecord, recommendationType);
+                        if (recommendedActionsArr &amp;&amp; Array.isArray(recommendedActionsArr) &amp;&amp; recommendedActionsArr.length &gt; 0)
+                            return recommendedActionsArr;
+                    }
+                } catch (ex) {
+                    this._log.error("Failed to evaluate action(s) for rule " + ruleRecord.getUniqueValue());
+                }
+            } else
+                this._log.error("Could not find implementaion for rule type " + ruleTableName);
+        }
+        return false;
+    },
+    isValidRule: function(ruleRecord) {
+        var ruleTableName = ruleRecord.getValue(sn_nb_action.Constants.COL_SYS_CLASS_NAME);
+        var ruleHandler = sn_nb_action.NextBestActionUtil.getRuleTypeHandler(ruleTableName);
+        if (ruleHandler &amp;&amp; typeof ruleHandler.isValidRule == "function") {
+            return ruleHandler.isValidRule(ruleRecord);
+        } else
+            this._log.error("Could not find implementaion for rule type " + ruleTableName);
+        return false;
+    },
+    type: 'RuleServiceImpl'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-08-23 21:05:30&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;246f463d3b3e1010c24e870044efc4e4&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;50&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;RuleServiceImpl&lt;/sys_name&gt;
+        &lt;sys_package display_value="Recommended Actions" source="sn_nb_action"&gt;427fe83177221010d7159b71a91061e1&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Recommended Actions"&gt;427fe83177221010d7159b71a91061e1&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_246f463d3b3e1010c24e870044efc4e4&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-10-13 21:24:50&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:18</sys_created_on>
+        <sys_id>d6f0f05983b01210c6695855eeaad3f9</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>RuleServiceImpl</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_d6f0f05983b01210c6695855eeaad3f9</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:18</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

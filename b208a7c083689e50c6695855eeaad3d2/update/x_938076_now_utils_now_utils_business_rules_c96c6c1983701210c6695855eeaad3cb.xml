@@ -1,0 +1,268 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules">
+    <x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection/>
+        <condition/>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>Validate Fields Type</name>
+        <order>10</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function executeRule(current, previous /*null when async*/ ) {
+
+    var commonCheckStats = commonCheck(current);
+    var classificationCheckStats = classificationCheck(current, previous);
+    var similiartyCheckStats = similarityCheck(current);
+
+    if (commonCheckStats && classificationCheckStats && similiartyCheckStats) {
+        return;
+    }
+
+    current.setAbortAction(true);
+
+})(current, previous);
+
+function commonCheck(current) {
+    //For Similarity and Clustering we test 
+    var minNumber = 10000;
+    var maxNumber = 300000;
+    var inputSize = inputDatasetSize(current);
+    var errorMsg = "";
+    var validInputSize = true;
+    var trainer = current.trainer.name;
+ var trainerName = "";
+    switch (trainer.toString()) {
+        case "similarity_trainer":
+            minNumber = gs.getProperty('glide.platform_ml.api.min_similarity_window_records', 10);
+            maxNumber = gs.getProperty('glide.platform_ml.api.max_similarity_window_records', 100000);
+   trainerName = gs.getMessage('Similarity');
+            break;
+        case "clustering_trainer":
+            minNumber = gs.getProperty('glide.platform_ml.api.min_clustering_records', 100);
+            maxNumber = gs.getProperty('glide.platform_ml.api.max_clustering_records', 100000);
+   trainerName = gs.getMessage('Clustering');
+            break;
+        case "classification_trainer":
+            minNumber = gs.getProperty('glide.platform_ml.api.csv_min_line', 10000);
+            maxNumber = gs.getProperty('glide.platform_ml.api.csv_max_line', 300000);
+   trainerName = gs.getMessage('Classification');
+            break;
+        default:
+    }
+    if (minNumber <= 0) {
+        minNumber = 1;
+    }
+    if (inputSize < minNumber) {
+        errorMsg = gs.getMessage("Solution training requires a minimum number of {0} records. ", minNumber.toString());
+        gs.addErrorMessage(errorMsg);
+        return false;
+    }
+    if (inputSize > maxNumber) {
+        errorMsg = gs.getMessage("Select a maximum of {0} records in Step 3 for {1} training. Train the solution after you update the filters in step 2. ", [maxNumber.toString(),trainerName]);
+        gs.addErrorMessage(errorMsg);
+        validInputSize = false;
+    }
+
+    if (!validInputSize) {
+        return false;
+    }
+    return true;
+}
+
+
+function similarityCheck(current) {
+    //from new york we dont need to check for subset for similarity
+    return true;
+}
+
+function classificationCheck(current, previous) {
+    var capability = current.trainer.name;
+    if (capability != "classification_trainer") {
+        return true;
+    }
+    var addedInputFields = getAddedInputFields(current, previous);
+    var outputField = current.output_field;
+       if (addedInputFields.length === 0 && outputField === previous.output_field) {
+        return true;
+    }
+
+    var fieldTypes = getFieldTypes(current.trainer);
+    var inputFieldTypes = getInputFieldTypes(fieldTypes.inputFields);
+
+    var inputFieldTypesName = inputFieldTypes[0];
+    var inputFieldTypesLabel = inputFieldTypes[1];
+    var outputFieldTypeName = fieldTypes.outputField;
+    var outputFieldTypeLabel = getOutputFieldTypeLabel(outputFieldTypeName);
+
+    var validInputTypes = checkInputTypes(current.table, addedInputFields, inputFieldTypesName.toString());
+    var validOutputType = checkOutputType(current.table, outputField, outputFieldTypeName.toString());
+
+    if (validInputTypes && validOutputType) {
+        return true;
+    }
+    if (!validInputTypes) {
+        var inputErrorMessage = gs.getMessage("Input Fields are only supported for {0} types", inputFieldTypesLabel.toString());
+        gs.addErrorMessage(inputErrorMessage);
+    }
+    if (!validOutputType) {
+        var outputErrorMessage = gs.getMessage("Output Field is only supported for {0} type", outputFieldTypeLabel.toString());
+        gs.addErrorMessage(outputErrorMessage);
+    }
+
+    return false;
+}
+
+// If the prediction_input_fields is not a subset of input_fields. It will terminate the operation.
+// For example, if the input_fields are A, B, C, the prediction_input_fields are C, D, E. It will 
+// throw exception: please add D, E columns in input_fields.
+function checkSubset(current) {
+    var trainerInput = current.input_fields.getDisplayValue().split(',');
+    var predictorInput = current.prediction_input_fields.getDisplayValue().split(',');
+    var trainerInputSet = Object.create(null);
+    for (var i = 0; i < trainerInput.length; i++) {
+        trainerInputSet[trainerInput[i]] = true;
+    }
+
+    var subsetArray = [];
+    for (var j = 0; j < predictorInput.length; j++) {
+        if (!(predictorInput[j] in trainerInputSet)) {
+            subsetArray.push(predictorInput[j]);
+        }
+    }
+    if (subsetArray.length != 0) {
+        var subsetErrorMessage = gs.getMessage("A Similarity Field has to be included as an Input Field in step 1. Please add {0} in Step 1. ", subsetArray.toString());
+        gs.addErrorMessage(subsetErrorMessage);
+        return false;
+    }
+
+    return true;
+}
+
+function getAddedInputFields(current, previous) {
+    var currentArray = current.input_fields.split(',');
+    if (gs.nil(previous.input_fields)) {
+        return currentArray;
+    }
+    var previousArray = previous.input_fields.split(',');
+    return currentArray.filter(function(x) {
+        return previousArray.indexOf(x) < 0;
+    });
+}
+
+function getFieldTypes(trainer) {
+    var trainerDefinition = new GlideRecord("ml_trainer_definition");
+    trainerDefinition.get(trainer);
+    var fieldTypes = {};
+    fieldTypes.inputFields = trainerDefinition.getValue("input_types");
+    fieldTypes.outputField = trainerDefinition.getValue("output_type");
+    return fieldTypes;
+}
+
+function getInputFieldTypes(fieldTypesID) {
+    var fieldTypesName = [];
+    var fieldTypesLabel = [];
+    var glideObject = new GlideRecord("sys_glide_object");
+    glideObject.addQuery("sys_id", "IN", fieldTypesID);
+    glideObject.query();
+    while (glideObject.next()) {
+        fieldTypesName.push(glideObject.getValue("name"));
+        fieldTypesLabel.push(glideObject.getValue("label"));
+    }
+    return [fieldTypesName, fieldTypesLabel];
+}
+
+function getOutputFieldTypeLabel(fieldTypeName) {
+    var glideObject = new GlideRecord("sys_glide_object");
+    glideObject.addQuery("name", fieldTypeName);
+    glideObject.query();
+    if (glideObject.next()) {
+        return glideObject.getValue('label');
+    }
+    return null;
+}
+
+function checkInputTypes(table, addFields, fieldTypes) {
+    var tableRecord = new GlideRecord(table);
+    for (var field in addFields) {
+        var element = tableRecord.getElement(addFields[field]);
+        var descriptor = element.getED();
+        var type = descriptor.getInternalType();
+        var choiceType = sn_ml.MLRecordUtil.getFieldType(table, addFields[field]);
+        if (!fieldTypes.includes(type) && !fieldTypes.includes(choiceType)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// The function will check whether the input dataset has the min_number of record, or it will abort the operation.
+// There will be a property, glide.platform_ml.min_record_size, to set the min_number, or it will use default value 1000.
+function inputDatasetSize(current) {
+    var filter = "";
+    if (current.trainer.name == 'similarity_trainer' || current.trainer.name == 'clustering_trainer') {
+        filter = current.similarity_window_filter;
+    } else {
+        filter = current.input_filter;
+    }
+    var gr = new GlideRecord(current.table);
+    gr.addEncodedQuery(filter);
+    gr.query();
+    return gr.getRowCount();
+}
+
+function checkOutputType(table, outputField, fieldType) {
+    var tableRecord = new GlideRecord(table);
+    var element = tableRecord.getElement(outputField);
+    var descriptor = element.getED();
+    var type = descriptor.getInternalType();
+    var choiceType = sn_ml.MLRecordUtil.getFieldType(table, outputField);
+
+    if (fieldType == type || fieldType == choiceType) {
+        return true;
+    }
+
+    return false;
+}
+
+function wordVectorpresent(gliderecord) {
+    return gliderecord.isValidField('word_vector_corpus');
+}]]></script>
+        <sys_class_name>x_938076_now_utils_now_utils_business_rules</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:52:16</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>c96c6c1983701210c6695855eeaad3cb</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Validate Fields Type</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>x_938076_now_utils_now_utils_business_rules_c96c6c1983701210c6695855eeaad3cb</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:52:16</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </x_938076_now_utils_now_utils_business_rules>
+    <sys_translated_text action="delete_multiple" query="documentkey=c96c6c1983701210c6695855eeaad3cb"/>
+</record_update>

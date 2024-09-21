@@ -1,0 +1,217 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>24a5568b774121109650350bee5a99a4</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_entitlement.EntitlementDownloader&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;EntitlementDownloader&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var EntitlementDownloader = Class.create();
+EntitlementDownloader.prototype = {
+    initialize: function() {
+        this.logger = new LoggingUtil();
+        this.entitlementEngineUtils = new sn_lef.EntitlementEngineUtils();
+        this.error = false;
+        this.instanceId = gs.base64Encode(gs.getProperty(LicensingEngineConstants.INSTANCE_ID));
+        this.instanceName = gs.base64Encode(gs.getProperty(LicensingEngineConstants.INSTANCE_NAME));
+        this.subscriptionEntitlementsService = new SubscriptionEntitlementsService();
+
+        //error code names
+        this.HTTP_ERROR = 2008;
+        this.HTTP_NULL_RESPONSE = 2009;
+    },
+
+    downloadEntitlements: function() {
+        try {
+            //check for on-perm instances
+            if (new sn_entitlement.InstanceInfoUtil().isSelfHostedInstance()) {
+                this.logger.logInfo(this.type, 'downloadEntitlement', 'Skipping entitlement download since the instance is self-hosted');
+                return;
+            }
+            // check if surf routing is enabled, and if so, then exit
+            if (gs.getProperty("glide.entitlement.surf.routing", "true") != "false") {
+                this.logger.logInfo(this.type, 'downloadEntitlement', 'Skipping entitlement download since the instance is using surf routing');
+                return;
+            }
+            this.entitlementEngineUtils.downloadInstInfo();
+            this.entitlementEngineUtils.downloadAppFamily();
+            this.entitlementEngineUtils.downloadEventRegistry();
+            this._downloadSubscriptionEntitlements();
+        } catch (e) {
+            this.logger.logErrorWithoutAudit(this.type, "downloadEntitlements", e + " \n " + e.stack);
+        } finally {
+            const cacheManager = new CacheDataHandler();
+            cacheManager.flush(LicensingEngineConstants.LICENSING_CACHE_CATALOG);
+            cacheManager.reloadAllCache();
+        }
+        const subscriptionList = this.subscriptionEntitlementsService.getEntitlementDetails(LicensingEngineConstants.INTEGRATIONHUBPOOL);
+        subscriptionList.forEach(subscription =&gt; {
+            this.entitlementEngineUtils.creatIHUsageCountCfg(subscription.name, subscription.subscription_identifier, LicensingEngineConstants.INTEGRATIONHUBPOOL);
+        });
+
+        //TODO to move definition creation for IH and IDR to a new post process function
+        this.entitlementEngineUtils.subscriptionDownloadPostProcess(); //this includes all post process activities that has dependency on glide/legacy code
+    },
+    _downloadSubscriptionEntitlements: function() {
+        this._download();
+        var result = this._process();
+        this._postProcess(result);
+    },
+
+    _download: function() {
+        //create record in entitlement data to add the payload attachment
+        var recordSysId = this.createEntitlementDataRecord();
+        var endPointURL = LicensingEngineConstants.V1_ENTITLEMENT_DOWNLOAD_SERVICE_URL + this.instanceId + "/" + this.instanceName;
+        var restMethod = "GET";
+
+        var saveResponseAsAttachment = {
+            'table_name': LicensingEngineDBConstants.ENTITLEMENT_DATA,
+            'record_sys_id': recordSysId,
+            'attachment_name': 'EntitlementPayload.txt',
+        };
+
+        var authorization = this.entitlementEngineUtils.getAuthHeader();
+        var headers = {
+            'Authorization': authorization
+        };
+
+        var queryParameters = {
+            'instance_name': this.instanceName,
+            'instance_id': this.instanceId
+        };
+
+        var restObject = {
+            'end_point': endPointURL,
+            'headers': headers,
+            'query_parameters': queryParameters,
+            'rest_method': restMethod
+        };
+
+        var resp = null;
+        try {
+            var licDownloaderUtils = new LicensingDownloaderUtils();
+            resp = licDownloaderUtils.executeRESTAPI(restObject);
+        } catch (error) {
+            const mesg = `Unexpected error while downloading entitlements: ${error} \n ${error.stack}`;
+            this.setEntitlementDataStatusAndLog(mesg, LicensingEngineDBConstants.STATUS_VALUE.ERROR, recordSysId, this.type, "_download", this.HTTP_NULL_RESPONSE, LicensingEngineConstants.LICENSING_ERROR_TYPES.SUBSCRIPTION_DOWNLOAD_JOB);
+        }
+
+        if (global.JSUtil.nil(resp)) {
+            const mesg = LicensingEngineConstants.LICENSING_ERROR_CODES[this.HTTP_NULL_RESPONSE] + "Instance ID: " + this.instanceId + ", Instance Name : " + this.instanceName;
+            this.setEntitlementDataStatusAndLog(mesg, LicensingEngineDBConstants.STATUS_VALUE.ERROR, recordSysId, this.type, "_download", this.HTTP_NULL_RESPONSE, LicensingEngineConstants.LICENSING_ERROR_TYPES.SUBSCRIPTION_DOWNLOAD_JOB);
+            this.error = true;
+            return;
+        }
+
+        var httpStatus = resp.getStatusCode();
+        if (global.JSUtil.notNil(httpStatus) &amp;&amp; httpStatus == LicensingEngineConstants.STATUS_OK){
+            this.savePayload(saveResponseAsAttachment, resp);
+            this.setEntitlementDataStatusAndLog("", LicensingEngineDBConstants.STATUS_VALUE.READY, recordSysId, "", "", "", "");
+        }
+        else if (httpStatus in LicensingEngineConstants.HTTP_STATUS_CODES) {
+            const errorCode = LicensingEngineConstants.HTTP_STATUS_CODES[httpStatus];
+            const errorMesg = LicensingEngineConstants.LICENSING_ERROR_CODES[errorCode] + resp.getErrorMessage();
+            this.setEntitlementDataStatusAndLog(errorMesg, LicensingEngineDBConstants.STATUS_VALUE.ERROR, recordSysId, this.type, "download", errorCode, LicensingEngineConstants.LICENSING_ERROR_TYPES.SUBSCRIPTION_DOWNLOAD_JOB);
+            this.error = true;
+        } else {
+            this.setEntitlementDataStatusAndLog(LicensingEngineConstants.LICENSING_ERROR_CODES[this.HTTP_ERROR] + resp.getErrorMessage(), LicensingEngineDBConstants.STATUS_VALUE.ERROR, recordSysId, this.type, "download", this.HTTP_ERROR, LicensingEngineConstants.LICENSING_ERROR_TYPES.SUBSCRIPTION_DOWNLOAD_JOB);
+            this.error = true;
+        }
+    },
+
+    savePayload: function(saveResponseAsAttachment, response) {
+        var payload = response.getBody();
+        if (typeof this.entitlementEngineUtils.saveAttachmentFromString == 'function') {
+            var contentType = response.getHeader("Content-Type");
+            this.entitlementEngineUtils.saveAttachmentFromString(saveResponseAsAttachment.record_sys_id, saveResponseAsAttachment.table_name, saveResponseAsAttachment.attachment_name, contentType, payload);
+        } else {
+            var gr = new GlideRecord(LicensingEngineDBConstants.ENTITLEMENT_DATA);
+            var sysId = saveResponseAsAttachment.record_sys_id;
+            if (gr.get(sysId)) {
+                var compressedPayload = new global.LicensingEngineGlobalHelper().compressToBytes(payload);
+                gr.setValue("payload", compressedPayload);
+                gr.update();
+            }
+        }
+    },
+
+    _process: function() {
+        if (this.error)
+            return;
+
+        var processor = new EntitlementProcessor();
+        return processor.processEntitlementPayload();
+    },
+
+    _postProcess: function(result) {
+        if (this.error)
+            return;
+
+        var status = result[LicensingEngineDBConstants.STATUS];
+        var errorMesg = result[LicensingEngineDBConstants.ERROR];
+        var recSysID = result[LicensingEngineDBConstants.SYS_ID];
+        this.setEntitlementDataStatusAndLog(errorMesg, status, recSysID, result[LicensingEngineConstants.CLASS_NAME], result[LicensingEngineConstants.METHOD_NAME], result[LicensingEngineDBConstants.ERROR_CODE], result[LicensingEngineDBConstants.ERROR_TYPE]);
+
+        var propertyValue = this.entitlementEngineUtils.getEntitlementEnginePropValue(LicensingEngineConstants.PROP_GLIDE_ENTITLEMENT_EMS_DATA_AVAILABLE);
+        if (status == LicensingEngineDBConstants.STATUS_VALUE.PROCESSED &amp;&amp; propertyValue != LicensingEngineConstants.TRUE)
+            this.entitlementEngineUtils.setEntitlementEngineProp(LicensingEngineConstants.PROP_GLIDE_ENTITLEMENT_EMS_DATA_AVAILABLE, LicensingEngineConstants.TRUE);
+
+        //TODO remove old records or add table cleaner for entitlement_data table - TBD
+    },
+
+    createEntitlementDataRecord: function() {
+        var gr = new GlideRecord(LicensingEngineDBConstants.ENTITLEMENT_DATA);
+        gr.setValue(LicensingEngineDBConstants.TYPE, LicensingEngineDBConstants.INSTANCE_LEVEL);
+        gr.setValue(LicensingEngineDBConstants.STATUS, LicensingEngineDBConstants.STATUS_VALUE.NOT_READY);
+        return gr.insert();
+    },
+
+    setEntitlementDataStatusAndLog: function(errorMesg, status, sysId, className, methodName, errorCode, errorType) {
+        var gr = new GlideRecord(LicensingEngineDBConstants.ENTITLEMENT_DATA);
+        if (gr.get(sysId)) {
+            gr.setValue(LicensingEngineDBConstants.STATUS, status);
+            gr.setValue(LicensingEngineDBConstants.ERROR_MESSAGE, errorMesg);
+            gr.update();
+        }
+
+        if (status == LicensingEngineDBConstants.STATUS_VALUE.ERROR)
+            this.logger.logError(className, methodName, errorMesg, errorCode, errorType);
+    },
+
+    type: 'EntitlementDownloader'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-02-20 23:48:50&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;24a5568b774121109650350bee5a99a4&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;20&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;EntitlementDownloader&lt;/sys_name&gt;
+        &lt;sys_package display_value="Licensing Engine" source="sn_entitlement"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Licensing Engine"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_24a5568b774121109650350bee5a99a4&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-11-08 04:16:02&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:20</sys_created_on>
+        <sys_id>7af0345983b01210c6695855eeaad33b</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>EntitlementDownloader</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_7af0345983b01210c6695855eeaad33b</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:20</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

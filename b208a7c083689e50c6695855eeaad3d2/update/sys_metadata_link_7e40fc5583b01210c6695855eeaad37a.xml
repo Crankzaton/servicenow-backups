@@ -1,0 +1,226 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>05fb38540b1323008d9ac74363673a54</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.AppWidget&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;AppWidget&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var AppWidget = Class.create();
+/* @author sunil.bn */
+AppWidget.prototype = {
+    initialize: function(obj /*sys_id or GlideRecord Object*/ , context /* optional*/ ) {
+        if (obj &amp;&amp; typeof obj === "string") {
+            var gr = new GlideRecord(AppWidgetHelper.TABLES.WIDGET);
+            if (gr.get(obj)) {
+                this.gr = gr;
+            }
+        } else if (typeof obj === "object") {
+            this.gr = obj;
+        }
+        this.context = context || '';
+    },
+    getJSON: function(fetchValue) {
+        var oWidget = {
+            name: this.gr.getDisplayValue(),
+            short_description: this.gr.getValue('short_description'),
+            color: this.gr.getValue('color'),
+            order: parseInt(this.gr.getValue('order')),
+            parent: this.gr.getValue('parent'),
+            show_label: Boolean(parseInt(this.gr.getValue('show_label'))),
+            formatter_required: Boolean(parseInt(this.gr.getValue('formatter_required'))),
+            sys_id: this.gr.getUniqueValue(),
+            aggregate_type: this.gr.getValue('aggregate_type'),
+            scripted: Boolean(parseInt(this.gr.getValue('scripted'))),
+        };
+        if (fetchValue) {
+            if (oWidget.scripted) {
+                oWidget.value = this.getScriptedValue();
+            } else {
+                oWidget.value = this.getAggregatedValue();
+            }
+        }
+        return oWidget;
+    },
+    _getAggValueFromTable: function(oEntity) {
+        var entityTable = oEntity.getValue('table');
+        var entityAggregateField = oEntity.getValue('aggregate_field');
+        var entityAggregateFilter = oEntity.getValue('aggregate_filter');
+        var aggType = this.gr.getValue('aggregate_type');
+        var aggGr = new GlideAggregate(entityTable);
+        var result = {};
+        if (aggType != 'COUNT') {
+            result.columnType = aggGr.getElement(entityAggregateField).getED().getInternalType();
+        }
+        if (this.context.filters &amp;&amp; JSUtil.notNil(this.context.filters[entityTable]))
+            aggGr.addEncodedQuery(this.context.filters[entityTable]);
+        else
+            return result;
+        if (entityAggregateFilter)
+            aggGr.addEncodedQuery(entityAggregateFilter);
+        //required to calculate the real average of heterogeneous enities
+        if (aggType === 'AVG') {
+            aggGr.addAggregate('SUM', entityAggregateField);
+            aggGr.addAggregate('COUNT', entityAggregateField);
+        } else {
+            aggGr.addAggregate(aggType, entityAggregateField);
+        }
+        aggGr.setGroup(false);
+        aggGr.query();
+        if (aggGr.next()) {
+            if (aggType === 'AVG') {
+                result.value = aggGr.getAggregate("SUM", entityAggregateField);
+                result.count = aggGr.getAggregate('COUNT', entityAggregateField);
+            } else {
+                result.value = aggGr.getAggregate(aggType, entityAggregateField);
+            }
+        }
+        return result;
+    },
+    getAggregatedValue: function() {
+        var oAggregatedValue = '';
+        //get related entities
+        var tables = [];
+        for (var k in this.context.filters) {
+            if (JSUtil.notNil(this.context.filters[k])) {
+                tables.push(k);
+            }
+        }
+        if (tables.length === 0) return oAggregatedValue;
+        var oEntity = new GlideRecord(AppWidgetHelper.TABLES.WIDGET_ENTITY);
+        oEntity.addQuery('widget', this.gr.getUniqueValue());
+        oEntity.addQuery('table', 'IN', tables);
+        var aggType = this.gr.getValue('aggregate_type');
+        var overallResult = {
+            total: 0,
+            count: 0,
+            values: []
+        };
+        oEntity.query();
+        while (oEntity.next()) {
+            var res = this._getAggValueFromTable(oEntity);
+            if (res.hasOwnProperty('value')) {
+                if (JSUtil.notNil(res.value))
+                    overallResult.values.push(parseFloat(res.value));
+                if (res.columnType === 'glide_duration') {
+                    overallResult.total = this.addGlideDuration(overallResult.total, res.value);
+                } else {
+                    if (JSUtil.notNil(res.value))
+                        overallResult.total += parseFloat(res.value);
+                }
+                if (aggType === "AVG" &amp;&amp; JSUtil.notNil(res.count)) {
+                    overallResult.count += res.count;
+                }
+            }
+        }
+        switch (aggType) {
+            case "MIN":
+                oAggregatedValue = Math.min.apply(null, overallResult.values);
+                break;
+            case "MAX":
+                oAggregatedValue = Math.max.apply(null, overallResult.values);
+                break;
+            case "SUM":
+                oAggregatedValue = overallResult.total;
+                break;
+            case "AVG":
+                if (overallResult.count &gt; 0) oAggregatedValue = overallResult.total / overallResult.count;
+                break;
+            case "COUNT":
+                oAggregatedValue = parseInt(overallResult.total);
+        }
+        return oAggregatedValue;
+    },
+    addGlideDuration: function(a, b) {
+        var duration = new GlideDuration(a);
+        if (JSUtil.notNil(b))
+            duration.add(b);
+        return duration;
+    },
+    _addOldParams: function(params) {
+        //intitialize else old widget evaluation fails
+        params.projectClass = "";
+        params.projectFilter = "";
+        params.demandClass = "";
+        params.demandFilter = "";
+        params.costPlanFilters = {};
+
+        for (var table in this.context.filters) {
+            var filter = this.context.filters[table];
+            var gr = new GlideRecord(table);
+            if (gr.instanceOf('pm_project')) {
+                params.projectClass = table;
+                params.projectFilter = filter;
+                params.costPlanFilters[table] = filter;
+            } else if (gr.instanceOf('dmn_demand')) {
+                params.demandClass = table;
+                params.demandFilter = filter;
+                params.costPlanFilters[table] = filter;
+            }
+        }
+        params.costPlanFilters = JSON.stringify(params.costPlanFilters);
+        return params;
+    },
+    getScriptedValue: function() {
+        try {
+            var oEvaluator = new GlideScopedEvaluator();
+            var params = {
+                context: JSON.stringify(this.context),
+                boardSysId: this.context.boardSysId
+            };
+            //backward compatability logic
+            params = this._addOldParams(params);
+            return oEvaluator.evaluateScript(this.gr, 'script', params);
+        } catch (e) {
+            this.log("Error occured in evaluating widget script", "getScriptedValue");
+            return "";
+        }
+    },
+    //used in the form
+    widgetParentFilter: function(widgetSysId) {
+        var filter = "^parentISEMPTY";
+        if (widgetSysId != -1) {
+            filter += "^sys_id!=" + widgetSysId;
+        }
+        return filter;
+    },
+    log: function(msg, methodName) {
+        AppWidgetLog.log('AppWidget:' + methodName + ':' + msg);
+    },
+    type: 'AppWidget'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2019-01-25 09:44:16&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;05fb38540b1323008d9ac74363673a54&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;46&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AppWidget&lt;/sys_name&gt;
+        &lt;sys_package display_value="Widgets" source="com.snc.app.widgets"&gt;f92012ab47e64210cd4e1ce4316d4370&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_05fb38540b1323008d9ac74363673a54&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2019-04-09 08:46:41&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:20</sys_created_on>
+        <sys_id>7e40fc5583b01210c6695855eeaad37a</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AppWidget</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_7e40fc5583b01210c6695855eeaad37a</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:20</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

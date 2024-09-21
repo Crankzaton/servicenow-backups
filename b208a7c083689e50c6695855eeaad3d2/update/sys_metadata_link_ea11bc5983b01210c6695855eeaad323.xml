@@ -1,0 +1,452 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>29fe8787734071106fa37fb154f6a7d6</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.WSDGetCalendarDetailsSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;WSDGetCalendarDetailsSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var WSDGetCalendarDetailsSNC = Class.create();
+WSDGetCalendarDetailsSNC.prototype = {
+	
+    initialize: function() {
+		this.rsvUtils = new WSDReservationUtils();
+		this.rsvAdminExperienceUtils = new WSDRsvAdminExperienceUtils();
+		this.rsvAdminExpJsonGenerator = new WSDRsvAdminExpJsonPayloadGenerator();
+    },
+    
+	/**
+	 * Gets the details for the calendar component in a json - count, contextDate, sections, events, timezone, nextPageIndex
+	 * @param {object} filterConfig
+	 * @param {number} pageSize
+	 * @param {number} startPageIndex
+	 * @param {GlideDateTime} startDateTime
+	 * @param {GlideDateTime} endDateTime
+	 * @returns {calendarDetails}
+	 */
+	getCalendarDetails: function(filterConfig, pageIndex, startDateTime, endDateTime, searchText) {
+		var calendarDetailsJson = {};
+		var timeZone;
+		
+		if (gs.nil(startDateTime) &amp;&amp; gs.nil(endDateTime)) {
+			if (this.rsvAdminExperienceUtils.isValidFilterConfig(filterConfig))
+				this.rsvAdminExperienceUtils.saveFilterConfig(filterConfig);
+			else
+				filterConfig = this.rsvAdminExperienceUtils.getInitFilterConfig();
+		} else
+			this.rsvAdminExperienceUtils.saveFilterConfig(filterConfig);
+		
+		var buildingsList = filterConfig.buildings;
+		if (buildingsList.length == 0)
+			timeZone = 'UTC';
+		else
+			timeZone = this.rsvUtils.getBuildingTimeZone(buildingsList[0]);
+		
+		var floors = filterConfig ? filterConfig.floors : [];
+		var reservablePurposes = filterConfig ? filterConfig.reservablePurposes : [];
+		var spaceIds = this.rsvUtils.getActiveSpacesWithReservablePurposes(floors, reservablePurposes);
+		
+		var momentsInUTC = this._getStartAndEndMomentsInUTC(startDateTime, endDateTime, timeZone); //gets start and end moment times in UTC
+		var startMomentGdt = new GlideDateTime(momentsInUTC.startMomentInUTC);
+		var endMomentGdt = new GlideDateTime(momentsInUTC.endMomentInUTC);
+		
+		//Filter spaceIds based on searchText
+        if (!WSDUtils.nullOrEmpty(searchText)) {
+            var filteredSpaceIds = this.rsvUtils.filterSpacesByTitle(spaceIds, searchText);
+            filteredSpaceIds = this._appendSpacesByReservationFilters(spaceIds, filteredSpaceIds, searchText, startMomentGdt, endMomentGdt);
+            spaceIds = Object.keys(filteredSpaceIds);
+        }
+	
+		calendarDetailsJson.count = spaceIds.length; // Total no of spaces without pagination
+		calendarDetailsJson.filterConfig = filterConfig;
+		calendarDetailsJson.contextDate = momentsInUTC.startMomentInUTC;
+		calendarDetailsJson.legends = this.rsvAdminExperienceUtils.getLegendsData();
+		calendarDetailsJson.timezone = timeZone;
+		calendarDetailsJson = this._getCalendarSectionsAndEvents(calendarDetailsJson, spaceIds, pageIndex, timeZone, startMomentGdt, endMomentGdt);
+
+		return calendarDetailsJson;
+	},
+	
+	/**
+	 * Gets the details of sections, events, timezone and endPageIndex
+	 * @param {calendarDetails} calendarDetailsJson
+	 * @param {object} spaceIds
+	 * @param {number} pageSize
+	 * @param {number} startPageIndex
+	 * @param {GlideDateTime} startMomentGdt
+	 * @param {GlideDateTime} endMomentGdt
+	 * @returns {calendarDetails}
+	 * @private
+	 */
+	_getCalendarSectionsAndEvents: function(calendarDetailsJson, spaceIds, pageIndex, timeZone, startMomentGdt, endMomentGdt) {
+		var sections = [];
+		var events = [];
+		var buildingsList = [];
+		var floorsList = [];
+		var inSpaceIds = [];
+
+		var startPageIndex = pageIndex.startPageIndex;
+		var endPageIndex = pageIndex.endPageIndex;
+	
+		var spaceGr = new GlideRecord(WSDConstants.TABLES.Space.name);
+		spaceGr.addEncodedQuery('sys_idIN' + spaceIds);
+		spaceGr.orderBy('building.order');
+		spaceGr.orderBy('building.title');
+		spaceGr.orderBy('floor.order');
+		spaceGr.orderBy('floor.title');
+		spaceGr.orderBy('order');
+		spaceGr.orderBy('title');
+		spaceGr.chooseWindow(startPageIndex, endPageIndex);
+
+		spaceGr.query();
+
+		while (spaceGr.next()) {
+			var building = spaceGr.getValue('building');
+			var floor = spaceGr.getValue('floor');
+			var buildingJson, floorJson, showHeader;
+
+			//Check to avoid duplicates for a buildingJson
+			if (buildingsList.indexOf(building) == -1) {
+				showHeader = true;
+				buildingJson = this.rsvAdminExpJsonGenerator.constructBuildingJsonForSections(spaceGr, showHeader);
+				buildingsList.push(building);
+				sections.push(buildingJson);
+			}
+			
+			//Check to avoid duplicates for a floorJson
+			if (floorsList.indexOf(floor) == -1) {
+				showHeader = true;
+				floorJson =  this.rsvAdminExpJsonGenerator.constructFloorJsonForSections(spaceGr, showHeader);
+				floorsList.push(floor);
+				sections.push(floorJson);
+			}
+			
+			var capacity = gs.getMessage('Capacity {0}', spaceGr.getValue('capacity'));
+			var spaceJson = this.rsvAdminExpJsonGenerator.constructSpaceJsonForSections(spaceGr, capacity);
+			sections.push(spaceJson);
+			
+			inSpaceIds.push(spaceGr.getValue('sys_id'));
+		}
+		
+		var spaceEvents = this._getCalendarEvents(inSpaceIds, timeZone, startMomentGdt, endMomentGdt); //get the event details
+		events = events.concat(spaceEvents);
+		
+		var blockLocationEvents = this._getBlockLocationEvents(inSpaceIds, timeZone);
+		events = events.concat(blockLocationEvents);
+		
+		calendarDetailsJson.sections = sections;
+		calendarDetailsJson.events = events;
+		calendarDetailsJson.floors = floorsList;
+		calendarDetailsJson.buildings = buildingsList;
+		calendarDetailsJson.spaces = inSpaceIds;
+		
+		return calendarDetailsJson;
+	},
+	
+	/**
+	 * Gets the details of events
+	 * @param {GlideRecord} spaceGr
+	 * @param {String} timeZone
+	 * @param {GlideDateTime} startMomentGdt
+	 * @param {GlideDateTime} endMomentGdt
+	 * @returns {events}
+	 * @private
+	 */
+	_getCalendarEvents: function(spaceIds, timeZone, startMomentGdt, endMomentGdt) {
+		var events = [];
+		var order, isBlocker;
+		var eventJsonParams, eventJson;
+		
+		//construct the eventJson for the reservations that are not blockers and that are not overlapping
+		var resGr = new GlideRecord(WSDConstants.TABLES.RoomsReservation.name);
+		resGr.addQuery('location', 'IN', spaceIds);
+		resGr.addEncodedQuery('active=true^ORstate=completed^state!=conflicted'); 
+		resGr.addEncodedQuery('reservation_subtype!=recurring_parent^reservation_subtype!=multi_parent^reservation_subtype!=group_parent');
+		resGr.addEncodedQuery('blocker_forISEMPTY');
+		resGr.addQuery('start', '&lt;=', endMomentGdt);
+		resGr.addQuery('end', '&gt;=', startMomentGdt);
+		
+		resGr.query();
+		
+		while (resGr.next()) {
+			order = 0;
+			isBlocker = false;
+			eventJsonParams = this._getParamsForConstructingEventJSON(resGr, timeZone, isBlocker);
+			
+			eventJson = this.rsvAdminExpJsonGenerator.constructEventJson(resGr, eventJsonParams.startTimeInBuildingTZ, eventJsonParams.endTimeInBuildingTZ, timeZone, eventJsonParams.reservedExtraServices, eventJsonParams.eventColor, eventJsonParams.parentSubtype, order, isBlocker, eventJsonParams.allowMove, eventJsonParams.isMultiDayReservation);
+			
+			events.push(eventJson);
+		}
+		
+		//construct the eventJson for the reservations that are not blockers but are overlapping
+		resGr = new GlideRecord(WSDConstants.TABLES.RoomsReservation.name);
+		resGr.addQuery('location', 'IN', spaceIds);
+		resGr.addQuery('active', 'true');
+		resGr.addQuery('state', 'conflicted');
+		resGr.addEncodedQuery('blocker_forISEMPTY');
+		resGr.addQuery('start', '&lt;=', endMomentGdt);
+		resGr.addQuery('end', '&gt;=', startMomentGdt);
+		resGr.orderBy('start');
+		resGr.orderBy('end');
+		resGr.orderBy('subject');
+		
+		resGr.query();
+		
+		var eventCount = 1;
+		while (resGr.next()) {
+			order = eventCount;  //order takes the higher precedence when the events are overlappig
+			isBlocker = false;
+			eventJsonParams = this._getParamsForConstructingEventJSON(resGr, timeZone, isBlocker);
+			
+			eventJson = this.rsvAdminExpJsonGenerator.constructEventJson(resGr, eventJsonParams.startTimeInBuildingTZ, eventJsonParams.endTimeInBuildingTZ, timeZone, eventJsonParams.reservedExtraServices, eventJsonParams.eventColor, eventJsonParams.parentSubtype, order, isBlocker, eventJsonParams.allowMove, eventJsonParams.isMultiDayReservation);
+			
+			events.push(eventJson);
+			eventCount++;		
+		}
+		
+		//construct the eventJson for blocker reservations
+		resGr = new GlideRecord(WSDConstants.TABLES.RoomsReservation.name);
+		resGr.addQuery('location', 'IN', spaceIds);
+		resGr.addEncodedQuery('active=true^ORstate=completed');
+		resGr.addEncodedQuery('blocker_forISNOTEMPTY');
+		resGr.addQuery('start', '&lt;=', endMomentGdt);
+		resGr.addQuery('end', '&gt;=', startMomentGdt);
+		
+		resGr.query();
+		
+		while (resGr.next()) {
+			isBlocker = true;
+			eventJsonParams = this._getParamsForConstructingEventJSON(resGr, timeZone, isBlocker);
+			var blockerRsvProperties = this.rsvAdminExperienceUtils.determineOrderAndColorForBlockers(resGr, events);
+			
+			eventJson = this.rsvAdminExpJsonGenerator.constructEventJson(resGr, eventJsonParams.startTimeInBuildingTZ, eventJsonParams.endTimeInBuildingTZ, timeZone, eventJsonParams.reservedExtraServices,  blockerRsvProperties.eventColor, eventJsonParams.parentSubtype, blockerRsvProperties.order, isBlocker, eventJsonParams.allowMove);
+			
+			events.push(eventJson);
+		}
+		
+		return events;
+	},
+	
+	/**
+	 * Gets the block locations for given space Ids
+	 * @param {object} spaceIds
+	 * @param {string} timeZone
+	 * @returns {object} blockLocationEvents
+	 * @private
+	 */
+	_getBlockLocationEvents: function(spaceIds, timeZone) {
+		var blockLocationGr = new GlideRecord(sn_wsd_core.WPConstants.TABLES.BLOCK_LOCATION);
+		blockLocationGr.addQuery('active', 'true');
+		blockLocationGr.addQuery('location', 'IN', spaceIds);
+		blockLocationGr.query();
+		
+		var blockLocationEvents = [];
+		var dateFormat = 'YYYY-MM-DD HH:mm:ss'; 
+		
+		while (blockLocationGr.next()) {
+			var blockLocationDescription = gs.getMessage('Space is not accessible because of {0}.', blockLocationGr.getValue('reason'));
+			var startTime = this.rsvAdminExperienceUtils.getTimeInBuildingTimeZone(blockLocationGr.getValue('start_time'), timeZone, dateFormat);
+			var endTime = this.rsvAdminExperienceUtils.getTimeInBuildingTimeZone(blockLocationGr.getValue('end_time'), timeZone, dateFormat);
+			var ariaLabel =  gs.getMessage('Space is not accessible because of {0} from {1} till {2}.', [blockLocationGr.getValue('reason'), startTime, endTime]);
+			allowMove = false;
+			
+			eventJson = this.rsvAdminExpJsonGenerator.constructBlockLocationsEventJson(blockLocationGr, blockLocationDescription, startTime, endTime, ariaLabel, allowMove);
+			
+			blockLocationEvents.push(eventJson);
+		}
+		
+		return blockLocationEvents;
+	},
+	
+	/**
+	 * Gets the reservation details in required format to display on popover 
+	 * @param {string} rsvId
+	 * @returns {details}
+	 */
+	getPopoverDetails : function(rsvId){
+		var details = {};
+		var rsvGr = new GlideRecord(WSDConstants.TABLES.RoomsReservation.name);
+		rsvGr.addQuery('sys_id',rsvId);
+		rsvGr.query();
+		if(rsvGr.next()){
+			var reservationTitle = rsvGr.getValue('subject');
+			
+			var reservationDetails = this.rsvAdminExperienceUtils.getReservationDetails(rsvGr);
+			
+			var reservationStatus = {
+				'label' : gs.getMessage('Reservation status'),
+				'value' : this.rsvAdminExperienceUtils.getRsvStatusHighlightedValue(rsvGr)
+			};
+			
+			var servicesAdded;
+			var services = this.rsvAdminExperienceUtils.getServicesAdded(rsvGr);
+			if(services &amp;&amp; services.length&gt;0){
+				servicesAdded = {
+					'label' : gs.getMessage('Services added'),
+					'value' : services
+				};
+			}
+			
+			var openReservationId = rsvGr.getValue('reservation_subtype')=='multi_child'?rsvGr.getValue('source_reservation'):rsvId;
+			
+			details = this.rsvAdminExpJsonGenerator.constructPopoverJSON(reservationTitle,reservationDetails,reservationStatus,openReservationId,servicesAdded);
+		}
+		return details;
+	},
+	
+	/**
+	 * Gets the start and end moments in UTC
+	 * @param {String} startDateTime
+	 * @param {String} endDateTime
+	 * @param {String} timeZone
+	 * @returns {momentsInUTC} start and end moments in UTC
+	 * @private
+	 */
+	_getStartAndEndMomentsInUTC: function(startDateTime, endDateTime, timeZone) {
+		if (gs.nil(startDateTime) &amp;&amp; gs.nil(endDateTime)) {
+			//get the current UTC time
+			var startMomentGdt = new GlideDateTime();
+			var endMomentGdt = new GlideDateTime();
+
+			if(WSDUtils.nullOrEmpty(timeZone))
+				timeZone = 'UTC';
+			
+			//convert the current UTC time to Building time zone
+			var dateFormat = 'YYYY-MM-DD HH:mm:ss'; 
+			var startMomentInBuildingTZ = this.rsvAdminExperienceUtils.getTimeInBuildingTimeZone(startMomentGdt, timeZone, dateFormat);
+			var endMomentInBuildingTZ = this.rsvAdminExperienceUtils.getTimeInBuildingTimeZone(endMomentGdt, timeZone, dateFormat);
+			
+			startDateTime = startMomentInBuildingTZ.toString().split(' ')[0]+' 00:00:00';
+			endDateTime = endMomentInBuildingTZ.toString().split(' ')[0]+' 23:59:59';
+		}	
+		
+		var startMomentInUTC = WSDUtils.getDateTimeInUtcAccordingToTimeZone(startDateTime, timeZone, 'YYYY-MM-DD HH:mm:ss');
+		var endMomentInUTC = WSDUtils.getDateTimeInUtcAccordingToTimeZone(endDateTime, timeZone, 'YYYY-MM-DD HH:mm:ss');
+
+		return {
+			'startMomentInUTC': startMomentInUTC,
+			'endMomentInUTC': endMomentInUTC
+		};
+	},
+	
+	/**
+	 * Gets the params required for constructing eventJSON
+	 * @param {GlideRecord} resGr
+	 * @param {string} timeZone
+	 * @param {boolean} isBlocker
+	 * @returns {params}
+	 * @private
+	 */
+	_getParamsForConstructingEventJSON: function(resGr, timeZone, isBlocker) {
+		var eventJsonParams = {};
+		var extraServiceRequestService = new WSDExtraServiceRequestService();
+		var dateFormat = 'YYYY-MM-DD HH:mm:ss'; 
+		
+		eventJsonParams.startTimeInBuildingTZ = this.rsvAdminExperienceUtils.getTimeInBuildingTimeZone(resGr.getValue('start'), timeZone, dateFormat);
+		eventJsonParams.endTimeInBuildingTZ = this.rsvAdminExperienceUtils.getTimeInBuildingTimeZone(resGr.getValue('end'), timeZone, dateFormat);
+		eventJsonParams.reservedExtraServices = resGr.getValue('related_case') ? 
+			extraServiceRequestService.getExtraServicesForReservation(resGr.getValue('sys_id')) : {};
+		
+		var sourceResGr = resGr.source_reservation.getRefRecord();
+		eventJsonParams.parentSubtype = !gs.nil(sourceResGr)? sourceResGr.getValue('reservation_subtype') : '';
+		
+		if (!isBlocker) {
+			eventJsonParams.eventColor= this.rsvAdminExperienceUtils.getColorBasedOnRsvState(resGr);
+		}
+
+		if (isBlocker || eventJsonParams.parentSubtype == WSDConstants.RESERVATION_SUBTYPE.multi_parent || eventJsonParams.parentSubtype == WSDConstants.RESERVATION_SUBTYPE.group_parent)
+			eventJsonParams.allowMove = false;
+		else
+			eventJsonParams.allowMove = true;
+		
+		if (resGr.getValue('rsv_span_days') &gt; 1)
+			eventJsonParams.isMultiDayReservation = true;
+		else
+			eventJsonParams.isMultiDayReservation = false;
+		
+		return eventJsonParams;
+	},
+	
+	/**
+     * Append Spaces By Reservation Filters
+     * @param {Object} AllSpaceIds
+     * @param {Object} selectedSpaceIds
+     * @param {String} searchText - Serch reservations with subject or requested for
+     * @returns {object} Filtered list of spaceIds
+     */
+    _appendSpacesByReservationFilters: function(AllSpaceIds, selectedSpaceIds, searchText, startMomentGdt, endMomentGdt) {
+        try {
+            if (searchText.length &lt; 3)
+                throw "Search text must be alteast 3 characters long";
+
+            var reservationGR = new GlideRecord(WSDConstants.TABLES.RoomsReservation.name);
+            reservationGR.addQuery('location', 'IN', AllSpaceIds);
+            reservationGR.addEncodedQuery('subject!='+ WSDConstants.PRIVACY.PRIVATE_SUBJECT +'^active=true^ORstate=' + WSDConstants.RESERVATION_STATE.completed);
+            reservationGR.addQuery('subject', 'CONTAINS', searchText).addOrCondition('requested_for', 'IN', this._getUsersByName(searchText));
+            reservationGR.addQuery('start', '&lt;=', endMomentGdt);
+            reservationGR.addQuery('end', '&gt;=', startMomentGdt);
+            reservationGR.query();
+            while (reservationGR.next()) {
+                selectedSpaceIds[reservationGR.location.toString()] = 'true';
+            }
+            return selectedSpaceIds;
+
+        } catch (exception) {
+            WSDLogger.exception('WSDReservationUtilsSNC.filterLocations', 'Failed to filter locations', exception);
+            throw exception;
+        }
+    },
+	
+	/**
+     * Get User Sys IDs by Name
+     * @param {String} searchText - user name contains searchText
+     * @returns {object} User Sys IDs
+     */
+    _getUsersByName: function(searchText) {
+        var userSysIds = [];
+        var userGR = new GlideRecord(WSDConstants.TABLES.SysUser.name);
+        userGR.addQuery('name', 'CONTAINS', searchText);
+        userGR.query();
+        while (userGR.next()) {
+            userSysIds.push(userGR.sys_id.toString());
+        }
+        return userSysIds;
+    },
+
+    type: 'WSDGetCalendarDetailsSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-07-20 07:03:49&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;29fe8787734071106fa37fb154f6a7d6&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;319&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;WSDGetCalendarDetailsSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value=""&gt;e9b477e9c3161010cc7060bf4b40dded&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value=""&gt;e9b477e9c3161010cc7060bf4b40dded&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_29fe8787734071106fa37fb154f6a7d6&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-27 06:16:19&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:52</sys_created_on>
+        <sys_id>ea11bc5983b01210c6695855eeaad323</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>WSDGetCalendarDetailsSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_ea11bc5983b01210c6695855eeaad323</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:52</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

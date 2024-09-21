@@ -1,0 +1,272 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>2742283b53305110dd8eddeeff7b124f</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_vsc.ScanComparisonUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;ScanComparisonUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ScanComparisonUtil = Class.create();
+ScanComparisonUtil.prototype = {
+    constants: new sn_vsc.SecurityCenterConstants(),
+    initialize: function() {},
+    /*
+     *
+     *Input params (scanResult1 = first comparison result)
+     *Input params (scanResult2 = second comparison result)
+     *Check if comparison already exist, update user assignment respectively
+     */
+    lookForComparison: function(scanResult1, scanResult2) {
+        var grR = new GlideRecord('scan_result');
+        grR.get(scanResult1);
+        var sr1 = grR.number;
+        var gr2 = new GlideRecord('scan_result');
+        gr2.get(scanResult2);
+        var sr2 = gr2.number;
+        var compId = sr1 + ',' + sr2;
+
+        var grUser = new GlideRecord("sn_vsc_scan_comparisons");
+        grUser.addQuery('scn_comp', compId);
+        grUser.query();
+        if (grUser.next()) { //Comparison found
+            if (!grUser.scn_list.toString().includes(gs.getUserID())) {
+                this.removeUserFromComparisons(gs.getUserID());
+                if (grUser.scn_list.toString() != '') {
+                    grUser.scn_list = grUser.scn_list.toString() + ',' + gs.getUserID();
+                } else {
+                    grUser.scn_list = gs.getUserID();
+                }
+                grUser.update();
+            }
+        } else { //Comparison not found
+            this.compareWithUserId(scanResult1, scanResult2);
+        }
+    },
+
+    /*
+     *
+     *Input params (timeStamp = dateTime for sys_created_on)
+     *check if result exist for given timestamp
+     */
+    checkTableForResult: function(timeStamp) {
+        var date = timeStamp.split(" ")[0];
+        var time = timeStamp.split(" ")[1];
+        var gr = new GlideRecord('scan_result');
+        gr.addEncodedQuery("sys_created_onON" + date + "@javascript:gs.dateGenerate('" + date + "','" + time + "')@javascript:gs.dateGenerate('" + date + "','" + time + "')");
+        gr.query();
+        if (gr.next()) {
+            return gr.sys_id;
+        }
+        return null;
+    },
+
+    /*
+     *
+     *Input params (userId = user running comparison)
+     *Remove user from previous comparisons
+     */
+    removeUserFromComparisons: function(userId) {
+        var gr = new GlideRecord("sn_vsc_scan_comparisons");
+        var eQ = "scn_listLIKE" + userId;
+        gr.addEncodedQuery(eQ);
+        gr.query();
+        while (gr.next()) {
+            var Uarr = gr.scn_list.split(",");
+            var index = Uarr.indexOf(userId.toString());
+            if (index !== -1) {
+                Uarr.splice(index, 1);
+            }
+            gr.scn_list = Uarr.toString();
+            gr.update();
+        }
+    },
+
+    /*
+     *Input params (scanId = sysId of scan result)
+     *Return Scan Result number
+     */
+    getScanNumber: function(scanId) {
+        var gr = new GlideRecord('scan_result');
+        gr.get('sys_id', scanId);
+        gr.query();
+        return gr.next() ? gr.number : null;
+    },
+
+    /*
+     *Triggered upon Auditor Scan suite execution
+     */
+    defaultComparison: function() {
+        var gr = new GlideRecord('scan_suite_execution');
+        gr.addQuery('suite', this.constants.HardeningSuite);
+        gr.orderByDesc('sys_created_on');
+        gr.query();
+        if (gr.getRowCount() &gt; 1) {
+            var count = 2;
+            var suiteIds = [];
+            while (gr.next() &amp;&amp; count &gt; 0) {
+                count--;
+                suiteIds.push(gr.result.toString());
+            }
+            var gU = new GlideRecord("sn_vsc_scan_comparisons");
+            gU.addQuery('scn_default', true);
+            gU.query();
+            while (gU.next()) {
+                gU.scn_default = false;
+                gU.update();
+            }
+            var com = this.createScanComparison(suiteIds[1], suiteIds[0], " ", this.constants.HardeningSuite, true);
+            var scan = com + ',' + suiteIds[1] + ',' + suiteIds[0];
+            gs.eventQueue('sn_vsc.sec.scan.comparison', null, 'sn_vsc_changed_scan_findings', scan);
+        }
+    },
+
+    /*
+     *Input params (scanResult1 = first comparison result)
+     *Input params (scanResult2 = second comparison result)
+     *Run comparison for user
+     */
+    compareWithUserId: function(scanResult1, scanResult2) {
+        var gr = new GlideRecord('scan_suite_execution');
+        gr.get('result', scanResult1);
+
+        //create new comparison
+        var compare = this.createScanComparison(scanResult1, scanResult2, gs.getUserID(), gr.suite, false);
+        var scan = compare + ',' + scanResult1 + ',' + scanResult2;
+        gs.eventQueue('sn_vsc.sec.scan.comparison', null, 'sn_vsc_changed_scan_findings', scan);
+    },
+
+    /*
+     *Input params (scanResult1 = first comparison result)
+     *Input params (scanResult2 = second comparison result)
+     *Input params (userId = Logged in user)
+     *Input params (suite = sysId of suite)
+     *Input params (isDefault = is this default comparison)
+     *Create comparison records
+     */
+    createScanComparison: function(scanResult1, scanResult2, userId, suite, isDefault) {
+        if (userId != " ") {
+            this.removeUserFromComparisons(gs.getUserID());
+        }
+        var grR = new GlideRecord('scan_result');
+        grR.get(scanResult1);
+        var sr1 = grR.number;
+        var gr2 = new GlideRecord('scan_result');
+        gr2.get(scanResult2);
+        var sr2 = gr2.number;
+        var res = sr1 + ',' + sr2;
+        var grC = new GlideRecord('sn_vsc_scan_comparisons');
+        grC.initialize();
+        grC.setValue("scn_comp", res);
+        grC.setValue("scn_suite", suite);
+        if (userId != "") {
+            grC.setValue("scn_list", userId);
+        }
+        grC.setValue("scn_default", isDefault);
+        grC.setValue("scn_status", 'progress');
+        return grC.insert();
+    },
+
+
+    /*
+     *Input params (scanResult1 = first comparison result)
+     *Input params (scanResult2 = second comparison result)
+     *Input params (compare = Comparison record)
+     *Insert records
+     */
+    runComparison: function(scanResult1, scanResult2, compare, scan1, scan2) {
+        var gFin = new GlideRecord('scan_finding');
+        gFin.addQuery('result', scanResult1);
+        gFin.query();
+        while (gFin.next()) {
+            var result = this.checkInResult(gFin.source, scanResult2);
+            if (result) {
+                var res = scan1 + ',' + scan2;
+                this.insertComparison(gFin.sys_id, res, compare);
+            } else {
+                this.insertComparison(gFin.sys_id, this.getScanNumber(scanResult1), compare);
+            }
+        }
+    },
+
+    /*
+     *Input params (scanResult1 = first comparison result)
+     *Input params (scanResult2 = second comparison result)
+     *Input params (compare = Comparison record)
+     *Insert records into chnaged findings table
+     */
+    insertComparison: function(finding, result, compare) {
+        var gInsert = new GlideRecord('sn_vsc_changed_scan_findings');
+        gInsert.initialize();
+        gInsert.fin_finding = finding;
+        gInsert.fin_status = result;
+        gInsert.fin_comp = compare;
+        gInsert.insert();
+    },
+
+    /*
+     *Input params (source = source of finding)
+     *Input params (scanResult = result to compare)
+     *Input params (compare = Comparison record)
+     *Check if finding already exist in other result
+     */
+    checkInResult: function(source, scanResult) {
+        var gFin = new GlideRecord('scan_finding');
+        gFin.addQuery('result', scanResult);
+        gFin.addQuery('source', source);
+        gFin.query();
+        if (gFin.next()) {
+            return true;
+        } else {
+            return false;
+        }
+    },
+
+    /*
+     *Input params (uId = logged in user)
+     *Assign default comparison to logged in user
+     */
+    loginEvent: function(uId) {
+        var gC = new GlideRecord("sn_vsc_scan_comparisons");
+        gC.query();
+        if (gC.getRowCount() &gt; 0) {
+            this.removeUserFromComparisons(uId);
+        }
+    },
+
+    type: 'ScanComparisonUtil'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-07-26 16:49:36&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;2742283b53305110dd8eddeeff7b124f&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ScanComparisonUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Security Center" source="sn_vsc"&gt;a51d46e3f2014110366b10017c5ba675&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Security Center"&gt;a51d46e3f2014110366b10017c5ba675&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_2742283b53305110dd8eddeeff7b124f&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-09-20 15:27:05&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:37</sys_created_on>
+        <sys_id>8701785983b01210c6695855eeaad3d6</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ScanComparisonUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_8701785983b01210c6695855eeaad3d6</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:37</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

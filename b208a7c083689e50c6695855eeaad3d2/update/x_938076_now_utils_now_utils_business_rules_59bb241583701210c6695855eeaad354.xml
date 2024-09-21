@@ -1,0 +1,218 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules">
+    <x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection/>
+        <condition>(current.operation() == "insert") || (current.start.changes() || current.end.changes() || current.from_user.changes() || current.catalog_item.changes() || current.location.changes())</condition>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>Check appointment is available</name>
+        <order>5</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function executeRule(current, previous /*null when async*/) {
+
+ current.activity_catalog = current.catalog_item; //Updating Catalog item on task activity table
+ 
+ var serviceConfigGR = new GlideRecord(AppointmentBookingConstants.SERVICE_CONFIG_TABLE);
+ serviceConfigGR.addQuery('catalog_item', current.catalog_item);
+ serviceConfigGR.addActiveQuery();
+ serviceConfigGR.setLimit(1);
+ serviceConfigGR.query();
+
+ if (serviceConfigGR.next()) {
+  var capacityMode = (serviceConfigGR.appointment_booking_config.availability_method == "capacity_based" && GlidePluginManager.isActive("com.snc.fsm_capacity_management"));
+  if(capacityMode){
+   var capacityObj = new sn_fsm_capacity_mg.FSMCapacityManagement().updateUsageWithTask(current, serviceConfigGR);
+   if(gs.nil(capacityObj) || !capacityObj.hasCapacity){
+    gs.error("Check appointment is available Before BR:: Capacity not available");
+    current.setAbortAction(true);
+    gs.addErrorMessage(AppointmentBookingConstants.ERROR_CODES.APPOINTMENT.CREATION_FAILED); 
+    return;
+   }
+   
+   if(!capacityObj.fallBacktoManual){
+    if (serviceConfigGR.enable_day_level_config && current.service_configuration_rule) { 
+     var ruleGr = new GlideRecord(AppointmentBookingConstants.SERVICE_CONFIGURATION_RULE_TABLE);
+     ruleGr.addQuery("sys_id", current.service_configuration_rule);
+     ruleGr.addActiveQuery();
+     ruleGr.setLimit(1);
+     ruleGr.query();
+
+     if (ruleGr.next()) {
+      if (!ruleGr.dedicated_capacity)
+       current.service_configuration_rule = "";
+     }
+    }
+    return;
+   }
+  }
+ }
+
+ var abLockUtil;
+ if (typeof GlideScriptedExtensionPoint == "undefined") {
+  abLockUtil = new sn_apptmnt_booking.AppointmentBookingLockingUtil();
+ } else {
+  var eps = new GlideScriptedExtensionPoint().getExtensions("sn_apptmnt_booking.AppointmentBookingLockingUtilExtPoint");
+  for (var e = 0; e < eps.length; e++) {
+   if (eps[e].handles(current)) {
+    abLockUtil = eps[e];
+    break;
+   }
+  }
+ }
+
+ if (!abLockUtil) {
+  gs.error("Check appointment is available Before BR:: AppointmentBookingLockingUtilExtPoint implementation not found");
+  current.setAbortAction(true);
+  gs.addErrorMessage(AppointmentBookingConstants.ERROR_CODES.APPOINTMENT.CREATION_FAILED); 
+  return;
+ }
+
+ abLockUtil.initialize();
+ var shouldSkipBrLocking = abLockUtil.skipBrLocking(current);
+ if (shouldSkipBrLocking)
+  return;
+
+ var skipExistingRecordsCheck = true;
+
+ var disableLockingTablesList = gs.getProperty("sn_apptmnt_booking.DisableLockingOnBRLevel", "");
+ disableLockingTablesList = disableLockingTablesList.split(",");
+ 
+ var singleConcurrentLockConfigs = gs.getProperty('sn_apptmnt_booking.SingleConcurrentLockAppointmentConfigs');
+ var singleConcurrentLockTables = singleConcurrentLockConfigs.split(",");
+
+ var disableLocking = false;
+ var isSingleConcurrentLock = false;
+ 
+ var aptBknServiceConfigGr = new GlideRecord(AppointmentBookingConstants.SERVICE_CONFIG_TABLE);
+ aptBknServiceConfigGr.addQuery('catalog_item', current.catalog_item);
+ aptBknServiceConfigGr.addActiveQuery();
+ aptBknServiceConfigGr.setLimit(1);
+ aptBknServiceConfigGr.query();
+
+ if (aptBknServiceConfigGr.next()) {
+  var tableName = aptBknServiceConfigGr.appointment_booking_config.task_table + '';
+  for (var i = 0; i < disableLockingTablesList.length; i++) {
+   if (disableLockingTablesList[i].trim() == tableName){
+    disableLocking = true;
+    break;
+   }
+  }
+  for (var i = 0; i < singleConcurrentLockTables.length; i++) {
+   if (singleConcurrentLockTables[i].trim() == tableName){
+    isSingleConcurrentLock = true;
+    break;
+   }
+  }
+ }
+ 
+ if(disableLocking || isSingleConcurrentLock)
+  skipExistingRecordsCheck = false;
+ 
+ if(current.service_configuration_rule == "-1") //-1 is used to not evaluate task conditions in rules for WalkUp cases.
+  current.service_configuration_rule = "";
+ 
+ // check if appointment is available
+ var abUtil = new sn_apptmnt_booking.AppointmentBookingUtil();
+ var isAppointmentAvailable = abUtil.isAppointmentAvailable(current.start, current.end, current.catalog_item, current.from_user, current.getValue("location"),skipExistingRecordsCheck,current.getValue("task"), current.service_configuration_rule);
+ 
+ if (!isAppointmentAvailable) {
+  // aborting the operation if appointment is not available
+  current.setAbortAction(true);
+  gs.addErrorMessage(AppointmentBookingConstants.ERROR_CODES.APPOINTMENT.CREATION_FAILED);
+  gs.info("Check appointment is available Before BR:: isAppointmentAvailable == false : Appointment window is no longer available. " + current.from_user + " Catalog: " + current.catalog_item + " Start: " + current.start + " End: " + current.end + " Location: " + current.location);
+  return;
+ }
+ 
+ if (!disableLocking) {
+  if (!shouldSkipBrLocking) {
+   if (current.origin_appointment_lock) { // make sure earlier lock is deleted (reschedule case)
+    abLockUtil.deleteAppointmentLock(current.origin_appointment_lock);
+    current.origin_appointment_lock = "";
+   }
+
+   var appointmentKey = current.catalog_item + "."+ current.location+ ":" + current.start + "-" + current.end + "-"+current.service_configuration_rule;
+   var lock = abLockUtil.addAppointmentLock(appointmentKey);
+
+   if (gs.nil(lock.sequence)) {
+    current.setAbortAction(true);
+    gs.addErrorMessage(AppointmentBookingConstants.ERROR_CODES.APPOINTMENT.CREATION_FAILED);
+    gs.error("Check appointment is available Before BR:: Appointment Booking Lock Error: Lock generated without sequence");
+    abLockUtil.deleteAppointmentLock(lock.sys_id);
+    return;
+   }
+
+   var retryLimit = 2;
+   var abortAction = true;
+   for (var i = 0 ; i< retryLimit; i ++) {
+    var countBeforeMe = abLockUtil.getCountLockBefore(appointmentKey, lock.sequence);
+    var slotsLeft = abLockUtil.getSlotsLeft(current.location, current.start, current.end, current.catalog_item, current.service_configuration_rule);
+    if (countBeforeMe < slotsLeft) {
+     //slots available
+     abortAction = false;
+     current.origin_appointment_lock = lock.sys_id;
+     break;
+    }
+   }
+
+   if (abortAction) {
+    current.setAbortAction(true);
+    gs.addErrorMessage(AppointmentBookingConstants.ERROR_CODES.APPOINTMENT.CREATION_FAILED);
+    abLockUtil.deleteAppointmentLock(lock.sys_id);
+    gs.info("Check appointment is available Before BR:: Appointment Booking Lock : Appointment window is no longer available. " + current.from_user + " Catalog: " + current.catalog_item + " Start: " + current.start + " End: " + current.end + " Location: " + current.location + " LockSeq:" + lock.sequence + " LockCountBeforeMe:" + countBeforeMe + " slotsLeft:" + slotsLeft);
+   }
+  }
+ }
+ 
+ if (aptBknServiceConfigGr.enable_day_level_config && current.service_configuration_rule) { 
+  var ruleGr = new GlideRecord(AppointmentBookingConstants.SERVICE_CONFIGURATION_RULE_TABLE);
+  ruleGr.addQuery("sys_id", current.service_configuration_rule);
+  ruleGr.addActiveQuery();
+  ruleGr.setLimit(1);
+  ruleGr.query();
+  
+  if (ruleGr.next()) {
+   if (!ruleGr.dedicated_capacity)
+    current.service_configuration_rule = "";
+  }
+ }
+
+})(current, previous);]]></script>
+        <sys_class_name>x_938076_now_utils_now_utils_business_rules</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:49:18</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>59bb241583701210c6695855eeaad354</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Check appointment is available</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>x_938076_now_utils_now_utils_business_rules_59bb241583701210c6695855eeaad354</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:49:18</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </x_938076_now_utils_now_utils_business_rules>
+    <sys_translated_text action="delete_multiple" query="documentkey=59bb241583701210c6695855eeaad354"/>
+</record_update>

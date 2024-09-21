@@ -1,0 +1,327 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>2d6c735ed4a12910f877ce4a4aac695f</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_entitlement.LicenseRoleDiscoveryService&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;LicenseRoleDiscoveryService&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var LicenseRoleDiscoveryService = Class.create();
+LicenseRoleDiscoveryService.prototype = {
+    initialize: function () {
+        this.licenseRoleDiscoveredDao = new LicenseRoleDiscoveredDao();
+        this.roleAnalyzerService = new RoleAnalyzerService();
+    },
+
+    /**
+     * Analyze custom roles using role analyzer and insert/update information about role type in license_role_discovered 
+     */
+    analyzeCustomRoles: function() {
+        const analysisResult = this.roleAnalyzerService.analyzeCustomRoles();
+
+        for (const [roleName, appDetail] of Object.entries(analysisResult.app_detail))
+            this._processRole(roleName, appDetail);
+        for (const roleName of this._findRolesInTableOtherThan(Object.keys(analysisResult.app_detail)))
+            this._processRole(roleName, {});
+    },
+
+    /**
+     * Return role information for the roles which have been changed since last time applyRoleDataChanges was called
+     * @return {Map} a map from roleName to an array containing two arrays [ [p1, p2...], [n1, n2, ...]]
+     * where first array has previously synched LicenseRoleDiscoveredData objects,
+     * and second array has new LicenseRoleDiscoveredData objects for those roles 
+     * Note that either of these could be empty, but never both.
+     */
+    fetchChangedRoleData: function() {
+        // first lookup un-synced records
+        const changedRoleData = this.licenseRoleDiscoveredDao.lookupByStateOtherThan([this.licenseRoleDiscoveredDao.SYNCED]);
+
+        // collect all unique roles names from them
+        const roleNames = Array.from(new Set(changedRoleData.map(roleData =&gt; roleData.roleName)));
+
+        // lookup synced records for those roles to place as previous
+        const existingRoleData = this.licenseRoleDiscoveredDao.lookupForRolesByState(roleNames, [this.licenseRoleDiscoveredDao.SYNCED]);
+
+        const result = new Map(roleNames.map(name =&gt; [name, [[],[]]]));
+
+        // collect all previous first
+        existingRoleData.forEach(roleData =&gt; {
+            const resultArrays = result.get(roleData.roleName);
+            resultArrays[0].push(roleData);
+        });
+    
+        // collect changed info next
+        changedRoleData.forEach(roleData =&gt; {
+            const resultArrays = result.get(roleData.roleName);
+            // add New/Error but if deleted, keep this empty
+            if (roleData.state === this.licenseRoleDiscoveredDao.NEW || roleData.state === this.licenseRoleDiscoveredDao.ERROR)
+                resultArrays[1].push(roleData);
+        });
+
+        return result;
+    },
+
+    /**
+     * Find changed role information for specified roleName since last time applyRoleDataChanges* was called and apply
+     * the changes by changing state to sync or error or delete records as appropriate.
+     * @param {string} roleName name of role to apply changes to
+     * @param {boolean} uploadSuccess true indicates that information has been synced successfully and to mark as synced, false otherwise
+     */
+    applyRoleDataChanges: function(roleName, uploadSuccess) {
+        const existingRoleData = this.licenseRoleDiscoveredDao.lookupForRole([roleName]);
+        const previous = existingRoleData.filter(obj =&gt; obj.state === this.licenseRoleDiscoveredDao.SYNCED);
+        const changed = existingRoleData.filter(obj =&gt; obj.state !== this.licenseRoleDiscoveredDao.SYNCED &amp;&amp; obj.state != this.licenseRoleDiscoveredDao.DELETED);
+
+        // case 0: success=false, mark changed as error
+        // case 1: if previous is empty, mark all changed as Synced
+        // case 2: if previous is not empty, changed is empty, delete all previous, and delete the DELETED record
+        // case 3: if previous is not empty, changed is not empty, delete previous, and mark all changed as Synched
+        if (!uploadSuccess)
+            this._markError(roleName, changed);
+        else if (previous.length === 0)
+            this._markSynced(roleName, changed);
+        else if (changed.length === 0) {
+            const deleted = existingRoleData.filter(obj =&gt; obj.state == this.licenseRoleDiscoveredDao.DELETED);
+            const previousWithDeleted = [...previous, ...deleted];
+            this._deleteRoleData(roleName, previousWithDeleted, 'removed role')
+        } else {
+            this._deleteRoleData(roleName, previous, 'changed');
+            this._markSynced(roleName, changed);
+        }
+    },
+
+    /**
+     * Find changed role information since last time applyRoleDataChanges* was called and apply
+     * the changes by changing state to error
+     */
+    applyRoleDataChangesAsError: function() {
+        const changedRoleData = this.fetchChangedRoleData();
+        const ids = [...changedRoleData]
+                            .map(value =&gt; value[1][1])
+                            .flat()
+                            .filter(roleData =&gt; roleData.state != this.licenseRoleDiscoveredDao.DELETED)
+                            .map(roleData =&gt; roleData.id);
+        gs.info(`Marking ${ids.length} records as error`);
+        this.licenseRoleDiscoveredDao.markState(ids, this.licenseRoleDiscoveredDao.ERROR);
+    },
+
+    _processRole: function(roleName, appDetail) {
+        const existingRoleData = this.licenseRoleDiscoveredDao.lookupForRole([roleName]);
+        existingRoleData.sort(this._compareRoleData.bind(this));
+
+        const existingSynced = existingRoleData.filter(obj =&gt; obj.state === this.licenseRoleDiscoveredDao.SYNCED);
+        const existingNonSynced = existingRoleData.filter(obj =&gt; obj.state !== this.licenseRoleDiscoveredDao.SYNCED);
+
+        const newRoleData = this._buildRoleData(roleName, appDetail);
+        newRoleData.sort(this._compareRoleData.bind(this));
+
+        // case 0: newRoleData is empty -- remove existingNonSynced and add record with deleted state if there are synced records
+        // case 1: existingSynced matches newRoleData --- remove existingNonSynced  (COMMON CASE)
+        // case 2: existingSynced does not match newRoleData 
+        //         case 21: if existingNonSynced matches newRoleData --- do nothing (this can be New records or Error records)
+        //         case 22: if existingNonSynced does not match newRoleData, remove existingNonSynced, create newRoleData
+
+        if (newRoleData.length === 0) {
+            this._deleteRoleData(roleName, existingNonSynced, 'non-synced');
+            if (existingSynced.length &gt; 0)
+                this._addDeletedRecord(roleName);
+        } else if (this._roleDataArraysEquivalent(existingSynced, newRoleData)) {
+            this._deleteRoleData(roleName, existingNonSynced, 'non-synced');
+        } else if (!this._roleDataArraysEquivalent(existingNonSynced, newRoleData)) {
+            this._deleteRoleData(roleName, existingNonSynced, 'non-synced');
+            this._addRoleData(roleName, newRoleData);
+        }
+    },
+
+    _findRolesInTableOtherThan: function(roleNames) {
+        return this.licenseRoleDiscoveredDao.lookupRolesOtherThan(roleNames);
+    },
+
+    /**
+     * Look at per role output of role analyzer return an array of LicenseRoleDiscoveredData which can be inserted
+     * into the license_role_discovered table
+     */
+    _buildRoleData: function(roleName, appDetail) {
+        return Object.values(appDetail)
+            .filter(roleInApplication =&gt; roleInApplication.appId !== 'platform')
+            .map(roleInApplication =&gt; this._toLicenseRoleDiscoveredData(roleName, roleInApplication));
+    },
+
+    /**
+     * Delete records for specified roleName
+     * @param {string} roleName name of role to which role data applies
+     * @param {array} roleData array of LicenseRoleDiscoveredData where id is taken as the sys_id of the record
+     * @param {string} description adjective to apply to deleted records in log
+     */
+    _deleteRoleData : function(roleName, roleData, description) {
+        const ids = roleData.map(obj =&gt; obj.id);
+        if (ids.length == 0)
+            return;
+        gs.info(`Deleting ${ids.length} ${description} records for role ${roleName}`);
+        this.licenseRoleDiscoveredDao.deleteRecords(ids);
+    },
+
+    /**
+     * Add a record in license_role_discovered where state=deleted for specified roleName
+     * @param {string} roleName 
+     */
+    _addDeletedRecord: function(roleName) {
+        const roleData = new LicenseRoleDiscoveredData(
+            null,
+            roleName,
+            'requestor',
+            true,
+            this.licenseRoleDiscoveredDao.DELETED,
+            'deleted',
+            'unknown',
+            'global'
+        );
+        gs.info(`Adding deleted record for role ${roleName}`);
+        this.licenseRoleDiscoveredDao.insertOrUpdate(roleData);
+    },
+
+    /**
+     * Add records for specified roleName
+     * @param {string} roleName name of role to which role data applies
+     * @param {array} newRoleData array of LicenseRoleDiscoveredData objects
+     */
+    _addRoleData: function(roleName, newRoleData) {
+        gs.info(`Adding ${newRoleData.length} records for role ${roleName}`);
+        newRoleData.forEach(roleData =&gt; this.licenseRoleDiscoveredDao.insertOrUpdate(roleData));
+    },
+
+    /**
+     * Mark records for specified roleName as state=Synced in license_role_discovered
+     * @param {string} roleName name of the role
+     * @param {array} changedRoleData array of LicenseRoleDiscoveredData objects where id is taken as the sys_id of the record
+     */
+    _markSynced: function(roleName, changedRoleData) {
+        const ids = changedRoleData.map(roleData =&gt; roleData.id);
+        gs.info(`Marking ${ids.length} records as synced for role ${roleName}`);
+        this.licenseRoleDiscoveredDao.markState(ids, this.licenseRoleDiscoveredDao.SYNCED);
+    },
+
+    /**
+     * Mark records for specified roleName as state=Error in license_role_discovered
+     * @param {string} roleName name of the role
+     * @param {array} changedRoleData array of LicenseRoleDiscoveredData objects where id is taken as the sys_id of the record
+     */
+    _markError: function(roleName, changedRoleData) {
+        const ids = changedRoleData.map(roleData =&gt; roleData.id);
+        gs.info(`Marking ${ids.length} records as for role ${roleName}`);
+        this.licenseRoleDiscoveredDao.markState(ids, this.licenseRoleDiscoveredDao.ERROR);
+    },
+
+    _toLicenseRoleDiscoveredData: function(roleName, roleInApplication) {
+        const appId = this._inferAppId(roleInApplication);
+
+        const isCustom = true;
+        const state = this.licenseRoleDiscoveredDao.NEW;
+
+        return  new LicenseRoleDiscoveredData(
+            null,
+            roleName,
+            roleInApplication.detectedType.roleType,
+            isCustom,
+            state,
+            roleInApplication.detectedType.code,
+            appId,
+            roleInApplication.scope
+        );
+    },
+
+    _inferAppId: function(roleInApplication) {
+        const source = roleInApplication.source.primary;
+        // if appId is
+        //  a. special fallthrough value 'unk' (for global applications which can't be guessed to be platform)
+        //  b. special fallthrough value 'global' with source='App Family' (for global tables where package is empty)
+        //  c. or source is a scoped app
+        // take (licensable) application as unknown
+        if (roleInApplication.appId === 'unk' || source.toLowerCase() === 'scope' ||
+            (roleInApplication.appId === 'global' &amp;&amp; source.toLowerCase() === 'app family'))
+            return 'unknown';
+        return roleInApplication.appId;
+    },
+
+    /**
+     * Return numeric value which indicates lexicographical ordering between input LicenseRoleDiscoveredData objects
+     * Comparison is based on (roleType, application, scope)
+     * @param {object} lhs 
+     * @param {object} rhs 
+     * @returns {integer} -1 if lhs&lt;rhs, 1 if lhs&gt;rhs, 0 otherwise
+     */
+    _compareRoleData: function(lhs, rhs) {
+        // simple lexigraphical ordering based on (roleType, application, scope)
+        let diff = this._compare(lhs.roleType, rhs.roleType);
+        if (diff != 0)
+            return diff;
+        diff = this._compare(lhs.application, rhs.application);
+        if (diff != 0)
+            return diff;
+        return this._compare(lhs.scope, rhs.scope);
+    },
+
+    /**
+     * Return numeric value which indicates lexicographical ordering between string arguments
+     */
+    _compare: function(lhs, rhs) {
+        if (lhs &lt; rhs)
+            return -1;
+        if (lhs &gt; rhs)
+            return 1;
+        return 0;
+    },
+    /**
+     * Compare two sorted arrays of LicenseRoleDiscoveredData to see if they hold equivalent data as determined by this._compareRoleData
+     * @param {array} lhs sorted array of LicenseRoleDiscoveredData 
+     * @param {array} rhs sorted array of LicenseRoleDiscoveredData
+     * @return {boolean} 
+     */
+    _roleDataArraysEquivalent: function(lhs, rhs) {
+        if (lhs.length != rhs.length)
+            return false;
+
+        for (let i = 0; i &lt; lhs.length; ++i) {
+            if (this._compareRoleData(lhs[i], rhs[i]) != 0)
+                return false;
+        }
+        return true;
+    },
+
+    type: 'LicenseRoleDiscoveryService'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;maint&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-03-15 19:49:06&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;2d6c735ed4a12910f877ce4a4aac695f&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;78&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;LicenseRoleDiscoveryService&lt;/sys_name&gt;
+        &lt;sys_package display_value="Licensing Engine" source="sn_entitlement"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Licensing Engine"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_2d6c735ed4a12910f877ce4a4aac695f&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-04-20 02:43:15&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:13:17</sys_created_on>
+        <sys_id>f431749983b01210c6695855eeaad364</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>LicenseRoleDiscoveryService</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_f431749983b01210c6695855eeaad364</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:13:17</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,385 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0454c3a2439ebd106c4bb0117fb8f2ce</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_udc.FileTaxonomyBuilder&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;FileTaxonomyBuilder&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[class FileTaxonomyBuilder {
+    static type = "FileTaxonomyBuilder";
+    static TABLE = "sn_udc_file_taxonomy_builder";
+    static WHITE_LISTED_FIELD_NAMES = ['sys_id', 'name', 'sys_class_name', 'view', 'admin_panel', 'sc_template'];
+    static DEFAULT_BUILDER = "4cc7ada7439231106c4bb0117fb8f2b1"; // Platform UI-16 Form
+    static BUILDER_CONFIG_TABLE = "sn_udc_file_taxonomy_builder_config"
+
+    /**
+     * Returns builder details
+     * @param {String} builder It can be either builder name or sysId
+     * @returns {Object}
+     */
+    static getBuilderDetails(builder) {
+        // Find Taxonomy Builder record either with builderSysId (or) builderName
+        const builderGr = FileTaxonomyBuilder.getRecordForSysIdORName(builder);
+        const builderSysId = builderGr ? builderGr.getUniqueValue() : '';
+
+        try {
+            // Builder home page
+            if (!builderSysId &amp;&amp; !builderGr)
+                throw UDCConstants.errors.BUILDER_DOES_NOT_EXISTS;
+
+            return {
+                name: builderGr.getValue("name") || "",
+                label: builderGr.getDisplayValue("label") || "",
+                sysId: builderSysId,
+                icon: builderGr.getDisplayValue("icon") || UDCConstants.fallbackIcons.TOOL,
+                url: UDCUtil.createCanonicalizedUri(builderGr.getValue("home_path")),
+                properties: FileTaxonomyBuilder.parseJSONString(builderGr.getValue("builder_properties"))
+            };
+        } catch (e) {
+            let message;
+            let code;
+
+            switch (e) {
+                case UDCConstants.errors.BUILDER_DOES_NOT_EXISTS:
+                    message = gs.getMessage("Builder not found: Check Builder name for any errors before trying again.")
+                    code = 404;
+                    break;
+
+                default:
+                    message = gs.getMessage("Unhandled exception: {0}", [e]);
+                    code = 500;
+                    break;
+            }
+
+            return {
+                name: builder,
+                error: {
+                    message,
+                    code
+                }
+            };
+        }
+    }
+
+    /**
+     * Retrieves parsed JSON object
+     * @param {string} jsonStr
+     * @returns {Object} parsed JSON value
+     */
+    static parseJSONString(jsonStr) {
+        try {
+            return JSON.parse(jsonStr);
+        } catch (e) {
+            return {};
+        }
+    }
+
+    /**
+     * Get object of builder detail using builder Gliderecord
+     * @param {GlideRecord} gr, GlideRecord object represent taxonomy builder record
+     * @returns {Object} object of builder details
+     */
+    static getBuilderDetailsFromGr(gr) {
+        return {
+            sysId: gr.getUniqueValue(),
+            name: gr.getValue('name'),
+            label: gr.getDisplayValue('label') || "",
+            description: gr.getDisplayValue('description') || "",
+            icon: gr.getDisplayValue("icon") || UDCConstants.fallbackIcons.TOOL,
+            homePath: UDCUtil.createCanonicalizedUri(gr.getValue("home_path")),
+            documentationUrl: gr.getValue('documentation_url') || "",
+            communityUrl: gr.getValue("community_url") || "",
+            properties: FileTaxonomyBuilder.parseJSONString(gr.getValue('builder_properties'))
+        };
+    }
+
+    /**
+     * Retrieves types based on tools
+     * @returns {Map} hash map of key as builderSysId and value as array of typeSysId
+     */
+    static getTypesForBuilder() {
+        const builderTypes = new Map();
+        const builderGr = new GlideRecord(FileTaxonomyBuilder.BUILDER_CONFIG_TABLE);
+        builderGr.addQuery('active', true)
+        builderGr.query();
+
+        while (builderGr.next()) {
+            const builderSysId = builderGr.getValue('builder');
+            const typeSysId = builderGr.getValue('taxonomy_type');
+            if (builderTypes.has(builderSysId)) {
+                builderTypes.get(builderSysId).push(typeSysId);
+            } else {
+                builderTypes.set(builderSysId, [typeSysId])
+            }
+        }
+        return builderTypes;
+    }
+
+    /**
+     * Retrieves list of categories based on builder
+     * @param {Map} typeCategory
+     * @param {Map} builderTypes
+     * @param {String} builderId
+     * @returns {Array} array of builders
+     */
+    static getCategoriesForBuilder(typeCategory, builderTypes, builderId) {
+        const builderCategories = []
+        if (typeCategory &amp;&amp; builderTypes &amp;&amp; builderId) {
+            const typesForBuilderId = builderTypes.has(builderId) &amp;&amp; builderTypes.get(builderId) || [];
+            if (typesForBuilderId.length) {
+                typesForBuilderId.forEach(type =&gt; {
+                    const categories = typeCategory.get(type) || [];
+                    if (categories.length) {
+                        categories.forEach(category =&gt; {
+                            if (!builderCategories.some(element =&gt; element.sysId === category.sysId)) {
+                                builderCategories.push(category);
+                            }
+                        })
+                    }
+                })
+            }
+        }
+        return builderCategories;
+    };
+
+    /**
+     * Retrieves list of tools
+     * @returns {Array} array of builders
+     */
+    static getBuilders(options = {}) {
+        const isIncludeCategory = options?.include_categories === "true"
+        const builders = [];
+        const typeCategories = isIncludeCategory &amp;&amp; FileTaxonomyCategoryMap.getCatagoriesForType();
+        const builderTypes = isIncludeCategory &amp;&amp; FileTaxonomyBuilder.getTypesForBuilder();
+        const gr = new GlideRecord(FileTaxonomyBuilder.TABLE);
+        gr.addNotNullQuery('home_path');
+        gr.addQuery('active', true);
+        gr.query();
+        while (gr.next()) {
+            const builderSysId = gr.getUniqueValue()
+            const builderDetails = FileTaxonomyBuilder.getBuilderDetailsFromGr(gr);
+            if (isIncludeCategory) {
+                builderDetails['categories'] = FileTaxonomyBuilder.getCategoriesForBuilder(typeCategories, builderTypes, builderSysId)
+            }
+            builders.push(builderDetails);
+        }
+        return builders;
+    }
+
+    /**
+     * Returns GlideRecord object represents Taxonomy Builder
+     * @param {String} builderSysId
+     * @returns {GlideRecord|null} GlideRecord object represents Taxonomy Builder
+     */
+    static getRecordForSysId(builderSysId) {
+        const gr = new GlideRecord(FileTaxonomyBuilder.TABLE);
+        if (gr.get(builderSysId))
+            return gr;
+        return null;
+    }
+
+    /**
+     * Returns GlideRecord object represents Taxonomy Builder
+     * @param {String} builderName
+     * @returns {GlideRecord|null} GlideRecord object represents Taxonomy Builder
+     */
+    static getRecordForName(builderName) {
+        const gr = new GlideRecord(FileTaxonomyBuilder.TABLE);
+        if (gr.get('name', builderName))
+            return gr;
+        return null;
+    }
+
+    /**
+     * Get GlideRecord object for sn_udc_file_taxonomy_builder record
+     * @param {String} builder builderName (or) builderSysId
+     * @returns {GlideRecord|null} GlideRecord object represents Taxonomy Builder
+     */
+    static getRecordForSysIdORName(builder) {
+        const gr = new GlideRecord(FileTaxonomyBuilder.TABLE);
+        gr.addEncodedQuery(`sys_id=${builder}^ORname=${builder}`);
+        gr.addQuery('active', true);
+        gr.query();
+        if (gr.next())
+            return gr;
+        return null;
+    }
+
+    /**
+     * Returns interpolated URL
+     * @param {String} rawUrl
+     * @param {GlideRecord} fileObjectRecord
+     * @returns {String} interpolated URL
+     */
+    static getInterpolatedUrl(rawUrl, fileObjectRecord) {
+        let interpolatedUrl = rawUrl;
+        // Find the ${} parameters embedded in the url
+        const interpolatedFieldsRegEx = /\$\{(.*?)}/g;
+        let match = interpolatedFieldsRegEx.exec(rawUrl);
+
+        while (match !== null) {
+            const replacementStr = match[0];
+            const interpolatedFieldName = match[1];
+
+            if (FileTaxonomyBuilder.WHITE_LISTED_FIELD_NAMES.includes(interpolatedFieldName)) {
+                const interpolatedFieldValue = gs.urlEncode(fileObjectRecord.getValue(interpolatedFieldName));
+                interpolatedUrl = interpolatedUrl.replace(replacementStr, interpolatedFieldValue);
+            } else {
+                gs.info(`Field ${interpolatedFieldName} is not whitelisted`);
+            }
+            match = interpolatedFieldsRegEx.exec(rawUrl);
+        }
+        return interpolatedUrl;
+    }
+
+    /**
+     * Returns valid builder sysId
+     * @param {String} value either builder name (or) sys_id
+     * @returns {String|null} builder sys_id
+     */
+    static getBuilderSysId(value) {
+        const gr = new GlideRecord(FileTaxonomyBuilder.TABLE);
+        gr.addEncodedQuery(`sys_id=${value}^ORname=${value}`);
+        gr.query();
+        if (gr.next())
+            return gr.getUniqueValue();
+
+        return null;
+    }
+
+
+    /**
+     * @param {String} typeSysId
+     * @param {GlideRecord} fileObjectRecord
+     * @param {String} [builderSysId] if not specified, the default builder config will be considered
+     */
+    constructor(typeSysId, fileObjectRecord, builderSysId) {
+        this.typeSysId = typeSysId;
+        this.fileObjectRecord = fileObjectRecord;
+        this.builderSysId = builderSysId;
+        this.builderRecord = null;
+        this.configRecord = null;
+
+        this.configRecord = FileTaxonomyBuilderConfig.getRecordForTaxonomy(this.typeSysId, this.builderSysId);
+        this.builderRecord = !gs.nil(this.configRecord) ? this.configRecord.builder.getRefRecord() : FileTaxonomyBuilder.getRecordForSysId(FileTaxonomyBuilder.DEFAULT_BUILDER);
+    }
+
+    /**
+     * @returns {String} metadata builder URL
+     */
+    getEditUrlForMetadata() {
+        if (!this.configRecord) return '';
+
+        if (!this.fileObjectRecord)
+            return UDCUtil.createCanonicalizedUri(this.configRecord.getValue('create_path'));
+
+        const rawEditPath = this.configRecord.getValue("edit_path");
+        if (!gs.nil(rawEditPath)) {
+            const editUrl = FileTaxonomyBuilder.getInterpolatedUrl(rawEditPath, this.fileObjectRecord);
+
+            // TODO: Apply associated feature flags in the final builder URL
+            return UDCUtil.createCanonicalizedUri(editUrl);
+        }
+        return "";
+    }
+
+    /**
+     * @returns {String} metadata creator URL
+     */
+    getCreateUrlForMetadata() {
+        if (!this.configRecord) return "";
+        return UDCUtil.createCanonicalizedUri(this.configRecord.getValue("create_path"));
+    }
+
+    /**
+     * @returns {String} builder label
+     */
+    getLabel() {
+        if (!this.builderRecord) return "";
+        return this.builderRecord.getDisplayValue("label") || "";
+    }
+
+    /**
+     * @returns {String} builder name
+     */
+    getName() {
+        if (!this.builderRecord) return "";
+        return this.builderRecord.getValue("name") || "";
+    }
+
+    /**
+     * @returns {String} icon
+     */
+    getIcon() {
+        if (!this.builderRecord) return "";
+        return this.builderRecord.getDisplayValue("icon") || UDCConstants.fallbackIcons.TOOL;
+    }
+
+    /**
+     * @returns {String} builder sys_id
+     */
+    getSysId() {
+        if (!this.builderRecord) return "";
+        return this.builderRecord.getUniqueValue() || "";
+    }
+
+    /**
+     * @returns {String} builder documentation URL
+     */
+    getDocumentationUrl() {
+        if (!this.builderRecord) return "";
+        return this.builderRecord.getValue("documentation_url") || "";
+    }
+
+    /**
+     * @returns {String} builder home page URL
+     */
+    getHomeUrlForBuilder() {
+        if (!this.builderRecord) return "";
+        return UDCUtil.createCanonicalizedUri(this.builderRecord.getValue("home_path"));
+    }
+
+    /**
+     * @returns {Object} builder properties
+     */
+    getBuilderProperties() {
+        if (!this.builderRecord) return {};
+        return FileTaxonomyBuilder.parseJSONString(this.builderRecord.getValue('builder_properties'));
+    }
+}]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-11-07 15:38:58&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0454c3a2439ebd106c4bb0117fb8f2ce&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;44&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;FileTaxonomyBuilder&lt;/sys_name&gt;
+        &lt;sys_package display_value="Unified Developer Core" source="sn_udc"&gt;8a841f2bc42f457e8809ea71d35e821f&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Unified Developer Core"&gt;8a841f2bc42f457e8809ea71d35e821f&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0454c3a2439ebd106c4bb0117fb8f2ce&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-02-20 14:46:23&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:09</sys_created_on>
+        <sys_id>88407c5583b01210c6695855eeaad3f2</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>FileTaxonomyBuilder</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_88407c5583b01210c6695855eeaad3f2</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:09</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

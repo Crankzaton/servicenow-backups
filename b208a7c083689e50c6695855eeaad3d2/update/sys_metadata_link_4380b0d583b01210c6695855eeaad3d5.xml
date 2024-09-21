@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>12563b9f87430010b6f8578c87cb0b35</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.AgileDemandConversionUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;AgileDemandConversionUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var AgileDemandConversionUtil = Class.create();
+AgileDemandConversionUtil.prototype = {
+    initialize: function() {},
+
+    convertDemand: function(table, sysId, mapId, preFields) {
+        var gr = new GlideRecord(table);
+        var response = {};
+        if (gr.get(sysId)) {
+            map = new CSMTableMapUtil(gr);
+            map.findMapByID(mapId);
+            var newTargetGr = map.getTargetGlideRecord();
+            if (newTargetGr) {
+				if (preFields) {
+					for (var i = 0; i &lt; preFields.length; i++) {
+						newTargetGr.setValue(preFields[i].fieldName, preFields[i].fieldValue);
+					}
+				}
+				
+                sysId = newTargetGr.insert();
+            }
+
+            if (newTargetGr.get(sysId)) {
+                response.id = newTargetGr.getValue('sys_id');
+                response.number = newTargetGr.getValue('number');
+                response.label = newTargetGr.getClassDisplayValue();
+				
+				/*
+				*Upon Conversion of Demand, Update Investment
+				*/
+				if (new GlidePluginManager().isActive('com.snc.investment_planning_pmo')) {
+					var invst = new InvstDemandConversion(gr, newTargetGr);
+					invst.updateExsistingInvestMentWhenDemandIsConverted();
+				}
+
+				/*
+				*Upon Conversion of Demand, Copy secondary goals
+				*/
+				if (new GlidePluginManager().isActive('com.snc.goal_framework') &amp;&amp; (newTargetGr.getValue('sys_class_name') == "rm_epic")){
+					var dmn_gf_m2mGr = new GlideRecord('sn_gf_goal_m2m_relationship');
+					dmn_gf_m2mGr.addQuery('demand', gr.getValue("sys_id"));
+					dmn_gf_m2mGr.addQuery('is_primary_goal', false);
+					dmn_gf_m2mGr.query();
+
+					while (dmn_gf_m2mGr.next()) {
+						var dmn_gf_m2m_prjGr = new GlideRecord('sn_gf_goal_m2m_relationship');
+						dmn_gf_m2m_prjGr.initialize();
+						dmn_gf_m2m_prjGr.setValue('goal',dmn_gf_m2mGr.getValue('goal'));
+						if (newTargetGr.getValue('sys_class_name') == "rm_epic")
+							dmn_gf_m2m_prjGr.setValue('scrum_epic',response.id);
+						dmn_gf_m2m_prjGr.setValue('is_primary_goal', false);
+						dmn_gf_m2m_prjGr.insert();
+					}			
+				}	
+				
+				if ((newTargetGr.getValue('sys_class_name') == "rm_epic")|| (newTargetGr.getValue('sys_class_name') == "sn_safe_epic"))
+					this.updateBenefitPlans(gr.getValue("sys_id"), newTargetGr);                
+				
+                return response;
+            }
+        }
+    },
+
+    convertDemandAndUpdateReferenceField: function(current, preFields) {
+        var message;
+        var destinationType = current.getValue("type");
+        var mapId = this.map[destinationType]["mapId"];
+        var targetTable = this.map[destinationType]["tableName"];
+        var targetField = this.map[destinationType]["fieldName"];
+        var viewName = this.map[destinationType]["viewName"];
+		var demandFieldValue = {
+			"fieldName": "demand",
+            "fieldValue": current.getValue("sys_id")
+        };
+		if (JSUtil.nil(preFields))
+			preFields = [demandFieldValue];			
+		else
+			preFields.push(demandFieldValue);
+        var response = this.convertDemand(current.getTableName(), current.getValue('sys_id'), mapId, preFields);
+        if (!JSUtil.nil(response)) {
+            current.setValue(targetField, response.id);
+            current.setValue('state', '8');
+            current.setValue('stage', destinationType);
+            current.update();
+            var number = response.number;
+            var id = response.id;
+            var label = response.label;
+            var link = '&lt;a href ="/' + targetTable + '.do?sysparm_query=sys_id%3D' + id + '&amp;sysparm_view%3D' + viewName + '"&gt;' + number + '&lt;/a&gt;';
+            message = gs.getMessage("{0} {1} has been created", [label, link]);
+            gs.addInfoMessage(message);
+        } else {
+            message = gs.getMessage("Error in conversion");
+            gs.addErrorMessage(message);
+        }
+    },
+
+	updateBenefitPlans: function(demandId, newTargetGr) {
+		var targetId = newTargetGr.getValue('sys_id');
+
+        var benefitPlan = new GlideRecord("benefit_plan");
+        benefitPlan.addQuery("task", demandId);
+        benefitPlan.setValue('task', targetId);
+        benefitPlan.setValue('top_task', targetId);
+        benefitPlan.setValue('sys_domain', newTargetGr.sys_domain);
+        benefitPlan.setWorkflow(false);
+        benefitPlan.updateMultiple();
+
+        var benefitBreakdowns = new GlideRecord("benefit_plan_breakdown");
+        benefitBreakdowns.addQuery("task", demandId);
+        benefitBreakdowns.setValue('task', targetId);
+        benefitBreakdowns.setValue('sys_domain', newTargetGr.sys_domain);
+        benefitBreakdowns.setWorkflow(false);
+        benefitBreakdowns.updateMultiple();
+
+        var nmBenefitBreakdowns = new GlideRecord("nm_benefit_plan_breakdown");
+        nmBenefitBreakdowns.addQuery("task", demandId);
+        nmBenefitBreakdowns.setValue('task', targetId);
+        nmBenefitBreakdowns.setValue('sys_domain', newTargetGr.sys_domain);
+        nmBenefitBreakdowns.setWorkflow(false);
+        nmBenefitBreakdowns.updateMultiple();
+    },    
+
+    type: 'AgileDemandConversionUtil'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-02-24 11:30:49&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;12563b9f87430010b6f8578c87cb0b35&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;21&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AgileDemandConversionUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="PPM Standard" source="com.snc.financial_planning_pmo"&gt;92ef82e747e64210cd4e1ce4316d43e3&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_12563b9f87430010b6f8578c87cb0b35&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2021-12-03 12:00:29&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:10:26</sys_created_on>
+        <sys_id>4380b0d583b01210c6695855eeaad3d5</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AgileDemandConversionUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_4380b0d583b01210c6695855eeaad3d5</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:10:26</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

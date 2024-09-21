@@ -1,0 +1,226 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0aa5dea91b1ced944c0f0f2de54bcbd5</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.WFReviewCTaskUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Contains validations for the business rule "WF Unable to Close without Review Task" (server side)
+
+Methods:
+getGLTypes()
+isGroupTypeGL(type)
+checkParentGroup(parentGrpSysID)
+findECABGroup(groupSysID)
+addReviewTask(grChange, subType, shortDesc, desc, group)
+hasReviewTask(grChange, subType)
+&lt;/description&gt;
+        &lt;name&gt;WFReviewCTaskUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var WFReviewCTaskUtil = Class.create();
+WFReviewCTaskUtil.prototype = {
+
+    initialize: function() {
+        this.ecab_group_type = gs.getProperty('wf.change.ecabgroup.type', ''); // contains the sys_id of the ECAB group type
+        this.gl2_group_type = gs.getProperty('wf.grouptype.gl2', '');
+        this.gl_group_types = []; // contains the sys_id of the group types GL4/GL3/GL2
+        var types = gs.getProperty('wf.grouptype.gl.types', '');
+        if (!gs.nil(types)) {
+            this.gl_group_types = types.split(',');
+        }
+        this.MAX_GROUP_LEVELS = parseInt(gs.getProperty('wf.change.group.levels', '10'));
+    },
+
+    /**
+    getGLTypes();
+    Get an array with the group type sys_id of the group types GL4/GL3/GL2
+    
+    @return array of sys_id
+    */
+    getGLTypes: function() {
+        return this.gl_group_types;
+    },
+
+    /**
+    isGroupTypeGL(type);
+    Validate if the group type sys_id matches with one of the group types sys_id for GL4/GL3/GL2
+    
+    @params
+    type: Sys ID of the group type to validate
+    
+    @return TRUE if the type matches, FALSE if it doesn't match a group type GL4/GL3/GL2
+    */
+    isGroupTypeGL: function(type) {
+        return this.getGLTypes().filter(function(glType) {
+            return type.indexOf(glType) !== -1;
+        }).length !== 0;
+    },
+
+    /**
+    checkParentGroup(parentGrpSysID);
+    Check if the group has a child group with a group type ECAB
+    
+    @params
+    parentGrpSysID: Sys ID of the group
+    
+    @return the sys_id of the group with group type ECAB, if an ECAB group is not found then return an blank value
+    */
+    checkParentGroup: function(parentGrpSysID) {
+        var grpSysID = "";
+        var grGroup = new GlideRecord('sys_user_group');
+        grGroup.addQuery('parent', parentGrpSysID);
+        grGroup.addEncodedQuery('typeLIKE' + this.ecab_group_type);
+        grGroup.addNotNullQuery('parent');
+        grGroup.addNotNullQuery('type');
+        grGroup.query();
+        if (grGroup.next()) {
+            grpSysID = grGroup.getUniqueValue();
+        }
+        return grpSysID;
+    },
+
+    /**
+    findECABGroup(parentGrpSysID);
+    Check if the group has an ECAB group according to the child-parent relationships from the parent groups with type GL4,GL3,GL2
+    
+    @params
+    groupSysID: Sys ID of the group
+    
+    @return the sys_id of the group with group type ECAB, if an ECAB group is not found then return an blank value
+    */
+    findECABGroup: function(groupSysID) {
+        var ecabGroup = "";
+        var nextGroup = groupSysID;
+        var groupsVisited = {};
+
+        // loop through child-parent group hierarchy
+        var levelCount = 0;
+        while (levelCount &lt; this.MAX_GROUP_LEVELS &amp;&amp; !gs.nil(nextGroup)) {
+            if (groupsVisited[nextGroup + ""] === true) {
+                // if group already visited then end the loop
+                nextGroup = '';
+                break;
+            }
+            groupsVisited[nextGroup + ""] = true;
+            // check nextGroup
+            var grGrpParent = new GlideRecord("sys_user_group");
+            grGrpParent.addQuery('sys_id', nextGroup);
+            grGrpParent.addNotNullQuery('sys_id');
+            grGrpParent.query();
+            if (grGrpParent.next()) {
+                // update nextGroup with next parent group
+                nextGroup = grGrpParent.parent + "";
+                // if parent group type is GL4/GL3/GL2 check for ECAB group
+                var type = grGrpParent.type;
+                if (this.isGroupTypeGL(type)) {
+                    ecabGroup = this.checkParentGroup(grGrpParent.getUniqueValue());
+                    // if ecabGroup is not empty then end the loop, or if the group type is GL2 then end the loop
+                    if (!gs.nil(ecabGroup) || type.indexOf(this.gl2_group_type) !== -1) {
+                        nextGroup = '';
+                        break;
+                    }
+                }
+            } else {
+                // if no group found then end the loop
+                nextGroup = '';
+                break;
+            }
+            levelCount++;
+        }
+        return ecabGroup;
+    },
+
+    /**
+    addReviewTask(grChange, subType, shortDesc, desc, group);
+    Adds a change task of type Review to the Change Request
+    
+    @params
+    grChange: GlideRecord of the change request
+    subType: Sub-type value for the change task
+    shortDesc: Short description for the change task
+    desc: Description for the change task
+    group: Sys ID of the Assignment Group for the change task
+    
+    @return NONE
+    */
+    addReviewTask: function(grChange, subType, shortDesc, desc, group) {
+        var grCTask = new GlideRecord("change_task");
+        grCTask.initialize();
+        grCTask.state = 1;
+        grCTask.priority = 3;
+        grCTask.change_task_type = "review";
+        grCTask.u_sub_type = subType;
+        grCTask.created_from = "workflow";
+        grCTask.parent = grChange.getUniqueValue();
+        grCTask.change_request = grChange.getUniqueValue();
+        grCTask.short_description = shortDesc;
+        grCTask.description = desc;
+        grCTask.assignment_group = group;
+        if (subType + "" === 'Senior Review') {
+            grCTask.assignment_group = this.findECABGroup(group);
+        }
+        grCTask.planned_start_date = grChange.start_date;
+        grCTask.planned_end_date = grChange.end_date;
+        grCTask.setWorkflow(false);
+        grCTask.insert();
+    },
+
+    /**
+    hasReviewTask(grChange, subType);
+    Validates if the change request has an existing Review task created
+    
+    @params
+    grChange: GlideRecord of the change request
+    subType: Sub-type value for the change task
+    
+    @return TRUE if a Review change task exists for the change request, FALSE if the change request doesn't have a review change task created
+    */
+    hasReviewTask: function(grChange, subType) {
+        var gaReviewTask = new GlideAggregate("change_task");
+        gaReviewTask.addQuery("change_request", grChange.getUniqueValue());
+        gaReviewTask.addQuery("change_task_type", "review");
+        gaReviewTask.addQuery("u_sub_type", subType);
+        gaReviewTask.addAggregate("COUNT");
+        gaReviewTask.query();
+        var taskCount = 0;
+        if (gaReviewTask.next()) {
+            taskCount = parseInt(gaReviewTask.getAggregate("COUNT"));
+        }
+        return (taskCount &gt; 0);
+    },
+
+    type: 'WFReviewCTaskUtil'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;U838459&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-01-10 01:11:13&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0aa5dea91b1ced944c0f0f2de54bcbd5&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;12&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;WFReviewCTaskUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Global" source="global"&gt;global&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0aa5dea91b1ced944c0f0f2de54bcbd5&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-02-04 17:22:49&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:44</sys_created_on>
+        <sys_id>b060f49583b01210c6695855eeaad3ae</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>WFReviewCTaskUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_b060f49583b01210c6695855eeaad3ae</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:44</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

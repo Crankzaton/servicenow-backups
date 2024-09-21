@@ -1,0 +1,313 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0fe26bcb77403110ce7b6a985f5a9913</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.WPProfileLocationSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;WPProfileLocationSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var WPProfileLocationSNC = Class.create();
+WPProfileLocationSNC.prototype = {
+    initialize: function() {},
+
+    /**
+     * Checks if a workplace profile is duplicated
+     * @params {wProfileGr} workplace profile GR
+     * @return {Boolean}
+     */
+    isProfileDuplicated: function(wProfileGr) {
+        var gr = new GlideRecord(sn_wsd_core.WPConstants.TABLES.WORKPLACE_PROFILE);
+        gr.addActiveQuery();
+        gr.addQuery('employee', wProfileGr.employee);
+        gr.query();
+
+        return gr.hasNext();
+    },
+
+    /**
+     * Inactivate is_primary for all other workplace profile location
+     * Copy values of primary child to the parent workplace profile
+     * @params {wProfileLocGr} workplace profile location GR
+     */
+    inActivateOtherPrimariesAndCopyValues: function(wProfileLocGr) {
+        var gr = new GlideRecord(sn_wsd_core.WPConstants.TABLES.WORKPLACE_PROFILE_LOCATION);
+        gr.addQuery('workplace_profile', wProfileLocGr.workplace_profile);
+        gr.addQuery('is_primary', true);
+        gr.query();
+
+        while (gr.next()) {
+            if (gr.getValue('sys_id') !== wProfileLocGr.getValue('sys_id')) {
+                gr.setValue('is_primary', false);
+                gr.setWorkflow(false);
+                gr.update();
+            }
+        }
+
+        this.copyValuesToParentWP(wProfileLocGr);
+    },
+
+    /**
+     * Copy values of primary child to the parent workplace profile
+     * @params {wProfileLocGr} workplace profile location GR
+     */
+    copyValuesToParentWP: function(wProfileLocGr) {
+        var grw = new GlideRecord(sn_wsd_core.WPConstants.TABLES.WORKPLACE_PROFILE);
+        grw.addActiveQuery();
+        grw.addQuery('sys_id', wProfileLocGr.workplace_profile);
+        grw.query();
+
+        while (grw.next()) {
+            grw.setValue('workplace_location', wProfileLocGr.workplace_location);
+            grw.setValue('enable_location_privacy', wProfileLocGr.enable_location_privacy);
+            grw.setValue('anomaly_reason', wProfileLocGr.getValue("anomaly_reason"));
+            grw.update();
+        }
+    },
+
+    /**
+     * Inactivate all active workplace profile location when the parent inactivated
+     * @params {wProfileGr} workplace profile GR
+     */
+    inActivateProfileChildren: function(wProfileGr) {
+        this.nullifyWPFields(wProfileGr);
+
+        var gr = new GlideRecord(sn_wsd_core.WPConstants.TABLES.WORKPLACE_PROFILE_LOCATION);
+        gr.addActiveQuery();
+        gr.addQuery('workplace_profile', wProfileGr.sys_id);
+        gr.query();
+
+        while (gr.next()) {
+            gr.setValue('active', false);
+            gr.setWorkflow(false);
+            gr.update();
+        }
+    },
+
+    /**
+     * Set the next child as primary and copy its values to the parent when inactivate a primary child
+     * If it’s the last children nullify the parent
+     * @params {wProfileGr} workplace profile GR
+     */
+    setNextLocAsPrimary: function(wProfileLocGr) {
+        var gr = new GlideRecord(sn_wsd_core.WPConstants.TABLES.WORKPLACE_PROFILE_LOCATION);
+        gr.addActiveQuery();
+        gr.addQuery('workplace_profile', wProfileLocGr.workplace_profile);
+        gr.orderByDesc('sys_created_on');
+        gr.setLimit(2);
+        gr.query();
+
+        while (gr.next()) {
+            if (gr.getValue('sys_id') !== wProfileLocGr.getValue('sys_id')) {
+                gr.setValue('is_primary', true);
+                gr.update();
+                return;
+            }
+        }
+
+        var grw = new GlideRecord(sn_wsd_core.WPConstants.TABLES.WORKPLACE_PROFILE);
+        grw.addActiveQuery();
+        grw.addQuery('sys_id', wProfileLocGr.workplace_profile);
+        grw.query();
+
+        if (grw.next()) {
+            this.nullifyWPFields(grw);
+        }
+    },
+    /**
+     * Nullify profile fileds
+     * @params {wProfilecGr} workplace profile GR
+     */
+    nullifyWPFields: function(wProfileGr) {
+        wProfileGr.setValue('workplace_location', '');
+
+        if (wProfileGr.isValidField('enable_location_privacy'))
+            wProfileGr.setValue('enable_location_privacy', '');
+
+        if (wProfileGr.isValidField('anomaly_reason'))
+            wProfileGr.setValue('anomaly_reason', 'no');
+
+        wProfileGr.update();
+    },
+
+    /**
+     * Checks if a workplace profile location is duplicated
+     * @params {wProfileLocGr} workplace profile location GR
+     * @return {Boolean}
+     */
+    checkIfProfileLocationDuplicated: function(wProfileLocGr) {
+        var gr = new GlideRecord(sn_wsd_core.WPConstants.TABLES.WORKPLACE_PROFILE_LOCATION);
+        gr.addActiveQuery();
+        gr.addQuery('workplace_profile', wProfileLocGr.workplace_profile);
+        gr.addQuery('workplace_location', wProfileLocGr.workplace_location);
+        gr.setLimit(2);
+        gr.query();
+
+        while (gr.next()) {
+            if (gr.getValue('sys_id') !== wProfileLocGr.getValue('sys_id')) return true;
+        }
+        return false;
+    },
+
+    /**
+     * Update records with cc_dept choice to allocation choice in anomaly reason column
+     */
+    migrateAnomalyChoice: function() {
+        var ANOMALY_REASON = 'anomaly_reason';
+        var wpGr = new GlideRecord(sn_wsd_core.WPConstants.TABLES.WORKPLACE_PROFILE);
+        wpGr.addQuery(ANOMALY_REASON, 'cc_dept');
+        wpGr.setValue(ANOMALY_REASON, 'allocation');
+        wpGr.setWorkflow(false);
+        wpGr.updateMultiple();
+    },
+
+    /**
+     * Checks if a workplace profile location is the last child
+     * @params {wProfileLocGr} workplace profile location GR
+     * @return {Boolean}
+     */
+    checkIfTheLastChild: function(wProfileLocGr) {
+        var gr = new GlideRecord(sn_wsd_core.WPConstants.TABLES.WORKPLACE_PROFILE_LOCATION);
+        gr.addActiveQuery();
+        gr.addQuery('workplace_profile', wProfileLocGr.workplace_profile);
+        gr.setLimit(2);
+        gr.query();
+
+        while (gr.next()) {
+            if (gr.getValue('sys_id') !== wProfileLocGr.getValue('sys_id'))
+                return false;
+        }
+        return true;
+    },
+
+    /**
+     * Checks if there is any active primary child
+     * @params {wProfileSysId} workplace profile sys_id
+     * @return {Boolean}
+     */
+    checkIfThereIsActivePrimaryChild: function(wProfileSysId) {
+        var gr = new GlideRecord(sn_wsd_core.WPConstants.TABLES.WORKPLACE_PROFILE_LOCATION);
+        gr.addActiveQuery();
+        gr.addQuery('workplace_profile', wProfileSysId);
+        gr.addQuery('is_primary', true);
+        gr.query();
+
+        return gr.hasNext();
+    },
+
+    migrateWP2WPL: function() {
+
+        var WORKPLACE_LOCATION = 'workplace_location';
+        var EMPLOYEE = 'employee';
+        var ANOMALY_REASON = 'anomaly_reason';
+        var ENABLE_PRIVACY = 'enable_location_privacy';
+        var ACTIVE = 'active';
+        var CREATED_ON = 'sys_created_on';
+
+        var duplicatedRec = {};
+        var employeeId;
+        var workplaceProfileId;
+
+        var wp = new GlideRecord(sn_wsd_core.WPConstants.TABLES.WORKPLACE_PROFILE);
+        wp.orderBy(EMPLOYEE);
+        wp.orderByDesc(ACTIVE);
+        wp.orderByDesc(CREATED_ON);
+        wp.query();
+
+        while (wp.next()) {
+
+            employeeId = wp.getValue(EMPLOYEE).toString();
+            workplaceProfileId = wp.getUniqueValue().toString();
+
+            var recordObj = {
+                workplaceLocation: wp.getValue(WORKPLACE_LOCATION),
+                anomalyReason: wp.isValidField(ANOMALY_REASON) ? wp.getValue(ANOMALY_REASON) : null,
+                privacy: wp.isValidField(ENABLE_PRIVACY) ? wp.getValue(ENABLE_PRIVACY) : null,
+                active: wp.getValue(ACTIVE) === '0' ? false : true,
+                createdOn: wp.getValue(CREATED_ON)
+            };
+
+            if (!duplicatedRec[employeeId]) {
+                recordObj.id = wp.getUniqueValue();
+                duplicatedRec[employeeId] = recordObj;
+
+                this.createWorkplaceProfileLocation(recordObj, workplaceProfileId, true);
+            } else {
+                this.createWorkplaceProfileLocation(recordObj, duplicatedRec[employeeId].id, false);
+                this.migrateNBH2ActiveWP(wp, duplicatedRec[employeeId].id);
+
+                if (wp.getValue(ACTIVE) === '0')
+                    this.nullifyWPFields(wp);
+
+                wp.setValue(ACTIVE, false);
+                wp.update();
+            }
+        }
+
+    },
+    migrateNBH2ActiveWP: function(inactiveWPGr, activeWPId) {
+        var nbhM2Mwp = new GlideRecord('sn_wsd_spcmgmt_neighborhood_m2m_workplace_profile');
+        nbhM2Mwp.addQuery('workplace_profile', inactiveWPGr.getUniqueValue());
+        nbhM2Mwp.query();
+
+        while (nbhM2Mwp.next()) {
+            nbhM2Mwp.setValue('workplace_profile', activeWPId);
+            nbhM2Mwp.setWorkflow(false);
+            nbhM2Mwp.update();
+        }
+    },
+    createWorkplaceProfileLocation: function(workplaceProf, workProfId, isPrimary) {
+        var wplocation = new GlideRecord(sn_wsd_core.WPConstants.TABLES.WORKPLACE_PROFILE_LOCATION);
+        wplocation.initialize();
+        wplocation.setValue('workplace_location', workplaceProf.workplaceLocation);
+        wplocation.setValue('workplace_profile', workProfId);
+        wplocation.setValue('is_primary', workplaceProf.active ? isPrimary : false);
+        wplocation.setValue('active', workplaceProf.active);
+        wplocation.setValue('actual_created_on', workplaceProf.createdOn);
+
+        if (workplaceProf.anomalyReason)
+            wplocation.setValue('anomaly_reason', workplaceProf.anomalyReason);
+
+        if (workplaceProf.privacy)
+            wplocation.setValue('enable_location_privacy', workplaceProf.privacy);
+
+        wplocation.insert();
+
+    },
+
+    type: 'WPProfileLocationSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-07-20 08:30:14&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0fe26bcb77403110ce7b6a985f5a9913&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;27&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;WPProfileLocationSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value=""&gt;a208b07253201010b10bddeeff7b1281&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value=""&gt;a208b07253201010b10bddeeff7b1281&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0fe26bcb77403110ce7b6a985f5a9913&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-11-02 02:06:27&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:10:14</sys_created_on>
+        <sys_id>0c8070d583b01210c6695855eeaad304</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>WPProfileLocationSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_0c8070d583b01210c6695855eeaad304</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:10:14</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

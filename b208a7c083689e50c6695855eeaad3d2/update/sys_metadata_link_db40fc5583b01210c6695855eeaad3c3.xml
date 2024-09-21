@@ -1,0 +1,802 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>066437bcc32132001c845cb981d3ae3d</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.DynamicSchedulingAgentRecommendationNew&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;DynamicSchedulingAgentRecommendationNew&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var DynamicSchedulingAgentRecommendationNew = Class.create();
+var DEFAULT_MAX_AGENTS = 100;
+var DEBUG_PROPERTY = "glide.autodispatch.debug";
+var DEFAULT_WORK_DURATION = 3600;
+var DEFAULT_SCHEDULE = "08fcd0830a0a0b2600079f56b1adb9ae";
+var EARTH_RADIUS = 7926.0/2;
+var MAX_RATING = 1.0;
+var INVALID_RATING = -100.0;
+var SCHEDULE_THRESHOLD = 0.85;
+var NOT_VALID_TASK = gs.getMessage("Operation not supported on this task");
+var NO_GROUPS = gs.getMessage("No dispatch group or assignment group is defined");
+var NO_ASSIGNMENT_GROUPS_COVERED = gs.getMessage("The selected dispatch group does not cover any assignment groups");
+var NO_RESOURCE_AVAILABLE = gs.getMessage("No resource is available at specified time(s)");
+var NO_AGENT_AVAILABLE = gs.getMessage("No Agent is available at specified time(s)");
+var TOO_MANY_AGENTS = gs.getMessage("There are too many resources covered by this dispatch group to dispatch the task.");
+var UPSTREAM_DEPENDENCY = gs.getMessage("Cannot auto-dispatch because of upstream dependency.");
+var INVALID_GOOGLE_KEY = gs.getMessage("Invalid Google Key. Falling back to Crow Distance to calculate travel duration.");
+var WINDOW_TOO_SMALL = gs.getMessage("The usable work window is too small for the task.");
+var CONFLICTING_DEPENDENCIES = gs.getMessage("There are conflicting task dependencies for the specified time(s).");
+var WINDOW_END_PAST = gs.getMessage("Window End is in the past");
+var NO_MATCHING_RULE = gs.getMessage("No task filter configured for this task");
+
+DynamicSchedulingAgentRecommendationNew.prototype = {
+    initialize: function(task, configObj, optimization, ignoreCalculateTravelTimeForAgents) {
+    	var showLogs = gs.getProperty("com.snc.dynamic.scheduling.showlogs");
+		if(showLogs == 'true'){
+			this.logLevel = 'DEBUG';   //Change level if you want to
+			this.useLogger = true;
+		}else{
+			this.logLevel = 'OFF';
+			this.useLogger = false;
+		}
+		
+		this.current = task;
+		var smConfig = new sn_sm.SMConfiguration();
+		this.smCacheManager = new SMConfigCacheManager();
+		this.cachedSMConfig = this.smCacheManager.getSMConfig(task.getTableName());
+		this.propertyPrefix = this.cachedSMConfig.property_prefix;
+		
+		this.dynamicSchedulingAgentRecommendationUtil = new DynamicSchedulingAgentRecommendationUtil(); 
+		
+		
+		this.debug = GlideProperties.getBoolean(DEBUG_PROPERTY, false);
+		
+		this._initConfig(task, smConfig, configObj);
+
+		this.geoLocationActive = GlidePluginManager.isActive("com.snc.geolocation");
+
+		//this.routingEngine = new SNC.GeoRouting();
+		if(this.config.useSchedule){
+			this.taskSpacing = this._getIntProperty("work.spacing", 0, 0, -1) * 60;
+			this.config.useGeoLoc = this._getBooleanProperty("autodispatch.geolocation", false) &amp;&amp; this.geoLocationActive &amp;&amp; this.config.useLocation;
+			// if(this.geoLocationActive &amp;&amp; this.config.useGeoLoc){
+			// 	var geoAgent = new SNC.GeoAgent(this.propertyPrefix);
+			// 	this.routingEngine.setAgent(geoAgent);	
+			// }
+
+			this.workDuration = 0;
+			var taskDuration = task.getValue("estimated_work_duration");
+			if(!taskDuration){
+				var estimatedStartWork = new GlideDateTime(task.getValue("expected_start"));					
+				var estimatedEndWork = null;
+				this.workDuration = DEFAULT_WORK_DURATION * 1000;
+
+				if (!estimatedStartWork.hasDate()) {
+					estimatedStartWork = new GlideDateTime(GlideSystemDateUtil.nowNoTZ());
+					task.setValue("expected_start", estimatedStartWork);
+				}
+			}
+			else
+				this.workDuration = (new GlideDateTime(taskDuration)).getNumericValue();
+		}
+		
+		this.taskLatitude = Number.MAX_VALUE;
+		this.taskLongitude = Number.MAX_VALUE;
+
+		this.overallRating = {};
+		this.agentInfo = {};
+		
+		this.workBlocks = {};
+		this.cachedWorkBlocks = {};
+		if(!gs.nil(optimization)){
+			this.optimization = optimization;
+			this.initResourceEntity();
+		}
+		
+		var location = new GlideRecord("cmn_location");
+		location.get(task.getValue("location"));
+		if (location.getRowCount() != 1)
+			return;
+		
+		if (!JSUtil.nil(location.getValue("latitude")))
+			this.taskLatitude = Number(location.getValue("latitude"));
+		if (!JSUtil.nil(location.getValue("longitude")))
+			this.taskLongitude = Number(location.getValue("longitude"));
+		this.current = task;
+		this.ignoreCalculateTravelTimeForAgents = ignoreCalculateTravelTimeForAgents;
+		
+    },
+	
+	initResourceEntity: function(){
+		this.resourceEntity = this.optimization.resourceEntity;
+		
+		this.resourceEntity.config = this.config;
+		this.resourceEntity.taskSpacing = this.taskSpacing;
+		this.resourceEntity.workDuration = this.workDuration;
+		this.resourceEntity.current = this.current;
+	},
+
+    _generateErrorResponse : function(msg, errorCode, task) {
+    	var response = {};
+    	response.success = false;
+    	response.current = task.getDisplayValue("number");
+    	response.message = msg;
+		response.msgType = "error";
+		this.loggerUtil.logError("Task : " + task.getDisplayValue("number") + ": Error: " + msg);
+		response.logs = this.loggerUtil.getLogs();
+		return response;	
+    },
+
+    _getAgentGroups : function(task, dispatch_group, assignment_group) {
+		this.resourceEntity.config = this.config;
+		var groupResponse = this.resourceEntity._getResourceGroups(task, dispatch_group, assignment_group);
+		return groupResponse;
+    },
+
+    _getGroupUsers : function (groupResponse, task){
+		var groupUsers = this.resourceEntity._getGroupResources(groupResponse, task);
+		return groupUsers;
+    },
+
+    _isAllNegativeRating : function (overallRating) {
+    	if (Object.keys(overallRating).length == 0)
+			return false;
+		for (var user in overallRating) 
+			if (overallRating[user] &gt;= 0)
+				return false;
+		
+		return true;
+    },
+
+    _getOverallRatingFromMatchingRule : function(candidatesFromMatchingRule, matchingRuleProcessor) {
+    	if(matchingRuleProcessor.dimensionResults) {
+    		var dimensionRating = matchingRuleProcessor.dimensionResults.overallRating;
+    		this.overallRating = dimensionRating;
+    	}
+    	else {
+    		for (var i = 0; i &lt; candidatesFromMatchingRule.length; i++) {
+    			var candidate = candidatesFromMatchingRule[i];
+    			this.overallRating[candidate] = 1.0 - (((i+1) / candidatesFromMatchingRule.length) * 1.0);
+    		};
+    	}
+    	
+    	return this.overallRating;
+    },
+
+    _isInBulkTaskUpdates : function(task, fieldName) {
+    	if(fieldName)
+    		return this.config.bulkTaskUpdates &amp;&amp; this.config.bulkTaskUpdates[task] &amp;&amp; this.config.bulkTaskUpdates[task].taskUpdates &amp;&amp; this.config.bulkTaskUpdates[task].taskUpdates[fieldName];
+    	return this.config.bulkTaskUpdates &amp;&amp; this.config.bulkTaskUpdates[task] &amp;&amp; this.config.bulkTaskUpdates[task].taskUpdates;
+    },
+
+    _getFieldFromBulkTaskUpdates : function(task, fieldName) {
+    	if(this._isInBulkTaskUpdates(task, fieldName)){
+    		if(fieldName)
+    			return this.config.bulkTaskUpdates[task].taskUpdates[fieldName];
+    		return this.config.bulkTaskUpdates[task].taskUpdates;
+    	}
+    	return null;
+    },
+
+    getCandidatesFromMatchingRule: function(task, groupUsers, matchingRuleProcessor){
+		response = {"returnCode": "success"};
+
+		var matchingRuleProcessorArgs = {};
+		matchingRuleProcessorArgs.config = this.config;
+		var candidatesFromMatchingRule = [];
+		var task_filter_query =  "";
+			task_filter_query = this.config.task_filter_query;
+		var resetUnassignData = false;
+		var unAssignData;
+		if(("config" in matchingRuleProcessorArgs ) &amp;&amp; ("unAssignData" in matchingRuleProcessorArgs.config)){
+			resetUnassignData = true;
+			unAssignData = matchingRuleProcessorArgs.config.unAssignData;
+			matchingRuleProcessorArgs.config.unAssignData = {};
+		}
+		if(this.config.matchingRuleRecord &amp;&amp; !JSUtil.nil(this.config.matchingRuleRecord)){
+			var filter = new GlideFilter(this.config.matchingRuleRecord.condition, "rule-condition");
+			filter.setCaseSensitive(true);
+			var match = filter.match(this.current, true);
+			if(match)
+				candidatesFromMatchingRule = matchingRuleProcessor.processRuleRecord(task, this.config.matchingRuleRecord, this.config.maxAgents, groupUsers, matchingRuleProcessorArgs); //processRuleRecord : function(taskRecord, matchingRuleRecord, userLimit, filterArray, args)
+			else{
+				response.returnCode = "failed";
+				response.result = this._generateErrorResponse(NO_MATCHING_RULE, "NO_MATCHING_RULE", this.current);
+				return response;
+			}
+		}
+		else
+        {
+            candidatesFromMatchingRule = matchingRuleProcessor.processAndGetCandidates(task, this.config.maxAgents, "","forward", false, groupUsers, matchingRuleProcessorArgs, "dynamic_schedule_task_filter",task_filter_query);
+			if(this.useLogger == true){
+				var dimensionResults = matchingRuleProcessor.getDimensionResults().dimensionResults;
+				var matchingRules = matchingRuleProcessor.matchingRules;
+				this.loggerUtil.logResourceDimensionResult(matchingRules, dimensionResults, this.agentInfo);
+			}
+		}
+		this.loggerUtil.logUsers(this.agentInfo, candidatesFromMatchingRule, "Candidates from Matching Rule : ");
+		if(resetUnassignData == true){
+			matchingRuleProcessorArgs.config.unAssignData = unAssignData;
+		}
+
+		response.result = candidatesFromMatchingRule;
+		return response;
+	},
+
+    getAgentRecommendation: function(task, appointmentBooking, taskCalculatedData) {
+    	this.loggerUtil = new SchedulingLoggerUtil(this.logLevel);
+		this.resourceEntity.loggerUtil = this.loggerUtil;
+        this.loggerUtil.logInfo("Task : " + task.getDisplayValue("number"));
+		var task_tables = j2js(GlideDBObjectManager.getTables(task.getTableName()));
+
+		//if task is sm_order disable schedule
+		if (task_tables.indexOf("sm_order") != -1)
+			this.config.useSchedule = false;
+		
+		//if task is not a sm_task return as not supported
+	//	if (task_tables.indexOf("sm_task") == -1)
+		//	return this._generateErrorResponse(NOT_VALID_TASK, "NOT_VALID_TASK", this.current);
+
+		// Prevent auto-dispatching a task that depends on an unassigned task
+		var dependsOn = new GlideRecord("sm_m2m_task_dependency");
+
+		if (dependsOn.isValid()) {
+			dependsOn.addQuery("downstream_task", task.getValue("sys_id"));
+			dependsOn.addQuery("upstream_task.assigned_to", "");
+			dependsOn.addQuery("upstream_task.active", true);
+			dependsOn.setCategory('field_service');
+			dependsOn.query();
+			while (dependsOn.next()) {
+				var upstreamTask = dependsOn.getValue("upstream_task");
+				this.loggerUtil.logInfo("depends on : " + upstreamTask);
+				var assigned_to = this._getFieldFromBulkTaskUpdates(upstreamTask, "assigned_to");
+				if(JSUtil.nil(assigned_to))
+					return this._generateErrorResponse(UPSTREAM_DEPENDENCY, "UPSTREAM_DEPENDENCY", this.current);
+			}
+		}
+
+		//get agents from assignment group or dispatch group
+		var dispatchGroupId = "";
+		var assignmentGroupId = "";
+
+		assignmentGroupId = task.getValue("assignment_group");
+		dispatchGroupId = task.getValue("dispatch_group");
+
+		var groupResponse = this._getAgentGroups(task, dispatchGroupId, assignmentGroupId);
+
+		//if no candidates from assignment or dispatch group return NO_RESOURCE_AVAILABLE
+		if(!groupResponse.success || !groupResponse.candidates || !groupResponse.candidates.hasNext())
+			return this._generateErrorResponse(NO_RESOURCE_AVAILABLE, "NO_RESOURCE_AVAILABLE", this.current);
+
+		//get the users from the GlideAggregate returned from the getAgentGroups
+		var groupUsers = this._getGroupUsers(groupResponse, task);
+		this.agentInfo = this.resourceEntity.resourceInfo;
+		this.loggerUtil.logUsers(this.agentInfo, groupUsers, "Groupusers:");
+		var matchingRuleProcessor = new global.MatchingRuleProcessor(this.resourceEntity.getResourceType());
+
+        var skipQualificationAndOptWithoutUnassign = !gs.nil(taskCalculatedData);
+        var candidatesFromMatchingRule = null;
+		if(!skipQualificationAndOptWithoutUnassign){
+		   var agentQualificationResponse = this.getCandidatesFromMatchingRule(task,groupUsers, matchingRuleProcessor);
+		   candidatesFromMatchingRule = agentQualificationResponse.result;
+		   if(appointmentBooking||agentQualificationResponse.returnCode!="success"){
+			   return candidatesFromMatchingRule;
+		   }
+		}
+		else{
+			candidatesFromMatchingRule = taskCalculatedData.candidatesFromMatchingRule;
+		}
+
+        if(!candidatesFromMatchingRule || candidatesFromMatchingRule.length == 0){
+			return  this._generateErrorResponse(NO_RESOURCE_AVAILABLE, "NO_RESOURCE_AVAILABLE", this.current);
+		}
+
+		//get overall rating from the dimensions or from the candidate list
+		this.overallRating = this._getOverallRatingFromMatchingRule(candidatesFromMatchingRule, matchingRuleProcessor);
+
+
+		//if all ratings are negative return NO_RESOURCE_AVAILABLE
+		if (this._isAllNegativeRating(this.overallRating))
+			return this._generateErrorResponse(NO_RESOURCE_AVAILABLE, "NO_RESOURCE_AVAILABLE", this.current);
+		var recommendationResult = null;
+		
+		var ignoreTravelTimeCalculation = task.ignore_travel;
+		if(!this.config.useSchedule){
+			//useSchedule is false so returning best agent based on rating.
+			this.loggerUtil.logInfo("useSchedule is false so returning best agent based on rating ");
+			recommendationResult =  this._noScheduleRecommendation(groupResponse.candidates);
+		} else{
+			if (ignoreTravelTimeCalculation) {
+				recommendationResult =  this._noScheduleRecommendation(groupResponse.candidates, this.current);
+			} else {
+				recommendationResult =  this._scheduleRecommendation(this.current, groupResponse.candidates, skipQualificationAndOptWithoutUnassign);
+			}
+		}
+		
+		
+		this._logInvalidLocations(recommendationResult);
+		recommendationResult.foundQualifiedAgents = true;
+		recommendationResult.calculatedData = {candidatesFromMatchingRule: candidatesFromMatchingRule};
+		return recommendationResult;
+	},
+	
+	_logInvalidLocations : function(recommendationResult){
+		recommendationResult.latLongInvalid = false;
+		if (!gs.nil(this.resourceEntity) &amp;&amp; !gs.nil(this.resourceEntity.invalidLocations)) {
+			var keys = [];
+			for (var key in this.resourceEntity.invalidLocations)
+				keys.push(key);
+			if (keys.length&gt;0) {
+				recommendationResult.latLongInvalid = true;
+				gs.logWarning("Task " +  this.current.getDisplayValue() + " may not have been optimally assigned due to missing latitude/longitude data for locations with sys ids:  " + keys.join(), "DynamicSchedulingInvalidLocations");
+			}
+		}
+	},
+	_getResponseFromWorkBlocks : function(task, workBlocks) {
+	    var shouldLogResponse = !this.ignoreCalculateTravelTimeForAgents;
+		var response = this.resourceEntity._getResponseFromWorkBlocks(task, workBlocks, shouldLogResponse);
+		return response;
+	},
+
+	_scheduleRecommendation : function(task, candidates, skipQualificationAndOptWithoutUnassign) {
+		var windowTimes = this._initWindow(task);
+		
+		this.loggerUtil.logDebug("Window start: " + windowTimes.window_start.getDisplayValue() + ": Window end:" + windowTimes.window_end.getDisplayValue());
+
+		if (windowTimes.window_start.compareTo(windowTimes.window_end) &gt; 0  || windowTimes.window_end.compareTo(new GlideDateTime(GlideSystemDateUtil.nowNoTZ())) &lt; 0)
+			return this._generateErrorResponse(WINDOW_END_PAST, "WINDOW_END_PAST", task);
+		if (this.workDuration &gt; windowTimes.window_end.getNumericValue() - windowTimes.window_start.getNumericValue())
+			return this._generateErrorResponse(WINDOW_TOO_SMALL, "WINDOW_TOO_SMALL", task);
+		if(this._checkDependencyConflict(task, windowTimes.window_start, windowTimes.window_end))
+			return this._generateErrorResponse(CONFLICTING_DEPENDENCIES, "CONFLICTING_DEPENDENCIES", task);
+
+		this.loggerUtil.logDebug("Window start after dependency check: " + windowTimes.window_start.getDisplayValue() + ": Window end after dependency check:" + windowTimes.window_end.getDisplayValue());
+
+		var qualAgents = this._filterAgentsWithNoLocation();
+		if(!qualAgents || qualAgents.length == 0)
+			return this._generateErrorResponse(NO_RESOURCE_AVAILABLE, "NO_RESOURCE_AVAILABLE", task);
+
+		this.loggerUtil.logUsers(this.agentInfo, qualAgents, "Qualifying agents: ");
+
+		//var allWorkBlocks = this._getWorkBlocks(qualAgents, windowTimes.window_start, windowTimes.window_end, task, this.workDuration);
+		//var workBlocks = allWorkBlocks.workBlocks;
+		//var unAssignWorkBlocks = allWorkBlocks.unAssignWorkBlocks;
+		
+		//Check if any blackout window applies to this task
+		var taskExclusions = this._getExclusionsFromConfig(task, "", "task");
+		
+		var workBlockResponse = null;
+		var bestWorkBlocks ={};
+		if(gs.nil(skipQualificationAndOptWithoutUnassign) || skipQualificationAndOptWithoutUnassign == false){
+		    bestWorkBlocks = this.optimization.process(task, qualAgents, windowTimes.window_start, windowTimes.window_end, this.overallRating, taskExclusions, this.agentInfo, this.loggerUtil);
+		}
+		if(Object.keys(bestWorkBlocks).length == 0 &amp;&amp; this.config.unAssign &amp;&amp; this.config.unAssignData) {
+			 if(JSUtil.notNil(this.config.unAssignData[task.getValue("sys_id")]) &amp;&amp; (Object.keys(this.config.unAssignData[task.getValue("sys_id")]).length &gt; 0)){
+				
+				bestWorkBlocks = this.optimization.process(task, qualAgents, windowTimes.window_start, windowTimes.window_end, this.overallRating, taskExclusions, this.agentInfo, this.loggerUtil, this.config.unAssign, this.config.unAssignData);
+				workBlockResponse = this._getResponseFromWorkBlocks(task, bestWorkBlocks);
+				this.optimization.clearUnassignmentData();
+				if(workBlockResponse.success) {
+					var suggestedResources = workBlockResponse.suggestedResources;
+					if(suggestedResources.length &gt; 0) {
+						for(var i=0;i &lt; suggestedResources.length;i++){
+							var suggestedResource = suggestedResources[i];
+							var unAssignData = this.config.unAssignData[task.getValue("sys_id")];
+							for(var unAssignableTask in unAssignData){
+								if(unAssignData[unAssignableTask].assigned_to != suggestedResource.agentID)
+									continue;
+									if((unAssignData[unAssignableTask].expected_travel_start.getNumericValue() &gt;= suggestedResource.workBlock.travelStart.getNumericValue() 
+										&amp;&amp; unAssignData[unAssignableTask].expected_travel_start.getNumericValue() &lt; suggestedResource.workBlock.spanEnd.getNumericValue()) ||
+										(unAssignData[unAssignableTask].estimated_end.getNumericValue() &gt; suggestedResource.workBlock.travelStart.getNumericValue() 
+										&amp;&amp; unAssignData[unAssignableTask].estimated_end.getNumericValue() &lt;= suggestedResource.workBlock.spanEnd.getNumericValue()) ||
+										(unAssignData[unAssignableTask].expected_travel_start.getNumericValue() &lt; suggestedResource.workBlock.travelStart.getNumericValue() 
+										&amp;&amp; unAssignData[unAssignableTask].estimated_end.getNumericValue() &gt;= suggestedResource.workBlock.spanEnd.getNumericValue())) {
+
+										if(!workBlockResponse.suggestedResources[i].unAssignedTask)
+											workBlockResponse.suggestedResources[i].unAssignedTask = [];	
+										workBlockResponse.suggestedResources[i].unAssignedTask.push(unAssignableTask);
+									}
+							}
+						} 
+					}
+				}
+			}
+			else {
+				workBlockResponse = this._getResponseFromWorkBlocks(task, bestWorkBlocks);	
+			}
+		}
+		else {
+			workBlockResponse = this._getResponseFromWorkBlocks(task, bestWorkBlocks);	
+		}
+		
+		return workBlockResponse;
+	},
+
+	checkAgentAvailability: function(task, candidates) {
+		//TODO: duplicate code exists, considered tech debt and need to be cleaned up in future release
+		var windowTimes = this._initWindow(task);
+		
+		this.loggerUtil.logDebug("Window start: " + windowTimes.window_start + ": Window end:" + windowTimes.window_end);
+
+		if (windowTimes.window_start.compareTo(windowTimes.window_end) &gt; 0  || windowTimes.window_end.compareTo(new GlideDateTime(GlideSystemDateUtil.nowNoTZ())) &lt; 0)
+			return this._generateErrorResponse(WINDOW_END_PAST, "WINDOW_END_PAST", task);
+		if (this.workDuration &gt; windowTimes.window_end.getNumericValue() - windowTimes.window_start.getNumericValue())
+			return this._generateErrorResponse(WINDOW_TOO_SMALL, "WINDOW_TOO_SMALL", task);
+		if(this._checkDependencyConflict(task, windowTimes.window_start, windowTimes.window_end))
+			return this._generateErrorResponse(CONFLICTING_DEPENDENCIES, "CONFLICTING_DEPENDENCIES", task);
+
+		this.loggerUtil.logDebug("Window start after dependency check: " + windowTimes.window_start + ": Window end after dependency check:" + windowTimes.window_end);
+
+		//check agents location
+		var qualifiedAgents = [];
+		var userGR = new GlideRecord('sys_user');
+		userGR.addQuery('sys_id', "IN", candidates);
+		userGR.addEncodedQuery('locationISNOTEMPTY^location.longitudeISNOTEMPTY^location.latitudeISNOTEMPTY');
+		userGR.query();
+		while (userGR.next()) {
+			 qualifiedAgents.push(String(userGR.sys_id)); 
+		}
+	
+		if(!qualifiedAgents || qualifiedAgents.length == 0) {
+			return this._generateErrorResponse(NO_RESOURCE_AVAILABLE, "NO_RESOURCE_AVAILABLE", task);
+		}
+ 		this.loggerUtil.logUsers(this.agentInfo, qualifiedAgents, "Qualifying agents for Availability Check: ");
+		
+		//Check if any blackout window applies to this task
+		var taskExclusions = this._getExclusionsFromConfig(task, "", "task");
+		
+		var workBlockResponse = null;
+		var findBlocks = this.optimization.checkAgentAvail(task, qualifiedAgents, windowTimes.window_start, windowTimes.window_end, this.overallRating, taskExclusions, this.agentInfo, this.loggerUtil);
+		
+		if (findBlocks) {
+			return true;
+		}
+		
+		if(!findBlocks &amp;&amp; this.config.unAssign &amp;&amp; this.config.unAssignData) {			 
+			if(JSUtil.notNil(this.config.unAssignData[task.getValue("sys_id")]) 
+				&amp;&amp;(Object.keys(this.config.unAssignData[task.getValue("sys_id")]).length &gt; 0)){
+				
+				var findBlocksUnAssign = this.optimization.checkAgentAvail(task, qualifiedAgents, windowTimes.window_start, windowTimes.window_end, this.overallRating, taskExclusions, this.agentInfo, this.loggerUtil, this.config.unAssign, this.config.unAssignData);
+				if (findBlocksUnAssign) {
+					return true;
+				}
+			}
+		}
+		return false;
+	},
+
+	_sortObjectMapOnField : function (map, fieldName, desc) {
+		var tuples = [];
+
+		for (var key in map) tuples.push([key, map[key]]);
+
+		tuples.sort(function(a, b) {
+		    a = a[1];
+		    b = b[1];
+
+		    if(a[fieldName] &lt; b[fieldName])
+		    	return ((desc) ? 1 : -1);
+
+		    if(a[fieldName] &gt; b[fieldName])
+		    	return ((desc) ? -1 : 1);
+
+		    return 0;
+		});
+
+		var sortedKeys = [];
+
+		for (var i = 0; i &lt; tuples.length; i++) {
+		    var key = tuples[i][0];
+			sortedKeys.push(key);
+		}
+		return sortedKeys;
+	},
+	
+	_getExclusionsFromConfig : function(task, agent, mode) {
+		var exclusions = [];
+		
+		var exclusionTimeSpans = this.config.exclusionTimeSpans;
+		if (JSUtil.notNil(exclusionTimeSpans)) {
+			if(!JSUtil.nil(exclusionTimeSpans.agents) &amp;&amp; mode == "agent"){
+				var exclusionTimeSpansForAgent = exclusionTimeSpans.agents[agent];
+				if (JSUtil.notNil(exclusionTimeSpansForAgent)) {
+					for(var i = 0; i &lt; exclusionTimeSpansForAgent.length; i++){
+						var start_date = new GlideScheduleDateTime(exclusionTimeSpansForAgent[i].startTime);
+						var end_date = new GlideScheduleDateTime(exclusionTimeSpansForAgent[i].endTime);
+						if (JSUtil.notNil(start_date) &amp;&amp; JSUtil.notNil(end_date)){ 
+							var exclusionTimeSpan = new GlideScheduleDateTimeSpan(start_date, end_date);
+							exclusions.push(exclusionTimeSpan);
+						}
+					} 
+					
+				}	
+			}
+			if(!JSUtil.nil(exclusionTimeSpans.tasks) &amp;&amp; mode == "task"){
+				var exclusionTimeSpansForTasks = exclusionTimeSpans.tasks[task.sys_id];
+				if (JSUtil.notNil(exclusionTimeSpansForTasks)) {
+					for(var i = 0; i &lt; exclusionTimeSpansForTasks.length; i++){
+						var start_date = new GlideScheduleDateTime(exclusionTimeSpansForTasks[i].startTime);
+						var end_date = new GlideScheduleDateTime(exclusionTimeSpansForTasks[i].endTime);
+						if (JSUtil.notNil(start_date) &amp;&amp; JSUtil.notNil(end_date)){ 
+							var exclusionTimeSpan = new GlideScheduleDateTimeSpan(start_date, end_date);
+							exclusions.push(exclusionTimeSpan);
+						}
+					}
+				}	
+			}
+		}
+		return exclusions;
+	},
+
+	_filterAgentsWithNoLocation : function() {
+		var qualAgents = [];
+		for (var agent in this.overallRating) {
+			var agentInfoObj = this.agentInfo[agent];
+			if(agentInfoObj.location &amp;&amp; !JSUtil.nil(agentInfoObj.location.latitude) &amp;&amp; !JSUtil.nil(agentInfoObj.location.longitude)) {
+				agentInfoObj.location.latitude = Number(agentInfoObj.location.latitude);
+				agentInfoObj.location.longitude = Number(agentInfoObj.location.longitude);
+				qualAgents.push(agent);
+			}
+				
+		};
+		return qualAgents;
+	},
+	
+	_checkDependencyConflict : function(task, start, end) {
+		var dependsOn = new GlideRecord("sm_m2m_task_dependency");
+		
+		if (dependsOn.isValid()) {
+			var upstreamMap = {};
+			dependsOn.addQuery("downstream_task", task.getValue("sys_id"));
+			//dependsOn.addQuery("upstream_task.state", "IN", "16,17,18");
+			dependsOn.orderByDesc("upstream_task.estimated_end");
+			dependsOn.setCategory('field_service');
+			dependsOn.query();
+			while (dependsOn.next()) {
+				var upstreamTask = new GlideRecord("sm_task");
+				upstreamTask.get(dependsOn.getValue("upstream_task"));
+				
+				var taskObj = {};
+				taskObj.sys_id = dependsOn.getValue("upstream_task");
+				var estEnd = upstreamTask.getValue("estimated_end");
+				if(JSUtil.nil(estEnd)){
+					taskObj.estimated_end = -1;	
+				}
+				else {
+					var taskEnd = new GlideDateTime(estEnd);
+				 	taskObj.estimated_end= taskEnd.getNumericValue();	
+				}
+				
+				taskObj.assigned_to = upstreamTask.getValue("assigned_to");
+				taskObj.state = upstreamTask.getValue("state");
+				upstreamMap[taskObj.sys_id] = taskObj;
+			}
+
+			if(this.config.bulkTaskUpdates){
+				for(var bulkTask in this.config.bulkTaskUpdates) {
+					var beforeTask = this.config.bulkTaskUpdates[bulkTask];
+					if(bulkTask in upstreamMap) {
+						var taskObj = {};
+						taskObj.sys_id = bulkTask;
+						var gdt = new GlideDateTime();
+						if(beforeTask.taskUpdates &amp;&amp; JSUtil.notNil(beforeTask.taskUpdates["estimated_end"]) &amp;&amp; JSUtil.notNil(beforeTask.taskUpdates["assigned_to"])) {
+							gdt.setDisplayValue(beforeTask.taskUpdates["estimated_end"]);
+						}
+						else {
+							gdt.setValue(beforeTask.glideRecord.getValue("estimated_end"));
+						}
+						taskObj.estimated_end =  gdt.getNumericValue();
+						taskObj.assigned_to = beforeTask.taskUpdates["assigned_to"];
+						if(JSUtil.nil(taskObj.assigned_to))
+							taskObj.state = "10";
+						else
+							taskObj.state = "16";
+						upstreamMap[taskObj.sys_id] = taskObj;	
+					}
+					
+				}
+			}
+
+			var upstreamTasks = this._sortObjectMapOnField(upstreamMap, "estimated_end", true);
+			var upstreamTask = null;
+			if(upstreamTasks &amp;&amp; upstreamTasks.length &gt; 0) {
+				upstreamTask = upstreamMap[upstreamTasks.shift()];
+				while(upstreamTask &amp;&amp; (JSUtil.nil(upstreamTask.assigned_to) ||  upstreamTask.estimated_end == -1))
+					upstreamTask = upstreamMap[upstreamTasks.shift()];
+			}
+			if(upstreamTask){
+				if (start.getNumericValue() &lt; upstreamTask.estimated_end)
+					start.setNumericValue(upstreamTask.estimated_end);
+			}
+
+			var downstreamMap = {};
+			var dependents = new GlideRecord("sm_m2m_task_dependency");
+			dependents.addQuery("upstream_task", task.getValue("sys_id"));
+			//dependents.addQuery("downstream_task.state", "IN", "16,17,18");
+			dependents.orderBy("downstream_task.expected_start");
+			dependents.setCategory('field_service');
+			dependents.query();
+			if (dependents.next()) {
+				var downstreamTask = new GlideRecord("sm_task");
+				downstreamTask.get(dependents.getValue("downstream_task"));
+				var taskObj = {};
+				taskObj.sys_id = dependents.getValue("downstream_task");
+				
+				var estStart = downstreamTask.getValue("expected_start");
+				if(JSUtil.nil(estStart)){
+					taskObj.expected_start = -1;	
+				}
+				else {
+					var taskStart = new GlideDateTime(estStart);
+				 	taskObj.expected_start= taskStart.getNumericValue();	
+				}
+				
+				taskObj.assigned_to = downstreamTask.getValue("assigned_to");
+				taskObj.state = downstreamTask.getValue("state");
+				downstreamMap[taskObj.sys_id] = taskObj;
+			}
+			if(this.config.bulkTaskUpdates){
+				for(var bulkTask in this.config.bulkTaskUpdates) {
+					var afterTask = this.config.bulkTaskUpdates[bulkTask];
+					if(bulkTask in downstreamMap) {
+						var taskObj = {};	
+						taskObj.sys_id = bulkTask;
+						var gdt = new GlideDateTime();
+						if(afterTask.taskUpdates &amp;&amp; JSUtil.notNil(afterTask.taskUpdates["expected_start"]) &amp;&amp; JSUtil.notNil(afterTask.taskUpdates["assigned_to"])){
+							gdt.setDisplayValue(afterTask.taskUpdates["expected_start"]);
+						}
+						else {
+							gdt.setValue(afterTask.glideRecord.getValue("expected_start"));
+						}
+						taskObj.expected_start =  gdt.getNumericValue();
+						taskObj.assigned_to = afterTask.taskUpdates["assigned_to"];
+						if(JSUtil.nil(taskObj.assigned_to))
+							taskObj.state = "10";
+						else
+							taskObj.state = "16";
+						downstreamMap[taskObj.sys_id] = taskObj;	
+					}
+					
+				}
+			}
+
+			var downstreamTasks = this._sortObjectMapOnField(downstreamMap, "expected_start");
+			var downstreamTask = null;
+			if(downstreamTasks &amp;&amp; downstreamTasks.length &gt; 0) {
+				downstreamTask = downstreamMap[downstreamTasks.shift()];
+				while(downstreamTask &amp;&amp; (JSUtil.nil(downstreamTask.assigned_to) ||  downstreamTask.expected_start == -1))
+					downstreamTask = downstreamMap[downstreamTasks.shift()];
+			}
+			if(downstreamTask){
+				if (end.getNumericValue() &gt; downstreamTask.expected_start)
+					end.setNumericValue(downstreamTask.expected_start);	
+			}
+			
+		}
+		
+		return ((end.getNumericValue() - start.getNumericValue()) &lt; this.workDuration);
+	},
+
+	_initWindow : function(task) {
+		var windowTimes = this.dynamicSchedulingAgentRecommendationUtil.initWindow(task);
+		return windowTimes;
+	},
+
+	_sortedCandidatesFromOverallRating : function(overallRating){
+		
+		var overallMap = overallRating;
+		
+		var tuples = [];
+		for (var user in overallMap){
+			tuples.push([user, overallMap[user]]);
+		}
+		tuples.sort(function(a, b) {
+		    a = a[1];
+		    b = b[1];
+		
+		    return a &lt; b ? 1 : (a &gt; b ? -1 : 0);
+		});
+		var returnUsers = [];
+		for (var i = 0; i &lt; tuples.length; i++) {
+		    var key = tuples[i][0];
+		    var value = tuples[i][1];
+			returnUsers.push(key);
+		}
+		return returnUsers;
+	},
+	
+	
+	_noScheduleRecommendation : function(candidates, task) {
+		var ignoreTravelTimeCalculation = false;
+		if (task) {
+			ignoreTravelTimeCalculation = true;
+			var windowTimes = this._initWindow(task);
+			if (windowTimes.window_start.compareTo(windowTimes.window_end) &gt; 0  || windowTimes.window_end.compareTo(new GlideDateTime(GlideSystemDateUtil.nowNoTZ())) &lt; 0)
+ 			    return this._generateErrorResponse(WINDOW_END_PAST, "WINDOW_END_PAST", task);
+ 			if (this.workDuration &gt; windowTimes.window_end.getNumericValue() - windowTimes.window_start.getNumericValue())
+ 			    return this._generateErrorResponse(WINDOW_TOO_SMALL, "WINDOW_TOO_SMALL", task);
+ 			if(this._checkDependencyConflict(task, windowTimes.window_start, windowTimes.window_end))
+ 			   return this._generateErrorResponse(CONFLICTING_DEPENDENCIES, "CONFLICTING_DEPENDENCIES", task);
+		}
+		if(Object.keys(this.overallRating).length == 0)
+			return this._generateErrorResponse(NO_RESOURCE_AVAILABLE, "NO_RESOURCE_AVAILABLE", this.current);
+		
+		var sortedUsers = this._sortedCandidatesFromOverallRating(this.overallRating);
+		
+		var response = this.resourceEntity._noScheduleRecommendation(candidates, task, sortedUsers, this.overallRating, ignoreTravelTimeCalculation, windowTimes);
+		return response;
+	},
+	
+	_initConfig : function(task, smConfig, configObj) {
+		this.config = this.dynamicSchedulingAgentRecommendationUtil.addServiceConfiguration(task, smConfig, configObj, this.propertyPrefix);
+	},
+
+	_getIntProperty : function (propertySuffix, defaultValue, min, max) {
+        return this.dynamicSchedulingAgentRecommendationUtil.getIntProperty(propertySuffix, defaultValue, min, max, this.propertyPrefix);
+	},
+
+	_getBooleanProperty : function (propertySuffix, defaultValue) {
+        var property = this.propertyPrefix + propertySuffix;
+		
+		var ret = GlideProperties.getBoolean(property, defaultValue);
+		
+		return ret;
+	},
+
+	_getStringProperty: function(propertyPrefix, propertySuffix, defaultValue) {
+        var property = propertyPrefix + propertySuffix;
+        var ret = GlideProperties.get(property, defaultValue);
+        return ret;
+    },
+
+	_getUseSkillsProperty : function(value) {
+		this.dynamicSchedulingAgentRecommendationUtil.getUseSkillsProperty(value);
+	},
+	
+	_getQueryRowCount: function(tableName, filterQuery) {
+		var count = new GlideAggregate(tableName);
+		count.addAggregate('COUNT');
+		if(filterQuery &amp;&amp; filterQuery.length != 0)
+			count.addEncodedQuery(filterQuery);
+		count.query();
+		if(count.next()) 
+			return count.getAggregate('COUNT');
+		return 0;
+	},
+	
+    type: 'DynamicSchedulingAgentRecommendationNew'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2017-03-14 21:20:08&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;066437bcc32132001c845cb981d3ae3d&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;78&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;DynamicSchedulingAgentRecommendationNew&lt;/sys_name&gt;
+        &lt;sys_package display_value="Dynamic Scheduling" source="com.snc.dynamic_scheduling"&gt;88cb5ebf4722c210cd4e1ce4316d43f3&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_066437bcc32132001c845cb981d3ae3d&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-06 15:14:03&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:22</sys_created_on>
+        <sys_id>db40fc5583b01210c6695855eeaad3c3</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>DynamicSchedulingAgentRecommendationNew</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_db40fc5583b01210c6695855eeaad3c3</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:22</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

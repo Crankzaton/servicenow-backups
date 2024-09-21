@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1e9e356c87e2030087542fb5e8cb0b37</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.ResourcePlanRequest&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;ResourcePlanRequest&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ResourcePlanRequest = Class.create();
+ResourcePlanRequest.prototype = {
+    initialize: function(gr, usersCapacityDetails, updateFromRequestedAllocations) { //gr is ResourcePlan
+		this.gr = gr;
+		this.rmRates = new RMRates(this.gr);
+		if(JSUtil.nil(updateFromRequestedAllocations)) {
+			this._setUsersCapacityDetails(this.gr.start_date.getGlideObject(), this.gr.end_date.getGlideObject(), usersCapacityDetails);
+			if(!usersCapacityDetails)
+				usersCapacityDetails = this.usersCapacityDetails;
+			this.rpSchedule = new ResourcePlanSchedule(this.gr, '','','', usersCapacityDetails);
+			this.dailyAllocator = new ResourcePlanDailyAllocator(this.gr, this.rpSchedule);
+		}
+		this.taskGR = gr.task.getRefRecord();
+		this.taskType = RMMultiCurrencyUtil.getTaskType(this.taskGR);
+		this.needToUpdateTaskCurrFields = RMMultiCurrencyUtil.isMultiCurrencyEnabled() &amp;&amp; JSUtil.notNil(this.taskType);
+		this.totalReqCostInTaskCurr = 0;
+    },
+	
+	planRequested: function() {
+		var reqAllocations = [];
+		var currency = ResourceManagementUtils.getGlobalCurrencyCode(this.gr.planned_cost.getReferenceCurrencyCode());
+		var dailyRate = this.rmRates.getDailyRatesForPlan();
+		var allocator = new ResourcePlanAllocator(this.gr);
+		allocator.setRpSchedule(this.rpSchedule);
+		if(this.gr.getValue('plan_type') === 'operational_work')
+			allocator.setUsersCapacityDetails(this.usersCapacityDetails);
+		reqAllocations = allocator.createAllocations();
+		
+		var plannedCost = 0;
+		var plannedHours = 0;
+		reqAllocations.forEach(function(reqAllocation) {
+            var reqAllocId = RequestedAllocation.create(reqAllocation);
+			var reqAlloc = new GlideRecord('requested_allocation');
+			reqAlloc.get(reqAllocId);
+			var requestedCost = this.updateRequest(reqAlloc, currency, dailyRate);
+			plannedCost += parseFloat(requestedCost);
+			plannedHours += Number(reqAlloc.getValue('requested_hours'));
+        }, this);
+		
+		if(this.gr.getValue('request_type') === 'percent_capacity' &amp;&amp; this.gr.getValue('planned_hours') != plannedHours) {
+			this._updateResourcePlanHours(plannedHours);
+		}
+		var resPlan = new GlideRecord('resource_plan');
+		resPlan.get(this.gr.getValue('sys_id'));
+		resPlan.planned_cost = currency + ';' + plannedCost;
+		if(this.needToUpdateTaskCurrFields){
+			resPlan['planned_cost_'+this.taskType+'_currency']['amount'] = this.totalReqCostInTaskCurr;
+			resPlan['planned_cost_'+this.taskType+'_currency']['currency'] = resPlan[this.taskType+'_currency']['code'];
+		}
+    resPlan.update();
+	},
+	
+	updateRequest: function(reqAlloc, currency, dailyRate) {
+		var dailies = this.dailyAllocator.createDailyAllocations(reqAlloc, dailyRate);
+		var cost = 0;
+
+		dailies.forEach(function(daily) {
+            cost += parseFloat(daily['cost']);
+            RequestedAllocationDaily.create(daily, currency);
+        });
+		reqAlloc.requested_cost = currency + ';' + cost;
+		this.totalReqCostInTaskCurr += RMMultiCurrencyUtil.setPlannedCostInTaskCurr(this.taskGR,reqAlloc,cost);
+		reqAlloc.setWorkflow(false);
+		reqAlloc.update();
+		return cost;
+	},
+	
+	refreshDailies: function (reqAlloc) {
+		this._setUsersCapacityDetails(reqAlloc.start_date.getGlideObject(), reqAlloc.end_date.getGlideObject());
+		this.rpSchedule = new ResourcePlanSchedule(this.gr, reqAlloc.getValue('start_date'), reqAlloc.getValue('end_date'), reqAlloc.getValue('requested_hours'));
+		this.dailyAllocator = new ResourcePlanDailyAllocator(this.gr, this.rpSchedule);
+		var resPlan = new ResourcePlan(this.gr);
+        var currency = ResourceManagementUtils.getGlobalCurrencyCode(this.gr.planned_cost.getReferenceCurrencyCode());
+		var dailyRate = this.rmRates.getDailyRatesForPlan(reqAlloc.getValue('start_date'), reqAlloc.getValue('end_date'));
+		var resPlanLogHelper = new ResourcePlanLogHelper(this.gr);
+        RequestedAllocationDaily.deleteDailies(reqAlloc);
+        this.updateRequest(reqAlloc,currency, dailyRate);
+
+		if(this.gr.getValue('state') == ResourcePlanState.PLANNING || this.gr.getValue('state') == ResourcePlanState.REQUESTED) {
+			if(this.gr.start_date.getGlideObject().getNumericValue() &gt; reqAlloc.start_date.getGlideObject().getNumericValue())
+				resPlan.setValue('start_date', reqAlloc.getValue('start_date'));
+			if(this.gr.end_date.getGlideObject().getNumericValue() &lt; reqAlloc.end_date.getGlideObject().getNumericValue())
+				resPlan.setValue('end_date', reqAlloc.getValue('end_date'));
+		}
+		resPlanLogHelper.populateLogs({'type':'requestedHoursUpdated','fromDate': reqAlloc.start_date.getGlideObject(), 'toDate': reqAlloc.end_date.getGlideObject(), 'requested_hours':reqAlloc.requested_hours});
+		resPlan.updatePlannedHoursAndCost('requested_allocation');
+    },
+	
+	plannedHoursUpdated: function(){
+        var reqAllocations = [];
+        var reqAlloc = new GlideRecord('requested_allocation');
+        var currency = ResourceManagementUtils.getGlobalCurrencyCode(this.gr.planned_cost.getReferenceCurrencyCode());
+		var dailyRate = this.rmRates.getDailyRatesForPlan();
+        var allocator = new ResourcePlanAllocator(this.gr);
+		allocator.setRpSchedule(this.rpSchedule);
+		if(this.gr.getValue('plan_type') === 'operational_work') {
+			allocator.setUsersCapacityDetails(this.usersCapacityDetails);
+		}
+        reqAllocations = allocator.createAllocations();
+        var exsistingReqAlloc = RequestedAllocation.find(this.gr.sys_id);
+		var plannedHours = 0;
+        ResourceManagementUtils.wrapWithSysId(reqAllocations,exsistingReqAlloc).forEach(function(reqAllocation){
+            RequestedAllocation.update(reqAllocation);
+            reqAlloc.get(reqAllocation.sys_id);
+            RequestedAllocationDaily.deleteDailies(reqAlloc);
+            this.updateRequest(reqAlloc,currency, dailyRate);
+			plannedHours += Number(reqAlloc.getValue('requested_hours'));
+        },this);
+		if(this.gr.getValue('planned_hours') != plannedHours) {
+			this._updateResourcePlanHours(plannedHours);
+		}
+		var currencyCode = ResourceManagementUtils.getGlobalCurrencyCode(this.gr.planned_cost.getReferenceCurrencyCode());
+		var resPlan = new ResourcePlan();
+		resPlan.get(this.gr.getValue('sys_id'));
+		resPlan.updatePlannedCost('requested_allocation', currencyCode);
+    },
+	
+	_setUsersCapacityDetails: function(startDate, endDate, usersCapacityDetails) {
+		if(this.gr.getValue('plan_type') === 'operational_work') {
+			if(typeof usersCapacityDetails != 'undefined' &amp;&amp; Object.keys(usersCapacityDetails).length != 0)
+				this.usersCapacityDetails = usersCapacityDetails; 
+			else {
+				var capacityObj = ResourceManagementUtils.getUsersCapacityForOperationalPlan(this.gr, startDate, endDate);
+ 				if(this.gr.getValue('request_type') == 'percent_capacity')
+ 					ResourceManagementUtils.fetchUserBasedPercentageCapacity(capacityObj.capacityDetails,this.gr.getValue('percent_capacity'));
+				this.usersCapacityDetails = capacityObj.capacityDetails;
+			}	
+		}
+	},
+	
+	_updateResourcePlanHours: function(plannedHours) {
+		var resPlan = new GlideRecord('resource_plan');
+		resPlan.get(this.gr.getValue('sys_id'));
+		resPlan.setValue('planned_hours', plannedHours);
+		resPlan.setWorkflow(false);
+		resPlan.update();
+	},
+	
+    type: 'ResourcePlanRequest'
+};
+
+]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2017-11-17 07:23:03&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1e9e356c87e2030087542fb5e8cb0b37&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;194&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ResourcePlanRequest&lt;/sys_name&gt;
+        &lt;sys_package display_value="Resource Management" source="com.snc.resource_management"&gt;7200da2b47e64210cd4e1ce4316d438e&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1e9e356c87e2030087542fb5e8cb0b37&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-03-10 13:05:07&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:39</sys_created_on>
+        <sys_id>74d0781983b01210c6695855eeaad3b4</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ResourcePlanRequest</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_74d0781983b01210c6695855eeaad3b4</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:39</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

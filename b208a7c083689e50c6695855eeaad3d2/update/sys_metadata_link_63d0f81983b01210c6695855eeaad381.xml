@@ -1,0 +1,196 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>2036633f4d757510f877001a8147fb00</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.IHUsageTrackerUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Compute IH usage tracking data - DEFN1001327&lt;/description&gt;
+        &lt;name&gt;IHUsageTrackerUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var IHUsageTrackerUtil = Class.create();
+IHUsageTrackerUtil.prototype = {
+    initialize: function() {
+        this.INTEGRATION_HUB_POOL = "IntegrationHubPool";
+        this.LIC_MONTHLY_DEFN_ID = "LICIHM";
+        this.IH_ROLLING_BORROWED = "IH rolling borrowed";
+        this.IH_ROLLING_CONTRIBUTED = "IH rolling contributed";
+        this.IH_ROLLING_USAGE = "IH rolling usage";
+        this.BORROWED = "borrowed";
+        this.CONTRIBUTED = "contributed";
+        this.USAGE = "Usage";
+
+        this.USAGEANALYTICS_COUNT = "usageanalytics_count";
+        this.UA_IH_USAGE = "ua_ih_usage";
+        this.UA_IH = "ua_ih";
+        this.KEY_DEFINITION_ID = "definition_id";
+        this.KEY_TIMESTAMP = "time_stamp";
+        this.KEY_TIMESTAMP = "time_stamp";
+        this.LICENSE_ID = "license_id";
+        this.PURCHASED = "purchased";
+        this.SUM = "SUM";
+        this.COUNT = "count";
+        this.USE_COUNT = "use_count";
+    },
+
+    /**
+     * To be used only with SMv2 and IHv2 data to calculate and track IH usage
+     */
+    generateIHUsageCount: function() {
+        return this._createIhUsageInfo();
+    },
+
+    _createIhUsageInfo: function() {
+        var totalBorrowedFromPool = 0;
+        var totalBorrowedFromPoolCumulative = 0;
+        var retJsonObj = {};
+        retJsonObj[this.COUNT] = 0;
+
+        var last12Month = SNC.UsageAnalyticsScriptUtils.getLast12MonthAccrualTimeStamp();
+        var last11Month = last12Month.substring(0, last12Month.lastIndexOf(','));
+
+        var genericSku; // no longer supported
+        var poolSku = this._getIHPoolSubscriptionDetails(); //get from cache
+
+        var self = this;
+
+        genericSku.forEach(function(ihBuSkuItem) {
+            var genericSkuObjDetails = {};
+
+            var licId = ihBuSkuItem.subscription_identifier; //data from cache
+            var purchased = ihBuSkuItem.purchased_count; //data from cache
+
+            try {
+                genericSkuObjDetails[self.LICENSE_ID] = licId;
+                genericSkuObjDetails[self.PURCHASED] = Number(purchased);
+
+                var monthDefn = self.LIC_MONTHLY_DEFN_ID + licId;
+
+                var totalUsage = self.getLicenseTotalUsageCurrentMonth(licId) + self.getIHTotalUseInRollingPeriod(monthDefn, last11Month);
+
+                var borrowed = 0;
+                if (purchased &lt; totalUsage)
+                    borrowed = Math.abs(totalUsage - purchased);
+
+                totalBorrowedFromPool += borrowed;
+
+                var total12MonthUsage = self.getIHTotalUseInRollingPeriod(monthDefn, last12Month);
+                var borrowedCumulative = 0;
+
+                if (purchased &lt; total12MonthUsage)
+                    borrowedCumulative = Math.abs(total12MonthUsage - purchased);
+
+                totalBorrowedFromPoolCumulative += borrowedCumulative;
+
+                genericSkuObjDetails[self.IH_ROLLING_BORROWED] = borrowedCumulative;
+                genericSkuObjDetails[self.IH_ROLLING_USAGE] = total12MonthUsage;
+                genericSkuObjDetails[self.BORROWED] = borrowed;
+                genericSkuObjDetails[self.USAGE] = totalUsage;
+
+                retJsonObj[licId] = genericSkuObjDetails;
+            } catch (error) {
+                gs.error("UA IH defn failed for : " + licId);
+            }
+        });
+
+        poolSku.forEach(function(poolSkuItem) {
+            var poolSkuObjDetails = {};
+
+            var licId = poolSkuItem.subscription_identifier;
+            var purchased = poolSkuItem.purchased_count;
+
+            try {
+                poolSkuObjDetails[self.LICENSE_ID] = licId;
+                poolSkuObjDetails[self.PURCHASED] = Number(purchased);
+
+                var monthDefn = self.LIC_MONTHLY_DEFN_ID + licId;
+                var totalUsage = self.getLicenseTotalUsageCurrentMonth(licId) + self.getIHTotalUseInRollingPeriod(monthDefn, last11Month);
+                var total12MonthUsage = self.getIHTotalUseInRollingPeriod(monthDefn, last12Month);
+
+                poolSkuObjDetails[self.IH_ROLLING_CONTRIBUTED] = totalBorrowedFromPoolCumulative;
+                poolSkuObjDetails[self.IH_ROLLING_USAGE] = total12MonthUsage;
+                poolSkuObjDetails[self.CONTRIBUTED] = totalBorrowedFromPool;
+                poolSkuObjDetails[self.USAGE] = totalUsage;
+
+                retJsonObj[licId] = poolSkuObjDetails;
+            } catch (error) {
+                gs.error("UA IH defn failed for : " + licId);
+            }
+        });
+        return JSON.stringify(retJsonObj);
+    },
+
+    _getIHPoolSubscriptionDetails: function() {
+        var entitlementService = new sn_entitlement.SubscriptionEntitlementsService();
+        var IhPoolSubscriptions = entitlementService.getEntitlementDetails(this.INTEGRATION_HUB_POOL);
+        return IhPoolSubscriptions;
+    },
+
+    getLicenseTotalUsageCurrentMonth: function(licId) {
+        return this.getIHTotalUseInMonth(licId, SNC.UsageAnalyticsScriptUtils.getAccrualTimeStamp(this.UA_IH));
+    },
+
+    getIHTotalUseInMonth: function(licId, accrualPeriod) {
+        var gr = new GlideAggregate(this.UA_IH_USAGE);
+        gr.addQuery(this.LICENSE_ID, licId);
+        gr.addQuery(this.KEY_TIMESTAMP, accrualPeriod);
+        gr.addAggregate(this.SUM, this.USE_COUNT);
+        gr.groupBy(this.LICENSE_ID);
+        gr.query();
+
+        var totalCount = 0;
+        if (gr.next())
+            totalCount = Number(gr.getAggregate(this.SUM, this.USE_COUNT));
+
+        return totalCount;
+    },
+
+    getIHTotalUseInRollingPeriod: function(defID, accrualPeriods) {
+        var grCount = new GlideAggregate(this.USAGEANALYTICS_COUNT);
+        grCount.addQuery(this.KEY_TIMESTAMP, 'IN', accrualPeriods);
+        grCount.addQuery(this.KEY_DEFINITION_ID, defID);
+        grCount.addAggregate(this.SUM, this.COUNT);
+        grCount.query();
+
+        var totalLastYear = 0;
+        while (grCount.next())
+            totalLastYear += Number(grCount.getAggregate(this.SUM, this.COUNT));
+
+        return totalLastYear;
+    },
+
+    type: 'IHUsageTrackerUtil'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;maint&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-10-17 17:03:44&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;2036633f4d757510f877001a8147fb00&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;1&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;IHUsageTrackerUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Licensing Engine Core" source="com.glide.licensing_engine"&gt;3a09d31f47220210cd4e1ce4316d4327&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_2036633f4d757510f877001a8147fb00&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;maint&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-10-18 22:53:32&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:50</sys_created_on>
+        <sys_id>63d0f81983b01210c6695855eeaad381</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>IHUsageTrackerUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_63d0f81983b01210c6695855eeaad381</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:50</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,253 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules">
+    <x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection/>
+        <condition>!(('FSMConditions' in global) &amp;&amp; new FSMConditions().checkScheduleOptimizationCondition(current))</condition>
+        <description/>
+        <execute_function>true</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>ValidateChanges</name>
+        <order>200</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[function onBefore(current, previous) {
+
+    var ss = new SharedServiceUtils();
+    var sc = new sn_sm.SMConfiguration();
+    var crewSchedulingActive = GlidePluginManager.isActive('com.snc.fsm_crew_scheduling');
+
+ var territoryActiveWM = isTerritoryActiveforFSM();
+ 
+ if(current.state == SMConstants.TASK_PENDING_DISPATCH && territoryActiveWM && current.territory.nil() && current.sys_class_name == 'wm_task'){
+  gs.addErrorMessage(gs.getMessage('A Territory has to be provided'));
+  current.setAbortAction(true);
+  return;
+ }
+ 
+    if (sc.isEnabled(current, "use_sf", "false")) {
+        if (current.operation() == "update" && ss.fieldChangeCheck("state") && (new SMTask().needsWorkNotesTask(current.state, previous.state)))
+            VerifyWorkNotes(current);
+
+        if (current.state == SMConstants.TASK_PENDING_DISPATCH && current.dispatch_group.nil() && sc.isEnabled(current, 'dispatch_queue', false))
+            CheckDispatchGroup(current);
+    }
+    if (ss.fieldChangeCheck("dispatch_group,assignment_group,assigned_to, assigned_crew")) {
+
+        if (current.sys_class_name != 'hr_task')
+            GroupValidation(current);
+        else if (current.sys_class_name == 'hr_task')
+            HRGroupValidation(current);
+
+    }
+
+    if (ss.fieldChangeCheck("work_notes") && (new sn_sm.SMConfiguration()).isEnabled(current, "rollup_work_notes", false))
+        RollUpWorkNotes(current);
+
+    function CheckDispatchGroup(current) {
+        gs.addErrorMessage(gs.getMessage('A dispatch group has to be provided'));
+        if (previous.state == 0)
+            current.state = 1;
+        else {
+            current.state = previous.state;
+            current.setAbortAction(true);
+        }
+    }
+
+    function VerifyWorkNotes(current) {
+        var stm = new SMTask();
+        if (!stm.hasWorkNotes(current)) {
+            gs.addErrorMessage(stm.getNoWorkNotesMessage(current.state));
+            current.state = previous.state;
+            current.assigned_to = previous.assigned_to;
+            current.setAbortAction(true);
+        }
+    }
+
+    function RollUpWorkNotes(current) {
+        if (current.parent) {
+            var parent = new GlideRecord('sm_order');
+            if (parent.get(current.parent)) {
+                parent.work_notes = current.work_notes;
+                parent.update();
+            }
+        }
+    }
+
+    function GroupValidation(current) {
+        var valid = true;
+
+        if (crewSchedulingActive && current.sys_class_name == 'wm_task' && current.requires_crew == true) {
+            if (current.assigned_crew == '""' || current.assigned_crew == "''") {
+                current.assigned_crew = '';
+            }
+        } else {
+            if (current.assigned_to == '""' || current.assigned_to == "''") {
+                current.assigned_to = '';
+            }
+        }
+
+        var dispatchQueue = (new sn_sm.SMConfiguration()).isEnabled(current, 'dispatch_queue', false);
+        if (crewSchedulingActive && current.sys_class_name == 'wm_task' && current.requires_crew == true) {
+            if (!current.assigned_crew.nil()) {
+                if (current.assignment_group.nil()) {
+                    gs.addErrorMessage(gs.getMessage('Cannot have a crew when the assignment group is empty'));
+                    valid = false;
+                } else if (!(new SMTask()).hasValidCrew(current) && (!current.dispatch_group.nil() || !dispatchQueue)) {
+                    // SMTask.hasValidCrew returns false when dispatch group is empty, localize extra checking here to minimize risk
+                    gs.addErrorMessage(gs.getMessage('The crew is not a member of the assignment group'));
+                    valid = false;
+                }
+            }
+        } else {
+            if (!(current.assigned_to.nil() || current.assigned_to == 'NULL')) {
+                if (current.assignment_group.nil()) {
+                    gs.addErrorMessage(gs.getMessage('Cannot have an assignee when the assignment group is empty'));
+                    valid = false;
+                } else if (!(new SMTask()).hasValidAssignee(current) && (!current.dispatch_group.nil() || !dispatchQueue)) {
+                    // SMTask.hasValidAssignee returns false when dispatch group is empty, localize extra checking here to minimize risk
+                    gs.addErrorMessage(gs.getMessage('The assignee is not a member of the assignment group'));
+                    valid = false;
+                }
+            }
+        }
+
+        if (dispatchQueue) {
+            //dispatch is required in order to be assigned
+            if (crewSchedulingActive && current.sys_class_name == 'wm_task' && current.requires_crew == true) {
+                if (current.dispatch_group == '' &&
+                    (current.assigned_crew != '' ||
+                        current.assignment_group != '' ||
+                        current.state != SMConstants.TASK_DRAFT)) {
+                    gs.addErrorMessage(gs.getMessage('The dispatch group is required in order to be assigned'));
+                    valid = false;
+                }
+            } else {
+                if (current.dispatch_group == '' &&
+                    (current.assigned_to != '' ||
+                        current.assignment_group != '' ||
+                        current.state != SMConstants.TASK_DRAFT)) {
+                    gs.addErrorMessage(gs.getMessage('The dispatch group is required in order to be assigned'));
+                    valid = false;
+                }
+            }            
+            if (valid && (!gs.nil(current.getValue('assignment_group')) && current.getValue('assignment_group')!= "''")) {
+    var isCrewPluginActive = GlidePluginManager.isActive("com.snc.fsm_crew_scheduling");
+    var groups = '';
+    if((new WMFilters()).isTerritoryPlanningActive() && current.sys_class_name == 'wm_task'){
+     groups = new WMFilters().filterAssignmentGroups(current);
+    } else{
+     groups = new SMFilters().filterWorkGroupBasedOnDispatchGroup(current.dispatch_group, current.getTableName(), false, current.location);
+    }
+                // Don't show error message when Dynamic scheduling is in progress and is yet to fill assigned_to for Territory Planning
+       // as assignment group might be backfilling and not necessarily part of territory.
+                if ((groups.substring(8) == '' || groups.indexOf(current.assignment_group) == -1) && (current.scheduling_method != "dynamic_schedule" && (new WMFilters()).isTerritoryPlanningActive() && !(isCrewPluginActive && current.requires_crew == true && !gs.nil(current.assigned_to)))) {
+                    gs.addErrorMessage(gs.getMessage('The assignment group is not contained in the dispatch group'));
+                    valid = false;
+                }
+            }
+        }
+
+        if (!valid) {
+            current.setAbortAction(true);
+        }
+    }
+
+
+    function HRGroupValidation(current) {
+        var valid = true;
+
+        if (current.assigned_to != '') {
+            if (current.assignment_group == '') {
+                valid = true;
+            } else {
+                var vendorGroupType = (new sn_sm.SMConfiguration()).getGroupType(current, 'vendor');
+                if (current.assignment_group.type.indexOf(vendorGroupType) == -1 || vendorGroupType == '') {
+                    var gr = new GlideRecord('sys_user_grmember');
+                    gr.addQuery('user', current.assigned_to);
+                    gr.addQuery('group', current.assignment_group);
+                    gr.query();
+                    if (!gr.hasNext()) {
+                        gs.addErrorMessage(gs.getMessage('The assignee is not a member of the record\'s group'));
+                        valid = false;
+                    }
+                } else if (new SMFilters().assignedToFilter(current).indexOf(current.assigned_to) == -1) {
+                    gs.addErrorMessage(gs.getMessage('The assignee is not a member of the record\'s vendor group'));
+                    valid = false;
+                }
+            }
+        }
+
+        if ((new sn_sm.SMConfiguration()).isEnabled(current, 'dispatch_queue', false)) {
+            //dispatch is required in order to be assigned
+            if (current.dispatch_group == '' &&
+                (current.assigned_to != '' ||
+                    current.assignment_group != '' ||
+                    current.state != SMConstants.TASK_DRAFT)) {
+                gs.addErrorMessage(gs.getMessage('The dispatch group is required in order to be assigned'));
+                valid = false;
+            }
+// Don't show error message when Dynamic scheduling is in progress and is yet to fill assigned_to for Territory Planning
+   // as assignment group might be backfilling and not necessarily part of territory.
+            if (valid && current.assignment_group.toString() != '') {
+                var groups = new SMFilters().filterWorkGroupBasedOnDispatchGroup(current.dispatch_group, current);
+                if (groups.substring(8) == '' || groups.indexOf(current.assignment_group) == -1) {
+                    gs.addErrorMessage(gs.getMessage('The assignment group is not contained in the dispatch group'));
+                    valid = false;
+                }
+            }
+        }
+
+        if (!valid) {
+            current.setAbortAction(true);
+        }
+    }
+ 
+ function isTerritoryActiveforFSM(current){
+  if(current.getTableName() == 'wm_task' && new WMFilters().isTerritoryPlanningActive()){
+   return true;
+  }
+  return false;
+ }
+
+
+    if ((current.sys_class_name == "wm_task") && gs.nil(current.assigned_to) && (current.state == "16" || current.state == "17")) {
+        current.state = "10"; //Pending dispatch/ pending assignment
+    }
+}]]></script>
+        <sys_class_name>x_938076_now_utils_now_utils_business_rules</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:47:18</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>c04be05183701210c6695855eeaad381</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ValidateChanges</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>x_938076_now_utils_now_utils_business_rules_c04be05183701210c6695855eeaad381</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:47:18</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </x_938076_now_utils_now_utils_business_rules>
+    <sys_translated_text action="delete_multiple" query="documentkey=c04be05183701210c6695855eeaad381"/>
+</record_update>

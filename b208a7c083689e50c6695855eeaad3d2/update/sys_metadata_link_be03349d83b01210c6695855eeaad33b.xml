@@ -1,0 +1,214 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>5c6ed4407346230056b5bef4b4f6a7b4</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_fix"&gt;
+    &lt;sys_script_fix action="INSERT_OR_UPDATE"&gt;
+        &lt;before&gt;false&lt;/before&gt;
+        &lt;description&gt;Migrate all the VTB card and board labels to new tables for all the existing boards&lt;/description&gt;
+        &lt;name&gt;Migrate VTB labels to new tables&lt;/name&gt;
+        &lt;record_for_rollback&gt;false&lt;/record_for_rollback&gt;
+        &lt;script&gt;&lt;![CDATA[migrateVTBCardAndBoardLabels();
+
+function createGlobalLabel(labelName) {
+	var grLabel = new GlideRecord('label');
+	grLabel.initialize();
+	grLabel.name = labelName;
+	grLabel.viewable_by = 'everyone';
+	grLabel.global = true;
+	grLabel.background_color = '#6ab7ef';
+	return grLabel.insert();
+}
+
+function createBoardLabel(board, label, color, active, order) {
+	var grBoardLabel = new GlideRecord('vtb_board_label');
+	grBoardLabel.initialize();
+	grBoardLabel.board = board;
+	grBoardLabel.label = label;
+	grBoardLabel.color = color;
+	grBoardLabel.active = active;
+	grBoardLabel.order = order;
+	return grBoardLabel.insert();
+}
+
+function assignLabel(cardId, labelId, cardDisplayValue) {
+	var grLabelEntry = new GlideRecord('label_entry');
+	grLabelEntry.initialize();
+	grLabelEntry.label = labelId;
+	grLabelEntry.table = 'vtb_card';
+	grLabelEntry.table_key = cardId;
+	grLabelEntry.title = 'Visual Task Board Card - ' + cardDisplayValue;
+	grLabelEntry.read = 'yes';
+	grLabelEntry.notify_onchange = false;
+	grLabelEntry.insert();
+}
+
+function queryLabelTable(name) {
+	var grLabel = new GlideRecord('label');
+	grLabel.addQuery('name', name);
+	var qc = grLabel.addQuery('viewable_by', 'everyone');
+	qc.addOrCondition('viewable_by', 'groups and users');
+	grLabel.setLimit(1);
+	grLabel.query();
+
+	return grLabel;
+}
+
+function isSharedLabel(name) {
+	var grLabel = new GlideAggregate('label');
+	grLabel.addQuery('name', name);
+	var qc = grLabel.addQuery('viewable_by', 'everyone');
+	qc.addOrCondition('viewable_by', 'groups and users');
+	grLabel.addAggregate('COUNT');
+	grLabel.query();
+
+	return grLabel.next() &amp;&amp; grLabel.getAggregate('COUNT') &gt; 0;
+}
+
+function migrateVTBCardAndBoardLabels() {
+	var colors = ['#f95050', '#278efc', '#71e279', '#6d79e8', '#fc8a3d', '#fcc742', '#fa8da2'];
+	var labelMap = {};
+	var nameMap = {};
+	var duplicateLabelMap = {};
+	var duplicateLabelNameMap = {};
+
+	var grBoard = new GlideRecord('vtb_board');
+	grBoard.query();
+	while (grBoard.next()) {
+		var boardLabelIds = [];
+		var boardDuplicateLabelCount = {};
+		for (var i=1; i&lt;=7; i++) {
+			var labelNameOriginal = grBoard.getValue('label_'+i);
+			if (labelNameOriginal == null)
+				continue;
+
+			var labelName = labelNameOriginal.toLowerCase();
+			var labelId = labelMap[labelName] || (nameMap[labelName] &amp;&amp; labelMap[nameMap[labelName]]);
+			if (labelId &amp;&amp; boardLabelIds.indexOf(labelId) &gt; -1) {
+				var index = boardDuplicateLabelCount[labelName] || 0;
+				if (duplicateLabelNameMap[labelName] &amp;&amp; index &lt; duplicateLabelNameMap[labelName].length) {
+					labelId = duplicateLabelNameMap[labelName][index];
+					if (!boardDuplicateLabelCount[labelName])
+						boardDuplicateLabelCount[labelName] = 0;
+
+					boardDuplicateLabelCount[labelName]++;
+				} else {
+					var j;
+					if (!labelMap[labelName] &amp;&amp; nameMap[labelName])
+						j = parseInt(nameMap[labelName].substr(nameMap[labelName].indexOf('.') + 1)) + 1;
+					else
+						j = 1;
+					var newLabelName = labelNameOriginal+'.'+j;
+					while (isSharedLabel(newLabelName)) {
+						j++;
+						newLabelName = labelNameOriginal+'.'+j;
+					}
+					labelId = createGlobalLabel(newLabelName);
+					if (!boardDuplicateLabelCount[labelName])
+						boardDuplicateLabelCount[labelName] = 0;
+
+					if (!duplicateLabelNameMap[labelName])
+						duplicateLabelNameMap[labelName] = [];
+
+					boardDuplicateLabelCount[labelName]++;
+					duplicateLabelNameMap[labelName].push(labelId);
+				}
+
+				duplicateLabelMap[grBoard.getUniqueValue()+'_label_'+i] = labelId;
+			}
+
+			if (!labelId) {
+				// Check name collision with labels viewable by groups and users.
+				// No need to check name collision with labels viewable by me.
+				var grLabel = queryLabelTable(labelName);
+
+				if (grLabel.next()) {
+					if (grLabel.getValue('viewable_by') == 'everyone') {
+						labelId = grLabel.getUniqueValue();
+						labelMap[labelName] = labelId;
+					} else {
+						// If a shared label with this name already exists, add a suffix.
+						nameMap[labelName] = labelNameOriginal + '.1';
+						for (j=2; isSharedLabel(nameMap[labelName]); j++) {
+							nameMap[labelName] = labelNameOriginal + '.' + j;
+						}
+
+						labelId = createGlobalLabel(nameMap[labelName]);
+						labelMap[nameMap[labelName]] = labelId;
+					}
+				} else {
+					labelId = createGlobalLabel(labelNameOriginal);
+					labelMap[labelName] = labelId;
+				}
+			}
+
+			boardLabelIds.push(labelId);
+			createBoardLabel(grBoard.getUniqueValue(), labelId, colors[i-1], grBoard.getValue('label_'+i+'_active'), i-1);
+		}
+	}
+
+	var grCard = new GlideRecord('vtb_card');
+	grCard.addEncodedQuery('removed=false^label_1=true^ORlabel_2=true^ORlabel_3=true^ORlabel_4=true^ORlabel_5=true^ORlabel_6=true^ORlabel_7=true');
+	grCard.query();
+	var boardMap = {};
+	while (grCard.next()) {
+		var boardId = grCard.getValue('board');
+		if (!boardMap[boardId]) {
+			grBoard = new GlideRecord('vtb_board');
+			grBoard.get(boardId);
+
+			boardMap[boardId] = {};
+			for (i=1; i&lt;=7; i++) {
+				var labelValue = grBoard.getValue('label_'+i);
+				if (labelValue)
+					boardMap[boardId]['label_'+i] = labelValue.toLowerCase();
+			}
+		}
+
+		var labels = [];
+		for (i=1; i&lt;=7; i++) {
+			if (boardMap[boardId]['label_'+i] &amp;&amp; grCard.getValue('label_'+i) == '1') {
+				labelName = boardMap[boardId]['label_'+i];
+				labelId = duplicateLabelMap[boardId+'_label_'+i] ||
+					labelMap[labelName] ||
+					labelMap[nameMap[labelName]];
+				labels.push(labelId);
+			}
+		}
+
+		for (i=0; i&lt;labels.length; i++) {
+			assignLabel(grCard.getUniqueValue(), labels[i], grCard.getDisplayValue());
+		}
+	}
+}]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_fix&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2018-11-23 07:17:01&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;5c6ed4407346230056b5bef4b4f6a7b4&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;5&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;Migrate VTB labels to new tables&lt;/sys_name&gt;
+        &lt;sys_package display_value="Visual Task Boards" source="com.glide.ui.vtb"&gt;d1d3fca43c31311068bcf327dfe37f30&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_fix_5c6ed4407346230056b5bef4b4f6a7b4&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2019-07-26 05:03:53&lt;/sys_updated_on&gt;
+        &lt;unloadable&gt;false&lt;/unloadable&gt;
+    &lt;/sys_script_fix&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:21:21</sys_created_on>
+        <sys_id>be03349d83b01210c6695855eeaad33b</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Migrate VTB labels to new tables</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_be03349d83b01210c6695855eeaad33b</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:21:21</sys_updated_on>
+        <tablename>sys_script_fix</tablename>
+    </sys_metadata_link>
+</record_update>

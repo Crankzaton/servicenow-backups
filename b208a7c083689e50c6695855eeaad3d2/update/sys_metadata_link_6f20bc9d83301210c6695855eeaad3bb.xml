@@ -1,0 +1,848 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>000b82eb93312010ebd4f157b67ffb86</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_appclient.ScheduledInstallService&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;This Script manages the scheduled Installation of Applications and Plugins&amp;#13;
+&lt;/description&gt;
+        &lt;name&gt;ScheduledInstallService&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ScheduledInstallService = Class.create();
+ScheduledInstallService.prototype = {
+    initialize: function(scheduleGr) {
+		this.scheduleGr = scheduleGr;
+    },
+	processError : function(error){
+		return {
+			responseData: {"error" : error},
+			statusCode: 400
+		};
+	},
+	sendResponse : function(data){
+		return {
+			responseData: data,
+			statusCode: 200
+		};
+	},
+	processRequest : function(requestParams){
+		var requestType =  requestParams.action;
+		if (gs.nil(requestType)) {
+			return this.processError("invalid action for schedule");
+		}
+		try {
+			var response = "";
+			var error = "";
+			switch(requestType.toLowerCase()) {
+				case "get_all_schedules" :
+					response = this.fetchAllActiveScheduledItems();
+					break;
+				case "get_schedule_stats" :
+					response = this.getCurrentScheduledState();
+					break;
+				case "create_schedule":
+					var scheduleObj = requestParams.schedule;
+					if (!scheduleObj){
+						error = "invalid schedule found";
+						break;
+					}
+					scheduleObj = JSON.parse(scheduleObj);
+					var scheduleInfo = this.createSchedule(scheduleObj);
+					if (!gs.nil(scheduleInfo.error)){
+						error = scheduleInfo.error;
+						break;
+					}
+					this.captureScheduleForAnalytics(scheduleObj);
+					response = scheduleInfo;
+					break;
+				case "update_schedule":
+					var newscheduleObj = requestParams.schedule;
+					var current_schedule_id = requestParams.schedule_id;
+					if (!current_schedule_id){
+						error = "schedule id cannot be empty";
+						break;
+					}
+					if (!newscheduleObj){
+						error = "invalid schedule found";
+						break;
+					}
+					newscheduleObj = JSON.parse(newscheduleObj);
+					var errors = this.checkForErrors(newscheduleObj);
+					if (errors.length != 0) {
+						error = errors.toString();
+						break;
+					}
+					var newScheduledInfo = this.updateSchedule(current_schedule_id, newscheduleObj);
+					if (!gs.nil(newScheduledInfo.error)){
+						error = newScheduledInfo.error;
+						break;
+					}
+					response = newScheduledInfo;
+					break;
+				case "delete_schedule":
+					var schedule_id = requestParams.schedule_id;
+					var source_app_id = requestParams.source_app_id;
+					if (!schedule_id){
+						response = "schedule id cannot be empty";
+						break;
+					}
+					if (!gs.nil(source_app_id))
+						response = {
+							"success" : this.deleteScheduleItem(schedule_id, source_app_id)
+						};
+					else
+						response = {
+							"success" : this.deleteSchedule(schedule_id)
+						};
+					break;
+				case "validate_slot":
+					var scheduled_time = requestParams.scheduled_time;
+					var appCount = requestParams.appCount;
+					var existing_schedule_id = requestParams.schedule_id;
+					if (gs.nil(scheduled_time) || gs.nil(appCount)){
+						error = "scheduled_time/appCount cannot be empty";
+						break;
+					}
+					if (gs.nil(appCount))
+						appCount = 1;
+					else
+						appCount = parseInt(appCount);
+					response = this.isConflictingSchedule(scheduled_time, appCount, existing_schedule_id);
+					break;
+				case "get_next_available_slot":
+					appCount = parseInt(requestParams.appCount) || 1;
+					response = this.getNextAvailableScheduleSlot(appCount);
+					break;
+				default:
+					error = "Unknown action. Bad Request";
+			}
+		}catch(e) {
+			return this.processError(e);
+		}
+		if (gs.nil(error))
+			return this.sendResponse(response);
+		else
+			return this.processError(error);
+	},
+	checkForErrors : function(schedule){
+		var error = "";
+		if (!schedule.name || !schedule.start_time) {
+			gs.error("Missing one of(name,start_time,end_time) for the schedule name:" +  schedule.name  + "start_time:"+ schedule.start_time);
+			error = gs.getMessage("Missing information about plugin name, start time");
+		}
+		else if (!this.validateEntriesInSchedule(schedule.list_of_apps, error)) {
+			error = gs.getMessage("Unable to create schedule due to invalid app or plugin selected for schedule");
+		}
+		return error;	
+	},
+	validateEntriesInSchedule : function(listOfApps,error){
+		var scheduleInput = {
+			isValid : true,
+			error : error
+		};
+		if (!listOfApps || listOfApps.length ==0 ) {
+			scheduleInput.isValid = false;
+			gs.error("No items found to schedule the installation");
+			scheduleInput.error = gs.getMessage("No items found in the schedule");
+		}
+		listOfApps.forEach(function(app){
+			if (!app.is_plugin &amp;&amp; !app.is_store_app) {
+				this.captureError(scheduleInput,app,"Installation item can only be either app/plugin");
+				return;
+			}
+			if (!app.source_app_id)
+				this.captureError(scheduleInput,app,"missing app/plugin id");
+			if (app.is_store_app &amp;&amp; !app.version)
+				this.captureError(scheduleInput,app,"Missing version");
+			else if (app.is_customization_version &amp;&amp; !app.customization_version)
+				this.captureError(scheduleInput, app , "Missing customization version info");
+		},this);
+		return scheduleInput.isValid;
+	},
+	captureError : function(scheduleInput,app,message){
+		scheduleInput.isValid = false;
+		scheduleInput.error = message;
+		gs.error("Invalid item found due to ("+ message +") in "+ JSON.stringify(app));
+	},
+	isValidTime : function(start_time,error){
+		var userSelectedTime = new GlideDateTime();
+		userSelectedTime.setDisplayValue(start_time);
+		if (new GlideDateTime().after(userSelectedTime)) {
+			return false;
+		}
+		return true;
+	},
+	createSchedule : function(schedule){
+		var error = this.checkForErrors(schedule);
+		if (error.length != 0)
+			return {
+				error : error,
+				status : 400
+			};
+		try{
+			var start_time = new GlideDateTime();
+			start_time.setDisplayValue(schedule.start_time);
+			var estimatedEndTime = 3600 *  schedule.list_of_apps.length;
+			var end_time = new GlideDateTime(start_time.getValue());
+			end_time.addSeconds(estimatedEndTime);
+			var scheduleGr = new GlideRecord("sys_installation_schedule");
+				scheduleGr.initialize();
+				scheduleGr.setValue("name", schedule.name);
+				scheduleGr.setValue("active", true);
+				scheduleGr.setValue("start_time", start_time);
+				scheduleGr.setValue("end_time", end_time);
+			    scheduleGr.setValue("failure_strategy", schedule.failure_strategy);
+				scheduleGr.setValue("load_demo_data",schedule.load_demo_data);
+				scheduleGr.setValue("additional_args", JSON.stringify(schedule.additional_args));
+				var schedule_sys_id = scheduleGr.insert();
+				if (gs.nil(schedule_sys_id))
+					return {
+						error: gs.getMessage("failed to create schedule"),
+						status : 500
+					};
+				schedule.list_of_apps.forEach(function(plugin){
+					this.createScheduledItem(plugin,schedule_sys_id, start_time, end_time);
+				},this);		
+		}catch(e){
+			return {
+				error : gs.getMessage("Failed to create schedule due to {0}", e),
+				status : 400
+			};
+		}
+		this.createScheduledEventForInstall(scheduleGr);
+		return this.fetchSchedule(schedule_sys_id);
+	},
+	createScheduledItem : function(scheduledItem,schedule_sys_id, start_time, end_time) {
+		var scheduleItemGr = new GlideRecord("sys_installation_schedule_item");
+		scheduleItemGr.initialize();
+		scheduleItemGr.setValue("name" , scheduledItem.name);
+		scheduleItemGr.setValue("scope" , scheduledItem.scope);
+		scheduleItemGr.setValue("source_app_id" , scheduledItem.source_app_id);
+		if (!scheduledItem.is_plugin){
+			scheduleItemGr.setValue("delivery_source" , scheduledItem.delivery_source || null);
+			scheduleItemGr.setValue("dependencies" , scheduledItem.dependencies || null);
+		}
+		scheduleItemGr.setValue("version" , scheduledItem.version || null);
+		scheduleItemGr.setValue("customization_version" , scheduledItem.customization_version || null);
+		scheduleItemGr.setValue("is_plugin" , scheduledItem.is_plugin || false);
+		scheduleItemGr.setValue("is_store_app" , scheduledItem.is_store_app || false);
+		scheduleItemGr.setValue("is_customization" , scheduledItem.is_customization_version || false);
+		scheduleItemGr.setValue("schedule" , schedule_sys_id);
+		scheduleItemGr.setValue("product" , scheduledItem.product || null);
+		scheduleItemGr.setValue("start_time" , start_time);
+		scheduleItemGr.setValue("end_time" , end_time);
+		scheduleItemGr.setValue("offering", scheduledItem.offering || "" );
+		if(scheduledItem.selected_options)
+			scheduleItemGr.setValue("selected_options",JSON.stringify(scheduledItem.selected_options));
+		scheduleItemGr.insert();
+	},
+	deleteSchedule : function(existing_schedule_id){
+		var gr = new GlideRecord("sys_installation_schedule_item");
+		gr.addQuery("schedule.sys_id", existing_schedule_id);
+		gr.deleteMultiple();
+		var gr = new GlideRecord("sys_installation_schedule");
+		gr.get(existing_schedule_id);
+		return gr.deleteRecord();
+	},
+	deleteScheduleItem : function(existing_schedule_id, source_app_id){
+		var isDeleted = false;
+		var gr = new GlideRecord("sys_installation_schedule_item");
+		gr.addQuery("schedule.sys_id", existing_schedule_id);
+		gr.addQuery("source_app_id", source_app_id);
+		gr.query();
+		if(gr.next())
+			isDeleted = gr.deleteRecord();
+
+		return isDeleted;
+	},
+	updateSchedule : function(existing_schedule_id,schedule){
+		this.deleteSchedule(existing_schedule_id);
+		return this.createSchedule(schedule);
+	},
+	fetchSchedule : function(schedule_sys_id) {
+		var schedule = {};
+		var scheduleGr = new GlideRecord("sys_installation_schedule");
+		scheduleGr.addQuery("active" , true);
+		scheduleGr.addQuery("sys_id" , schedule_sys_id);
+		scheduleGr.query();
+		if(scheduleGr.next()) {
+			schedule["name"]  = scheduleGr.getValue("name");
+			schedule["start_time"] = scheduleGr.getValue("start_time");
+			//schedule["end_time"] = scheduleGr.getValue("end_time");
+			schedule["state"] = scheduleGr.getValue("state");
+			schedule["failure_strategy"] = scheduleGr.getValue("failure_strategy");
+			schedule["load_demo_date"] = scheduleGr.load_demo_data;
+			schedule["execution_tracker_id"] = scheduleGr.getValue("execution_tracker_id");
+			return this.fetchScheduledItems(schedule,schedule_sys_id);
+		}
+		return {
+				"error" : "no schedule exists",
+				"status" :  400
+		};
+	},
+	fetchScheduledItems : function(schedule, schedule_sys_id)	{
+		var scheduledItems = [];
+		var scheduleItemGr = new GlideRecord("sys_installation_schedule_item");
+		scheduleItemGr.addQuery("schedule" , schedule_sys_id);
+		scheduleItemGr.addQuery("state" ,"IN" ,"ready"); // failed ones are for retry
+		scheduleItemGr.query();
+		while(scheduleItemGr.next()) {
+			scheduledItems.push(this.getScheduledItemObj(scheduleItemGr));
+		}
+		schedule['list_of_apps'] = scheduledItems;
+		return schedule;
+	},
+	fetchAllActiveScheduledItems : function(){
+		var scheduledItems = {};
+		var blockedSlots = [];
+		var schedulesBlocked = {};
+		var startTime = "";
+		var endTime = "";
+		var slot = "";
+		var blockedSlots = {};
+		var slotTime = new GlideDateTime();
+		var scheduleItemGr = new GlideRecord("sys_installation_schedule_item");
+		scheduleItemGr.addQuery("state" , "ready");
+		scheduleItemGr.query();
+		while(scheduleItemGr.next()){
+			startTime = scheduleItemGr.getDisplayValue("start_time");
+			endTime = scheduleItemGr.getDisplayValue("end_time");
+			if (scheduleItemGr.getValue("product"))
+				scheduledItems[scheduleItemGr.getValue("product")] = {
+					"scheduled_on" : startTime + "|" + endTime,
+					"schedule_id" : scheduleItemGr.getValue("schedule")
+				};
+			scheduledItems[scheduleItemGr.getValue("source_app_id")] = this.getScheduledItemObj(scheduleItemGr);
+			this.captureBlockedSlot(scheduleItemGr, blockedSlots);
+		}
+		var slots = this.toArray(blockedSlots);
+		gs.getSession().putClientData("blocked_slots", JSON.stringify(slots));
+		return scheduledItems;
+	},
+	fetchActiveSchedulesForEntity: function(args) {
+		var scheduledItems = {};
+		var blockedSlots = [];
+		var startTime = "";
+		var endTime = "";
+		var scheduleItemGr = new GlideRecord("sys_installation_schedule_item");
+		scheduleItemGr.addQuery("state" , "ready");
+		scheduleItemGr.addQuery("source_app_id" , args.source_app_id);
+		scheduleItemGr.query();
+		while(scheduleItemGr.next()){
+			startTime = scheduleItemGr.getDisplayValue("start_time");
+			endTime = scheduleItemGr.getDisplayValue("end_time");
+			if (scheduleItemGr.getValue("product"))
+				scheduledItems[scheduleItemGr.getValue("product")] = {
+					"scheduled_on" : startTime + "|" + endTime,
+					"schedule_id" : scheduleItemGr.getValue("schedule")
+				};
+			scheduledItems[scheduleItemGr.getValue("source_app_id")] = this.getScheduledItemObj(scheduleItemGr);
+			this.captureBlockedSlot(scheduleItemGr, blockedSlots);
+		}
+		var slots = this.toArray(blockedSlots);
+		return scheduledItems;
+	},
+	captureBlockedSlot : function(scheduleItemGr, blockedSlots){
+		var scheduledSlot = scheduleItemGr.getValue("schedule");
+		var blockedSlot = {};
+		var slotTime = new GlideDateTime();
+		var slot = "";
+		if (blockedSlots[scheduledSlot])
+			return;
+
+		var startTime = scheduleItemGr.getDisplayValue("start_time");
+		var	endTime = scheduleItemGr.getDisplayValue("end_time");
+		slotTime.setDisplayValue(startTime);
+		blockedSlot.start_time = slotTime.getNumericValue();
+		slotTime.setDisplayValue(endTime);
+		blockedSlot.end_time = slotTime.getNumericValue();
+		blockedSlot.schedule_id = scheduleItemGr.getValue("schedule");
+		blockedSlot.scheduled_on = startTime + "|" + endTime;
+		blockedSlots[scheduledSlot] = blockedSlot;
+		return blockedSlots;
+	},
+	getBlockedSlots : function() {
+		var blockedSlotsJSON = {};
+		var blockedSlots = [];
+		var scheduleItemGr = new GlideRecord("sys_installation_schedule_item");
+		scheduleItemGr.addQuery("state" , "ready");
+		scheduleItemGr.query();
+		while(scheduleItemGr.next()){
+			this.captureBlockedSlot(scheduleItemGr, blockedSlotsJSON);
+		}
+		return this.toArray(blockedSlotsJSON);
+	},
+	toArray : function(blockedSlotsJSON) {
+		var blockedSlots = [];
+		for (var slot in blockedSlotsJSON) {
+			if (blockedSlotsJSON.hasOwnProperty(slot)) {
+				blockedSlots.push(blockedSlotsJSON[slot]);
+			}
+		}
+		return blockedSlots;
+	},
+	getScheduledItemObj: function(scheduleItemGr) {
+		return {
+				"name" : scheduleItemGr.getValue("name"),
+				"scheduled_on" : scheduleItemGr.getDisplayValue("start_time") + "|" + scheduleItemGr.getDisplayValue("end_time"),
+				"schedule_id" : scheduleItemGr.getValue("schedule"),
+				"version" : scheduleItemGr.getValue("version"),
+				"customization_version" : scheduleItemGr.getValue("customization_version"),
+				"source_app_id" : scheduleItemGr.getValue("source_app_id"),
+				"is_plugin" : scheduleItemGr.getValue("is_plugin") == '1',
+				"is_store_app" : scheduleItemGr.getValue("is_store_app") == '1',
+				"is_customization" : scheduleItemGr.getValue("is_customization") == '1',
+				"scope" : scheduleItemGr.getValue("scope"),
+				"product" : scheduleItemGr.getValue("product"),
+				"time" :  scheduleItemGr.getDisplayValue("start_time") + "|" + scheduleItemGr.getDisplayValue("end_time"),
+				"load_demo_data" : !!scheduleItemGr.load_demo_data,
+				"state" : scheduleItemGr.getValue("state"),
+				"status" : scheduleItemGr.getDisplayValue("state"),
+				"delivery_source" : scheduleItemGr.getValue("delivery_source"),
+				"id" :  scheduleItemGr.getValue("source_app_id"),
+				"start_time" : scheduleItemGr.getDisplayValue("start_time"),
+				"end_time" : scheduleItemGr.getDisplayValue("end_time"),
+				"offering" : scheduleItemGr.getValue("offering"),
+				"selected_options" : scheduleItemGr.getValue("selected_options")
+			};
+	},
+	createScheduledEventForInstall : function(scheduleGr){
+		if (gs.nil(scheduleGr.start_time))
+			return;
+		
+		gs.eventQueueScheduled("sn_appclient.install.scheduled.plugins",scheduleGr,"","", scheduleGr.start_time);
+	},
+	processSchedule : function(schedule,retries){
+		try{
+			if (!schedule.active){
+				gs.debug("Skipped schedule as its inactive");
+				this.updateScheduleStatus(schedule,"schedule not active", true);
+				return;
+			}
+
+			var batchPayload = this.getBatchPayload(schedule);
+			if (Object.keys(batchPayload).length == 0){
+				this.updateScheduleStatus(schedule,"invalid batch payload", true);
+				return;
+			}
+
+			if (this.isSystemBusy()){
+				if (gs.nil(retries))
+					retries = 0;
+				retries = parseInt(retries);
+				if (retries &gt; 3)
+					this.updateScheduleStatus(schedule,"Failed as system is busy continously for 3 retries", true);
+				else
+					this.retrySchedule(schedule, retries);
+				return; // either retry the schedule or cancel it if already retried thrice
+			}
+			this.syncWithStore(batchPayload);
+			var filteredAppsInfo = this.filterUnableToInstallApps(batchPayload.packages);
+			if (filteredAppsInfo.packages.length == 0) {
+				this.updateScheduleStatus(schedule,"No items to install", filteredAppsInfo.retire);
+				return;
+			}
+
+			batchPayload.packages = filteredAppsInfo.packages;
+			var batchInfo = new AppUpgrader().installBatch(JSON.stringify(batchPayload), true);
+			batchInfo = JSON.parse(batchInfo);
+			this.updateBatchDetails(batchInfo);
+			this._addProgressTracker(batchPayload, batchInfo);
+		}catch(e){
+			this.updateScheduleStatus(schedule,e, false);
+		}
+		
+	},
+	markPendingScheduledItems : function(schedule_sys_id, state, message){
+		var itemGr = new GlideRecord("sys_installation_schedule_item");
+		itemGr.addQuery("schedule.sys_id", schedule_sys_id);
+		itemGr.addQuery("state", "IN", "ready,in_progress");
+		itemGr.query();
+		while(itemGr.next()){
+			itemGr.setValue("state", state);
+			if (!gs.nil(message))
+				itemGr.setValue("failure_reason", message);
+			itemGr.setValue("processed_on", new GlideDateTime());
+			itemGr.update();
+		}
+	},
+	getBatchPayload : function(schedule){
+		
+		var batchPayload = {};
+		batchPayload.name = schedule.getValue("name");
+		var scheduleObj = this.fetchScheduledItems({},schedule.getUniqueValue());
+		var packages = [];
+		var installationObj = {};
+		if (!scheduleObj.list_of_apps || scheduleObj.list_of_apps.length ==0)
+			return {};
+		scheduleObj.list_of_apps.forEach(function(item){
+			installationObj = {
+				"id" : item.id,
+				"type" : this.getType(item),
+				"load_demo_data" : schedule.getValue("load_demo_data") == "1",
+				"requested_version" : gs.nil(item.version)? "" : item.version
+			};
+			if(item.offering)
+				installationObj.offering = item.offering;
+			if((item.selected_options || "").trim().length &gt; 0){
+				installationObj.selected_options = [];
+				var optionals = JSON.parse(item.selected_options || "[]");
+				optionals.forEach(function(optional){
+					installationObj.selected_options.push(optional.split(":")[0]);
+				});
+			}
+			if (item.is_customization){
+				installationObj.requested_customization_version = item.customization_version;
+			}
+			packages.push(installationObj);
+		},this);
+		batchPayload.packages = packages;
+		return batchPayload;
+	},
+	getType: function(scheduledItem){
+		if (scheduledItem.is_plugin)
+			return "plugin";
+		if (scheduledItem.is_store_app)
+			return "application";
+	},
+	isSystemBusy : function(){
+		var isMutexAvailable = sn_app_api.AppStoreAPI.isUpdateMutexAvailable();
+		return (gs.isPaused() || !isMutexAvailable) ;
+	},
+	retireSchedule : function(scheduleGr, comments){
+		scheduleGr.setValue("active", false);
+		if (!gs.nil(comments))
+			scheduleGr.setValue("comments" , comments);
+		scheduleGr.update();
+		this.markPendingScheduledItems(scheduleGr.getUniqueValue(), "failed", comments);
+	},
+	updateScheduleStatus : function(scheduleGr, comments, retireSchedule){
+		if (retireSchedule || !(parseInt(scheduleGr.getValue("retry_count")) == 0 &amp;&amp; "retry_next_day" == scheduleGr.getValue("failure_strategy"))) {
+			this.retireSchedule(scheduleGr, comments);
+		}
+		if (parseInt(scheduleGr.getValue("retry_count")) == 0 &amp;&amp; "retry_next_day" == scheduleGr.getValue("failure_strategy")) //this schedule was said not to shut off and user selected to retry and have 1 more chance
+			this.rescheduleNextDay(scheduleGr.getUniqueValue());
+	},
+	retrySchedule : function(scheduleGr,retries){
+		var startTime = new GlideDateTime();
+		startTime.addSeconds(900);
+		scheduleGr.setValue("comments", "Rescheduled to process in next 15mins as system is busy");
+		scheduleGr.update();
+gs.eventQueueScheduled("sn_appclient.install.scheduled.plugins",scheduleGr,retries + 1,"", startTime);
+		
+	},
+	rescheduleNextDay : function(scheduleSysId){
+		var scheduleGr = new GlideRecord("sys_installation_schedule");
+		scheduleGr.get(scheduleSysId);
+		if (!scheduleGr.isValidRecord()){
+			gs.error("No schedule available for retry");
+			return;
+		}
+
+		gs.debug("Rescheduling due to failed event on " + scheduleGr.getValue("name"));
+		var noOfAppsToRetry = this.getRetryAppsCount(scheduleGr.getUniqueValue());
+		if (noOfAppsToRetry == 0)
+			return;
+
+		var startTime = new GlideDateTime(scheduleGr.getValue("start_time"));
+		startTime.addDaysUTC(1);
+		var conflictingSchedule = this.isConflictingSchedule(startTime.getDisplayValue(), noOfAppsToRetry, scheduleGr.getUniqueValue());
+		if (conflictingSchedule.conflict){
+			startTime.setDisplayValue(conflictingSchedule.nextSlot);
+		}
+		var estimatedEndTime = 3600 *  noOfAppsToRetry;
+		var end_time = new GlideDateTime(startTime.getValue());
+			end_time.addSeconds(estimatedEndTime);
+		this.copySchedule(scheduleGr, startTime, end_time);
+		this.retireSchedule(scheduleGr);
+	},
+	copySchedule : function(scheduleGr, startTime, endTime){
+		gs.debug("********Copying schedule" + scheduleGr.getUniqueValue() +" "+scheduleGr.getValue("name"));
+		var newSchedulegr = new GlideRecord("sys_installation_schedule");
+		newSchedulegr.initialize();
+		newSchedulegr.setValue("name", "Rescheduled : " + scheduleGr.getValue("name"));
+		newSchedulegr.setValue("active", true);
+		newSchedulegr.setValue("start_time", startTime);
+		newSchedulegr.setValue("end_time", endTime);
+		newSchedulegr.setValue("failure_strategy", scheduleGr.getValue("failure_strategy"));
+		newSchedulegr.setValue("load_demo_data",scheduleGr.load_demo_data);
+		newSchedulegr.setValue("retry_count",1);
+		var newScheduleSysId = newSchedulegr.insert();
+		gs.debug("New schedule created for " + newSchedulegr.getValue("name"));
+		// copy schedule items
+		var scheduleItemObj = {};
+		var itemGr = new GlideRecord("sys_installation_schedule_item");
+		itemGr.addQuery("schedule.sys_id", scheduleGr.getUniqueValue());
+		itemGr.addQuery("state", "IN", "ready,failed,invalid");
+		itemGr.query();
+		while(itemGr.next()){
+			scheduleItemObj = this.getScheduledItemObj(itemGr);
+			this.createScheduledItem(scheduleItemObj, newScheduleSysId, startTime, endTime);
+			gs.debug("New schedule item created" + scheduleItemObj.name);
+		}
+		this.createScheduledEventForInstall(newSchedulegr);
+	},
+	getRetryAppsCount : function(schedule_sys_id){
+		var gr = new GlideRecord("sys_installation_schedule_item");
+		gr.addQuery("state", "IN" ,"failed,invalid,ready");
+		gr.addQuery("schedule.sys_id", schedule_sys_id);
+		gr.query();
+		return gr.getRowCount();
+	},
+	syncWithStore : function(batchPayload) {
+		try{
+			new UpdateChecker(batchPayload,true).checkAvailableUpdates(false,true);
+		}catch(e){
+			gs.error("Failed to sync to store due to", e);
+		}
+	},
+	filterUnableToInstallApps : function(batchedPackages){
+		var response = {
+			retire : true,
+			packages : []
+		};
+		batchedPackages.forEach(function(app){
+			if(app.requested_customization_version) {
+				response.packages.push(app); // if customization install do not check for whether app is installed or not or plugin is installed or not
+				return;
+			}
+			if (app.type == "application"){
+				if (this.isAppAlreadyInstalled(app)) {
+					this.updateScheduledInstallItem(app , "failed","Application already installed");
+					return;
+				}
+				if (!this.isAvailableForInstall(app)){
+					response.retire = false;
+					this.updateScheduledInstallItem(app, "failed","Application version not available for installation");
+					return;
+				}
+			}
+			if (app.type == "plugin"){
+				if (this.isPluginActive(app)) {
+					this.updateScheduledInstallItem(app , "failed","Plugin already active");
+					return;
+				}
+			}
+			response.packages.push(app);
+		},this);
+		return response;
+	},
+	isAvailableForInstall : function(app){
+		var gr = new GlideRecord("sys_app_version");
+		gr.addQuery("source_app_id",app.id);
+		gr.addQuery("version",app.requested_version);
+		gr.addQuery("block_install",false);
+		gr.query();
+		return gr.getRowCount() &gt; 0;
+	},
+	isAppAlreadyInstalled : function(app){
+		var versionComparator = new VersionComparator();
+		var gr = new GlideRecord("sys_store_app");
+		gr.get(app.id);
+		if (!gr.isValidRecord())
+			return false;
+		return gr.active &amp;&amp; (versionComparator.isDowngrade(gr.getValue("version"),app.requested_version) || versionComparator.isEqual(gr.getValue("version"),app.requested_version));
+	},
+	isPluginActive : function(app){
+		return GlidePluginManager.isActive(app.id);
+	},
+	updateScheduledInstallItem : function(app,state,message){
+		var gr = new GlideRecord("sys_installation_schedule_item");
+		gr.addQuery("schedule.sys_id", this.scheduleGr.getUniqueValue());
+		gr.addQuery("source_app_id", app.id);
+		gr.addQuery("version", app.requested_version);
+		gr.addQuery("state", "IN" , "ready,failed");
+		gr.query();
+		if (gr.next()) {
+			gr.setValue("state",state);
+			gr.setValue("failure_reason",message);
+			gr.setValue("processed_on" , new GlideDateTime());
+			gr.update();
+		}
+	},
+	captureBatchOnScheduledInstallItem : function(batchId){ // used by java layer to update the status based on installation item
+		var gr = new GlideRecord("sys_installation_schedule_item");
+		gr.addQuery("schedule.sys_id", this.scheduleGr.getUniqueValue());
+		gr.query();
+		while (gr.next()) {
+			gr.setValue("batch_install_plan",batchId);
+			gr.update();
+		}
+	},
+	updateBatchDetails : function(batchInfo){
+		if (!batchInfo || !batchInfo.batch_installation_id)
+			return;
+		var scheduleGr = this.scheduleGr;
+		scheduleGr.setValue("batch_install_plan",batchInfo.batch_installation_id);
+		scheduleGr.setValue("execution_tracker_id",batchInfo.execution_tracker_id);
+		scheduleGr.update();
+		this.captureBatchOnScheduledInstallItem(batchInfo.batch_installation_id);
+	},
+	getCurrentScheduledState : function(){
+		var progressTracker = new ProgressTracker();
+		var status = {"failed" : 0,"success":0, "currentRunningBatch" : progressTracker.getPendingBatchInstalls()};
+		var gd = new GlideDateTime();
+		gd.addWeeksLocalTime(-1);
+		
+		var count = new GlideAggregate('sys_installation_schedule_item');
+		count.addQuery('sys_updated_on', '&gt;=' ,gd);
+		count.addQuery('state', 'IN' ,'failed,invalid,installed');
+		count.addAggregate('COUNT','state');
+		count.query();
+		while(count.next()) {
+			if (["failed","invalid"].indexOf(count.getValue("state")) != -1)
+				status["failed"] += parseInt(count.getAggregate('COUNT',"state"));
+			if ("installed" == count.getValue("state"))
+				status["success"] += parseInt(count.getAggregate('COUNT',"state"));
+		}
+		return status;
+	},
+	getNextAvailableScheduleSlot: function(appCount) {
+		var d = new GlideDateTime();
+		d.add(2 * Constants.HOUR_MILLIS);
+		var nextSlotTime = d.getDisplayValue().toString().slice(0,-5)+'00:00';
+		var isScheduleConflict = this.isConflictingSchedule(nextSlotTime, appCount);
+
+		if(isScheduleConflict.conflict) {
+			nextSlotTime = isScheduleConflict.nextSlot;
+		}
+		return {
+			nextSlot: nextSlotTime
+		};
+	},
+
+	isConflictingSchedule : function(userSelectedTime, countOfApps, schedule_id){
+		/*                                             {userselected time}
+		 1st Condition : blockedslotStart-------------------------------------------blockedslotEnd ==&gt; conflict
+		 (user selected time can fall under existing blocked slot)
+
+		                 {userselected time}~~~~~~~~~~~~~~~~~~~~~~~~~~~~~{end time}
+		 2nd condition :                       |blockedslot start-------------------------blockedslot end|   ==&gt; conflict
+		 (end time can fall under existing schedule)
+
+		 3rd condition : {userselected time}~~~~~~~~~~~~~~{blocked start time} --------------{blocked end time}~~~~~~~~~~~~{end time}
+		 (user selected time is outer range of existing blocked time)  =====&gt; conflict
+		*/
+
+		var error;
+		if (!this.isValidTime(userSelectedTime)) {
+			var d = new GlideDateTime();
+			d.add(2 * Constants.HOUR_MILLIS);
+			var displayTime = d.getDisplayValue().toString().slice(0,-5)+'00:00';
+			gs.error("user selected time is in the past" + userSelectedTime);
+			error = gs.getMessage("The start time you chose for the installation is in the past. Installation has been set for the next possible time,");
+			error = error + " " + displayTime;
+			return {
+				conflict: true,
+				error: error,
+				nextSlot: displayTime
+			};
+		}
+
+		var blockedSlots = "";
+		if (gs.isInteractive()) {
+			blockedSlots = gs.getSession().getClientData("blocked_slots");
+			blockedSlots = JSON.parse(blockedSlots || "[]");
+		}
+		else
+			blockedSlots = this.getBlockedSlots();
+		var response = {
+			conflict : false
+		};
+		if (blockedSlots.length == 0)
+			return response;
+
+		var timeToComplete = 3600 *  countOfApps;
+		var dateTime = new GlideDateTime();
+		dateTime.setDisplayValue(userSelectedTime);
+		userSelectedTime = dateTime.getNumericValue();
+		dateTime.addSeconds(timeToComplete);
+		var estimatedEndTime = dateTime.getNumericValue();
+		blockedSlots.sort(function(slot1, slot2){
+			return slot1.start_time - slot2.start_time;
+		});
+		dateTime.setNumericValue(blockedSlots[blockedSlots.length - 1].end_time);
+		var estimatedTimeToComplete = estimatedEndTime - userSelectedTime;
+			for(var i = 0; i &lt; blockedSlots.length; i++) {
+				if(blockedSlots[i].schedule_id !== schedule_id &amp;&amp;
+					((userSelectedTime &gt;= blockedSlots[i].start_time &amp;&amp; userSelectedTime &lt; blockedSlots[i].end_time) ||
+					(estimatedEndTime &gt; blockedSlots[i].start_time &amp;&amp; estimatedEndTime &lt;= blockedSlots[i].end_time) || 
+					(userSelectedTime &lt;= blockedSlots[i].start_time &amp;&amp; blockedSlots[i].end_time &lt;= estimatedEndTime))) {
+					response.conflict = true;
+					if((i == blockedSlots.length - 1) ||
+						(blockedSlots[i+1].start_time - blockedSlots[i].end_time &gt;= estimatedTimeToComplete)) {
+						dateTime.setNumericValue(blockedSlots[i].end_time);
+						break;
+					}
+					userSelectedTime = blockedSlots[i].end_time;
+					estimatedEndTime = userSelectedTime + estimatedTimeToComplete;
+				}
+			}
+		var errorMsg = gs.getMessage("cannot be installed at the time you chose because it's too close to another scheduled installation. It will be installed at the next available time,");
+		if(response.conflict) {
+			response.error = errorMsg + " " + dateTime.getDisplayValue().slice(0, 16) + " "+gs.getSession().getTimeZoneName();
+			response.nextSlot = dateTime.getDisplayValue();
+		}
+		return response;
+	},
+
+	captureScheduleForAnalytics: function(scheduleObj) {
+		var collectionData = {};
+		collectionData.installation_type = "Schedule Install";
+		collectionData.is_search_applied = scheduleObj.isSearchApplied;
+		collectionData.is_filter_applied = scheduleObj.isFilterApplied;
+		new AppClientGCFUtil().captureBatchInstallAnalytics(collectionData, scheduleObj.list_of_apps);
+	},
+
+    _addProgressTracker: function(batchPayload, batchInfo) {
+        var responsePayload = batchInfo;
+        responsePayload.trackerId = batchInfo.execution_tracker_id;
+        var id;
+	var type; 
+	if(batchPayload &amp;&amp; batchPayload.packages &amp;&amp; batchPayload.packages.length==1){
+		id = batchPayload.packages[0].id;
+		type= batchPayload.packages[0].type;
+	}
+	if(type =='application' || type == 'plugin'){
+		CommonUtils.addProgressTracker(batchPayload, responsePayload, id, type, Constants.SCHEDULE_INSTALL);
+	}else{
+		CommonUtils.addProgressTracker(batchPayload, responsePayload, batchPayload.product_id, Constants.BATCH_INSTALL, Constants.SCHEDULE_INSTALL);
+	}
+    },
+
+    type: 'ScheduledInstallService'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-01-25 10:28:23&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;000b82eb93312010ebd4f157b67ffb86&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;212&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ScheduledInstallService&lt;/sys_name&gt;
+        &lt;sys_package display_value="Scoped App Client" source="sn_appclient"&gt;781f36a96fef21005be8883e6b3ee43d&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Scoped App Client"&gt;781f36a96fef21005be8883e6b3ee43d&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_000b82eb93312010ebd4f157b67ffb86&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-21 11:52:08&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:08:50</sys_created_on>
+        <sys_id>6f20bc9d83301210c6695855eeaad3bb</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ScheduledInstallService</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_6f20bc9d83301210c6695855eeaad3bb</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:08:50</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

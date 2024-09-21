@@ -1,0 +1,249 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules">
+    <x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection/>
+        <condition/>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>Check validity before submit</name>
+        <order>100</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function executeRule(current, previous /*null when async*/ ) {
+
+    var allArtifactDetails = new LFArtifactUtils().getAllArtifactConfigurations();
+    var allArtifacts = allArtifactDetails.allArtifacts;
+    var allArtifactInternalNames = allArtifactDetails.sortedArtifactInternalNames;
+    var allLanguages = new LFUtils().getAllLanguages().allLanguages;
+    var arrayUtil = new ArrayUtil();
+    var validationUtils = new LFValidationUtils();
+
+    var isValid = 'true';
+    //ensure multiple records will not be created for same language
+    if (!validateSelectedArtifactLanguagePairs()) {
+        isValid = 'false';
+    }
+    //when automate translate is enabled, ensure corresponding translation preference is enabled.
+    var workflow = current.getValue('workflow');
+    if (!(workflow === 'atranslate_tapproval_publish' || workflow === 'atranslate_publish' || workflow === 'atranslate_apublish' || workflow === 'bapproval_atranslate_tapproval_publish' || workflow === 'bapproval_atranslate_publish' || workflow === 'bapproval_atranslate_apublish')) {
+        current.automate_translate = '';
+    }
+    if (current.automate_translate == 'machine_translate' && !current.enable_machine_translate) {
+        showInvalidMessageForAutoTranslation();
+        isValid = 'false';
+    } else if (current.automate_translate == 'send_to_tms' && !current.enable_tms) {
+        showInvalidMessageForAutoTranslation();
+        isValid = 'false';
+    } else if (current.automate_translate == 'send_via_email' && !current.enable_email) {
+        showInvalidMessageForAutoTranslation();
+        isValid = 'false';
+    }
+    //validate the translator
+    if (current.translator_name != '' && !validateTranslator()) {
+        isValid = 'false';
+    }
+    //validate email_ids if send_via_email is enabled
+    if (!validateEmailIds()) {
+        isValid = 'false';
+    }
+    //validate the fulfiller user group
+    if (!validationUtils.hasFulfillerRole(current.localization_fulfiller_group)) {
+        gs.addErrorMessage(gs.getMessage('Selected Localization Fulfiller group does not have localization_fulfiller role.'));
+        isValid = 'false';
+    }
+    //validate translation approver group
+    if (current.translation_approver_group != '' && !validationUtils.hasFulfillerRole(current.translation_approver_group)) {
+        gs.addErrorMessage((gs.getMessage('Selected Translation Approver group does not have localization_fulfiller role.')));
+        isValid = 'false';
+    }
+    //validate business approver group
+    if (current.business_approver_group != '' && !validationUtils.hasFulfillerRole(current.business_approver_group)) {
+        gs.addErrorMessage((gs.getMessage('Selected Business Approver group does not have localization_fulfiller role.')));
+        isValid = 'false';
+    }
+    //validate project details
+    if (!validateProjectDetails()) {
+        isValid = 'false';
+    }
+    if (isValid === 'false') {
+        current.setAbortAction(true);
+    }
+
+    function showInvalidMessageForAutoTranslation() {
+        gs.addErrorMessage(gs.getMessage('Ensure the corresponding translation preference for your auto translation option is enabled.'));
+    }
+
+    function validateEmailIds() {
+        if (!current.default_recipients_list) return true;
+        var emailIds = current.default_recipients_list.split(',');
+        var emailPattern = /^[a-zA-Z0-9._+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]+$/;
+        var invalidEmailIds = [];
+        for (var i = 0; i < emailIds.length; i++) {
+            var email = emailIds[i].trim();
+            if (email === '' || !emailPattern.test(email)) {
+                invalidEmailIds.push(email);
+            }
+        }
+        if (invalidEmailIds.length > 0) {
+            gs.addErrorMessage(gs.getMessage('The Default recipients list contains invalid email address(es): {0}', invalidEmailIds.join(',')));
+            return false;
+        }
+        return true;
+    }
+
+    function validateTranslator() {
+        if (!GlidePluginManager.isActive('com.glide.dynamic_translation')) {
+            return false;
+        }
+        var translatorName = current.translator_name;
+        var gr = new GlideRecord('sn_dt_translator_configuration');
+        gr.addQuery('name', translatorName);
+        gr.query();
+        if (gr.next()) {
+            var isValid = true;
+            if (gr.getValue('version') !== 'v3') {
+                gs.addErrorMessage(gs.getMessage('{0} translator is not of version v3.', translatorName));
+                isValid = false;
+            }
+            if (!gr.getValue('translate_sub_flow')) {
+                gs.addErrorMessage(gs.getMessage('{0} translator has no translate subflow configured.', translatorName));
+                isValid = false;
+            }
+            if (gr.getValue('active') !== '1') {
+                gs.addErrorMessage(gs.getMessage('{0} translator is not active.', translatorName));
+                isValid = false;
+            }
+            return isValid;
+        }
+        return false;
+    }
+
+    function validateSelectedArtifactLanguagePairs() {
+        var configuredLanguagesForArtifact = {};
+        var duplicatePairs = [];
+        var gr = new GlideRecord('sn_lf_setting');
+        gr.addQuery('sys_id', '!=', current.getUniqueValue());
+        gr.query();
+        while (gr.next()) {
+            var artifact = gr.getValue('artifact');
+            var languageSysIds = gr.getValue('languages').split(',');
+            for (var i = 0; i < languageSysIds.length; i++) {
+                if (artifact === 'all_artifacts') {
+                    for (var artifactIdx = 0; artifactIdx < allArtifactInternalNames.length; artifactIdx++) {
+                        addToConfiguredLanguages(configuredLanguagesForArtifact, allArtifactInternalNames[artifactIdx], languageSysIds);
+                    }
+                } else {
+                    addToConfiguredLanguages(configuredLanguagesForArtifact, artifact, languageSysIds);
+                }
+            }
+        }
+
+        var selectedLanguages = current.languages.split(',');
+        var selectedArtifact = current.getValue("artifact");
+        if (selectedArtifact === "all_artifacts") {
+            for (var artifactIdx = 0; artifactIdx < allArtifactInternalNames.length; artifactIdx++) {
+                var artifactInternalName = allArtifactInternalNames[artifactIdx];
+                addDuplicatePairs(duplicatePairs, selectedLanguages, artifactInternalName, configuredLanguagesForArtifact[artifactInternalName]);
+            }
+        } else {
+            addDuplicatePairs(duplicatePairs, selectedLanguages, selectedArtifact, configuredLanguagesForArtifact[selectedArtifact]);
+        }
+
+        if (duplicatePairs.length > 0) {
+            var msg = gs.getMessage('A setting record already exists for the artifact - language pair(s): {0}. Resolve the conflict(s) to proceed.', duplicatePairs.join(','));
+            gs.addErrorMessage(msg);
+            return false;
+        }
+        return true;
+    }
+
+    function addToConfiguredLanguages(configuredLanguagesForArtifact, artifact, languages) {
+        if (!configuredLanguagesForArtifact.hasOwnProperty(artifact)) {
+            configuredLanguagesForArtifact[artifact] = [];
+        }
+        configuredLanguagesForArtifact[artifact] = arrayUtil.union(configuredLanguagesForArtifact[artifact], languages);
+    }
+
+    function addDuplicatePairs(duplicatePairs, selectedLanguages, artifactInternalName, configuredLanguages) {
+        if (configuredLanguages) {
+            for (var languageIdx = 0; languageIdx < configuredLanguages.length; languageIdx++) {
+                var language = configuredLanguages[languageIdx];
+                if (selectedLanguages.indexOf(language) != -1) {
+                    duplicatePairs.push(allArtifacts[artifactInternalName] + ' - ' + allLanguages[language]);
+                }
+            }
+        }
+    }
+
+    function validateProjectDetails() {
+        var isValid = true;
+        var enableProjects = current.enable_projects;
+        var enableAutoCreation = current.enable_auto_creation;
+        var localizationManagerGroup = current.localization_manager_group;
+        if (!enableProjects) {
+            if (enableAutoCreation) {
+                gs.addErrorMessage(gs.getMessage('Projects should be enabled to create projects automatically.'));
+                isValid = false;
+            } else if (localizationManagerGroup) {
+                showInvalidMessageForAutoCreation();
+                isValid = false;
+            }
+        } else if (enableAutoCreation) {
+            if (!localizationManagerGroup) {
+                gs.addErrorMessage((gs.getMessage('Localization manager group is required to create projects automatically.')));
+                isValid = false;
+            } else if (!validationUtils.hasManagerRole(localizationManagerGroup)) {
+                // Validate localization manager group
+                gs.addErrorMessage((gs.getMessage('Selected localization manager group does not have localization_manager role.')));
+                isValid = false;
+            }
+        } else if (localizationManagerGroup) {
+            showInvalidMessageForAutoCreation();
+            isValid = false;
+        }
+        return isValid;
+    }
+
+    function showInvalidMessageForAutoCreation() {
+        gs.addErrorMessage(gs.getMessage('Auto creation of projects should be enabled to assign localization manager group.'));
+    }
+
+})(current, previous);]]></script>
+        <sys_class_name>x_938076_now_utils_now_utils_business_rules</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:48:10</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>f07b289183701210c6695855eeaad3ff</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Check validity before submit</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>x_938076_now_utils_now_utils_business_rules_f07b289183701210c6695855eeaad3ff</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:48:10</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </x_938076_now_utils_now_utils_business_rules>
+    <sys_translated_text action="delete_multiple" query="documentkey=f07b289183701210c6695855eeaad3ff"/>
+</record_update>

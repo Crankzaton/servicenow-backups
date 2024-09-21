@@ -1,0 +1,345 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>272d6c830b041300a6acc93563673a02</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.ResourceGridAllocationEditor&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;ResourceGridAllocationEditor&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ResourceGridAllocationEditor = Class.create();
+ResourceGridAllocationEditor.prototype = {
+    initialize: function(tableName, planRecord, timespan, userId, allowOverAllocation) {
+        this.tableName = tableName; //requested_allocation or resource_allocation
+        this.planRecord = planRecord;
+        this.editorTimespan = timespan;
+        this.planTimespan = planRecord.getValue('distribution');
+        this.planId = planRecord.getValue('sys_id');
+        this.hoursField = tableName == 'requested_allocation'? 'requested_hours' : 'allocated_hours';
+        this.taskId = this.planRecord.getValue('task');
+		this.userId = userId;
+		if ([ResourcePlanState.PLANNING, ResourcePlanState.REQUESTED, ResourcePlanState.CONFIRMED].indexOf(this.planRecord.getValue('state')) &gt; -1)
+			this.bookingType = 2;//soft
+		else if (planRecord.getValue('state') == ResourcePlanState.ALLOCATED)
+			this.bookingType = 1;//hard
+		else
+			this.bookingType = 2;//defaluting it to soft for all other states
+		this.allocationMap = {};
+		this.rmRates = new RMRates(this.planRecord);
+		this.userFTE = {};
+		this.isBatchingEnabled = false;
+		this.arrayUtil = new ArrayUtil();
+		this.appendDailyHours = false;
+		this.overAllocate = JSUtil.nil(allowOverAllocation) ? true : allowOverAllocation;
+    },
+	
+	setCapacityHelper: function(capacityHelper){
+		this.capacityHelper = capacityHelper;
+	},
+	
+	setUserId: function(userId){
+		this.userId = userId;
+	},
+    
+	setBookingType: function(bookingType){
+		this.bookingType = bookingType;
+	},
+	
+	setResPlanLogHelper: function(resPlanLogHelper){
+		this.resPlanLogHelper = resPlanLogHelper;
+	},
+	
+	setAppendDailyHours: function(appendDailyHours){
+		this.appendDailyHours = appendDailyHours;
+	},
+	
+    updateAllocations: function(allocationArr) {
+        return this.updateOverlappingAllocations(allocationArr);
+    },
+	
+	_getUserFTE: function(userId){
+		if(!(userId in this.userFTE)){
+			this.userFTE[userId] =  RMUtil.averageDailyFteForUser(userId);
+		}
+		return this.userFTE[userId];
+	},
+	
+    updateOverlappingAllocations: function(allocationArr) {
+		var allocationIds = [];
+		var hoursPerDay;
+		allocationArr.forEach(function(allocation) {
+			var dailyRate;
+			var allocIds = [];
+			var hours = Number(allocation.value);
+			if (this.tableName == 'requested_allocation')
+				dailyRate = this.rmRates.getDailyRatesForPlan(allocation.dates.startDate, allocation.dates.endDate);
+			else
+				dailyRate = this.rmRates.getDailyRatesForUser(this.userId, allocation.dates.startDate, allocation.dates.endDate);
+			if (allocation.bookingType)
+				this.bookingType = allocation.bookingType;
+			if(hours &gt; 0){
+				hoursPerDay = this.distributeHoursAcrossDates(allocation.value, allocation.dates.startDate, allocation.dates.endDate, allocation.allocationId);
+				if(hoursPerDay &amp;&amp; Object.keys(hoursPerDay).length &gt; 0)
+				allocIds = this.updateDailies(hoursPerDay, allocation.dates.startDate, allocation.dates.endDate, dailyRate, allocation.allocationId, allocation.taskId);
+				
+			}
+			else{
+				var dailyEditor = new ResourceGridAllocationDailyEditor(this.tableName + '_daily', this.planRecord);
+				var dailies = dailyEditor.getAllocationDailyRecordsByDates( allocation.dates.startDate, allocation.dates.endDate,this.userId,'',allocation.allocationId);
+				allocIds = dailyEditor.updateDailiesWithZeroHours(dailies,dailyRate);
+			}
+			allocationIds = this.arrayUtil.concat(allocationIds, allocIds);
+		}, this);
+
+		if (this.isBatchingEnabled &amp;&amp; !gs.nil(this.datastore)) {
+					this.datastore.commitResourceAllocationDaily();
+				}
+
+		return allocationIds;
+	},
+	
+	updateDailies: function(hoursPerDay,startDate,endDate,dailyRate,allocationId, taskId){
+		var dailyEditor = new ResourceGridAllocationDailyEditor(this.tableName + '_daily', this.planRecord);
+		dailyEditor.setAppendDailyHours(this.appendDailyHours);
+		var dailies = dailyEditor.getAllocationDailyRecordsByDates(startDate, endDate,this.userId,'',allocationId);
+		var allocIds = [];
+		if(dailies.getRowCount() &gt; 0)
+			allocIds = dailyEditor.updateExistingDailies(dailies, hoursPerDay, this.userId, dailyRate);
+		var newAllocIds = this.createNewDailies(hoursPerDay, dailyRate, allocationId, taskId);
+		allocIds = this.arrayUtil.concat(allocIds,newAllocIds);
+		return allocIds;
+	},
+	
+	getAllocIdsByDailies: function(startDate, endDate, userId, bookingType){
+		var dailyEditor = new ResourceGridAllocationDailyEditor(this.tableName+'_daily',this.planRecord,this.editorTimespan);
+		var dailies = dailyEditor.getAllocationDailyRecordsByDates(startDate, endDate, userId, bookingType);
+		var allocIds = [];
+		while(dailies.next()){
+			var allocId = dailies.getValue(dailyEditor.allocationField);
+			if(allocIds.indexOf(allocId) &lt; 0)
+				allocIds.push(allocId);
+		}
+		return allocIds;
+	},
+	
+	distributeHoursAcrossDates: function(hours, startDate, endDate, allocId) {
+		var hoursPerDay;
+		var rmCapacityApi;
+		
+		var minTimeUnit = parseInt(gs.getProperty('com.snc.resource_management.allocation_interval_minutes', '60'));
+		if(this.tableName == 'requested_allocation'){	
+			this.workingSchedule = new ResourcePlanSchedule(this.planRecord, startDate, endDate, hours).getWorkingScheduleByDate();
+			hoursPerDay = RMHourDistribution.distributeHoursAcrossDates(startDate, endDate, hours, minTimeUnit, this.workingSchedule);
+			return hoursPerDay;
+		}
+		else {
+			if (this.capacityHelper != null) {
+				this.workingSchedule = this.capacityHelper.getCapacityForUserByDate(this.userId, startDate, endDate);
+			} else {
+				rmCapacityApi = new RMCapacityAPI(startDate, endDate, true);
+				this.workingSchedule = rmCapacityApi.getCapacityForUserByDate(this.userId);
+			}
+		}
+		
+		var allocSpread = this.planRecord.getValue('distribution_type');
+		var allocator;
+		if(allocSpread == 'front_load')
+			allocator = new ResourceGridFrontLoadAllocator(hours,startDate.getValue(),endDate.getValue(),[this.userId], this.capacityHelper);
+		else
+			allocator = new ResourceGridEvenSpreadAllocator(hours,startDate.getValue(),endDate.getValue(),[this.userId],this.capacityHelper);
+			
+		var hoursPerDayPerUser = allocator.hoursToAllocatePerUserPerDate(this.planRecord.getValue('sys_id'),this.overAllocate,true,this.appendDailyHours, this.planRecord.getValue('resource_type'), allocId);
+		this.resPlanLogHelper.updateHoursInfo(allocator.getHoursAllocatedPerUser(),allocator.getHoursLeft(),startDate.getValue(),endDate.getValue());
+		return hoursPerDayPerUser[this.userId];
+	},
+    
+    createNewDailies: function(hoursPerDay, dailyRate, allocId, taskId) {
+		var allocationIds = [];
+		Object.keys(hoursPerDay).forEach(function(day) {
+			var rateObj = dailyRate.getRateForDay(day);
+			var rmDateRangeHelper = new RMDateRangeHelper();
+			var dates = rmDateRangeHelper.getTimeSpanDatesForDay(day, this.planTimespan, this.planRecord);
+            var allocationId = gs.nil(allocId) ? this._createOrGetAllocation(dates.startDate, dates.endDate, this.userId, this.taskId, this.bookingType) : allocId;
+            var dailyEditor = new ResourceGridAllocationDailyEditor(this.tableName + '_daily', this.planRecord, this.editorTimespan);
+			if(this.isBatchingEnabled &amp;&amp; JSUtil.notNil(this.datastore)) {
+				dailyEditor.setDatastore(this.datastore);
+				dailyEditor.setBatching(this.isBatchingEnabled);
+			}
+			var task = !gs.nil(taskId) ? taskId : this.taskId;
+            dailyEditor.createAllocationDaily(allocationId, day, hoursPerDay[day], task, this.bookingType, this.userId, rateObj,this._getUserFTE(this.userId), this.workingSchedule);
+			allocationIds.push(allocationId);
+		}, this);
+		
+		var au = new ArrayUtil();
+		allocationIds = au.unique(allocationIds);
+		return allocationIds;
+    },
+	
+	createAllocation: function(startDate,endDate,userId,hours,taskId,bookingType) {
+		var resAlloc = new GlideRecord(this.tableName);
+		if(this.isBatchingEnabled &amp;&amp; JSUtil.notNil(this.datastore)) 
+			resAlloc.newRecord(); 
+			
+		resAlloc.setValue('resource_plan', this.planId);
+		resAlloc.setValue('start_date', startDate);
+		resAlloc.setValue('end_date', endDate);
+		if (JSUtil.notNil(userId))
+			resAlloc.setValue('user', userId);
+		if (JSUtil.notNil(taskId))
+			resAlloc.setValue('task', taskId);
+		if(this.planRecord.isValidField('planning_item') &amp;&amp; !gs.nil(this.planRecord.getValue('planning_item')))
+			resAlloc.setValue('planning_item', this.planRecord.getValue('planning_item'));
+		resAlloc.setValue(this.hoursField, hours);
+		if (JSUtil.notNil(bookingType))
+			resAlloc.setValue('booking_type',bookingType);
+		this._calculateAndSetManDaysAndFteFromHours(resAlloc);
+		var planDomain = this.planRecord.getValue('sys_domain');
+		resAlloc.setValue('sys_domain',planDomain);
+		if(this.tableName == 'resource_allocation') {
+			resAlloc.setValue('distribution_type',this.planTimespan);
+			resAlloc.setValue('actual_hours', 0);										 
+			if(this.planRecord.getValue('project_currency'))
+				resAlloc.setValue('project_currency',this.planRecord.getValue('project_currency'));
+			else if(this.planRecord.getValue('demand_currency'))
+				resAlloc.setValue('demand_currency',this.planRecord.getValue('demand_currency'));
+			
+		}
+		var resAllocId;
+		if(this.isBatchingEnabled &amp;&amp; JSUtil.notNil(this.datastore)) {
+			var num = new NumberManager('resource_allocation').getNextObjNumberPadded();
+			resAlloc.number = num;
+			resAllocId = this.datastore.addAllocation(resAlloc, 'insert');
+		} else {
+			resAlloc.setWorkflow(false);
+			resAllocId = resAlloc.insert();
+		}
+		return resAllocId;
+	},
+	
+	_calculateAndSetManDaysAndFteFromHours: function(resAlloc) {
+		if (this.tableName == 'resource_allocation') {
+			var resAllocSI = new ResourceAllocation(resAlloc);
+			resAllocSI.setCapacityHelper(this.capacityHelper);
+			resAllocSI.calculateAndSetManDaysAndFteFromAllocatedHours();
+		} else if (this.tableName == 'requested_allocation') {
+			var reqAllocSI = new RequestedAllocation(resAlloc);
+			reqAllocSI.calculateAndSetManDaysAndFteFromRequestedHours();
+		}
+	},
+	
+	_createOrGetAllocation : function(startDate,endDate,userId,taskId,bookingType) {
+		var allocationId = this.allocationMap[startDate.getValue()+'_'+userId];
+		if(!allocationId){
+			var allocation = new GlideRecord(this.tableName);
+			allocation.addQuery('resource_plan', this.planId);
+			allocation.addQuery('start_date', "&gt;=" ,startDate);
+			allocation.addQuery('end_date', "&lt;=" ,endDate);
+			if (JSUtil.notNil(userId) &amp;&amp; this.tableName.startsWith("resource"))
+				allocation.addQuery('user', userId);
+			allocation.query();
+			if(allocation.next()){
+				allocationId = allocation.getValue('sys_id');
+				var datesNeedsToBeUpdated = allocation.getValue("start_date") != startDate || allocation.getValue("end_date") != endDate;
+				if(allocation.getValue("start_date") != startDate)
+					allocation.setValue("start_date", startDate);
+				if(allocation.getValue("end_date") != endDate)
+					allocation.setValue("end_date", endDate);
+				if(datesNeedsToBeUpdated){
+					allocation.setWorkflow(false);
+					allocation.update();
+				}
+			} else{
+				allocationId = this.createAllocation(startDate,endDate,userId,0,taskId,bookingType);
+			}
+			this.allocationMap[startDate.getValue()+'_'+userId] = allocationId;
+		}
+		return allocationId;
+	},
+	
+	convertToHardBooking: function(date,userId,rollupRPlan,updateAggregates,logBookingsChange){
+		var dailyEditor = new ResourceGridAllocationDailyEditor(this.tableName+'_daily',this.planRecord,this.editorTimespan);
+		var userIds = [];
+		var isGroupLevel = JSUtil.nil(userId);
+		var helper = new RMDateRangeHelper();
+		var dr = helper.getTimeSpanDatesForDay(date,this.editorTimespan,this.planRecord);
+		var startDate = dr.startDate;
+		var endDate = dr.endDate;
+		var validator = new RMActionValidator(this.planRecord);
+		var isWriteCellAllowed = validator.canWriteCell("resource_allocation",startDate,endDate,userId);
+		var hardBookedHours = 0;
+		if(isWriteCellAllowed){
+			var dailies = dailyEditor.getAllocationDailyRecordsByDates(startDate,endDate,userId,'2');
+			var allocIds = [];
+			while(dailies.next()){
+				if(allocIds.indexOf(dailies.getValue('allocation')) &lt; 0)
+					allocIds.push(dailies.getValue('allocation'));
+				if(isGroupLevel)
+					if(userIds.indexOf(dailies.getValue('user')) &lt; 0)
+						userIds.push(dailies.getValue('user'));
+				dailies.setValue('booking_type','1');
+				hardBookedHours += Number(dailies.getValue('hours'));
+				dailies.setWorkflow(false);
+				dailies.update();
+			}
+			if(userIds.length == 0)
+				userIds.push(userId);
+			if(allocIds.length &gt; 0){
+				ResourcePlanRollupHelper.rollupFromResAllocationDailiesToAllocations(allocIds,'1',this.capacityHelper);
+				if(rollupRPlan)
+					ResourcePlanRollupHelper.rollupResourcePlan(this.planId, ResourcePlanState.ALLOCATED);
+			}
+			if(userIds.length &gt; 0 &amp;&amp; updateAggregates)
+				ResourceGridAggregatesHelper.resPlanActionFromFinder(userIds,startDate,endDate,this.taskId,'allocate');
+			
+			if(logBookingsChange){
+				var logHelper = new ResourcePlanLogHelper(this.planRecord,false,true);
+				logHelper.populateLogs({'type':'bookingTypeUpdated','hardBookedHours': hardBookedHours,'fromDate':dr.startDate,'toDate':dr.endDate,'userId':userId});
+			}
+		}
+		return {'isWriteCellAllowed': isWriteCellAllowed, 'hardBookedHours': hardBookedHours};
+	},
+	
+	setDatastore: function (datastore) {
+        this.datastore = datastore;     
+    },  
+	
+    setBatching: function (batching) {
+         this.isBatchingEnabled = batching;
+	},
+	
+    type: 'ResourceGridAllocationEditor'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2018-02-07 09:24:30&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;272d6c830b041300a6acc93563673a02&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;271&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ResourceGridAllocationEditor&lt;/sys_name&gt;
+        &lt;sys_package display_value="Resource Grid Interface" source="com.snc.resource_grid"&gt;7e00da2b47e64210cd4e1ce4316d438f&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_272d6c830b041300a6acc93563673a02&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-11-01 08:37:56&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:36</sys_created_on>
+        <sys_id>ba01785983b01210c6695855eeaad3cb</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ResourceGridAllocationEditor</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_ba01785983b01210c6695855eeaad3cb</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:36</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,451 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>20a2e0a793311200ea933007f67ffbbb</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.PlannedTaskEntityUpdater&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;PlannedTaskEntityUpdater&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var PlannedTaskEntityUpdater = Class.create();
+PlannedTaskEntityUpdater.prototype = {
+	initialize: function() {
+		this.CONSTS = PmFieldConstants;
+		this.currencyUtil = new ProjectCurrencyUtil();
+
+	},
+	prependGlobalCurrency: function(value) {
+		var currencyCode = new SNC.FMCurrency().getGlobalCurrencyCode();
+		return currencyCode + ';' + value;
+	},
+	updatePlannedTaskEstimatedCost: function(originalTask){
+		var task = this.currencyUtil.getRealTableRecord(originalTask);
+		var isProjectCurrencyPresent = this.currencyUtil.isProjectCurrencyPresent(task);
+		var parentProjectCurrency = task.getValue(this.CONSTS.PROJECT_CURRENCY);
+				
+		var costPlanBreakdownTotal;var totalCapex = 0;var totalOpex =0;var relatedStoryCapexCost = 0; var relatedStoryOpexCost = 0 ; 
+		var totalCapexProjectCurrency = 0;
+		var totalOpexProjectCurrency = 0;
+		if(GlidePluginManager.isActive('com.snc.financial_planning_pmo')){
+			var columnList = ["cost_default_currency"];
+			if (isProjectCurrencyPresent)
+				columnList.push(this.CONSTS.COST_PROJECT_CURRENCY);
+			costPlanBreakdownTotal = this._getCapexOpexTotal('cost_plan_breakdown', 'requirement', 'cost_plan.task',task.getValue('sys_id'), columnList);
+		}
+		var costColumns = {'FX-COLUMNS':['capex_cost','opex_cost']};
+		if (isProjectCurrencyPresent)
+			costColumns['FX2-COLUMNS'] = [this.CONSTS.CAPEX_COST_PROJECT_CURRENCY, this.CONSTS.OPEX_COST_PROJECT_CURRENCY];
+		
+		var childCost = {
+			capex_cost: 0,
+			capex_cost_project_currency: 0,
+			opex_cost: 0,
+			opex_cost_project_currency: 0
+		};
+
+        	if (gs.getProperty("com.snc.project.rollup.cost") === "true") {
+	            childCost = this._getChildTaskCostTotal(costColumns, task);
+        	}
+		
+		if(GlidePluginManager.isActive('com.snc.sdlc.agile.2.0')){
+			var  isProjectTask = task.instanceOf('pm_project_task');
+			relatedStoryCapexCost = this._getStoryCostTotal('capex_cost', task.getValue('sys_id'),isProjectTask);
+			relatedStoryOpexCost = this._getStoryCostTotal('opex_cost', task.getValue('sys_id'),isProjectTask);
+		}
+		//we get costPlanBreakdownTotal = {"capex-cost_default_currency": 100, "capex-cost_project_currency": 200, "opex-cost_default_currency": 300}
+		//childCost = {"capex_cost": 100, "opex_cost": 200, "capex_cost_project_currency": 300, "opex_cost_project_currency": 400}
+		//use them to set values 
+		if(isNaN(costPlanBreakdownTotal["capex-cost_default_currency"]))
+			totalCapex = childCost["capex_cost"]+relatedStoryCapexCost;
+		else
+			totalCapex = parseFloat(costPlanBreakdownTotal["capex-cost_default_currency"])+childCost["capex_cost"]+relatedStoryCapexCost;
+
+		if(isNaN(costPlanBreakdownTotal["opex-cost_default_currency"]))
+			totalOpex = childCost["opex_cost"]+relatedStoryOpexCost;
+		else
+			totalOpex = parseFloat(costPlanBreakdownTotal["opex-cost_default_currency"])+childCost["opex_cost"]+relatedStoryOpexCost;
+
+		//if(totalCapex&gt;0)
+		task.capex_cost = this.prependGlobalCurrency(totalCapex);
+		//if(totalOpex&gt;0)
+		task.opex_cost = this.prependGlobalCurrency(totalOpex);
+		
+		if (isProjectCurrencyPresent) {
+			totalCapexProjectCurrency = isNaN(costPlanBreakdownTotal['capex-cost_project_currency'])? childCost["capex_cost_project_currency"] : childCost["capex_cost_project_currency"] + costPlanBreakdownTotal["capex-cost_project_currency"];
+			totalOpexProjectCurrency = isNaN(costPlanBreakdownTotal['opex-cost_project_currency']) ? childCost["opex_cost_project_currency"] : childCost["opex_cost_project_currency"] + costPlanBreakdownTotal['opex-cost_project_currency'];
+			var projectCurrencyCode=task[this.CONSTS.PROJECT_CURRENCY][this.CONSTS.CODE];
+			task[this.CONSTS.CAPEX_COST_PROJECT_CURRENCY].amount = totalCapexProjectCurrency;
+			task[this.CONSTS.CAPEX_COST_PROJECT_CURRENCY][this.CONSTS.CURRENCY] = projectCurrencyCode;
+			task[this.CONSTS.OPEX_COST_PROJECT_CURRENCY].amount = totalOpexProjectCurrency;
+			task[this.CONSTS.OPEX_COST_PROJECT_CURRENCY][this.CONSTS.CURRENCY] = projectCurrencyCode;
+						
+		}
+
+		task.update();
+
+	},
+
+
+	updatePlannedTaskPlannedBenefit: function(originalTask){
+		var task = this.currencyUtil.getRealTableRecord(originalTask);
+		var isProjectCurrencyPresent = this.currencyUtil.isProjectCurrencyPresent(task);
+		var parentProjectCurrencyCode;
+		if(isProjectCurrencyPresent)
+			parentProjectCurrencyCode= task[this.CONSTS.PROJECT_CURRENCY][this.CONSTS.CODE];
+		
+		if (GlidePluginManager.isActive('com.snc.financial_planning_pmo')) {
+			//get breakdown total
+			var columnList = ["base_estimated_benefit"];
+			if (isProjectCurrencyPresent)
+				columnList.push(this.CONSTS.BENEFIT_PROJECT_CURRENCY);
+			var sumResult = this._getTotal("benefit_plan_breakdown", "requirement", "benefit_plan.task", task.getValue('sys_id'), columnList);    
+			//get childTotal	
+			if (PMPropertiesUtil.isCostRollUp(current.getTableName()) == 'true' ){
+				var costColumns = {'FX-COLUMNS':['benefits']};
+				if (isProjectCurrencyPresent)
+					costColumns['FX2-COLUMNS'] = [this.CONSTS.PLANNED_BENEFIT_PROJECT_CURRENCY];
+				var childCost = this._getChildTaskCostTotal(costColumns, task); 
+			}
+			//sumResult = {"base_estimated_benefit": 100, "cost_project_currency": 200}
+			//childCost = {"benefits":100, "planned_benefit_project_currency":200}  set project currency rollup values
+			var totalBenefit = 0;
+			var totalBenefitProjectCurrency = 0;
+			if (PMPropertiesUtil.isCostRollUp(current.getTableName()) == 'false' ){
+				totalBenefit = isNaN(sumResult["base_estimated_benefit"])? 0 : sumResult["base_estimated_benefit"] ;
+				totalBenefitProjectCurrency = isNaN(sumResult[this.CONSTS.BENEFIT_PROJECT_CURRENCY])? 0 : sumResult[this.CONSTS.BENEFIT_PROJECT_CURRENCY];
+			} else {
+				totalBenefit = isNaN(sumResult["base_estimated_benefit"])? isNaN(childCost["benefits"]): sumResult["base_estimated_benefit"] + childCost["benefits"];
+				totalBenefitProjectCurrency = isNaN(sumResult[this.CONSTS.BENEFIT_PROJECT_CURRENCY])? childCost[this.CONSTS.PLANNED_BENEFIT_PROJECT_CURRENCY] : sumResult[this.CONSTS.BENEFIT_PROJECT_CURRENCY] + childCost[this.CONSTS.PLANNED_BENEFIT_PROJECT_CURRENCY];
+			}
+			
+		
+			var updated=false;
+			if (JSUtil.notNil(totalBenefit)){
+				task.benefits = this.prependGlobalCurrency(totalBenefit);
+				updated=true;
+			}
+			if (isProjectCurrencyPresent &amp;&amp; JSUtil.notNil(totalBenefitProjectCurrency)){
+				task.planned_benefit_project_currency.amount = totalBenefitProjectCurrency;
+				task.planned_benefit_project_currency.currency = parentProjectCurrencyCode;
+				updated=true;
+			}
+			if (updated)
+				task.update();
+		}
+	},
+
+    updatePlannedTaskActualBenefit: function (task) {
+        var taskBenefit = 0;
+        var taskBenefitProjectCurrency = 0;
+		var taskPlans = this.currencyUtil.getRealTableRecord(task);
+		var isProjectCurrencyPresent=this.currencyUtil.isProjectCurrencyPresent(taskPlans);
+		var parentProjectCurrencyCode;
+		if (isProjectCurrencyPresent)
+			parentProjectCurrencyCode= taskPlans[this.CONSTS.PROJECT_CURRENCY][this.CONSTS.CODE];
+		
+        if (GlidePluginManager.isActive('com.snc.financial_planning_pmo')) {
+			var columnList = ["actual_benefit"];
+			if (isProjectCurrencyPresent)
+				columnList.push(this.CONSTS.ACTUAL_BENEFIT_PROJECT_CURRENCY);
+			var benefitSumResult = this._getTotal("benefit_plan_breakdown", "requirement", "benefit_plan.task", task.getValue('sys_id'), columnList);    
+            
+            var childTotal = 0;
+			var childTotalProjectCurrency = 0;
+            if (PMPropertiesUtil.isCostRollUp(current.getTableName()) == 'true') {
+				
+				var costColumns = {'FX-COLUMNS':['actual_benefits']};
+				if (isProjectCurrencyPresent)
+					costColumns['FX2-COLUMNS'] = [this.CONSTS.ACTUAL_BENEFIT_PROJECT_CURRENCY];
+				var childCost = this._getChildTaskCostTotal(costColumns, taskPlans); 		
+            }
+			//benefitSumResult = {"actual_benefit": 100, "actual_benefit_project_currency": 200}
+			//childCost = {"actual_benefits":100, "actual_benefit_project_currency":200}  set project currency rollup values
+			var totalBenefit = 0;
+			var totalBenefitProjectCurrency = 0;
+			if (PMPropertiesUtil.isCostRollUp(current.getTableName()) == 'false' ){
+				totalBenefit = isNaN(benefitSumResult["actual_benefit"])? 0 : benefitSumResult["actual_benefit"];
+				totalBenefitProjectCurrency = isNaN(benefitSumResult[this.CONSTS.ACTUAL_BENEFIT_PROJECT_CURRENCY])? 0 : benefitSumResult[this.CONSTS.ACTUAL_BENEFIT_PROJECT_CURRENCY];
+			} else {
+				totalBenefit = isNaN(benefitSumResult["actual_benefit"])? childCost["actual_benefits"] : benefitSumResult["actual_benefit"] + childCost["actual_benefits"];
+				totalBenefitProjectCurrency = isNaN(benefitSumResult[this.CONSTS.ACTUAL_BENEFIT_PROJECT_CURRENCY])? childCost[this.CONSTS.ACTUAL_BENEFIT_PROJECT_CURRENCY] : benefitSumResult[this.CONSTS.ACTUAL_BENEFIT_PROJECT_CURRENCY] + childCost[this.CONSTS.ACTUAL_BENEFIT_PROJECT_CURRENCY];
+			}
+			
+			var updated=false;
+            if (JSUtil.notNil(totalBenefit)){
+				taskPlans.actual_benefits = this.prependGlobalCurrency(totalBenefit);
+				updated=true;
+			}
+            if (isProjectCurrencyPresent &amp;&amp; JSUtil.notNil(totalBenefitProjectCurrency)){
+				taskPlans.actual_benefit_project_currency.amount = totalBenefitProjectCurrency;
+				taskPlans.actual_benefit_project_currency.currency = parentProjectCurrencyCode;
+				updated=true;
+			}
+			if (updated)
+                taskPlans.update();
+        }
+    },
+
+	updatePlannedTaskForecast: function(topTask) {
+		if(!GlidePluginManager.isActive('com.snc.financial_planning_pmo'))
+			return;
+		var columnsCostPlan=['forecast_cost_default_currency','etc_cost_default_currency'];
+		var columnsTaskDecimal=['forecast_cost','estimate_to_completion'];
+		var columnsCostPlanFxCurrency=[];
+		var columnsTaskFxCurrency=[];
+		if(new ProjectCurrencyUtil().isProjectCurrencyPresent(topTask)){
+			columnsCostPlanFxCurrency=[this.CONSTS.EAC_PROJECT_CURRENCY,this.CONSTS.ETC_COST_PROJECT_CURRENCY];
+			columnsTaskFxCurrency=[this.CONSTS.EAC_PROJECT_CURRENCY,this.CONSTS.ETC_PROJECT_CURRENCY];
+		}
+		var columnsTotal = {};
+		var costPlanETCTotal = 0;
+		var taskQuery = 'top_task=' + topTask.getValue('sys_id');
+		columnsTotal = this._getCostPlanForecastTotals(columnsCostPlan.concat(columnsCostPlanFxCurrency),taskQuery);
+
+		var updated=false;
+		for(var i=0;i&lt;columnsCostPlan.length;i++){
+			if(columnsTotal[columnsCostPlan[i]] != topTask[columnsTaskDecimal[i]]){
+				topTask[columnsTaskDecimal[i]]=this.prependGlobalCurrency(columnsTotal[columnsCostPlan[i]]);
+				updated=true;
+			}
+		}
+
+		for(var j=0;j&lt;columnsCostPlanFxCurrency.length;j++){
+			if(columnsTotal[columnsCostPlanFxCurrency[j]] != topTask[columnsTaskFxCurrency[j]][this.CONSTS.AMOUNT]){
+				topTask[columnsTaskFxCurrency[j]][this.CONSTS.AMOUNT]=columnsTotal[columnsCostPlanFxCurrency[j]];
+				topTask[columnsTaskFxCurrency[j]][this.CONSTS.CURRENCY]=topTask[this.CONSTS.PROJECT_CURRENCY];
+				updated=true;
+			}
+		}
+
+		if (updated)
+			topTask.update();
+	},
+
+	_getForecastTotal: function(topTaskId) {
+		var forecastCost = 0.0;
+		var financialApi = new FinancialsForPPM();
+
+		var openForecastPeriod = financialApi.getCurrentOpenForecastPeriod();
+		if(JSUtil.nil(openForecastPeriod))
+			return forecastCost;
+
+		var openFiscalPeriodId = openForecastPeriod.fiscal_period;
+		var openFiscalPeriodGr = new GlideRecord('fiscal_period');
+		if(openFiscalPeriodGr.get(openFiscalPeriodId)) {
+			var openFPStartDateTime = openFiscalPeriodGr.fiscal_start_date_time;
+			var taskQuery = 'cost_plan.top_task='+topTaskId;
+
+			var closedFPQuery = taskQuery + '^fiscal_period.fiscal_start_date_time&lt;' + openFPStartDateTime;
+			forecastCost += this._getCostPlanBreakdownTotal('actual', closedFPQuery);
+
+			var openFPQuery = taskQuery + '^fiscal_period.fiscal_start_date_time&gt;=' + openFPStartDateTime;
+			forecastCost += this._getCostPlanBreakdownTotal('cost_default_currency', openFPQuery);
+		}
+
+		return forecastCost;
+	},
+
+	_getStoryCostTotal: function(costColumn, taskId, isProjectTask) {
+		var relatedStoriesCostTotal = 0;
+		var relatedStories = new GlideAggregate('rm_story');
+		if (isProjectTask == false) {
+			relatedStories.addQuery('project', taskId);
+			relatedStories.addNullQuery('project_phase');
+		} else
+			relatedStories.addQuery('project_phase', taskId);
+		relatedStories.addAggregate('SUM', costColumn);
+		relatedStories.setGroup(false);
+		relatedStories.query();
+		if (relatedStories.next()) {
+			relatedStoriesCostTotal += parseFloat(relatedStories.getAggregate('SUM', costColumn));
+		}
+		if (isNaN(relatedStoriesCostTotal))
+			relatedStoriesCostTotal = 0;
+		return relatedStoriesCostTotal;
+	},
+
+	/*
+	parameter costColumns is an object, for example
+	{
+		'FX-COLUMNS': ['capex_cost', 'opex_cost'],
+		'FX2-COLUMNS': ['capex_cost_project_currency', 'opex_cost_project_currency']
+	}
+	*/
+	_getChildTaskCostTotal: function(costColumns, task) {
+		var result = {};
+		var fxColumns = costColumns['FX-COLUMNS'];
+		var fx2Columns = costColumns['FX2-COLUMNS'];		
+		for (var i = 0; i &lt; fxColumns.length; i++) {
+			result[fxColumns[i]] = 0.0;
+		}
+		for (var j = 0; j &lt; fx2Columns.length; j++) {
+			result[fx2Columns[j]] = 0.0;
+		}
+
+		var childTasks = new GlideRecord('planned_task');
+		childTasks.addQuery('parent', task.getValue('sys_id'));
+		childTasks.query();
+		while (childTasks.next()){
+			for (var m = 0 ; m &lt; fxColumns.length; m++) {
+				var costColumn = fxColumns[m];
+				result[costColumn] += parseFloat(childTasks[costColumn].getCurrencyValue());
+			}
+			if (fx2Columns.length == 0) continue;
+			var children = this.currencyUtil.getRealTableRecord(childTasks);
+			var parentProjectCurrency = task.getValue(this.CONSTS.PROJECT_CURRENCY);
+			var childProjectCurrency = children.getValue(this.CONSTS.PROJECT_CURRENCY);
+			if (parentProjectCurrency)
+				var parentProjectCurrencyCode = task[this.CONSTS.PROJECT_CURRENCY][this.CONSTS.CODE];
+			if(childProjectCurrency)
+				var childProjectCurrencyCode = children[this.CONSTS.PROJECT_CURRENCY][this.CONSTS.CODE];
+			if (childProjectCurrency != parentProjectCurrency &amp;&amp; PMPropertiesUtil.subProjectCanRollup() == 'false') continue;
+			for (var n = 0 ; n &lt; fx2Columns.length; n++) {
+				var fx2CostColumn = fx2Columns[n];
+				if (gs.nil(children[fx2CostColumn].amount) || (!gs.nil(children[fx2CostColumn].amount) &amp;&amp; children[fx2CostColumn].amount == 0)) continue;
+				var taskProjectCurrency = 0.0;
+				if (childProjectCurrency != parentProjectCurrency) {
+					//do convert: actual benefit project currency use fx rate, others use budget rate
+					if (fx2CostColumn == this.CONSTS.ACTUAL_BENEFIT_PROJECT_CURRENCY) {
+						taskProjectCurrency = parseFloat(this.currencyUtil.convertCurrencyUsingFxRate(children[fx2CostColumn].amount,childProjectCurrencyCode, parentProjectCurrencyCode));
+					} else {
+						var fmCurrency = new SNC.FMCurrency();
+						taskProjectCurrency = fmCurrency.convertAmountWithFp(children[fx2CostColumn].amount, childProjectCurrency, parentProjectCurrency, new GlideDate());
+					}					
+				} else 
+					taskProjectCurrency = parseFloat(children[fx2CostColumn].amount);
+				
+				if (isNaN(taskProjectCurrency))
+					taskProjectCurrency = 0.0;
+				result[fx2CostColumn] += taskProjectCurrency;
+			}
+		}
+
+		return result;
+	},
+
+	 //planned task cost plan breakdown cost aggregate
+	//planned task cost plan breakdown cost aggregate
+	_getCostPlanBreakdownTotal: function(aggregateColumn, extraQuery) {
+		var costPlanBreakdownTotal = 0;
+
+		var taskPlans = new GlideAggregate('cost_plan_breakdown');
+		taskPlans.addQuery('breakdown_type', 'requirement');
+		if(extraQuery)
+			taskPlans.addEncodedQuery(extraQuery);
+		taskPlans.addAggregate('SUM', aggregateColumn);
+		taskPlans.setGroup(false);
+		taskPlans.query();
+		if(taskPlans.next()){
+			costPlanBreakdownTotal = parseFloat(taskPlans.getAggregate('SUM', aggregateColumn));
+		}
+		if(isNaN(costPlanBreakdownTotal))
+			costPlanBreakdownTotal = 0;
+
+		return costPlanBreakdownTotal;
+	},
+
+	_getCostPlanForecastTotals: function(columns,extraQuery) {
+		var columnTotal = 0;
+		var response={};
+		var costPlans = new GlideAggregate('cost_plan');
+		if(extraQuery)
+			costPlans.addEncodedQuery(extraQuery);
+		columns.forEach(function(column){
+			costPlans.addAggregate('SUM', column);
+		});
+		costPlans.setGroup(false);
+		costPlans.query();
+		if(costPlans.next()){
+			columns.forEach(function(column){
+				if(isNaN(columnTotal))
+					columnTotal = 0;
+				columnTotal = parseFloat(costPlans.getAggregate('SUM', column));
+				response[column] = columnTotal;
+			});
+		}
+
+		return response;
+	},
+
+	_getTotal: function(tableName, breakdownType, columnName, columnValue, aggColumns) {
+		var sumResult = {};
+		var taskPlans = new GlideAggregate(tableName);
+		taskPlans.addQuery('breakdown_type', breakdownType);
+		taskPlans.addQuery(columnName, columnValue);
+		aggColumns.forEach(function (column){
+			taskPlans.addAggregate('SUM', column);
+		}, this);
+		taskPlans.setGroup(false);
+		taskPlans.query();
+		if(taskPlans.next()){
+			aggColumns.forEach(function (column){
+				var amount = parseFloat(taskPlans.getAggregate('SUM', column));
+				if(isNaN(amount))
+					amount = 0;
+				sumResult[column] = amount;
+			}, this);
+		}
+
+		return sumResult;
+	},
+
+	_getCapexOpexTotal: function(tableName, breakdownType, columnName, columnValue, aggColumns) {
+		var agg = {};
+		var taskPlans = new GlideAggregate(tableName);
+		taskPlans.addQuery('breakdown_type', breakdownType);
+		taskPlans.addQuery(columnName, columnValue);
+		aggColumns.forEach(function (column){
+			taskPlans.addAggregate('SUM', column);
+			agg['capex-' + column] = 0;
+			agg['opex-' + column] = 0;
+		});
+		taskPlans.groupBy("expense_type");
+		taskPlans.query();
+		while(taskPlans.next()){
+			aggColumns.forEach(function (column){
+				var amount = parseFloat(taskPlans.getAggregate('SUM', column));
+				if(isNaN(amount))
+					amount = 0;
+				agg[taskPlans.getValue("expense_type") + '-' + column] = amount;
+			});
+		}
+
+		return agg;
+	},
+
+	type: 'PlannedTaskEntityUpdater'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2016-03-02 13:07:00&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;20a2e0a793311200ea933007f67ffbbb&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;138&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;PlannedTaskEntityUpdater&lt;/sys_name&gt;
+        &lt;sys_package display_value="Project Management" source="com.snc.project_management_v3"&gt;9eef82e747e64210cd4e1ce4316d43e3&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_20a2e0a793311200ea933007f67ffbbb&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-10-27 06:00:02&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:54</sys_created_on>
+        <sys_id>6ce03c1983b01210c6695855eeaad346</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>PlannedTaskEntityUpdater</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_6ce03c1983b01210c6695855eeaad346</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:54</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

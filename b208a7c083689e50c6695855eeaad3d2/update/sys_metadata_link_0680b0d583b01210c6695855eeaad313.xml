@@ -1,0 +1,991 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1169ee464ce75510f877f8ad0e930dcc</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_install_base.SoldProductAndInstallBaseFilterSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;true&lt;/client_callable&gt;
+        &lt;description&gt;Set of Function to filter install base and sold product&lt;/description&gt;
+        &lt;name&gt;SoldProductAndInstallBaseFilterSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var SoldProductAndInstallBaseFilterSNC = Class.create();
+SoldProductAndInstallBaseFilterSNC.prototype = {
+    initialize: function() {
+        this.householdPluginPresent = false;
+        this.householdApi = null;
+        if (gs.tableExists('csm_household_member')) {
+            this.householdPluginPresent = true;
+            this.householdApi = new sn_csm_household.HouseHoldUtils();
+        }
+        this.csmRelationshipUtil = new global.CSMRelationshipUtils();
+        this.respParams = {
+            "isSPViewer": true
+        };
+        this.B2B2CPluginAtive = GlidePluginManager.isActive('com.sn_csm_b2b_consumers');
+        this.serviceOrgPluginActive = GlidePluginManager.isActive('com.snc.service_organization');
+        this.isPSSPluginPresent = new GlidePluginManager().isActive('com.sn_pss_core');
+    },
+
+    isConsumerOrHouseholdPresent: function(soldProduct) {
+        return (!gs.nil(soldProduct) &amp;&amp; (!gs.nil(soldProduct.household) || !gs.nil(soldProduct.consumer)));
+    },
+
+    /*
+        Helper functions to validate the kind of sold products - 
+        1. B2CSoldProduct -&gt; soldProduct.account is empty &amp; consumer or household is not empty.
+        2. B2BSoldProduct -&gt; soldProduct.account is not empty &amp; consumer &amp; household is empty.
+        3. B2B2CSoldProduct -&gt; b2b2c plugin is active &amp; soldProduct.account is not empty &amp; consumer is not empty.
+    */
+    isB2CSoldProduct: function(soldProduct) {
+        return !gs.nil(soldProduct) &amp;&amp; gs.nil(soldProduct.account) &amp;&amp; this.isConsumerOrHouseholdPresent(soldProduct);
+    },
+
+    isB2BSoldProduct: function(soldProduct) {
+        return !gs.nil(soldProduct) &amp;&amp; !gs.nil(soldProduct.account) &amp;&amp; !this.isConsumerOrHouseholdPresent(soldProduct);
+    },
+
+    isB2B2CSoldProduct: function(soldProduct) {
+        if (!this.B2B2CPluginAtive) return false;
+        return !gs.nil(soldProduct) &amp;&amp; !gs.nil(soldProduct.account) &amp;&amp; !gs.nil(soldProduct.consumer);
+    },
+
+    //check whether current logged in consumer is a valid consumer for sold product
+    isLoggedinUserValidConsumer: function(soldproduct) {
+        var userConsumerID = new global.CSManagementUtils().getConsumerId();
+        list = this.getValidConsumers(soldproduct.sys_id);
+        if (list.indexOf(userConsumerID) != -1)
+            return true;
+        return false;
+    },
+    /* a sold product S is valid for given consumer C if 
+    	1. S is created for C
+    	2. S is created for household where household.head = C
+    	3. C has additonal access on S by sn_install_base_m2m_consumer_sold_product table and satify 
+    	   any of one below condition
+    	      S is created for a consumer
+    		  S is created for Household H, and C is valid memebbr of H
+        4. Perform above based on responsibilities related to consumer.
+    	5. @consumerId: consumerId to fetch the related SP -
+    	    if null, defaults to loggedInConsumerId
+    	6. @responsibilities: list of responsibilities to fetch the SP -
+    	    if null, defaults to read responsibilities.
+    */
+    getValidSoldProducts: function(consumerId, responsibilities, skipRoles) {
+        var params = {
+            "isSPViewer": true,
+            "responsibilities": responsibilities,
+            "consumerId": consumerId
+        };
+        params[global.CSMRelationshipConstants.SKIP_ROLE_CHECK] = skipRoles;
+        return new sn_install_base.InstallBaseUtil().getConsumerSoldProducts(global.CSMRelationshipConstants.ACCESS.READ, params);
+    },
+
+    /*  consumer C is valid for given Sold Product S if 
+    	1. S is created for C
+    	2. S is created for household where household.head = C
+    	3. C has additional access on S by sn_install_base_m2m_consumer_sold_product table and satify
+    	   any of one below condition
+    	      S is created for any consumer
+    		  S is created for Household H, and C is valid memebbr of H
+    */
+    getValidConsumers: function(soldproductId, skipResponsibilities) {
+        var activeconsumer;
+        var validConsumerList = [];
+        var soldProduct = new GlideRecord(global.CSMBaseConstants.SOLD_PRODUCT);
+        soldProduct.get(soldproductId);
+        if (soldProduct.consumer.nil() &amp;&amp; gs.nil(soldProduct.household))
+            return;
+        else if (!soldProduct.consumer.nil()) /* condition 1 as mentioned above */
+            validConsumerList.push(soldProduct.consumer + '');
+        /* condition 3 as mentioned above */
+        var conSoldProductGr = new GlideRecord(global.CSMBaseConstants.SOLD_PRODUCT_RELATED_PARTY);
+        conSoldProductGr.addQuery('sold_product', soldProduct.sys_id);
+        if (!skipResponsibilities) {
+            var responsibilities = this.csmRelationshipUtil.getResponsibilities(global.CSMRelationshipConstants.RELATIONSHIP_CONSUMER_SOLDPRODUCT, global.CSMRelationshipConstants.ACCESS.READ, this.respParams);
+            conSoldProductGr.addQuery("responsibility", "IN", responsibilities);
+        }
+        if (this.householdPluginPresent &amp;&amp; !soldProduct.household.nil()) {
+			activeconsumer = this.householdUtil(soldProduct.household, 'household');
+            conSoldProductGr.addQuery('consumer', 'IN', activeconsumer);
+            if (this.householdApi.isConsumerCurrentInHousehold(soldProduct.household.head, soldProduct.household))
+                validConsumerList.push(soldProduct.household.head); /* condition 2 as mentioned above */
+        }
+        //skip before query filters
+        conSoldProductGr._skip_before_query_filter = true;
+        conSoldProductGr.query();
+        while (conSoldProductGr.next()) {
+            validConsumerList.push(conSoldProductGr.consumer.sys_id + '');
+        }
+        return validConsumerList;
+    },
+
+    isAdditionalConsumerAndInHousehold: function(household, soldProduct) {
+        if(!gs.tableExists('csm_household_member') || !gs.tableExists('sn_install_base_m2m_consumer_sold_product'))
+          return false;
+        var consumer = new global.CSManagementUtils().getConsumerId();
+        var chm = new GlideRecord("csm_household_member");
+        chm.addQuery("household", household);
+        chm.addQuery("consumer", consumer);
+        chm.setLimit(1);
+        chm.query();
+        if (!chm.next())
+            return false;
+        var csp = new GlideRecord("sn_install_base_m2m_consumer_sold_product");
+        csp.addQuery("consumer", consumer);
+        csp.addQuery("sold_product", soldProduct);
+        csp.setLimit(1);
+        csp.query();
+
+        return csp.next();
+
+
+    },
+    getHouseholdRefQulifier: function(SoldRec) {
+        if (!this.householdPluginPresent || SoldRec.consumer.nil())
+            return;
+        var refQualifier = '';
+        var list = this.householdUtil(SoldRec.consumer, 'consumer');
+        refQualifier = 'sys_idIN' + list;
+        return refQualifier;
+    },
+    getConsumerRefQulifier: function(SoldRec) {
+        var refQualifier = '';
+        if (gs.nil(SoldRec)) {
+            return refQualifier;
+        }
+        if (this.householdPluginPresent &amp;&amp; !SoldRec.household.nil()) {
+            var list = this.householdUtil(SoldRec.household, 'household');
+            refQualifier = 'sys_idIN' + list;
+        }
+        if (GlidePluginManager.isActive('com.sn_csm_b2b_consumers') &amp;&amp; !SoldRec.account.nil()) {
+            refQualifier += '^' + new sn_acct_consumer.AccountConsumerUtil().getConsumerRefFromAccount(SoldRec.account);
+        }
+        return refQualifier;
+    },
+    /* get valid consumer for consumer sold product when sold product is selected */
+    getConsumerForConsumerSoldProduct: function(sold_product, currentRecord) {
+        /*
+            if currentRecord.type.entity_type is not "csm_consumer", no consumer should be shown
+        */
+        if (gs.nil(currentRecord) || (currentRecord.type &amp;&amp; (currentRecord.type.entity_type != global.CSMBaseConstants.CONSUMER_TABLE)))
+            return 'sys_idISEMPTY';
+        var refQualifier = 'active=true';
+		if (this.householdPluginPresent &amp;&amp; !sold_product.household.nil()) {
+            var list = this.householdUtil(sold_product.household.sys_id, 'household');
+            refQualifier += '^sys_idIN' + list;
+        }
+        // When b2b2c is active show sold_product.account-&gt;consumers for (b2b &amp; b2b2c sold products)
+        if (this.B2B2CPluginAtive &amp;&amp; !sold_product.account.nil()) {
+            var consumerIds = new sn_acct_consumer.AccountConsumerUtil().getConsumerFromAccount(sold_product.account);
+            if (consumerIds &amp;&amp; consumerIds.length)
+                refQualifier += '^sys_idIN' + consumerIds.join();
+            else
+                refQualifier = 'sys_idISEMPTY';
+        }
+        return refQualifier;
+    },
+    /* get valid Sold Product for consumer sold product table when consumer is selected */
+    getSoldProductForConsumerSoldProduct: function(consumer) {
+        var refQualifier = 'consumerISNOTEMPTY^ORhouseholdISNOTEMPTY';
+
+        if (consumer.nil())
+            return refQualifier;
+        if (this.householdPluginPresent) {
+            var list = this.householdUtil(consumer, 'consumer');
+            refQualifier = 'householdIN' + list + '^NQhouseholdISEMPTY^consumerISNOTEMPTY';
+        }
+        return refQualifier;
+    },
+    householdUtil: function(sysid, type) {
+        /* type = consumer then API returns all household of which the consumer is active member of */
+        /* type = household then retrive all active consumers of the household */
+        var list = [];
+        if (type === 'consumer')
+            list = this.householdApi.getCurrentHouseholdIdsForConsumerId(sysid);
+        else if (type === 'household')
+            list = this.householdApi.getCurrentConsumerIdsForHouseholdId(sysid);
+        else
+            return;
+        return list.join();
+    },
+
+    getReferenceQualifierForUser: function(relPartyRecord) {
+        var refQualifier = relPartyRecord.type.reference_condition + '';
+        if (relPartyRecord.type.name == "Authorized Member" &amp;&amp; !relPartyRecord.service_organization.nil()) {
+            var memberGr = new GlideRecord("sn_csm_service_organization_member");
+            var membersList = [];
+            memberGr.addQuery("service_organization", relPartyRecord.service_organization)
+            memberGr.query();
+            while (memberGr.next()) {
+                membersList.push(memberGr.user + '');
+            }
+            refQualifier += refQualifier == '' ? "sys_idIN" + membersList.join(',') : "^sys_idIN" + membersList.join(',');
+        }
+        return refQualifier;
+    },
+
+    getContactRefQual: function(installBaseRelatedPartyRecord) {
+        var refQualifier = '';
+        if (!installBaseRelatedPartyRecord.account.nil()) {
+            refQualifier = 'account=' + installBaseRelatedPartyRecord.account;
+        }
+        return refQualifier;
+    },
+
+    getParentSoldProductRefQulifier: function(SoldRec) {
+        var refQualifier = '';
+        if (!SoldRec.account.nil()) {
+            refQualifier = 'account=' + SoldRec.account;
+        } else if (!gs.nil(SoldRec.service_organization)) {
+            refQualifier = 'service_organization=' + SoldRec.service_organization;
+        } else {
+            if (!SoldRec.consumer.nil()) {
+                refQualifier = 'accountISEMPTY^consumer=' + SoldRec.consumer;
+            }
+            if (this.householdPluginPresent) {
+                var list = '';
+                /* if consumer present, fetch all householdIDs of which consumer is active member */
+                if (!SoldRec.consumer.nil())
+                    list = this.householdUtil(SoldRec.consumer, 'consumer');
+                /* if Household is set, fetch all sold product for selected household as well  */
+                if (!SoldRec.household.nil()) {
+                    if (list.length &gt; 0)
+                        list = list + ',' + SoldRec.household;
+                    else
+                        list = SoldRec.household + '';
+                }
+                if (list.length &gt; 0)
+                    refQualifier = refQualifier + (refQualifier.length &gt; 0 ? '^OR' : '') +
+                    'householdIN' + list;
+            }
+        }
+
+        refQualifier = refQualifier + (refQualifier.length &gt; 0 ? '^' : '') +
+            'sys_id!=' + SoldRec.sys_id;
+
+        return refQualifier;
+
+    },
+
+    getInstallBaseItemRefQualifier: function(depSol) {
+
+        var refQualifier = '';
+        if (!depSol.sold_product.nil()) {
+            if (!depSol.sold_product.account.nil())
+                refQualifier = 'account=' + depSol.sold_product.account.sys_id;
+            else if (!depSol.sold_product.consumer.nil())
+                refQualifier = 'accountISEMPTY^consumer=' + depSol.sold_product.consumer.sys_id;
+            else if (new sn_install_base.SoldProductAndInstallBaseUtil().isSOActivated())
+                refQualifier = 'service_organization=' + depSol.sold_product.service_organization.sys_id;
+
+        }
+        return refQualifier;
+
+    },
+
+    getSoldProductRefQulifier: function(depSol) {
+
+        var refQualifier = '';
+        if (!depSol.install_base_item.nil()) {
+            if (!depSol.install_base_item.account.nil())
+                refQualifier = 'account=' + depSol.install_base_item.account.sys_id;
+            else if (!depSol.install_base_item.consumer.nil())
+                refQualifier = 'accountISEMPTY^consumer=' + depSol.install_base_item.consumer.sys_id;
+            else if (new sn_install_base.SoldProductAndInstallBaseUtil().isSOActivated())
+                refQualifier = 'service_organization=' + depSol.install_base_item.service_organization.sys_id;
+        }
+        return refQualifier;
+    },
+
+    getContactRefQualifier: function(installBaseItem) {
+        if (!installBaseItem.account.nil())
+            return "account=" + installBaseItem.account.sys_id;
+
+    },
+
+    getContactRefQualifierForSoldProduct: function(soldProduct) {
+        if (!soldProduct.account.nil())
+            return "account=" + soldProduct.account.sys_id;
+
+    },
+    filterInstallBaseItemOnCase: function(passedRec) {
+		var csm_case_record = new GlideRecord('sn_customerservice_case');
+		csm_case_record.get(passedRec.csm_case);
+        var refQualifier = this.getInstallBaseRefQualifierOnCase(csm_case_record);
+        return refQualifier;
+    },
+
+    filterCaseOnInstallBaseItem: function(passedRec) {
+        var refQualifier = '';
+        if (passedRec.install_base_item.nil())
+            return refQualifier;
+        // account and consumer are mutually exclusive.
+        if (!passedRec.install_base_item.account.nil()) {
+            refQualifier = 'account=' + passedRec.install_base_item.account;
+            refQualifier = refQualifier + '^' + 'ORaccountISEMPTY' + '^' + 'consumerISEMPTY';
+        } else if (!passedRec.deployed_entity.consumer.nil()) {
+            refQualifier = 'consumer=' + passedRec.install_base_item.consumer;
+            refQualifier = refQualifier + '^' + 'ORconsumerISEMPTY' + '^' + 'accountISEMPTY';
+        }
+        return refQualifier;
+    },
+
+    _getAccountHierarchy: function(account) {
+        var accountgr = new GlideRecord('customer_account');
+        accountgr.addQuery('sys_id', account);
+        accountgr.query();
+        var list = new Array();
+        while (accountgr.next()) {
+            list.push(account + '');
+            account = accountgr.account_parent;
+            accountgr = new GlideRecord('customer_account');
+            accountgr.addQuery('sys_id', account);
+            accountgr.query();
+        }
+        return list;
+    },
+    getContract: function(m2m) {
+        if (this.isPSSPluginPresent) {                                 
+            return new sn_pss_core.ServiceContract().getContractReferenceQualifier(m2m);                                    
+        }
+        var refQualifier = '';
+        // account and consumer are mutually exclusive.
+        if (!gs.nil(m2m) &amp;&amp; !m2m.sold_product.nil()) {
+            if (!m2m.sold_product.account.nil()) {
+                var list = this._getAccountHierarchy(m2m.sold_product.account);
+                refQualifier = 'accountIN' + list;
+            } else {
+                refQualifier = 'consumer=' + m2m.sold_product.consumer;
+            }
+        } else if (!gs.nil(m2m) &amp;&amp; !m2m.install_base.nil()) {
+            if (!m2m.install_base.account.nil()) {
+                var list = this._getAccountHierarchy(m2m.install_base.account);
+                refQualifier = 'accountIN' + list;
+            } else {
+                refQualifier = 'consumer=' + m2m.install_base.consumer;
+            }
+        }
+        return refQualifier;
+    },
+    getSoldProduct: function(m2m) {
+        if (this.isPSSPluginPresent) {                                 
+            return new sn_pss_core.ServiceContract().getSoldProductReferenceQualifier(m2m);                                    
+        }
+        var refQualifier = '';
+        // account and consumer are mutually exclusive.
+        if (!gs.nil(m2m) &amp;&amp; !m2m.contract.nil()) {
+            if (!m2m.contract.account.nil()) {
+                var acc = m2m.contract.account;
+                var list = [m2m.contract.account];
+                while (!gs.nil(acc)) {
+                    var accountgr = new GlideRecord('customer_account');
+                    accountgr.addQuery('account_parent', 'IN', acc);
+                    accountgr.query();
+                    acc = '';
+                    while (accountgr.next()) {
+                        list.push(accountgr.sys_id + '');
+                        acc = acc + ',' + accountgr.sys_id;
+                    }
+                    if (!gs.nil(acc))
+                        acc = acc.substr(1);
+                }
+                refQualifier = 'accountIN' + list;
+            } else {
+                refQualifier = 'consumer=' + m2m.contract.consumer;
+            }
+        }
+        return refQualifier;
+    },
+    getInstallBase: function(m2m) {
+        if (this.isPSSPluginPresent) {                                 
+            return new sn_pss_core.ServiceContract().getInstallBaseReferenceQualifier(m2m);                                    
+        }
+        var refQualifier = '';
+        // account and consumer are mutually exclusive.
+        if (!gs.nil(m2m) &amp;&amp; !m2m.contract.nil()) {
+            if (!m2m.contract.account.nil()) {
+                var acc = m2m.contract.account;
+                var list = [m2m.contract.account];
+                while (!gs.nil(acc)) {
+                    var accountgr = new GlideRecord('customer_account');
+                    accountgr.addQuery('account_parent', 'IN', acc);
+                    accountgr.query();
+                    acc = '';
+                    while (accountgr.next()) {
+                        list.push(accountgr.sys_id + '');
+                        acc = acc + ',' + accountgr.sys_id;
+                    }
+                    if (!gs.nil(acc))
+                        acc = acc.substr(1);
+                }
+                refQualifier = 'accountIN' + list;
+            } else {
+                refQualifier = 'consumer=' + m2m.contract.consumer;
+            }
+        }
+        return refQualifier;
+    },
+    //Check is valid household member or not
+    addHouseHoldRelatedQuery: function(conSoldProductGr, consumerId) {
+        if (!consumerId || !conSoldProductGr || !conSoldProductGr.isValid()) return;
+        if (this.householdPluginPresent) {
+            this.validHousehold = this.householdUtil(consumerId, 'consumer');
+            qc = conSoldProductGr.addJoinQuery('sn_install_base_sold_product', 'sold_product', 'sys_id');
+            qc.addCondition('household', 'IN', this.validHousehold);
+            qc.addOrCondition('household', null);
+        }
+    },
+
+    /* a sold product S is valid for given consumer C if 
+    	1. S is created for C
+    	2. S is created for household where household.head = C
+    */
+    getAdditionalValidSoldProducts: function(consumerId, validSoldProducts) {
+        if (!consumerId) return;
+        if (!validSoldProducts) validSoldProducts = {};
+        var soldProductGr = new GlideRecord(global.CSMBaseConstants.SOLD_PRODUCT);
+        var encodedQuery = 'consumer=' + consumerId;
+        if (this.householdPluginPresent) {
+            /* get Ids of household whose current head is consumer */
+            var hdIds = [];
+            var householdGr = new GlideRecord(global.CSMBaseConstants.HOUSEHOLD);
+            householdGr.addQuery('head', consumerId);
+            if (gs.nil(this.validHousehold))
+                this.validHousehold = this.householdUtil(consumerId, 'consumer');
+            householdGr.addQuery('sys_id', 'IN', this.validHousehold);
+            householdGr.query();
+            while (householdGr.next()) {
+                hdIds.push(householdGr.getUniqueValue());
+            }
+            encodedQuery = encodedQuery + '^ORhouseholdIN' + hdIds;
+        }
+        soldProductGr.addEncodedQuery(encodedQuery);
+        soldProductGr.setWorkflow(false);
+        soldProductGr.query();
+        while (soldProductGr.next())
+            validSoldProducts[soldProductGr.getUniqueValue()] = true;
+        return Object.keys(validSoldProducts);
+    },
+
+    //Get contacts belonging to same account, accounts from account relationships, accounts from contact relationship
+    getContactsForSoldProduct: function(soldProduct, currentRecord) {
+        /*
+           if currentRecord.type.entity_type is not "customer_contact", no contacts should be shown
+        */
+        if (gs.nil(currentRecord) || (currentRecord.type &amp;&amp; (currentRecord.type.entity_type != global.CSMBaseConstants.CONTACT_TABLE)))
+            return 'sys_idISEMPTY';
+        var query = null;
+        var account = currentRecord.account;
+        // If account field is filled, show the related contacts. Else, show all active contacts.
+        var isSPAccount = false;
+        if (!gs.nil(soldProduct) &amp;&amp; !gs.nil(soldProduct.account)) {
+            if (gs.nil(account)) {
+                account = soldProduct.account;
+            }
+            if (account == soldProduct.account) {
+                isSPAccount = true;
+            }
+        }
+
+        if (gs.nil(soldProduct) || gs.nil(account)) return 'active=true';
+        var csmutil = new global.CSManagementUtils();
+        //Add Partner Accounts
+        var accounts = [];
+        if (gs.nil(currentRecord.account)) {
+            accounts = csmutil.getPartnerAccounts(account) || [];
+        }
+        //Add contacts of the same account   
+        accounts.push(account);
+
+        query = 'accountIN' + accounts.join(',');
+        //Add Contacts from Contact Relationship of this account
+        if (isSPAccount) {
+            var contacts = csmutil.getContactsFromContactRelationship([account]) || [];
+            if (contacts.length &gt; 0)
+                query = query + '^ORsys_idIN' + contacts.join(',');
+        }
+        query = query + '^active=true';
+        return query;
+    },
+    //Get sold products belonging to same account, accounts from account relationships, accounts from contact relationship
+    getSoldProductsForContact: function(contact) {
+        //If no contact is chosen, all sold products associated with account should be shown
+        if (gs.nil(contact)) return 'accountISNOTEMPTY';
+        var query = null;
+        var gr = new GlideRecord(global.CSMBaseConstants.CONTACT_TABLE);
+        if (gr.get(contact)) {
+            var account = gr.getValue('account');
+            if (!gs.nil(account)) {
+                var csmutil = new global.CSManagementUtils();
+                //Add Customer Accounts
+                var accounts = csmutil.getCustomerAccounts(account) || [];
+                // Add sold products of the same account
+                accounts.push(account);
+                //Add Accounts from Contact Relationship
+                var accountsfromrels = csmutil.getAccountsFromContactRelationship(contact);
+                var allAccounts = accounts.concat(accountsfromrels);
+                query = 'accountIN' + allAccounts.join(',');
+            }
+        }
+        //if for some misconfiguration, contact selected is invalid or valid and doesnot have an account populated, no sold products should be shown
+        if (gs.nil(query))
+            query = 'sys_idISEMPTY';
+        return query;
+    },
+    getSoldProductsForRelatedParty: function(current) {
+        if (gs.nil(current))
+            return 'consumerISNOTEMPTY^ORhouseholdISNOTEMPTY^ORaccountISNOTEMPTY';
+        if (current.consumer)
+            return this.getSoldProductForConsumerSoldProduct(current.consumer);
+        if (current.contact)
+            return this.getSoldProductsForContact(current.contact);
+    },
+    getTypeRefQual: function(entity, currentRecord) {
+        var entityOperator = '=';
+        var appliesToTable = global.CSMBaseConstants.SOLD_PRODUCT;
+        if (gs.nil(entity)) {
+            if (currentRecord.getTableName() == global.CSMBaseConstants.M2M_CON_SOLD_PRODUCT)
+                entity = 'csm_consumer';
+            else if (currentRecord.getTableName() == global.CSMBaseConstants.M2M_CONTACT_SOLD_PRODUCT)
+                entity = 'customer_contact';
+            else if (currentRecord.getTableName() == global.CSMBaseConstants.SOLD_PRODUCT_RELATED_PARTY) {
+                var soldProduct = currentRecord.sold_product;
+                /* 
+                    1. B2BSoldProduct - without b2b2c show only contact/account types
+                    2. B2CSoldProduct - with or without b2b2c show only consumer type
+                    3. B2B2CSoldProduct || B2BSoldProduct (with b2b2c plugin active) - show all types
+                    4. Else, retrict the type (show no type)
+                */
+                if (this.isB2BSoldProduct(soldProduct) &amp;&amp; !this.B2B2CPluginAtive) entity = 'customer_contact,customer_account';
+                else if (this.isB2CSoldProduct(soldProduct)) entity = 'csm_consumer';
+                else if (this.isB2B2CSoldProduct(soldProduct) || (this.isB2BSoldProduct(soldProduct) &amp;&amp; this.B2B2CPluginAtive))
+                    entity = 'csm_consumer,customer_contact,customer_account';
+                else entity = "";
+                entityOperator = 'IN';
+            } else if (currentRecord.getTableName() == global.CSMBaseConstants.INSTALL_BASE_RELATED_PARTY) {
+                entity = 'csm_consumer,customer_contact,customer_account,sys_user,sn_customer_service_organization';
+                entityOperator = 'IN';
+                appliesToTable = global.CSMBaseConstants.INSTALL_BASE_ITEM;
+            } else
+                entity = '';
+        }
+        return "entity_type" + entityOperator + entity + "^applies_to=" + appliesToTable;
+    },
+    getResponsibilityRefQual: function(entity, currentRecord) {
+        if (gs.nil(entity)) {
+            if (currentRecord.getTableName() == global.CSMBaseConstants.M2M_CON_SOLD_PRODUCT)
+                entity = 'csm_consumer';
+            else if (currentRecord.getTableName() == global.CSMBaseConstants.M2M_CONTACT_SOLD_PRODUCT)
+                entity = 'customer_contact';
+            else if (currentRecord.getTableName() == global.CSMBaseConstants.SOLD_PRODUCT_RELATED_PARTY || currentRecord.getTableName() == global.CSMBaseConstants.INSTALL_BASE_RELATED_PARTY) {
+                entity = currentRecord.type.entity_type;
+            } else
+                entity = '';
+        }
+        // Not fetching "authotized representative" when the entity type is "customer_account"
+        var fetchNullType = !(entity == "customer_account");
+        return (fetchNullType ? "type=NULL^OR" : "") + "type=" + entity;
+    },
+    isValidAdditionalConsumerOfSP: function(consumerId, soldProduct, accessLevel, household) {
+        if (!consumerId || !soldProduct) return false;
+        var isValidConsumer = this._isAdditionalConsumerOfSP(consumerId, soldProduct, accessLevel);
+        return (gs.nil(household)) ? isValidConsumer : (isValidConsumer &amp;&amp; this.householdApi.isConsumerCurrentInHousehold(consumerId, household));
+    },
+    _isAdditionalConsumerOfSP: function(consumerId, soldProduct, accessLevel) {
+        if (!accessLevel)
+            accessLevel = global.CSMRelationshipConstants.ACCESS.READ;
+        var responsibilities = this.csmRelationshipUtil.getResponsibilities(global.CSMRelationshipConstants.RELATIONSHIP_CONSUMER_SOLDPRODUCT, accessLevel, this.respParams);
+        var conSoldProductGr = new GlideRecord(global.CSMBaseConstants.M2M_CON_SOLD_PRODUCT);
+        conSoldProductGr.addQuery("consumer", consumerId);
+        conSoldProductGr.addQuery("sold_product", soldProduct);
+        conSoldProductGr.addQuery("responsibility", "IN", responsibilities);
+        conSoldProductGr.query();
+        return conSoldProductGr.hasNext();
+    },
+
+    /*
+     * This function returns consumer id only if household plugin is inactive
+     * If household is active, string "HOUSEHOLD_ACTIVE" will be returned
+     * There is no purpose in setting return value to "HOUSEHOLD_ACTIVE", -
+     * it could have been anything else , we just don't want the return value to match a general consumer id.
+     */
+    getConsumerIdOnlyIfHouseHoldPluginInactive: function() {
+        if (this.householdPluginPresent) {
+            return "HOUSEHOLD_ACTIVE";
+        }
+        return new global.CSManagementUtils().getConsumerId();
+    },
+
+    getSPForAdditionalUser: function() {
+        var result = [];
+        var spGr = new GlideRecord(global.CSMBaseConstants.SOLD_PRODUCT);
+        spGr.addEncodedQuery("additional_usersLIKE" + gs.getUserID());
+        spGr.query();
+        while (spGr.next()) {
+            result.push(spGr.getUniqueValue());
+        }
+        return result;
+    },
+
+    getSPForAdditionalConsumer: function() {
+        var result = [];
+        var spGr = new GlideRecord(global.CSMBaseConstants.SOLD_PRODUCT);
+        spGr.addEncodedQuery("additional_consumersLIKE" + new global.CSManagementUtils().getConsumerId());
+        spGr.query();
+        while (spGr.next()) {
+            result.push(spGr.getUniqueValue());
+        }
+        return result;
+    },
+
+    getSPForAddConsumerWithoutHousehold: function() {
+        var result = [];
+        if (!gs.tableExists('csm_household_member')) {
+            result = this.getSPForAdditionalConsumer();
+        }
+        return result;
+    },
+
+    getAccountsForSoldProduct: function(currentRecord) {
+        if (gs.nil(currentRecord) || gs.nil(currentRecord.type) || gs.nil(currentRecord.type.entity_type))
+            return "sys_idISEMPTY";
+        var query = "";
+        var soldProduct = currentRecord.sold_product;
+        var enityType = currentRecord.type.entity_type;
+        if (enityType == global.CSMBaseConstants.CONSUMER_TABLE) {
+            /*
+                if b2b2c is not activated, no account should be shown.
+                else, show only sold_product.account (for b2c show no account)
+            */
+            if (!this.B2B2CPluginAtive || this.isB2CSoldProduct(soldProduct))
+                return "sys_idISEMPTY";
+            query = "sys_idIN" + soldProduct.account;
+        } else if (enityType == global.CSMBaseConstants.CONTACT_TABLE || enityType == global.CSMBaseConstants.ACCOUNT_TABLE) {
+			if(gs.nil(soldProduct) || gs.nil(soldProduct.account)){
+				return "sys_idISEMPTY";
+			}
+			var account = soldProduct.account;
+            var csmutil = new global.CSManagementUtils();
+            // Add customer accounts
+            var accounts = csmutil.getPartnerAccounts(account) || [];
+            // Add contact account
+            accounts.push(account);
+            query = "sys_idIN" + accounts.join(",");
+        }
+        return query;
+    },
+
+    getAccountsForInstallBase: function(currentRecord) {
+        if (gs.nil(currentRecord) || gs.nil(currentRecord.type) || gs.nil(currentRecord.type.entity_type))
+            return "sys_idISEMPTY";
+        if (currentRecord.type.entity_type == global.CSMBaseConstants.CONTACT_TABLE) {
+            var contact = currentRecord.contact;
+            if (gs.nil(contact)) return "";
+            return "sys_idIN" + contact.company;
+        }
+        return "";
+    },
+
+    getSOForInstallBase: function(currentRecord) {
+        if (gs.nil(currentRecord) || gs.nil(currentRecord.type) || gs.nil(currentRecord.type.entity_type))
+            return "sys_idISEMPTY";
+        if (currentRecord.type.name == "Authorized Member" &amp;&amp; !currentRecord.user.nil()) {
+            var memberGr = new GlideRecord("sn_csm_service_organization_member");
+            memberGr.addQuery("user", currentRecord.user);
+            memberGr.query();
+            if (memberGr.next()) {
+                return "sys_idIN" + memberGr.service_organization;
+            }
+        }
+        return "";
+    },
+
+    getInstallBaseItemParentRefQulifier: function(installBaseGr) {
+        var refQualifier = '';
+        if (gs.nil(installBaseGr)) return refQualifier;
+        if (!gs.nil(installBaseGr.account)) {
+            refQualifier = 'account=' + installBaseGr.account;
+        } else if (this.serviceOrgPluginActive &amp;&amp; !gs.nil(installBaseGr.service_organization)) {
+            refQualifier = 'service_organization=' + installBaseGr.service_organization;
+        } else {
+            if (!gs.nil(installBaseGr.consumer)) {
+                refQualifier = 'consumer=' + installBaseGr.consumer;
+            }
+            if (this.householdPluginPresent) {
+                var list = '';
+                /* if consumer is present, fetch all householdIDs in which consumer is active member */
+                if (!gs.nil(installBaseGr.consumer))
+                    list = this.householdUtil(installBaseGr.consumer, 'consumer');
+                if (!gs.nil(installBaseGr.household)) {
+                    if (list.length &gt; 0)
+                        list = list + ',' + installBaseGr.household;
+                    else
+                        list = installBaseGr.household + '';
+                }
+                if (list.length &gt; 0)
+                    refQualifier = refQualifier + (refQualifier.length &gt; 0 ? '^OR' : '') + 'householdIN' + list;
+            }
+        }
+        refQualifier = refQualifier + (refQualifier.length &gt; 0 ? '^' : '') + 'sys_id!=' + installBaseGr.sys_id;
+        return refQualifier;
+    },
+
+    getInstallBaseItemConsumerRefQulifier: function(installBaseGr) {
+        var refQualifier = '';
+        if (gs.nil(installBaseGr)) return refQualifier;
+        if (this.householdPluginPresent &amp;&amp; !gs.nil(installBaseGr.household)) {
+            var list = this.householdUtil(installBaseGr.household, 'household');
+            refQualifier = 'sys_idIN' + list;
+        }
+		//When b2b2c is active show installBase.account-&gt;consumers for (b2b &amp; b2b2c install bases)
+        if (this.B2B2CPluginAtive &amp;&amp; !installBaseGr.account.nil()) {
+            var consumerIds = new sn_acct_consumer.AccountConsumerUtil().getConsumerFromAccount(installBaseGr.account);
+            if (consumerIds &amp;&amp; consumerIds.length)
+                refQualifier += '^sys_idIN' + consumerIds.join();
+            else
+                refQualifier = 'sys_idISEMPTY';
+        }
+        return refQualifier;
+    },
+
+    getInstallBaseItemHouseholdRefQulifier: function(installBaseGr) {
+        var refQualifier = '';
+        if (gs.nil(installBaseGr)) return refQualifier;
+        if (this.householdPluginPresent &amp;&amp; !gs.nil(installBaseGr.consumer)) {
+            var list = this.householdUtil(installBaseGr.consumer, 'consumer');
+            refQualifier = 'sys_idIN' + list;
+        }
+        return refQualifier;
+    },
+
+    getInstallBaseItemProductModelRefQulifier: function(installBaseGr) {
+        var refQualifier = '';
+        if (gs.nil(installBaseGr)) return refQualifier;
+        var productModel = '';
+        if (!gs.nil(installBaseGr.configuration_item)) {
+            productModel = installBaseGr.configuration_item.model_id;
+        } else if (!gs.nil(installBaseGr.asset)) {
+            productModel = installBaseGr.asset.model;
+        } else if (!gs.nil(installBaseGr.specification)) {
+            var productModelList = this.getModelsforSpecification(installBaseGr.specification);
+            if (productModelList.length &gt; 0) refQualifier = 'sys_idIN' + productModelList.join();
+        } else if (!gs.nil(installBaseGr.model_category) &amp;&amp; !gs.nil(installBaseGr.model_category.product_model_class)) {
+            var modelCategoryID = installBaseGr.getValue('model_category');
+            var productClassName = installBaseGr.model_category.product_model_class.toString();
+            var reqProductModelSysIds = this.getModelsForModelCategory(modelCategoryID, productClassName);
+            refQualifier = 'sys_idIN' + reqProductModelSysIds.join();
+        }
+        if (!gs.nil(productModel)) refQualifier = 'sys_id=' + productModel;
+        return refQualifier;
+    },
+
+	getModelsForModelCategory: function(modelCategory, productClassName) {
+	    var model = new GlideRecord('cmdb_model');
+	    model.addQuery('sys_class_name', productClassName);
+	    model.addQuery('cmdb_model_category', 'CONTAINS', modelCategory);
+	    model.query();
+	    var productModelList = [];
+	    while (model.next()) {
+	        productModelList.push(model.getUniqueValue());
+	    }
+	    return productModelList;
+	},
+
+    getInstallBaseItemProductSpecificationRefQulifier: function(installBaseGr) {
+        var refQualifier = '';
+        if (gs.nil(installBaseGr)) return refQualifier;
+        var productSpecification = '';
+        var productModel = ''; // We don't have direct mapping between asset/CI and specification. So we need Product model to get related specification.
+        if (!gs.nil(installBaseGr.product)) {
+            productModel = installBaseGr.product;
+        } else if (!gs.nil(installBaseGr.configuration_item)) {
+            productModel = installBaseGr.configuration_item.model_id;
+        } else if (!gs.nil(installBaseGr.asset)) {
+            productModel = installBaseGr.asset.model;
+        }
+        if (!gs.nil(productModel)) {
+            productSpecification = productModel.specification;
+            refQualifier = 'sys_id=' + productSpecification;
+        }
+        return refQualifier;
+    },
+
+    getInstallBaseItemCIRefQulifier: function(installBaseGr) {
+        var refQualifier = '';
+        if (gs.nil(installBaseGr)) return refQualifier;
+        if (!gs.nil(installBaseGr.specification)) {
+            var modelList = this.getModelsforSpecification(installBaseGr.specification);
+            if (modelList.length &gt; 0) {
+                refQualifier = 'model_idIN' + modelList.join();
+            }
+        }
+        if (!gs.nil(installBaseGr.model_category) &amp;&amp; !gs.nil(installBaseGr.model_category.cmdb_ci_class)) {
+            refQualifier = 'sys_class_name=' + installBaseGr.model_category.cmdb_ci_class + '';
+        }
+        if (!gs.nil(installBaseGr.product)) {
+            refQualifier = 'model_id=' + installBaseGr.product;
+        }
+        var asset = installBaseGr.asset;
+        if (!gs.nil(asset)) {
+            refQualifier = 'sys_id=' + asset.ci;
+        }
+        return refQualifier;
+    },
+
+    getInstallBaseItemAssetRefQulifier: function(installBaseGr) {
+        var refQualifier = '';
+        if (gs.nil(installBaseGr)) return refQualifier;
+        if (!gs.nil(installBaseGr.specification)) {
+            var modelList = this.getModelsforSpecification(installBaseGr.specification);
+            if (modelList.length &gt; 0) {
+                refQualifier = 'modelIN' + modelList.join();
+            }
+        }
+        if (!gs.nil(installBaseGr.model_category)) {
+            refQualifier = 'model_category=' + installBaseGr.model_category;
+        }
+        if (!gs.nil(installBaseGr.product)) {
+            refQualifier = 'model=' + installBaseGr.product;
+        }
+        var ci = installBaseGr.configuration_item;
+        if (!gs.nil(ci)) {
+            refQualifier = 'sys_id=' + ci.asset;
+        }
+        return refQualifier;
+    },
+
+	isAdditionalAccountContact: function(soldProduct, contact) {
+		if (gs.tableExists(global.CSMBaseConstants.SOLD_PRODUCT_RELATED_PARTY) &amp;&amp; !gs.nil(soldProduct) &amp;&amp; !gs.nil(contact) &amp;&amp; !gs.nil(contact.account)) {
+			var gr = new GlideRecord(global.CSMBaseConstants.SOLD_PRODUCT_RELATED_PARTY);
+			gr.addQuery('sold_product', soldProduct);
+			gr.addQuery('account', contact.account);
+			gr.addQuery('responsibility', global.CSMRelationshipConstants.AUTHORISED_ACCOUNT);
+			gr.setLimit(1);
+			gr.setWorkflow(false);
+			gr.query();
+			return gr.hasNext();
+		}
+		return false;
+	},
+
+    getInstallBaseRefQualifierOnCase: function(caseRecord) {
+        if (gs.nil(caseRecord)) return "";
+
+        var inputVars = {};
+        inputVars[global.CSMBaseConstants.ACCOUNT_TABLE] = caseRecord.getValue('account');
+        inputVars[global.CSMBaseConstants.CONTACT_TABLE] = caseRecord.getValue('contact');
+        inputVars[global.CSMBaseConstants.CONSUMER_TABLE] = caseRecord.getValue('consumer');
+        if (this.isHouseholdPluginActive())
+            inputVars[global.CSMBaseConstants.HOUSEHOLD] = caseRecord.getValue('household');
+        if (this.isServiceOrgPluginActive()) {
+            inputVars[global.CSMBaseConstants.SERVICE_ORGANIZATION_TABLE] = caseRecord.getValue('requesting_service_organization');
+            if(caseRecord.service_organization)
+               var supportedProducts = new global.ServiceOrganizationUtil().getProductsAvailableForCase(caseRecord);
+        }
+
+        var refQualifier = new sn_install_base.InstallBaseFilter().getRefQualifierForIBonCase(inputVars);
+
+        var installBaseGr = new GlideRecord(global.CSMBaseConstants.INSTALL_BASE_ITEM);
+        installBaseGr.addQuery(refQualifier);
+
+        if (!gs.nil(caseRecord.product))
+            installBaseGr.addQuery('product', caseRecord.product).addOrCondition('product', '');
+            if (!gs.nil(supportedProducts))
+            installBaseGr.addQuery('product', supportedProducts);
+        if (!gs.nil(caseRecord.asset))
+            installBaseGr.addQuery('asset', caseRecord.asset).addOrCondition('asset', '');
+        if (!gs.nil(caseRecord.cmdb_ci))
+            installBaseGr.addQuery('configuration_item', caseRecord.cmdb_ci).addOrCondition('configuration_item', '');
+        return installBaseGr.getEncodedQuery();
+    },
+
+    // For a given specification, there can be one or many Product models mapped.
+    getModelsforSpecification: function(specification) {
+        var modelList = [];
+        if (gs.nil(specification)) return modelList;
+        var pmGr = new GlideRecord(global.CSMBaseConstants.PRODUCT);
+        pmGr.addQuery('specification', specification);
+        pmGr.query();
+        while (pmGr.next()) {
+            modelList.push(pmGr.getUniqueValue() + '');
+        }
+        return modelList;
+    },
+
+	getInstallBaseModelCategoryRefQual: function(ibGr) {
+	    var refQual = '';
+	    var ibClass = ibGr.sys_class_name + '';
+	    if (ibClass == global.CSMBaseConstants.INSTALL_BASE_ITEM) {
+	        refQual = 'install_base_item_class=NULL';
+	    } else {
+	        refQual = 'install_base_item_class=' + ibClass;
+	    }
+
+	    var modelCategories = '';
+	    if (!gs.nil(ibGr.product) &amp;&amp; !gs.nil(ibGr.product.cmdb_model_category)) {
+	        modelCategories = ibGr.product.cmdb_model_category;
+	    }
+	    if (!gs.nil(ibGr.asset)) {
+	        if (gs.nil(modelCategories)) {
+	            modelCategories = ibGr.asset.model_category;
+	        } else {
+	            modelCategories += ',' + ibGr.asset.model_category;
+	        }
+	    }
+
+	    if (!gs.nil(modelCategories)) {
+	        refQual += '^sys_idIN' + modelCategories;
+	    }
+	    if (gs.nil(ibGr.product) &amp;&amp; gs.nil(ibGr.asset) &amp;&amp; !gs.nil(ibGr.configuration_item)) {
+	        refQual += '^cmdb_ci_class=' + ibGr.configuration_item.sys_class_name + '';
+	    }
+	    return refQual;
+	},
+
+    isServiceOrgPluginActive: function() {
+        return GlidePluginManager.isActive(global.CSMBaseConstants.SERVICE_ORGANIZATION_PLUGIN);
+    },
+
+    isB2BConsumersPluginActive: function() {
+        return GlidePluginManager.isActive(global.CSMBaseConstants.B2B2C_PLUGIN);
+    },
+
+    isHouseholdPluginActive: function() {
+        return GlidePluginManager.isActive(global.CSMBaseConstants.HOUSEHOLD_PLUGIN);
+    },
+
+    type: 'SoldProductAndInstallBaseFilterSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-12-05 09:02:23&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1169ee464ce75510f877f8ad0e930dcc&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;20&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;SoldProductAndInstallBaseFilterSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Customer Service Install Base Management" source="sn_install_base"&gt;7f1fc05477122300d7159b71a91061b7&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Customer Service Install Base Management"&gt;7f1fc05477122300d7159b71a91061b7&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1169ee464ce75510f877f8ad0e930dcc&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-10-16 12:14:01&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:10:22</sys_created_on>
+        <sys_id>0680b0d583b01210c6695855eeaad313</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>SoldProductAndInstallBaseFilterSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_0680b0d583b01210c6695855eeaad313</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:10:22</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

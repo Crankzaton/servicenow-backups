@@ -1,0 +1,732 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0530d0f0d7311100158ba6859e610384</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.SMTemplates&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;true&lt;/client_callable&gt;
+        &lt;description&gt;Build a service order and tasks from a template&lt;/description&gt;
+        &lt;name&gt;SMTemplates&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var SMTemplates = Class.create();
+SMTemplates.prototype = {
+    initialize : function() {
+    },
+	
+	getScopeErrorMessage: function(recordAppScopeId, recordAppScopeName, currentAppScopeId, currentAppScopeName, changeUrl) {
+		return gs.getMessage('sm_template_scope_msg', [recordAppScopeId, recordAppScopeName, currentAppScopeId, currentAppScopeName, changeUrl]);
+	},
+
+    checkWorkFlowTriggerCondition : function(current) {
+	    var sc = new sn_sm.SMConfiguration();
+	    var propertyPrefix = sc.getPropertyPrefix(current);
+	    var stateValue = gs.getProperty(propertyPrefix + 'workflow.state', 10); // default the value to ready
+	    return (!(new sn_sm.SMConfiguration()).isEnabled(current, "use_sf", false) || (!current.template.nil() &amp;&amp; !current.template.workflow.nil() &amp;&amp; current.state == stateValue));
+    },
+
+    newFromCatalogItem : function(current, gs, catalogId, successMessage, producer2) {
+	    // Get the catalog item and copy the model into the template field on the new record
+	    var uri;
+	    try {
+		    uri = gs.action.getGlideURI();
+	    } catch (e) { // Required for test case
+		    gs.debug("Unable to get URI: " + e);
+	    }
+				
+		var sys_id;
+		
+		if (uri) {
+			sys_id = uri.get('sysparm_id');
+			var uriStr = uri + '';
+			
+			if (!sys_id) {
+				// We could not get the sys id from sysparm_id, so
+				// this must be Service Portal. Let's
+				// try to find the sys ID from the URI string:
+				
+				 if (uriStr.indexOf('api/sn_sc/') == 0) {
+					var matches = uriStr.match(/[0-9a-f]{32}/i);
+					if (matches) 
+						sys_id = matches[0];
+				}
+			} 
+			else {
+				// If we were able to get the sys ID from sysparm_id,
+				// this was submitted from the platform catalog, and
+				// we know the sys_id of the catalog item. Good.
+				// Nothing else needs to be done
+			}
+
+			// Hopefully at this stage, our attempts to find the catalog item 
+			// sys_id have worked
+			
+			if (sys_id) {
+				var gr = new GlideRecord('sc_cat_item');
+				gr.get(sys_id);
+				
+				if (!gr.model.nil())
+					current.template = gr.model.sys_id;
+			}
+		}
+		
+		if (!sys_id) 
+			gs.debug('Unable to determine catalog item ID. Request template field could not be set');
+		
+		current.is_catalog = true;
+
+	    // Redirect back to this catalog
+	    if (typeof producer != 'undefined')
+		    producer.redirect = "catalog_home.do?sysparm_catalog=" + catalogId;
+	    else if (typeof producer2 != 'undefined')
+		    producer2.redirect = "catalog_home.do?sysparm_catalog=" + catalogId;
+
+		if (successMessage == '' || successMessage == null)
+			gs.addInfoMessage('Request'+ ' ' +'&lt;a href="' + current.getTableName() + '.do?sys_id=' +current.sys_id + '"&gt;' + current.number + '&lt;/a&gt;' + ' ' +'has been created. You can add additional comments now or access all your active cases through the \'My Requests\' module.');
+		else
+	    	gs.addInfoMessage(successMessage);
+    },
+
+    applyServiceOrderTemplate : function(serviceOrder) {
+	    if (serviceOrder.short_description.nil())
+		    serviceOrder.short_description = serviceOrder.template.short_description.toString();
+	    if (serviceOrder.description.nil())
+		    serviceOrder.description = serviceOrder.template.order_description.toString();
+	    if (serviceOrder.qualification_group.nil())
+		    serviceOrder.qualification_group = serviceOrder.template.qualification_group;
+
+	    // apply all new request fields
+	    this._applyNewTemplateFields(serviceOrder);
+
+	    // Create the checklist
+	    this._createChecklist(serviceOrder);
+        
+		//Apply dynamic fields
+		if(serviceOrder &amp;&amp; serviceOrder.sys_class_name == "wm_order"){
+			if(GlidePluginManager.isActive("com.snc.fsm_template_management")){
+				var helper = new sn_fsm_adv_tmp.FSMTemplateMgmntHelper();
+				helper.applyDynamicTemplateFieldsHelper(serviceOrder);
+			}
+		}
+			
+	    //Add Kb article to the serviceOrder
+	    var kb = new GlideRecord('sm_m2m_model_knowledge');
+	    kb.addQuery('model', serviceOrder.template);
+	    kb.addActiveQuery();
+	    kb.query();
+	    while (kb.next()) {
+		    var m2m_kb_task = new GlideRecord('m2m_kb_task');
+		    m2m_kb_task.addQuery('kb_knowledge', kb.knowledge);
+		    m2m_kb_task.addQuery('task', serviceOrder.sys_id);
+		    m2m_kb_task.addActiveQuery();
+		    m2m_kb_task.query();
+		    if (!m2m_kb_task.next()) {
+			    m2m_kb_task.setValue('kb_knowledge', kb.knowledge);
+			    m2m_kb_task.setValue('task', serviceOrder.sys_id);
+			    m2m_kb_task.insert();
+		    }
+	    }
+	    return serviceOrder;
+    },
+
+    _createChecklist : function(dest) {
+	    var cheklistTemp = new GlideRecord('checklist_template');
+
+	    if (cheklistTemp.get(dest.template.checklist_template + '')) {
+		    var itemJSON = new JSON().decode(cheklistTemp.template);
+		    var name = itemJSON['name'];
+		    var items = itemJSON['items'];
+		    var owner = itemJSON['owner'];
+
+		    // create checklist
+		    var table = dest.getTableName();
+		    var checklistId = '';
+		    var gr = new GlideRecord('checklist');
+		    gr.addQuery('document', dest.sys_id + '');
+		    gr.addQuery('table', table);
+		    gr.query();
+
+		    if (!gr.next()) {
+			    gr.document = dest.sys_id + '';
+			    gr.name = name;
+			    gr.owner = owner;
+			    gr.table = table;
+			    checklistId = gr.insert();
+
+			    // create checklist items
+			    for (var i = 0; i &lt; items.length; i++) {
+				    var item = new GlideRecord('checklist_item');
+				    item.checklist = checklistId;
+				    item.complete = false;
+				    item.name = items[i]['name'];
+				    item.order = items[i]['order'];
+				    item.insert();
+			    }
+		    }
+	    }
+
+    },
+
+    _applyNewTemplateFields : function(serviceOrder) {
+	    // Apply all new template fields
+	    var table = serviceOrder.getTableName();
+	    var requestDriven = new sn_sm.SMConfiguration().isEnabled(serviceOrder, "request_driven", false);
+	    var taskTable = new sn_sm.SMConfiguration().getTaskTable(serviceOrder);
+	    var tempDef = new GlideRecord('sm_template_definition');
+	    tempDef.addQuery('template', serviceOrder.template.sys_id);
+	    tempDef.query();
+
+	    while (tempDef.next()) {
+		    var gr = new GlideRecord(table);
+		    var fieldType = gr.getElement(tempDef.field).getED().getInternalType();
+		    var fieldName = tempDef.field;
+
+		    if (fieldType == 'integer') {
+			    var choiceOfInteger = gr.getElement(tempDef.field).getED().getChoice();
+			    if ((choiceOfInteger == 1) || (choiceOfInteger == 3)) {
+				    if (serviceOrder[fieldName] + '' == '0')
+					    serviceOrder[fieldName] = tempDef.value.toString();
+			    } else {
+				    if (serviceOrder[fieldName].nil())
+					    serviceOrder[fieldName] = tempDef.value.toString();
+			    }
+		    } else {
+			    if (serviceOrder[fieldName].nil()) {
+				    if (fieldType == 'glide_date_time' || fieldType == 'glide_date') {
+					    serviceOrder[fieldName].setValue(tempDef.value);
+				    } else if ((fieldName == 'assignment_group') &amp;&amp; serviceOrder[fieldName].nil()) {
+					    if (requestDriven || (!requestDriven &amp;&amp; (table == taskTable))) {
+						    serviceOrder[fieldName] = tempDef.value;
+						    var vendorType = new sn_sm.SMConfiguration().getGroupType(serviceOrder, "vendor");
+						    if (serviceOrder.assignment_group.type.indexOf(vendorType) &gt; -1) //Vendor group
+							    serviceOrder.assigned_to = serviceOrder.assignment_group.manager;
+					    }
+				    } else
+					    serviceOrder[fieldName] = tempDef.value.toString();
+			    }
+		    }
+	    }
+    },
+
+    startWorkFlowForServiceOrder : function(serviceOrder) {
+	    new Workflow().startFlow(serviceOrder.template.workflow, serviceOrder, null, null);
+    },
+
+    buildTemplateFromServiceOrder : function(serviceOrder) {
+	    // Build the checklist template
+	    var checklistTempId = this.buildCheckListTemplate(serviceOrder);
+
+	    // Build service order template
+	    var soTemplate = this.buildSOTemplateFromServiceOrder(serviceOrder, checklistTempId);
+
+	    // Build new request fields in the template definition table
+	    var requestFieldsBlackList = [ "approval", "active", "name", "cmdb_model_category", "short_description", "description", "workflow", "qualification_group", "state", "closed_by", "escalation", "reassignment_count", "number", "upon_approval",
+	            "sla_due", "rejection_goto", "opened_at", "calendar_duration", "wf_activity", "delivery_task", "parent", "upon_reject", "opened_by", "task_created", "approval_history", "sla_suspended_on", "previous_agent", "work_end", "closed_at", "spam",
+	            "work_start", "correlation_id", "request_type", "correlation_display", "made_sla", "delivery_plan", "template" ];
+	    var requestTable = serviceOrder.getTableName();
+	    this.buildNewTemplateFields(requestTable, serviceOrder.sys_id + '', soTemplate.sys_id + '', requestFieldsBlackList);
+
+	    // Build service order task template
+	    this.buildSOTTemplateFromServiceOrder(soTemplate.sys_id + '', serviceOrder);
+
+	    this._redirectToNewTemplate(soTemplate, serviceOrder);
+    },
+
+    buildCheckListTemplate : function(source) {
+	    var templateInfo = {};
+	    templateInfo['items'] = [];
+	    var checklistTempId = '';
+
+	    var cl = new GlideRecord('checklist');
+	    cl.addQuery('document', source.sys_id + '');
+	    cl.query();
+
+	    if (cl.next()) {
+		    var owner = cl.owner + '';
+		    var name = cl.name + '';
+
+		    // Get the checklist item info
+		    var item = new GlideRecord('checklist_item');
+		    item.addQuery('checklist', cl.getUniqueValue());
+		    item.query();
+
+		    while (item.next()) {
+			    var itemName = item.name + '';
+			    var order = item.order + '';
+
+			    // Build item info
+			    var singleItem = {
+			        'order' : order,
+			        'name' : itemName
+			    };
+			    templateInfo['items'].push(singleItem);
+		    }
+
+		    // Build template info in checklist template
+		    templateInfo['name'] = name;
+		    templateInfo['owner'] = owner;
+
+		    //var templateInfoJSON = new JSON().encode(templateInfo);
+		    var templateInfoJSON = JSON.stringify(templateInfo);
+
+		    // Insert checklist template record
+		    var temp = new GlideRecord('checklist_template');
+		    temp.name = source.short_description + '';
+		    temp.template = templateInfoJSON;
+		    temp.user = owner;
+		    checklistTempId = temp.insert();
+	    }
+
+	    return checklistTempId;
+    },
+
+    buildNewTemplateFields : function(table, resourceId, templateId, blackList) {
+	    var scope = '';
+	    var fieldNameInfo = {};
+	    var fieldInfoResult = {};
+	    var blackListMap = {};
+
+	    // Convert the black list array to map
+	    for (var n = 0; n &lt; blackList.length; n++)
+		    blackListMap[blackList[n]] = true;
+
+	    // Get all the fields name
+	    var gr = new GlideRecord(table);
+	    gr.query();
+
+	    if (gr.next()) {
+		    var dupField = false;
+		    var fieldList = gr.getFields();
+		    for (var i = 0; i &lt; fieldList.size(); i++) {
+			    var field = fieldList.get(i);
+			    var fieldName = field.getName();
+
+			    if ((fieldName.indexOf("sys_") !== 0) &amp;&amp; (!blackListMap[fieldName]) &amp;&amp; (fieldName !== undefined))
+				    fieldNameInfo[fieldName] = '';
+		    }
+	    }
+
+	    // Get all the fields value	
+	    var gr = new GlideRecord(table);
+	    gr.get(resourceId);
+	    for ( var key in fieldNameInfo) {
+		    var type = gr.getElement(key).getED().getInternalType();
+		    if ((type == 'glide_duration') || (type == 'timer')) {
+			    var durationVal = gr[key].getDurationValue();
+			    if (durationVal == '')
+				    durationVal = '0 00:00:00';
+			    else if (durationVal.split(' ').length == 1)
+				    durationVal = '0 ' + durationVal;
+
+			    fieldInfoResult[key] = durationVal;
+		    }
+
+		    else if ((!gr[key].nil() &amp;&amp; (gr.getElement(key).getED().getInternalType() != 'boolean')) || ((gr.getElement(key).getED().getInternalType() == 'boolean') &amp;&amp; gr[key])) {
+			    fieldInfoResult[key] = gr[key].toString();
+		    }
+	    }
+
+	    // Get the scope from sm_config
+	    var config = new GlideRecord('sm_config');
+	    config.addQuery('main_table', table).addOrCondition('task_table', table);
+	    config.query();
+
+	    if (config.next())
+		    scope = config.sys_scope + '';
+
+	    // Insert new fields value to the template definition table
+	    for ( var key2 in fieldInfoResult) {
+		    var smTemp = new GlideRecord('sm_template_definition');
+		    smTemp.table = table;
+		    smTemp.field = key2;
+		    smTemp.mandatory = false;
+		    smTemp.show = false;
+		    smTemp.template = templateId;
+		    smTemp.value = fieldInfoResult[key2];
+		    smTemp.sys_scope = scope;
+		    smTemp.insert();
+	    }
+    },
+
+    buildSOTemplateFromServiceOrder : function(serviceOrder, checklistTempId) {
+	    var mainModelClass = new sn_sm.SMConfiguration().getMainModelTable(serviceOrder);
+	    // Create the so template
+	    var template = new GlideRecord(mainModelClass);
+	    template.name = serviceOrder.short_description.toString();
+	    template.short_description = serviceOrder.short_description.toString();
+	    template.order_description = serviceOrder.description.toString();
+	    template.qualification_group = serviceOrder.qualification_group;
+	    template.checklist_template = checklistTempId;
+	    template.insert();
+	    return template;
+    },
+
+    buildSOTTemplateFromServiceOrder : function(soTemplateId, serviceOrder) {
+	    var taskFieldsBlackList = [ "approval", "active", "description", "short_description", "dispatch_group", "parent", "state", "closed_by", "routing_in_progress", "escalation", "reassignment_count", "number", "vendor_reference", "is_fixed_window",
+	            "upon_approval", "sla_due", "actual_travel_duration", "rejection_goto", "cloned_from", "opened_at", "calendar_duration", "wf_activity", "delivery_task", "upon_reject", "actual_travel_start", "acknowledged_on", "approval_history",
+	            "previous_agent", "work_end", "dispatched_on", "work_start", "parent_order", "correlation_id", "correlation_display", "made_sla", "delivery_plan", "template" ];
+
+	    // Create the sot template if the so has the sot
+	    var taskClass = this.getChildTable(serviceOrder);
+	    var taskToModelMap = {};
+	    var taskModelClass = new sn_sm.SMConfiguration().getTaskModelTable(serviceOrder);
+	    var soTask = new GlideRecord(taskClass);
+	    soTask.addQuery('parent', serviceOrder.sys_id + '');
+	    soTask.query();
+
+	    while (soTask.next()) {
+		    // Build the checklist template
+		    var checklistTempId = this.buildCheckListTemplate(soTask);
+
+		    var taskTemplate = new GlideRecord(taskModelClass);
+		    taskTemplate.name = soTask.short_description.toString();
+		    taskTemplate.short_description = soTask.short_description.toString();
+		    taskTemplate.task_description = soTask.description.toString();
+		    taskTemplate.dispatch_group = soTask.dispatch_group;
+		    taskTemplate.checklist_template = checklistTempId;
+
+		    var taskTemplateId = taskTemplate.insert();
+
+		    // Build the new task template fields in template definition table			
+		    this.buildNewTemplateFields(taskClass, soTask.sys_id + '', taskTemplateId, taskFieldsBlackList);
+
+		    taskToModelMap[soTask.sys_id] = taskTemplateId;
+		    this.buildM2MSOSTFromServiceOrder(soTemplateId, taskTemplateId);
+		    this.buildPartRequirementTemplateFromServiceOrder(soTask, taskTemplateId);
+	    }
+	    this.checkingTaskDependencies(taskToModelMap, soTemplateId);
+    },
+
+    checkingTaskDependencies : function(taskToModelMap, soTemplateId) {
+	    for ( var keys in taskToModelMap) {
+		    var m2m = new GlideRecord('sm_m2m_task_dependency');
+		    m2m.addQuery('upstream_task', keys);
+		    m2m.query();
+		    while (m2m.next()) {
+			    if (taskToModelMap[m2m.downstream_task])
+				    this._createTaskToModelDependency(taskToModelMap[m2m.upstream_task], taskToModelMap[m2m.downstream_task], soTemplateId);
+		    }
+	    }
+    },
+
+    _createTaskToModelDependency : function(upst, dwnst, soTemplateId) {
+	    var gr = new GlideRecord('sm_m2m_task_template_dependency');
+	    gr.upstream_task = upst;
+	    gr.downstream_task = dwnst;
+	    gr.order_model = soTemplateId;
+	    gr.insert();
+    },
+
+    buildPartRequirementTemplateFromServiceOrder : function(soTask, taskTemplateId) {
+	    // Create part requirement template if the sot has the part requirement
+	    var partRequirement = new GlideRecord('sm_part_requirement');
+	    partRequirement.addQuery('service_order_task', soTask.sys_id + '');
+	    partRequirement.query();
+
+	    while (partRequirement.next()) {
+		    var modelPartReq = new GlideRecord('cmdb_model_part_requirement');
+		    modelPartReq.service_order_task = taskTemplateId;
+		    modelPartReq.model = partRequirement.model.sys_id + '';
+		    modelPartReq.required_quantity = partRequirement.required_quantity;
+		    modelPartReq.mandatory = partRequirement.mandatory;
+		    modelPartReq.insert();
+	    }
+    },
+
+    buildM2MSOSTFromServiceOrder : function(soTemplateId, taskTemplateId) {
+	    // Create the m2m
+	    var gr = new GlideRecord("sm_m2m_somodel_stmodel");
+	    gr.so_model = soTemplateId;
+	    gr.st_model = taskTemplateId;
+	    gr.insert();
+    },
+
+    _redirectToNewTemplate : function(template, serviceOrder) {
+	    gs.addInfoMessage(gs.getMessage(template.getLabel() + " is created for {0}", serviceOrder.number));
+	    action.setRedirectURL(template);
+    },
+
+    buildServiceOrderTasks : function(serviceOrder) {
+
+	    var sc = new sn_sm.SMConfiguration();
+	    var model_to_task_map = {};
+	    var vendorType = sc.getGroupType(serviceOrder, "vendor");
+
+	    var gr = new GlideRecord("sm_m2m_somodel_stmodel");
+	    gr.addQuery("so_model", serviceOrder.template);
+	    gr.orderBy("order");
+	    gr.query();
+	    while (gr.next()) {
+			
+			
+		    // Get the task table based on the task type
+		    var taskModelClass = gr.st_model.sys_class_name + '';
+		    var configuration = sc.getConfigurationByTaskModelTable(taskModelClass);
+			if (!configuration) {
+				continue;
+			}
+			
+		    var taskClass = configuration.task_table + '';
+
+		    var st = new GlideRecord(taskClass);
+		    st.parent = serviceOrder.sys_id;
+		    st.template = gr.st_model;
+		    st.short_description = gr.st_model.short_description;
+		    st.description = gr.st_model.task_description;
+		    if (sc.isEnabled(serviceOrder, 'dispatch_queue', false))
+			    st.dispatch_group = gr.st_model.dispatch_group;
+		    st.location = serviceOrder.location;
+			if(taskClass == "wm_task"){
+                if (serviceOrder.sys_class_name == "wm_order") {
+                    st.work_order = serviceOrder.sys_id+"";
+					
+					// Evaluating the filter condition
+					if(this._isFilterConditionAdded(gr)){
+						var conditiionMatched = this._evaluateFilterCondition(gr, serviceOrder); 
+						if(conditiionMatched == false){
+							// When filter condtion falied, then associatd task should not be created.
+							continue;
+						}
+					}
+                }
+                
+				st.work_type = gr.st_model.work_type;
+				if(gr.st_model.requires_crew)
+					st.requires_crew = gr.st_model.requires_crew;
+				if(!gs.nil(gr.st_model.work_type) &amp;&amp; (gr.st_model.work_type.getRefRecord().requires_crew))
+					st.requires_crew = true;
+				if(st.requires_crew &amp;&amp; (gr.st_model.work_type.getRefRecord().resource_requirements)){
+					st.resource_requirements = true;
+				}
+			}
+
+		    // apply all new task fields
+		    this._applyNewTemplateFields(st);
+
+		    var stId = st.insert();
+
+		    if(taskClass == "wm_task" &amp;&amp; serviceOrder.sys_class_name == "wm_order" &amp;&amp; SNC.ModelUtil.isPluginActive("com.snc.fsm_access_hours") &amp;&amp; st.getValue("access_hour") == null){
+        		var defaultUtils = new sn_fsm_access_hour.FSMDefaultAccessHourUtils();
+       			defaultUtils.updateDefaultAccessHour(st,serviceOrder);
+        	}
+
+		    // Create the checklist
+		    this._createChecklist(st);
+
+		    model_to_task_map[st.template] = stId;
+		    st = new GlideRecord(taskClass);
+		    st.get(stId);
+		    if (!st.dispatch_group.nil() &amp;&amp; !st.assignment_group.nil() &amp;&amp; st.state &lt;= SMConstants.TASK_PENDING_DISPATCH) {
+			    st.state = SMConstants.TASK_PENDING_DISPATCH;
+			    st.update();
+		    }
+			
+			if(!st.template.nil()){
+				//Add Kb article to the serviceOrderTasks
+				var kb = new GlideRecord('sm_m2m_model_knowledge');
+				kb.addQuery('model', st.template);
+				kb.addActiveQuery();
+				kb.query();
+				while (kb.next()) {
+					var m2m_kb_task = new GlideRecord('m2m_kb_task');
+					m2m_kb_task.addQuery('kb_knowledge', kb.knowledge);
+					m2m_kb_task.addQuery('task', st.sys_id);
+					m2m_kb_task.addActiveQuery();
+					m2m_kb_task.query();
+					if (!m2m_kb_task.next()) {
+						m2m_kb_task.setValue('kb_knowledge', kb.knowledge);
+						m2m_kb_task.setValue('task', st.sys_id);
+						m2m_kb_task.insert();
+					}
+				}
+			}
+			
+	    }
+	    this.checkingTaskTemplateDependencies(model_to_task_map, serviceOrder.template);
+    },
+	
+	// This function validate the field "Filter condition" for the record in m2m somodel_stmodel
+	_isFilterConditionAdded : function(soModelGr){
+		return soModelGr.isValidField('filter_condition') &amp;&amp; !gs.nil(soModelGr.filter_condition);
+	},
+	
+	// Evaluate the "Filter condition" for the record in m2m somodel_stmodel
+	_evaluateFilterCondition : function(soModelGr, serviceOrderGr) {
+		// Generating the filter object and use REGEX to constrain input
+		var condition = soModelGr.filter_condition;
+		var condition_clean = condition.replace( /[{}\\\/]/g, "" );
+		var filterRecord = new GlideFilter(condition_clean, 'filterCondition');
+		filterRecord.setEnforceSecurity(true);
+		filterRecord.setCaseSensitive(false);
+		// Checking for matching record on given work order
+		return filterRecord.match(serviceOrderGr, true) ? true : false; 
+	},
+	
+    createCaseFromTemplate : function(tempID, hrProfile, openedFor) {
+	    var st = new GlideRecord("hr_case");
+	    st.template = tempID;
+
+	    // apply all new task fields
+	    this._applyNewTemplateFields(st);
+	    st.hr_profile = hrProfile;
+	    st.opened_for = openedFor;
+	    return st.insert();
+    },
+
+   createHRTaskFromTemplate : function(templateId, grCase, grTask) {
+
+	    var sc = new sn_sm.SMConfiguration();
+	    var model_to_task_map = {};
+
+	    //get the teamplate of case
+	    var template = new GlideRecord('cmdb_hr_task_product_model');
+	    template.get(templateId);
+		 
+	    var st = new GlideRecord('hr_task');
+		if (grTask)
+			st.get(grTask.sys_id);
+	    else 
+			st.insert();
+	   
+	    st.parent = grCase.sys_id;
+	    st.template = template.sys_id;
+
+	    st.short_description = template.short_description;
+	    st.description = template.task_description;
+	    st.location = grCase.location;
+	    if (sc.isEnabled(grCase, 'dispatch_queue', false))
+		    st.dispatch_group = template.dispatch_group;
+
+	    // apply all new task fields
+	    this._applyNewTemplateFields(st);
+	    st.update();
+	    var stId = st.sys_id;
+
+	    // Create the checklist
+	    this._createChecklist(st);
+
+	    model_to_task_map[st.template] = stId;
+	    st = new GlideRecord('hr_task');
+	    st.get(stId);
+		//gs.addInfoMessage(st.hr_task_type + ': ' + typeof st.hr_task_type);
+	    //Will revisit this.
+	    if (st.hr_task_type) {
+		    st.assigned_to = grCase.opened_for;
+		    st.update();
+	    } else if (!st.dispatch_group.nil() &amp;&amp; !st.assignment_group.nil() &amp;&amp; st.state &lt;= SMConstants.TASK_PENDING_DISPATCH) {
+		    st.state = SMConstants.TASK_PENDING_DISPATCH;
+		    st.update();
+	    }
+    },
+
+    checkingTaskTemplateDependencies : function(model_to_task_map, soTemplate) {
+	    var m2m;
+	    var gr = new GlideRecord("sm_m2m_somodel_stmodel");
+	    gr.addQuery("so_model", soTemplate);
+	    gr.query();
+	    while (gr.next()) {
+		    m2m = new GlideRecord('sm_m2m_task_template_dependency');
+		    m2m.addQuery('upstream_task', gr.st_model);
+		    m2m.query();
+		    while (m2m.next()) {
+			    if (model_to_task_map[m2m.upstream_task])
+				    this._createTemplateToTaskDependency(model_to_task_map[m2m.upstream_task], model_to_task_map[m2m.downstream_task]);
+		    }
+	    }
+    },
+
+    _createTemplateToTaskDependency : function(upst, dwnst) {
+	    var gr = new GlideRecord('sm_m2m_task_dependency');
+	    gr.upstream_task = upst;
+	    gr.downstream_task = dwnst;
+	    gr.insert();
+    },
+
+    buildPartRequirements : function(serviceTask) {
+	    var gr = new GlideRecord("cmdb_model_part_requirement");
+	    gr.addQuery("service_order_task", serviceTask.template);
+	    gr.query();
+	    while (gr.next()) {
+		    var pr = new GlideRecord("sm_part_requirement");
+		    pr.service_order_task = serviceTask.sys_id;
+		    pr.model = gr.model;
+		    pr.required_quantity = gr.required_quantity;
+	     	pr.mandatory = gr.mandatory;
+	     	pr.creation_method = "template";
+		    pr.insert();
+	    }
+    },
+
+    checkIfHasTaskTemplate : function(serviceOrder) {
+	    var gr = new GlideRecord("sm_m2m_somodel_stmodel");
+	    gr.addQuery("so_model", serviceOrder.template + "");
+	    gr.query();
+
+	    if (gr.next())
+		    return true;
+	    else
+		    return false;
+    },
+
+    getMainModelCategory : function(tableName) {
+	    var configuration = new sn_sm.SMConfiguration().getConfigurationByMainModelTable(tableName);
+	    if (configuration)
+		    return configuration.main_model_category.toString();
+	    return '';
+    },
+
+    getTaskModelCategory : function(tableName) {
+	    var configuration = new sn_sm.SMConfiguration().getConfigurationByTaskModelTable(tableName);
+	    if (configuration)
+		    return configuration.task_model_category.toString();
+	    return '';
+    },
+
+    getChildTable : function(serviceOrder) {
+	    var configHelper = new sn_sm.SMConfiguration();
+	    var applicationName = configHelper.getAppName(serviceOrder);
+	    var configuration = configHelper.getConfigRecord(applicationName);
+	    var childTable = configHelper.getTaskTable(configuration);
+	    return childTable;
+    },
+	
+	getCatalogItemDefaultDescription : function(catalogItem) {
+		if (catalogItem &amp;&amp; !catalogItem.model.nil())
+			return catalogItem.model.order_description + '';
+		return '';
+	},
+	
+    type : 'SMTemplates'
+    };]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2013-12-19 13:51:54&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0530d0f0d7311100158ba6859e610384&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;276&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;SMTemplates&lt;/sys_name&gt;
+        &lt;sys_package display_value="Service Management Core" source="com.snc.service_management.core"&gt;3e6bd6bb4722c210cd4e1ce4316d4387&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0530d0f0d7311100158ba6859e610384&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-01-17 01:24:15&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:15</sys_created_on>
+        <sys_id>e940bc5583b01210c6695855eeaad3d1</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>SMTemplates</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_e940bc5583b01210c6695855eeaad3d1</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:15</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

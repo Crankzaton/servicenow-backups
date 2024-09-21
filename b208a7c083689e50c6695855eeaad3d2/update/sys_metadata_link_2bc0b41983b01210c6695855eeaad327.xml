@@ -1,0 +1,200 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1dba2fcd734c3300cd69f021c4f6a70c</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.CFCommentDataServiceSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Customers should not change this script include directly&amp;#13;
+This is never called directly.&lt;/description&gt;
+        &lt;name&gt;CFCommentDataServiceSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var CFCommentDataServiceSNC = Class.create();
+
+CFCommentDataServiceSNC.prototype = {
+	
+	initialize: function() {
+		this.commentsTable = 'cf_comment';
+	},
+	
+	getNewCommentId: function() {
+		return gs.generateGUID();
+	},
+	
+	getCommentMenuItems: function(commentData) {
+		var _actions = [];
+		if(commentData.canUpdate)
+			_actions.push({
+				label: gs.getMessage('Edit'),
+				type: 'edit'
+			});
+		if(commentData.canDelete)
+			_actions.push({
+				label: gs.getMessage('Delete'),
+				type: 'delete'
+			});
+		return _actions;
+	},
+	
+	getCommentMenuItemsForComment: function(commentId) {
+		var commentGr = CFQueryService.getComment(this.commentsTable, commentId);
+		if(commentGr.isValidRecord()) {
+			return this.getCommentMenuItems({
+				canUpdate: commentGr.canWrite(),
+				canDelete: commentGr.canDelete()
+			});
+		} else {
+			return [];
+		}
+	},
+	
+	getChildCommentsCountForComment: function(commentId) {
+		var childCommentsCount = 0;
+		var commentsAgg = new GlideAggregate(this.commentsTable);
+		commentsAgg.addAggregate('COUNT');
+		commentsAgg.addQuery('parent', commentId);
+		commentsAgg.query();
+		
+		if(commentsAgg.next())
+				childCommentsCount = Number(commentsAgg.getAggregate('count'));
+		return childCommentsCount;
+	},
+	
+	getTopCommentsForParentEntity: function(parentEntitySysId, startOffset, endOffset) {
+		
+		var commentsInfo = {};
+		commentsInfo.commentsList = [];
+		var commentsGr = CFQueryService.getCommentsForParentEntity(this.commentsTable, parentEntitySysId, true, startOffset, endOffset);
+		
+		while(commentsGr.next()) {
+			var commentSysId = commentsGr.getValue('sys_id');
+			var childCommentsCount = this.getChildCommentsCountForComment(commentSysId);
+			var commentData = CFCommonService.getCommentInfo(commentsGr);
+			commentData.childCommentsCount = childCommentsCount;
+			commentData.actions = this.getCommentMenuItems(commentData);
+			commentData.level = 1;
+			commentsInfo.commentsList.push(commentData);
+		}
+		commentsInfo.totalComments = CFCommonService.getTotalCommentCount(this.commentsTable,parentEntitySysId);
+		commentsInfo.totalParentComments = commentsGr.getRowCount();
+		commentsInfo.latestCommentInfo = CFCommonService.getLatestCommentInfo(this.commentsTable, parentEntitySysId);
+		commentsInfo.canCreate = commentsGr.canCreate(); //todo- this needs to be changed
+		return commentsInfo;
+	},
+	
+	getChildComments: function(parentCommentSysId, parentEntitySysId) {
+		var childCommentsList = [];
+		var commentsGr = CFQueryService.getChildComments(parentCommentSysId, this.commentsTable);
+		
+		while(commentsGr.next()) {
+			var commentData = CFCommonService.getCommentInfo(commentsGr);
+			commentData.actions = this.getCommentMenuItems(commentData);
+			childCommentsList.push(commentData);
+		}
+		return {
+			childCommentsList: childCommentsList,
+			latestCommentInfo: CFCommonService.getLatestCommentInfo(this.commentsTable, parentEntitySysId),
+			totalComments: CFCommonService.getTotalCommentCount(this.commentsTable, parentEntitySysId)
+		};
+	},
+	
+	deleteComment: function(commentSysId) {
+		var commentGr = CFQueryService.getComment(this.commentsTable, commentSysId);
+		var _isCommentValid = commentGr.isValidRecord();
+		var _canDeleteComment = commentGr.canDelete();
+		if(_isCommentValid &amp;&amp; _canDeleteComment) {
+			commentGr.deleteRecord();
+			return {
+				deletedCommentSysId: commentSysId,
+				status: 'SUCCESS'
+			};
+		} else {
+			return {
+				status: 'FAILED',
+				isValid: _isCommentValid,
+				hasAccess: _canDeleteComment
+			};
+		}
+	},
+	
+	getNestedComments: function(parentEntitySysId) {
+		var commentsGr = new GlideRecord(this.commentsTable);
+		commentsGr.addNotNullQuery('parent');
+		commentsGr.addQuery('source', parentEntitySysId);
+		commentsGr.orderBy('sys_created_on'); //Tree building completely based on this.
+		commentsGr.query();
+		var nestedCommentsTree = {};
+		var commentToIndexMapper = {};
+		var index = 0;
+		var _commentsList = [];
+		
+		while(commentsGr.next()) {
+			var parentCommentId = commentsGr.getValue('parent');
+			var commentData = CFCommonService.getCommentInfo(commentsGr);
+			commentData.actions = this.getCommentMenuItems(commentData);
+			/**
+			* Pushing each comment in temporary _commentsList. So that we will maintain the index of comment
+			**/
+			_commentsList.push(commentData);
+			/**
+			* Storing comment's index w.r.t commentSysId in a mapper. i.e.. comment's index in _commentsList
+			**/
+			commentToIndexMapper[commentData.sysId] = index;
+			/**
+			* Check for comment's parent index in _commentsList
+			* If comment exist in _commentsList - add/push commentData to it's childCommentsList. (adding data to its childList will effect in nestedCommentsTree object as objects work with references in javascript)
+			* If comment doesn't exist in _commentsList - It's a level 1 comment and create a key with comment.parent in nestedCommentsTree and add this comment into it.
+			**/
+			var parentCommentIndex = commentToIndexMapper[commentData.commentParent];
+			if(parentCommentIndex &gt;= 0) {
+				var parentComment = _commentsList[parentCommentIndex];
+				commentData.level = parentComment.level + 1;
+				parentComment.childCommentsList.push(commentData);
+				parentComment.childCommentsCount = parentComment.childCommentsList.length;
+			} else {
+				commentData.level = 2;
+				if(!nestedCommentsTree[commentData.commentParent])
+					nestedCommentsTree[commentData.commentParent] = [commentData];
+				else
+					nestedCommentsTree[commentData.commentParent].push(commentData);
+			}
+			index++;
+		}
+		return nestedCommentsTree;
+	},
+	
+    type: 'CFCommentDataServiceSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2019-03-06 10:28:02&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1dba2fcd734c3300cd69f021c4f6a70c&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;34&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;CFCommentDataServiceSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Comments and feedback" source="com.snc.comments_and_feedback"&gt;0f2056ab47e64210cd4e1ce4316d4320&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1dba2fcd734c3300cd69f021c4f6a70c&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2019-04-23 11:39:08&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:33</sys_created_on>
+        <sys_id>2bc0b41983b01210c6695855eeaad327</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>CFCommentDataServiceSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_2bc0b41983b01210c6695855eeaad327</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:33</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

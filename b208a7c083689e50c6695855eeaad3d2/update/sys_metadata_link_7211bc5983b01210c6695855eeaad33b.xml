@@ -1,0 +1,244 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>2a0967c9c3033010a9f5e548fa40dd79</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_deploy_pipeline.DeploymentRequestUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;DeploymentRequestUtils&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var DeploymentRequestUtils = Class.create();
+DeploymentRequestUtils.prototype = {
+    initialize: function() {},
+
+    /**
+     * Checks for presence of newer deployment request for the given app sys_id based on the passed date.
+     *
+     * @param {String} appSysId - sys_id of the app 
+     * @param {String} depReqSysId - Excludes the record related to sys_id when peforming the check.
+     * @param {String} createdOn - Date after which deployment requests are being looked for
+     * @returns {Boolean}
+     */
+    isNewerDeploymentRequestPresent: function(sysId, appSysId, createdOn) {
+        var depReq = new GlideRecord(DeploymentPipelineConstants.tables.DEPLOYMENT_REQUEST);
+
+        depReq.addQuery("sys_id", '!=', sysId);
+        depReq.addQuery("app_sys_id", appSysId);
+        depReq.addQuery("sys_created_on", "&gt;=", createdOn);
+        depReq.query();
+
+        return depReq.next();
+    },
+
+    /**
+     * Checks to see if an open deployment request exists for the given app sys_id.
+     *
+     * @param {String} appSysId - sys_id of the app 
+     * @returns {Boolean}
+     */
+    isOpenDeploymentRequestPresentForApp: function(appSysId) {
+        var openDeploymentStates = DeploymentPipelineConstants.deploymentRequest.openStates;
+
+        var depReq = new GlideRecord(DeploymentPipelineConstants.tables.DEPLOYMENT_REQUEST);
+
+        depReq.addQuery("app_sys_id", appSysId);
+        depReq.addQuery("state", DeploymentPipelineConstants.deploymentRequest.openStates);
+
+        depReq.query();
+
+        return depReq.next();
+    },
+	
+	/**
+     * Returns if present, open deployment request for the given app sys_id.
+     *
+     * @param {String} appSysId - sys_id of the app 
+     * @returns {GlideRecord}
+     */
+    getOpenDeploymentRequestRecordForApp: function(appSysId) {
+        var openDeploymentStates = DeploymentPipelineConstants.deploymentRequest.openStates;
+
+        var depReq = new GlideRecord(DeploymentPipelineConstants.tables.DEPLOYMENT_REQUEST);
+
+        depReq.addQuery("app_sys_id", appSysId);
+        depReq.addQuery("state", DeploymentPipelineConstants.deploymentRequest.openStates);
+
+        depReq.query();
+
+        if(depReq.next()) {
+			return depReq;
+		}
+		
+		return null;
+    },
+
+    /**
+     * Gets open deployment request from controller
+     *
+     * @param {String} appSysId - sys_id of the app 
+     * @returns {Object}
+     */
+    getOpenDeploymentRequestPresentForAppFromEnv: function(appSysId, envRec) {
+		var inputs = {
+			app_id: appSysId,
+			credential: envRec.instance_credential.getRefRecord(),
+			url: envRec.getValue("instance_url")
+		};
+
+        try {
+            var actionResult = sn_fd.FlowAPI.getRunner()
+                .action("sn_deploy_pipeline.get_open_app_deployment_request")
+                .inForeground()
+                .withInputs(inputs)
+                .run();
+
+            return actionResult.getOutputs();
+        } catch (e) {
+            return {
+                error_code: 1,
+                error_message: e.getMessage()
+            };
+        }
+    },
+	
+	checkCanUpdateDeploymentRequestOnController: function(appId, controllerEnv) {
+		try {
+			var actionOutputs = this.getOpenDeploymentRequestPresentForAppFromEnv(appId, controllerEnv);
+			var status = actionOutputs["status_code"];
+			var responseFromController = actionOutputs.response_body ? JSON.parse(actionOutputs.response_body) : {};
+		} catch (e) {
+			gs.debug("Fetching open deployment request from controller failed with error: " + JSON.stringify(e));
+			
+			throw new sn_ws_err.ServiceError()
+				.setStatus(500)
+				.setMessage(gs.getMessageLang("Error fetching deployment information", "en"))
+				.setDetail(gs.getMessage("Error fetching deployment information from controller instance: ", JSON.stringify(e)));
+		}
+		
+		if (status !== 200) {
+			var parsedError = responseFromController.error || {};
+			
+			throw new sn_ws_err.ServiceError()
+				.setStatus(status)
+				.setMessage(parsedError.message)
+				.setDetail(gs.getMessage("Redirected response from controller instance: {0}", parsedError.detail));
+		}
+		
+		var parsedResult = responseFromController.result;
+		
+		if (!parsedResult.sys_id) {
+			throw new sn_ws_err.ServiceError()
+                .setStatus(404)
+                .setMessage(gs.getMessageLang("Open deployment request not found.", "en"))
+                .setDetail(gs.getMessage("There is no open deployment request for app id {0}.", appId));
+		}
+		
+		// check if user can update records on deployment request
+		var depReq = new GlideRecord(DeploymentPipelineConstants.tables.DEPLOYMENT_REQUEST);
+		if (!depReq.canWrite() &amp;&amp; parsedResult.requestor_sys_id !== gs.getUserID() &amp;&amp; parsedResult.requestor_user_name !== gs.getUserName()) {
+			throw new sn_ws_err.ServiceError()
+				.setStatus(403)
+				.setMessage(gs.getMessageLang("User Not Authorized.", "en"))
+				.setDetail(gs.getMessage("User does not have the permission to update the deployment request for app with sys_id {0}", appId));
+		}
+	},
+	
+	checkCanUpdateDeploymentRequest: function(appId, depRequestRecord) {
+		if(!depRequestRecord || !depRequestRecord.isValidRecord()){
+			throw new sn_ws_err.ServiceError()
+                .setStatus(404)
+                .setMessage(gs.getMessageLang("Open deployment request not found.", "en"))
+                .setDetail(gs.getMessage("There is no open deployment request for app id {0}.", appId));
+		}
+		
+		if (depRequestRecord.canWrite()) {
+			return true;
+		}
+		
+		var requestorSysId = depRequestRecord.getValue("requestor_sys_id");
+		var requestorUserName = depRequestRecord.getValue("requestor_user_name");
+		
+		if(requestorSysId !== gs.getUserID() &amp;&amp; requestorUserName !== gs.getUserName()) {
+			throw new sn_ws_err.ServiceError()
+				.setStatus(403)
+				.setMessage(gs.getMessageLang("User Not Authorized.", "en"))
+				.setDetail(gs.getMessage("User does not have the permission to update the deployment request for app with sys_id {0}", appId));
+		}
+	},
+	
+	updateOpenDeploymentRequestPresentForAppOnEnv: function (appId, envRec, requestBody) {
+		var inputs = {
+			application_sys_id: appId,
+			credential: envRec.instance_credential.getRefRecord(),
+			url: envRec.getValue("instance_url"),
+			request_body: JSON.stringify(requestBody || {})
+		};
+
+        try {
+            var actionResult = sn_fd.FlowAPI.getRunner()
+                .action("sn_deploy_pipeline.update_open_deployment_request")
+                .inForeground()
+                .withInputs(inputs)
+                .run();
+
+            return actionResult.getOutputs();
+        } catch (e) {
+            return {
+                error_code: 1,
+                error_message: e.getMessage()
+            };
+        }
+	},
+	getDeploymentRequestObject: function (depReqRecord) {
+		if (!depReqRecord || !depReqRecord.isValidRecord()) {
+			return {};
+		}
+		
+		var depReqObject = (new DeploymentPipelineGenericUtils()).getObjectFromGlideRecord(
+			depReqRecord,
+			DeploymentPipelineConstants.deploymentRequest.columns
+		);
+		depReqObject.state = {
+			value: depReqObject.state,
+			displayName: depReqRecord.getDisplayValue('state')
+		};
+		
+		return depReqObject;
+	},
+
+    type: 'DeploymentRequestUtils'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-10-05 22:12:43&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;2a0967c9c3033010a9f5e548fa40dd79&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;14&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;DeploymentRequestUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Deployment Pipeline" source="sn_deploy_pipeline"&gt;bb67ed7253e83010b846ddeeff7b1204&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Deployment Pipeline"&gt;bb67ed7253e83010b846ddeeff7b1204&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_2a0967c9c3033010a9f5e548fa40dd79&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2021-12-15 18:43:28&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:53</sys_created_on>
+        <sys_id>7211bc5983b01210c6695855eeaad33b</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>DeploymentRequestUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_7211bc5983b01210c6695855eeaad33b</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:53</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

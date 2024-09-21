@@ -1,0 +1,289 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>06ac564453d323004acaddeeff7b12ce</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_intel_analyzer.TrendRecommendation&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;TrendRecommendation&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var TrendRecommendation = Class.create();
+TrendRecommendation.prototype = {
+	COMMON_VALUE: "common_value",
+	COMMON_REFERENCE: "common_reference",
+	COMMON_CONDITION: "common_condition",
+
+	initialize: function () {
+	},
+
+	processTrendsWithString: function(trendJSONString) {
+		if (typeof trendJSONString != 'string')
+			return '';
+			
+		var trendJSON = JSON.parse(trendJSONString);
+		this.processTrends(trendJSON);
+		return JSON.stringify(this.resultsJSON);
+	},
+	
+	// trendJSON includes request_table, record_list an array of record ids, trend_list an array of trends ids.
+	processTrends: function (trendJSON) {
+		
+		this.request_table = trendJSON["request_table"];
+		this.record_list = trendJSON["record_list"];
+		this.trend_list = trendJSON["trend_list"];
+		if (!this.request_table || !this.record_list || this.record_list.length == 0)
+			return {
+				"request_table": (this.request_table ? this.request_table : "" ),
+				"state": "failed",
+				"message": gs.getMessage("invalid table or record list"),
+				"trends": [],
+				"results": []
+			};
+
+		this.resultsJSON = {"request_table": this.request_table};
+		this.trends = [];
+		this.recommendObjs = [];
+		this._buildRecordAgeMap();
+
+		// if trendList exists, get the trends in list; if not, get all applicable trends
+		var trendGr = new GlideRecord("trend_definition");
+		trendGr.addQuery("table", this.request_table);
+		if (this.trend_list)
+			trendGr.addQuery("trend_id","IN", this.trend_list);
+		trendGr.orderBy("order");
+		trendGr.query();
+		while (trendGr.next()) {
+			var recommendObj = {};
+			var trend_threshold = parseInt(trendGr.getValue("threshold"));
+
+			recommendObj['trend_type'] = trendGr.getValue("trend_type");
+			recommendObj['trend_id'] = trendGr.getValue("trend_id");
+			recommendObj['trend_threshold'] = trend_threshold;
+
+			switch (trendGr.getValue("trend_type")) {
+				case this.COMMON_VALUE:
+					this._processCommonValue(trendGr, recommendObj);
+					break;
+				case this.COMMON_REFERENCE:
+					this._processCommonReference(trendGr, recommendObj);
+					break;
+				case this.COMMON_CONDITION:
+					this._processCommonCondition(trendGr, recommendObj);
+					break;
+			}
+
+			// if no result found in a trend, don't add the trend to resultsJSON
+			if (recommendObj &amp;&amp; recommendObj["common_results"] &amp;&amp; recommendObj["common_results"].length &gt; 0) {
+				this.recommendObjs.push(recommendObj);
+				this.trends.push(trendGr.getValue("trend_id"));
+			}
+		}
+
+		if (!this.trends || this.trends.length == 0)
+			return {
+				"request_table": this.request_table,
+				"state": "successful",
+				"message": gs.getMessage("no recommendation was found"),
+				"trends": [],
+				"results": []
+			};
+
+		this.resultsJSON["state"] = "successful";
+		this.resultsJSON["message"] = gs.getMessage("trends are executed succssfully");
+		this.resultsJSON["trends"] = this.trends;
+		this.resultsJSON["results"] = this.recommendObjs;
+
+		return this.resultsJSON;
+	},
+
+	_processCommonValue: function (trendGr, recommendObj) {
+		var trend_common_field = trendGr.getValue("common_field");
+		recommendObj['source_table'] = this.request_table;
+		recommendObj['trend_field'] = trend_common_field;
+		this._buildGroupResultList(recommendObj, this.request_table, trend_common_field, "sys_id");
+	},
+
+	_processCommonReference: function (trendGr, recommendObj) {
+		var trend_reference_type = trendGr.getValue("reference_type");
+
+		if (trend_reference_type === "simple") {
+			var trend_field = trendGr.getValue("trend_field");
+
+			var reference_field = (new GlideRecord(this.request_table)).getElement(trend_field);
+			if (reference_field === null || !reference_field.getReferenceTable())
+				return;
+
+			recommendObj['source_table'] = reference_field.getReferenceTable();   // get the reference table
+			recommendObj['trend_field'] = trend_field;
+			this._buildGroupResultList(recommendObj, this.request_table, trend_field, "sys_id");
+		}
+		else if (trend_reference_type === "m2m") {
+			var trend_m2m_table = trendGr.getValue("m2m_table");
+			var m2m_to_field = trendGr.getValue("m2m_to_field");
+			var m2m_from_field = trendGr.getValue("m2m_from_field");
+
+			if (!trend_m2m_table || !m2m_to_field || !m2m_from_field)
+				return;
+
+			var m2mGR = new GlideRecord(trend_m2m_table);
+			if (m2mGR.getElement(m2m_to_field) === null || m2mGR.getElement(m2m_from_field) === null || !m2mGR.getElement(m2m_to_field).getReferenceTable() || !m2mGR.getElement(m2m_from_field).getReferenceTable())
+				return;
+
+			recommendObj['source_table'] = m2mGR.getElement(m2m_to_field).getReferenceTable();
+			recommendObj['trend_field'] = "";
+			this._buildGroupResultList(recommendObj, trend_m2m_table, m2m_to_field, m2m_from_field);
+		}
+	},
+
+	_processCommonCondition: function (trendGr, recommendObj) {
+		var trend_condition = trendGr.condition;
+		this.recordMap = this._buildRecordMap(this.record_list);
+
+		recommendObj['source_table'] = this.request_table;
+		recommendObj['trend_field'] = "";
+
+		var recordsGr = new GlideRecord(this.request_table);
+		recordsGr.addQuery("sys_id", "IN", this.record_list);
+		if (trend_condition)
+			recordsGr.addEncodedQuery(trend_condition);
+		recordsGr.query();
+
+		if (recordsGr.getRowCount() &gt;= recommendObj["trend_threshold"])
+			this._buildResultList(recommendObj, recordsGr);
+	},
+
+	//build map to keep the input order of recordList
+	_buildRecordMap: function (recordList) {
+		var recordMapConstr = {};
+		for (var i = 0; i &lt; recordList.length; i++)
+			recordMapConstr[recordList[i]] = i;
+		return recordMapConstr;
+	},
+
+	// construct the result list by complying with the order of input records and adding count
+	_buildResultList: function(recommendObj, recordsGr) {
+		var resultListSorted = [];
+		var resultListWithIdx = [];
+		var trendOldest = (new GlideDateTime()).toString();
+
+		while (recordsGr.next())
+			resultListWithIdx.push({"id": recordsGr.getValue("sys_id"), "display_value": recordsGr.getDisplayValue(), "idx": this.recordMap[recordsGr.sys_id], "group_oldest": recordsGr.getValue("sys_created_on")});
+
+		var resultListWithIdxSorted = resultListWithIdx.sort(function(a, b) {return a.idx - b.idx;});
+		for (var j = 0; j &lt; resultListWithIdxSorted.length; j++) {
+			resultListSorted.push({
+				"value": resultListWithIdxSorted[j].id,
+				"display_value": resultListWithIdxSorted[j].display_value,
+				"count": 1,   // hard code count
+				"group_oldest": resultListWithIdxSorted[j].group_oldest
+			});
+
+			if (resultListWithIdxSorted[j].group_oldest &lt; trendOldest)
+				trendOldest = resultListWithIdxSorted[j].group_oldest;
+		}
+
+		recommendObj['group_count'] = resultListSorted.length;
+		recommendObj['trend_oldest'] = trendOldest;
+		recommendObj['common_results'] = resultListSorted;
+	},
+
+	// construct the result list, use flattened GlideRecord because need information for both group and each record
+	_buildGroupResultList: function(recommendObj, query_table, group_field, query_field) {
+		// build groupMap
+		var groupMap = {};
+		var destGr = new GlideRecord(query_table);
+		destGr.addQuery(query_field, "IN", this.record_list);
+		destGr.addNotNullQuery(group_field);
+		destGr.query();
+		while (destGr.next()) {
+			var group_key = destGr.getValue(group_field);
+			if (!groupMap[group_key])
+				groupMap[group_key] = {"display_value": destGr.getDisplayValue(group_field), "ids": [], "count": 0};
+			groupMap[group_key]['ids'].push(destGr.getValue(query_field));
+			groupMap[group_key]['count']++;
+		}
+
+		// build commonValueLis and add since
+		var trendOldest = (new GlideDateTime()).toString();
+		var commonValueList = [];
+		for (var key in groupMap) {
+			var currentGroup = groupMap[key];
+
+			if (currentGroup["count"] &lt; recommendObj["trend_threshold"])
+				continue;
+
+			var groupOldest = (new GlideDateTime()).toString();
+			var ids = currentGroup["ids"];
+			for (var i = 0; i &lt; ids.length; i++) {
+				if (this.requestRecordsAgeMap[ids[i]] &lt; groupOldest)
+					groupOldest = this.requestRecordsAgeMap[ids[i]];
+			}
+
+			commonValueList.push({
+				"value": currentGroup["ids"][0],
+				"count": currentGroup["count"],
+				"display_value": currentGroup["display_value"],
+				"group_oldest": groupOldest
+			});
+
+			if (groupOldest &lt; trendOldest)
+				trendOldest = groupOldest;
+		}
+
+		//sorted map by count in DESC order
+		var commonValueListSorted = commonValueList.sort(function(a, b) {return b.count - a.count;});
+
+		// add to recommendObj
+		recommendObj['group_count'] = commonValueListSorted.length;
+		recommendObj['trend_oldest'] = trendOldest;
+		recommendObj['common_results'] = commonValueListSorted;
+	},
+
+	//build map to keep the created time for recordList
+	_buildRecordAgeMap: function (recordList) {
+		this.requestRecordsAgeMap = {};
+
+		var gr = new GlideRecord(this.request_table);
+		gr.addQuery("sys_id", "IN", this.record_list);
+		gr.query();
+
+		while (gr.next())
+			this.requestRecordsAgeMap[gr.getValue("sys_id")] = gr.getValue("sys_created_on");
+	},
+
+	type: 'TrendRecommendation'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2019-01-24 19:24:57&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;06ac564453d323004acaddeeff7b12ce&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;360&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;TrendRecommendation&lt;/sys_name&gt;
+        &lt;sys_package display_value="Similarity Analyzer" source="sn_intel_analyzer"&gt;c3354d2f73032300e64cc1f52ff6a7c7&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Similarity Analyzer"&gt;c3354d2f73032300e64cc1f52ff6a7c7&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_06ac564453d323004acaddeeff7b12ce&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-02-13 10:40:47&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:23</sys_created_on>
+        <sys_id>2f40fc5583b01210c6695855eeaad3de</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>TrendRecommendation</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_2f40fc5583b01210c6695855eeaad3de</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:23</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

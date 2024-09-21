@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules">
+    <x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>false</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection/>
+        <condition/>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>Trigger Subflow for CMDB DM Task</name>
+        <order>100</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function executeRule(current, previous /*null when async*/ ) {
+    var session = GlideSession.get();
+    var sessionUser = session.getUser().getID();
+    var msg = '';
+
+    try {
+
+        var policyId = '' + current.getValue('policy_id');
+        if (JSUtil.nil(policyId)) {
+            msg = gs.getMessage('Invalid task: Missing policy ID');
+            gs.error(msg);
+            // Update task to error
+            handleFailure(msg);
+            return;
+        }
+
+        var policyGr = new GlideRecord('cmdb_data_management_policy');
+        policyGr.addQuery('sys_id', policyId);
+        policyGr.query();
+
+        if (!policyGr.next()) {
+            msg = gs.getMessage('Could not find policy with sys_id: {0}', policyId);
+            gs.error(msg);
+            // Update task to error
+            handleFailure(msg);
+            return;
+        }
+
+        var subflow = policyGr.getValue('subflow');
+  var is_subflow_optional = policyGr.cmdb_policy_type.is_subflow_optional == true ? true : false;
+
+        if (JSUtil.nil(subflow)) {
+            if (!is_subflow_optional) {
+    msg = gs.getMessage('The subflow record was not found', policyId);
+    gs.error(msg);
+    // Update task to error
+    handleFailure(msg);
+   }
+            return;
+        }
+
+        var subflowGr = new GlideRecord('sys_hub_flow');
+        subflowGr.addQuery('sys_id', subflow);
+        subflowGr.query();
+
+        if (!subflowGr.next()) {
+            msg = gs.getMessage('The subflow record was not found', policyId);
+            gs.error(msg);
+
+            // Update task to error
+            handleFailure(msg);
+            return;
+        }
+
+        // Grab subflow
+        var subflowName = subflowGr.getValue('sys_scope') + '.' + subflowGr.getValue('internal_name');
+
+        // Grab run as user
+        var gr = new GlideRecord('cmdb_data_management_policy_runtime_attributes');
+        gr.addQuery('policy', current.getValue('policy_id'));
+        gr.query();
+
+        if (!gr.next()) {
+            msg = gs.getMessage('Could not find the runtime attribute record for the policy for this task.');
+
+            gs.error(msg);
+            // Update task to error
+            handleFailure(msg);
+            return;
+        }
+
+        var runAsUser = gr.getValue('run_as');
+
+        if (JSUtil.nil(runAsUser)) {
+            msg = gs.getMessage('Could not find the run as user for the policy for this task.');
+            gs.error(msg);
+            // Update task to error
+            handleFailure(msg);
+            return;
+        }
+
+        var inputs = {};
+        inputs['task'] = current;
+
+        //Impersonate
+        session.impersonate(runAsUser);
+        var DEF_TIME_OUT = 1000 * 60 * 10;
+        var TIME_OUT = gs.getProperty('glide.cmdb.data.manager.subflow.timeout') || DEF_TIME_OUT;
+
+        // Trigger workflow
+        var res = sn_fd.FlowAPI.getRunner()
+            .subflow(subflowName)
+            .inForeground()
+            .withInputs(inputs)
+            .timeout(TIME_OUT)
+            .run();
+
+        var outputs = res.getOutputs();
+        if (outputs.error === true) {
+            handleFailure(outputs.error_message + " " + outputs.notes, runAsUser);
+        }
+
+    } catch (ex) {
+        var message = ex.getMessage();
+        gs.error(message);
+
+        // Update task to error
+        // this might double-notify users if the exception occurs in the subflow call to CMDBDataManagerScriptableApis
+        handleFailure(message);
+
+    } finally {
+        session.impersonate(sessionUser);
+    }
+
+    function handleFailure(closeNotes, runAsUser) {
+        current.setValue('state', 4); // Closed Incomplete
+        current.setValue('close_notes', closeNotes);
+        current.update();
+
+        // send notification
+        var grUserRoles = new GlideRecord("sys_user_has_role");
+        grUserRoles.addQuery("role", "b156309e53722010af64ddeeff7b1227"); // data_manager_admin role
+        grUserRoles.query();
+        var userList = [];
+        if (runAsUser) {
+            userList.push(runAsUser);
+        }
+        while (grUserRoles.next()) {
+            userList.push(grUserRoles.getValue('user'));
+        }
+        if (userList.length == 0) {
+            gs.warn(gs.getMessage("The CMDB Data Manager policy: {0} does not have any users to send notification emails", current.policy_id));
+            return;
+        }
+        gs.eventQueue("cmdbdatamanager.task.failed", current, userList.toString(), current.policy_id);
+
+    }
+
+})(current, previous);]]></script>
+        <sys_class_name>x_938076_now_utils_now_utils_business_rules</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:50:21</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>f8fbac5583701210c6695855eeaad313</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Trigger Subflow for CMDB DM Task</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>x_938076_now_utils_now_utils_business_rules_f8fbac5583701210c6695855eeaad313</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:50:21</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </x_938076_now_utils_now_utils_business_rules>
+    <sys_translated_text action="delete_multiple" query="documentkey=f8fbac5583701210c6695855eeaad313"/>
+</record_update>

@@ -1,0 +1,324 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>22af764d5b673200514d484c11f91a55</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_bm_client.RecommendationManager&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Script Include which creates/manages the activity data for Benchmarks Recommendations&lt;/description&gt;
+        &lt;name&gt;RecommendationManager&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var RecommendationManager = Class.create();
+RecommendationManager.prototype = {
+    initialize: function() {
+    },
+
+	updateRegister: function(reco, register) {
+		var result = {sys_id: '', number: '', state: ''};
+
+		/** Get the register **/
+		var registerGR = new GlideRecord('sn_cim_register');
+		if(!registerGR.get(register))
+			return result;
+
+		/** Update the recommendation activity**/
+		this.createOrUpdateActivity(reco, {improvement_initiative: registerGR.getUniqueValue()});
+		return {
+			sys_id: registerGR.getUniqueValue(),
+			number: registerGR.getDisplayValue('number'),
+			state: {
+				display: registerGR.getDisplayValue('state'),
+				value: registerGR.getValue('state')
+			}
+		};
+	},
+
+	removeRegister: function(reco) {
+		return this.createOrUpdateActivity(reco, {improvement_initiative: ''});
+	},
+
+    getRecentScores: function(indicatorId) {
+        var date = null;
+        var scores = {global: null, local: null};
+        var isBetter = true;
+
+        var gr = new GlideRecord('sn_bm_client_score');
+        gr.addQuery('breakdown_reference', 'ISEMPTY', '');
+        gr.addQuery('indicator', indicatorId);
+        gr.orderByDesc('start_date');
+        gr.setLimit(2);
+        gr.query();
+
+        while (gr.next()) {
+            // Set the date to be the same
+            if (gs.nil(date)) {
+                date = new GlideDate();
+                date.setValue(gr.getValue('start_date'));
+            }
+            else if (date.getValue() !== gr.getValue('start_date'))
+                continue;
+
+            // Set the score values for global and non-global
+            if (gr.getDisplayValue('global') === 'true')
+                scores.global = Number(gr.getValue('mean_value'));
+            else
+                scores.local = Number(gr.getValue('mean_value'));
+
+            // Set the direction
+            scores.direction = gr.indicator.indicator.direction + '';
+        }
+
+        if (!gs.nil(scores.local) &amp;&amp; !gs.nil(scores.global))
+            isBetter = (scores.direction === '2') ?
+                        (scores.local &lt;= scores.global) : (scores.local &gt;= scores.global);
+
+        return {date: date, isBetter: isBetter};
+    },
+
+    getLastMonth: function(indicatorId) {
+        var results    = {idList: [], idMap: {}};
+        var scores     = this.getRecentScores(indicatorId);
+        var scoreDate  = scores.date;
+        var isBetter   = scores.isBetter;
+        var dateToReco = {};
+
+        var gr = new GlideRecord('sn_bm_client_recommendation_view');
+        gr.addQuery('ri_indicator', indicatorId);
+        gr.addQuery('re_date', scoreDate);
+        gr.addQuery('re_recommendation.active', true);
+        gr.orderByDesc('re_score');
+        gr.orderByDesc('ra_implementation_date');
+        gr.query();
+
+        results.counts = {all: 0, accepted: 0, implemented: 0};
+        while (gr.next()) {
+
+            /* For each valid recommendation, add it to our list */
+            var obj = this.createRecommendationObj(gr);
+
+            /* Filter out the non-rejected ones */
+            if (obj.state === 'rejected' || (obj.state === 'none' &amp;&amp; !obj.result))
+                continue;
+
+			if(!(obj.state === 'implemented' || obj.state === 'accepted')) {
+				/* Filter out if score is better than global */
+				if (obj.checkGlobal &amp;&amp; isBetter)
+					continue;
+			}
+
+            /* Update counts */
+            results.counts.all++;
+            if (obj.state === 'accepted')
+                results.counts.accepted++;
+            else if (obj.state === 'implemented') {
+                results.counts.implemented++;
+                results.counts.all--;
+            }
+
+            /* Put this in our structure */
+            results.idList.push(obj.sys_id);
+            results.idMap[obj.sys_id] = obj;
+            results.pa_indicator = gr.ri_indicator.indicator + '';
+
+            /* Overlapping implementations */
+            if(!gs.nil(obj.implementedDateNumeric) &amp;&amp; obj.implementedDateNumeric &gt; 0) {
+                var date = obj.implementedDate.getDate().getValue();
+                if(!(date in dateToReco))
+                    dateToReco[date] = [];
+                dateToReco[date].push(obj.sys_id);
+            }
+        }
+        this.adjustImplementationDate(results, dateToReco);
+        this.getPAScore(results);
+        return results;
+    },
+
+	getPAScore: function(results) {
+		var indicator = results.pa_indicator;
+		var aggregate = sn_bm_common.CommonConstants.PA_MONTHLY_AVG;
+		var scorecard = new global.PAScorecard();
+		scorecard.addParam('uuid', indicator + ':' + aggregate);
+		var scores    = scorecard.query();
+		var score     = !gs.nil(scores) &amp;&amp; scores.length &gt; 0 &amp;&amp; scores[0].value;
+		results.pa_indicator = {sys_id: indicator, score: (!!score) ? score : 0};
+	},
+
+    adjustImplementationDate: function(recos, dateToReco) {
+        /* Set the same numeric value for the overlapping recommendations **/
+        Object.keys(dateToReco).forEach(function(date) {
+            var numericValue = recos.idMap[dateToReco[date][0]].implementedDateNumeric;
+            dateToReco[date].forEach(function(id) {
+                recos.idMap[id].implementedDateNumeric = numericValue;
+            })
+        });
+    },
+
+    createRecommendationObj: function(gr) {
+        var id = gr.getValue('ri_recommendation');
+        var activity;
+
+        // If there is no activity record, create a new one
+        if (gs.nil(gr.getValue('ra_recommendation'))) {
+            activity = this.createOrUpdateActivity(id);
+            activity.actionDate = new GlideDateTime(activity.actionDate);
+            activity.implementedDate = new GlideDateTime();
+            activity.implementedDate.setNumericValue(activity.implementedDateNumeric)
+        }
+        else {
+            activity = {
+                state: gr.getValue('ra_state'),
+                actionDate: new GlideDateTime(gr.getValue('ra_action_date')),
+                implementedDate: new GlideDateTime(gr.getValue('ra_implementation_date')),
+                register: {
+                    sys_id: gr.getDisplayValue('ra_improvement_initiative.sys_id'),
+                    number: gr.getDisplayValue('ra_improvement_initiative.number'),
+                    state: {
+				display: gr.getDisplayValue('ra_improvement_initiative.state'),
+				value: (gr.isValidField('ra_improvement_initiative')) ? gr.ra_improvement_initiative.state + '' : ''
+		    }
+                }
+            };
+        }
+
+        var score = Number(gr.getValue('re_score'));
+        var weight = Number(gr.getValue('ri_weight'));
+
+        return {
+            sys_id: id,
+            url: gr.getDisplayValue('ri_recommendation.url'),
+            name: gr.getDisplayValue('ri_recommendation.name'),
+            number: gr.getDisplayValue('ri_recommendation.number'),
+            content: gr.getDisplayValue('ri_recommendation.content'),
+
+            //CIM metadata
+            allowCIM: gr.getDisplayValue('ri_recommendation.allow_cim') === 'true',
+
+            //Register Info
+            register: {
+                sys_id: activity.register.sys_id,
+                number: activity.register.number,
+                state:  activity.register.state
+            },
+
+            // Evaluation Info
+            score: score,
+            result: gr.getDisplayValue('re_result') === 'true',
+
+            // Activity info
+            state: activity.state,
+            actionDate: activity.actionDate.getValue(),
+            implementedDate: activity.implementedDate,
+            implementedDateNumeric: activity.implementedDate.getNumericValue(),
+            savedDisplay: activity.actionDate.hasDate() ?
+                            gs.getMessage('Saved on {0}', activity.actionDate.getDate().getDisplayValue()) : '',
+            implementedDisplay: activity.implementedDate.hasDate() ?
+                            gs.getMessage('Implemented on {0}', activity.implementedDate.getDate().getDisplayValue()) : '',
+
+            // Get these fields from the M2M table
+            weight: weight,
+            checkGlobal: gr.getDisplayValue('ri_check_global') !== 'true',
+            weightedScore: score * weight
+        };
+    },
+
+    createOrUpdateActivity: function(recoID, fields) {
+        var insertNeeded = false;
+        var gr = new GlideRecord('sn_bm_client_recommendation_activity');
+        if (!gr.get('recommendation', recoID)) {
+            gr.initialize();
+            insertNeeded = true;
+        }
+
+        gr.setValue('recommendation', recoID);
+        if (!gs.nil(fields)) {
+
+            Object.keys(fields).forEach(function(field) {
+                gr.setValue(field, fields[field]);
+            });
+
+            if (!insertNeeded)
+                gr.update();
+        }
+
+        if (insertNeeded)
+            gr.insert();
+
+        /* Get activity dates */
+        var actionDate = new GlideDateTime(gr.getValue('action_date'));
+        var implementedDate = new GlideDateTime(gr.getValue('implementation_date'));
+
+        return {
+            sys_id: gr.getValue('recommendation'),
+            state: gr.getValue('state'),
+            actionDate: actionDate.getValue(),
+            implementedDateNumeric: implementedDate.getNumericValue(),
+            savedDisplay: actionDate.hasDate() ?
+                            gs.getMessage('Saved on {0}', actionDate.getDate().getDisplayValue()) : '',
+            implementedDisplay: implementedDate.hasDate() ?
+                            gs.getMessage('Implemented on {0}', implementedDate.getDate().getDisplayValue()) : '',
+            register: {
+                sys_id: gr.getDisplayValue('improvement_initiative.sys_id'),
+                number: gr.getDisplayValue('improvement_initiative.number'),
+                state: {
+			display: gr.getDisplayValue('improvement_initiative.state'),
+			value: (gr.isValidField('improvement_initiative')) ? gr.improvement_initiative.state + '' : ''
+		}
+            }
+        };
+    },
+
+    shouldEvaluate: function(recoID) {
+        var activity = this.createOrUpdateActivity(recoID);
+        return activity.state.toString() !== 'rejected';
+    },
+
+    accept: function(recoID) {
+        return this.createOrUpdateActivity(recoID, {state: 'accepted', action_date: new GlideDateTime()});
+    },
+
+    reject: function(recoID) {
+        return this.createOrUpdateActivity(recoID, {state: 'rejected', action_date: new GlideDateTime()});
+    },
+
+    setImplemented: function(recoID) {
+        var date = new GlideDateTime();
+        var fields = {'state': 'implemented', implementation_date: date};
+
+        return this.createOrUpdateActivity(recoID, fields);
+    },
+
+    type: 'RecommendationManager'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2017-06-22 22:17:03&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;22af764d5b673200514d484c11f91a55&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;15&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;RecommendationManager&lt;/sys_name&gt;
+        &lt;sys_package display_value="Benchmark Client" source="sn_bm_client"&gt;3ad18693db92220004997878f0b8f516&lt;/sys_package&gt;
+        &lt;sys_policy&gt;protected&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Benchmark Client"&gt;3ad18693db92220004997878f0b8f516&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_22af764d5b673200514d484c11f91a55&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2019-02-17 03:24:24&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:07</sys_created_on>
+        <sys_id>bfe0705983b01210c6695855eeaad37c</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>RecommendationManager</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_bfe0705983b01210c6695855eeaad37c</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:07</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

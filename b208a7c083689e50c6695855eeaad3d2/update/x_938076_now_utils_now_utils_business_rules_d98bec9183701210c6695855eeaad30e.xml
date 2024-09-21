@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules">
+    <x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection/>
+        <condition>!(('FSMConditions' in global) &amp;&amp; new FSMConditions().checkScheduleOptimizationCondition(current))</condition>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>Date Checks</name>
+        <order>120</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[var currentTableName = current.sys_class_name;
+var useScheduleEnabled = false;
+var isDynamicDispatch = false;
+var propertyPrefix = null;
+var followTheSun = false;
+var scheduleCheckFields = "estimated_work_duration,estimated_onsite_arrival_buffer_duration,assigned_to,assigned_crew";
+var sharedServiceUtil = new SharedServiceUtils();
+var dateValidation = new SMDateValidation();
+
+if (currentTableName == 'wm_task') {
+    var cacheManager = new global.SMConfigCacheManager().getSMConfig('wm_task');
+    useScheduleEnabled = (cacheManager.use_schedule == 'true' ? true : false);
+    isDynamicDispatch = (cacheManager.task_dispatch_method == 'dynamic' ? true : false);
+    propertyPrefix = cacheManager.property_prefix;
+    var taskPriority = (current.priority + "");
+    followTheSun = (cacheManager.follow_the_sun_priority.indexOf(taskPriority) > -1 ? true : false);
+} else {
+    var smConfig = (new sn_sm.SMConfiguration());
+    useScheduleEnabled = smConfig.isEnabled(current, "use_schedule", "false");
+    isDynamicDispatch = (smConfig.getDispatchMethod(current) == 'dynamic');
+    propertyPrefix = smConfig.getPropertyPrefix(current);
+    followTheSun = smConfig.isFollowTheSunEnabled(current, "false");
+}
+
+if (sharedServiceUtil.fieldChangeCheck("work_start,work_end,actual_travel_start,actual_travel_duration,actual_onsite_arrival,actual_onsite_arrival_buffer_duration"))
+    dateRollupIntegrityActual(current, previous);
+
+//start travel is updating expected_start, expected_travel_start and estimated_end. bypassing the check when start travel
+if(!sharedServiceUtil.fieldChangeCheck("actual_travel_start")){
+    scheduleCheckFields = "expected_start,expected_travel_start,estimated_travel_duration,"+scheduleCheckFields;
+}
+if (sharedServiceUtil.fieldChangeCheck(scheduleCheckFields))
+    dateRollupIntegrityScheduled(current, useScheduleEnabled, isDynamicDispatch, followTheSun, propertyPrefix);
+
+function dateRollupIntegrityScheduled(current, useScheduleEnabled, isDynamicDispatch, followTheSun, propertyPrefix) {
+     (new SMDateValidation()).validateEstimated(current);
+    var crewSchedulingActive = GlidePluginManager.isActive('com.snc.fsm_crew_scheduling');
+ var contractorPlugin = GlidePluginManager.isActive('com.snc.fsm_contractor_management');
+ var allowDoubleBookingForDynamic = (gs.getProperty(propertyPrefix + 'allow.doublebooking.dynamicscheduling') == 'true');
+ var currentNum = current.number;
+    if (crewSchedulingActive && current.sys_class_name == 'wm_task' && current.requires_crew == true) {
+        // check for crew scheduling conflicts; if it's a task specific crew, do not check for member effective dates
+        if (useScheduleEnabled && (!gs.nil(current.assigned_crew)) && (!(new String(current.assigned_crew) + "" == "''")) &&
+            (!gs.nil(current.assigned_crew.initiated_from) || dateValidation.checkCrewLeaderAvailability(current, current.assigned_crew.leader))) {
+            // pass validation if double booking property on dynamic scheduling or schedule method is optimization .
+            if ((isDynamicDispatch && allowDoubleBookingForDynamic) || isScheduleOptimization(current)) {
+                //check if the schedule conflict, return false if there is conflict
+                if (!(dateValidation.checkSchedulingConflictSimple(current, current, current.assigned_crew))) {
+                    gs.addInfoMessage(gs.getMessage("Warning: {0} has been scheduled for a time the assigned crew or its members may not be available", currentNum));
+                }
+            } else {
+                //do not assign task to crew if the crew leader has any exisiting task conflicts
+                if (dateValidation.checkCrewLeaderSchedulingConflict(current, current.assigned_crew.leader)) {
+                    if (followTheSun || !contractorPlugin) {
+                        dateValidation.checkSchedulingConflict(current);
+                    } else if ((current.assignment_group != null) && ((current.assignment_group.type.getDisplayValue() == "wm_work") || ((current.assignment_group.type.getDisplayValue() == "wm_vendor")))) {
+                        dateValidation.checkSchedulingConflict(current);
+                    }
+                }
+            }
+        }
+    } else if (!current.assigned_to.nil()) {
+            if (useScheduleEnabled) {
+                // pass validation if double booking property on dynamic scheduling or schedule method is optimization . 
+                if ((isDynamicDispatch && allowDoubleBookingForDynamic) || isScheduleOptimization(current)) {
+                    //check if the schedule conflict, return false if there is conflict
+                    if (!(dateValidation.checkSchedulingConflictSimple(current))) {
+                        gs.addInfoMessage(gs.getMessage("Warning: {0} has been scheduled for a time the assigned agent may not be available", currentNum));
+                    }
+                } else {
+                    if (followTheSun) {
+                        if (current.assignment_group != null && current.assignment_group.manager != null) {
+                            if (current.assigned_to != current.assignment_group.manager)
+                                dateValidation.checkSchedulingConflict(current);
+                        } else
+                            dateValidation.checkSchedulingConflict(current);
+                    } else if (!contractorPlugin) {
+                        dateValidation.checkSchedulingConflict(current);
+                    } else if ((current.assignment_group != null) && ((current.assignment_group.type.getDisplayValue() == "wm_work") || ((current.assignment_group.type.getDisplayValue() == "wm_vendor") && (current.assigned_to != current.assignment_group.manager)))) {
+                        dateValidation.checkSchedulingConflict(current);
+                    }
+                }
+            }
+            if (crewSchedulingActive && current.sys_class_name == 'wm_task' && current.requires_crew == false && new SMDateValidation().checkPartofCrews(current)) {
+                gs.addInfoMessage(gs.getMessage("Warning: {0} has been scheduled for a time the assigned agent is part of some crews.", currentNum));
+            }
+    }
+}
+
+function dateRollupIntegrityActual(current, previous) {
+    dateValidation.validateActual(current, previous);
+}
+
+function isScheduleOptimization(current) {
+    if (current.sys_class_name != 'wm_task')
+        return false;
+    else
+        return (((!gs.nil(current.scheduling_method)) && current.scheduling_method == 'optimization') ? true : false);
+}]]></script>
+        <sys_class_name>x_938076_now_utils_now_utils_business_rules</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:48:29</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>d98bec9183701210c6695855eeaad30e</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Date Checks</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>x_938076_now_utils_now_utils_business_rules_d98bec9183701210c6695855eeaad30e</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:48:29</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </x_938076_now_utils_now_utils_business_rules>
+    <sys_translated_text action="delete_multiple" query="documentkey=d98bec9183701210c6695855eeaad30e"/>
+</record_update>

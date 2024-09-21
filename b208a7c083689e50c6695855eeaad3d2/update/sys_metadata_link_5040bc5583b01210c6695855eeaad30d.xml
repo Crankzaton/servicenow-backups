@@ -1,0 +1,265 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>04962882eb12310065deac6aa206feda</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.TwitterCollector&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;TwitterCollector&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var TwitterCollector = Class.create();
+
+TwitterCollector.prototype = {
+
+    initialize: function() {
+    },
+    
+    type: 'TwitterCollector',
+
+    tweets_table_name: 'u_pa_tweets',
+    twitter_context_table_name: 'u_pa_twitter_context',
+    twitter_source_table_name: 'u_pa_twitter_source',
+
+    maxAgeInDays: 365,
+    sourceCache: {},
+    
+    execute: function() {
+        var token = this._getAuthorizationBearer();  
+        gs.log(token);
+
+        var terms = this._getTerms();
+        for (var i = 0; i &lt; terms.length; i++) {
+            var term = terms[i];
+            if (this._isUserTimeLine(term))
+                this._getUserTimeLine(token, term);
+            else
+                this._getSearchResults(token, term);
+        }
+    },
+
+    setMaxAgeInDays: function(days) {
+        this.maxAgeInDays = days;
+    },
+
+    // private
+
+    // https://dev.twitter.com/oauth/application-only
+    _getAuthorizationBearer: function() {  
+        var client = new RESTMessage('Get Twitter OAuth Token', 'post');  
+        var response = client.execute().getBody();
+        var token = (new JSONParser()).parse(response).access_token;
+        return 'Bearer ' + token;  
+    },
+    
+    // https://dev.twitter.com/rest/reference/get/statuses/user_timeline
+    _getUserTimeLine: function(token, screen_name) {
+        this._queryAndSaveTweets(screen_name, function() {
+            var client = new RESTMessage('Get Twitter User Timeline', 'get');  
+            client.setStringParameter('token', token);
+            client.setStringParameter('screen_name', screen_name);
+            return client;
+        });
+    },
+
+    // https://dev.twitter.com/rest/reference/get/search/tweets
+    _getSearchResults: function(token, query) {  
+        this._queryAndSaveTweets(query, function() {
+            var client = new RESTMessage('Get Twitter Search', 'get');  
+            client.setStringParameter('token', token);
+            client.setStringParameter('q', query);
+            return client;
+        });
+    },
+
+    _getTerms: function() {
+        var terms = [],
+            gr = new GlideRecord(this.twitter_context_table_name);
+        gr.query();
+        while (gr.next())
+            terms.push(gr.getValue('name'));
+        return terms;
+    },
+
+    _getContext: function(name) {
+        var gr = new GlideRecord(this.twitter_context_table_name);
+        gr.addQuery('name', name);
+        gr.query();
+        gr.next();
+        return gr.getUniqueValue();
+    },
+
+    _tweetsExist: function(context) {
+        var ga = new GlideAggregate(this.tweets_table_name);
+        ga.addQuery('context', context);
+        ga.addAggregate('COUNT');
+        ga.query();
+        ga.next();
+        return (ga.getAggregate('COUNT') &gt; 0);
+    },
+
+    _isUserTimeLine: function(term) {
+        return (term[0] !== '#') &amp;&amp; (term[0] !== '@');
+    },
+
+    _queryAndSaveTweets: function(context_name, client_fn) {
+        var max_id = '999999999999999999';
+        var tweetsCounter = 0;
+        var ctx = this._getContext(context_name);
+        gs.log('Twitter context: ' + context_name + ' : ' + ctx);
+        var historic_collect = !this._tweetsExist(ctx);
+        gs.log('Twitter historic collect: ' + historic_collect);
+        
+        var userTimeLine = this._isUserTimeLine(context_name);
+        
+        for(;;) {
+            var client = client_fn();
+            client.setStringParameter('max_id', max_id);
+            var response = client.execute().getBody();
+            // gs.log(response);
+            var tweets = (new JSONParser()).parse(response);
+
+            if (tweets.error) {
+                gs.log(response);
+                break;
+            }
+
+            if (tweets.statuses)
+                tweets = tweets.statuses;
+
+            if (!tweets || !tweets.length || tweets.length &lt;= 1) {
+                gs.log(response);
+                break;
+            }
+
+            var oldest_tweet = tweets[tweets.length - 1];
+            gs.log('Length: ' + tweets.length);
+            gs.log('First : ' + tweets[0].id_str + ' ' + tweets[0].created_at);
+            gs.log('Last  : ' + oldest_tweet.id_str + ' ' + oldest_tweet.created_at);
+            this._saveTweets(ctx, tweets, tweetsCounter, userTimeLine);
+            
+            tweetsCounter = tweetsCounter + tweets.length;
+            
+            if (!historic_collect) {
+                // stop when processing tweets olders than x days (default 180)
+                var past = (new Date().getTime()) - (this.maxAgeInDays * 24 * 60 * 60 * 1000);
+                if (Date.parse(oldest_tweet.created_at) &lt; past)
+                    break;
+            }
+            
+            max_id = oldest_tweet.id_str;
+        }
+    },
+
+    _getSourceSysID: function(source) {
+        var matches = source.match(/&lt;a href="(.*?)".*&gt;(.*?)&lt;\/a&gt;/);
+        var url = matches[1],
+            name = matches[2],
+            sys_id = this.sourceCache[name];
+        if (sys_id === undefined) {
+            var gr = new GlideRecord(this.twitter_source_table_name);
+            gr.addQuery('name', name);
+            gr.query();
+            if (!gr.next()) {
+                gr = new GlideRecord(this.twitter_source_table_name);
+                gr.initialize();
+                gr.setValue('name', name);
+                gr.setValue('url', url);
+                gr.insert();
+            }
+            sys_id = gr.getValue('sys_id');
+            this.sourceCache[name] = sys_id;
+        }
+        return sys_id;
+    },
+    
+    _saveTweets: function(ctx, tweets, tweetsCounter, userTimeLine) {
+        for (var i = 0; i &lt; tweets.length; i++) {
+           var tweet = tweets[i];
+           var gr = new GlideRecord(this.tweets_table_name);
+           gr.addQuery('context', ctx);
+           gr.addQuery('id_str', tweet.id_str);
+           gr.query();
+           if (!gr.next()) {
+               gr = new GlideRecord(this.tweets_table_name);
+               gr.initialize();
+               gr.setValue('context', ctx);
+               gr.setValue('id_str', tweet.id_str);
+               tweet.is_new = true;
+           }
+
+           gr.setValue('retweet_count', tweet.retweet_count);
+           gr.setValue('favorite_count', tweet.favorite_count);
+
+           if (!tweet.is_new) {
+               gr.update();
+               continue;
+           }
+
+		   var created_at = new Date(tweet.created_at);
+		   created_at = [
+               created_at.getUTCFullYear(), '-',
+			   ('0' + (created_at.getUTCMonth() + 1)).slice(-2), '-',
+	           ('0' + created_at.getUTCDate()).slice(-2), ' ',
+    		   ('0' + created_at.getUTCHours()).slice(-2), ':',
+               ('0' + created_at.getUTCMinutes()).slice(-2), ':',
+               ('0' + created_at.getUTCSeconds()).slice(-2)
+		   ].join('');
+		   gr.setValue('created_at', new GlideDateTime(created_at));
+
+           gr.setValue('tweet', tweet.text);
+           gr.setValue('source', this._getSourceSysID(tweet.source));
+
+           var user = tweet.user;
+           gr.setValue('user_id_str', user.id_str);
+           gr.setValue('user_name', user.name);
+           gr.setValue('user_screen_name', user.screen_name);
+           gr.setValue('user_utc_offset', user.utc_offset);
+           gr.setValue('user_time_zone', user.time_zone);
+           gr.setValue('user_followers_count', user.followers_count);
+           gr.setValue('user_friends_count', user.friends_count);
+       
+           var userTweets = user.statuses_count;
+           if (userTimeLine) {
+               userTweets = userTweets - tweetsCounter;
+               tweetsCounter = tweetsCounter + 1;
+           }
+           gr.setValue('user_tweets', userTweets);
+       
+           gr.insert();
+        }
+    }
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2015-02-19 01:36:02&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;04962882eb12310065deac6aa206feda&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;16&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;TwitterCollector&lt;/sys_name&gt;
+        &lt;sys_package display_value="Performance Analytics - Example - Twitter" source="com.snc.pa.twitter"&gt;839de0fb47668210cd4e1ce4316d4342&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_04962882eb12310065deac6aa206feda&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2016-11-22 11:17:24&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:10</sys_created_on>
+        <sys_id>5040bc5583b01210c6695855eeaad30d</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>TwitterCollector</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_5040bc5583b01210c6695855eeaad30d</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:10</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

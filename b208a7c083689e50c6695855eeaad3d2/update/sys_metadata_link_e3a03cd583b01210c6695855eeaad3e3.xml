@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>18d763a9776921101b53c5ed3c5a9933</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.NluPredictOutcomeUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;NluPredictOutcomeUtils&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var NluPredictOutcomeUtils = Class.create();
+NluPredictOutcomeUtils.prototype = {
+    initialize: function() {},
+
+    FAULTED_STATE: "faulted",
+    CANCELED_STATE: "canceled",
+    CLOSING: "closing",
+    SKIPPED_WITH_NEW_UTTERANCE: "skipped_with_new_utterance",
+    EXITED_WITH_NO_CONFIRMATION: "exited_with_no_confirmation",
+    AI_SEARCH_FALLBACK: "ai_search_fallback",
+    SEARCH_CATALOG_REQUESTED_EVENT: "ai_search_catalog_requested",
+    SEARCH_RESULT_CLICKED: "ai_search_result_clicked",
+    SEARCH_COMPLETED_EVENT: "ai_search_completed",
+
+
+    updateNluOutcomeOnConversationEnd: function(sys_id, state) {
+        var cancelTopic = false;
+        var tasks = "";
+        var payload = {};
+
+        var messages = new GlideRecord("sys_cs_message");
+        messages.addQuery("conversation", sys_id);
+        messages.addQuery("direction", 'inbound');
+        messages.orderByDesc("sequence");
+        messages.query();
+        while (messages.next()) {
+            if (messages.getValue("payload").contains('cancelTopic')) {
+                cancelTopic = true;
+            }
+            payload[messages.task.toString()] = messages.getValue("payload");
+        }
+
+        var tasksGr = new GlideRecord("sys_cs_conversation_task");
+        tasksGr.query("conversation", sys_id);
+        while (tasksGr.next()) {
+            tasks = tasks + "," + tasksGr.getValue("sys_id");
+        }
+
+        this.updateNLUOutcome(tasks, cancelTopic, state, sys_id, payload);
+    },
+
+    updateNLUOutcome: function(tasks, cancelTopic, state, sys_id, payload) {
+        var closeUtterance, utterance, lastUtterance, task;
+        var closeConversation = false;
+        var typedNewUtterance = false;
+        var closingOutcomeUpdated = false;
+        var aiSearchFallbackUtterances = [];
+        var events = this.getAISearchFallbackEvents(sys_id);
+        var topicId = sn_cs.VASystemObject.getContextProfileParamsForConversationId(sys_id, this.CLOSING);
+
+        var open_nlu_predict_intent_feedback_gr = new GlideRecord("open_nlu_predict_intent_feedback");
+        open_nlu_predict_intent_feedback_gr.addQuery("app_document", 'IN', tasks);
+        open_nlu_predict_intent_feedback_gr.orderByDesc("sys_created_on");
+        open_nlu_predict_intent_feedback_gr.query();
+
+        while (open_nlu_predict_intent_feedback_gr.next()) {
+            utterance = open_nlu_predict_intent_feedback_gr.getValue("utterance");
+            task = open_nlu_predict_intent_feedback_gr.getValue("app_document");
+
+            if (typedNewUtterance) {
+                open_nlu_predict_intent_feedback_gr.setValue("nlu_discovery_outcome", this.SKIPPED_WITH_NEW_UTTERANCE);
+                open_nlu_predict_intent_feedback_gr.update();
+                typedNewUtterance = false;
+            }
+
+            typedNewUtterance = payload[task] &amp;&amp; JSON.parse(payload[task])["searchText"] != null &amp;&amp; JSON.parse(payload[task])["uiType"] == "Picker";
+
+            if (open_nlu_predict_intent_feedback_gr.getValue("topic_switched") == topicId) {
+                closeConversation = true;
+                closeUtterance = utterance;
+            }
+
+            if ((cancelTopic || state === this.FAULTED_STATE || state === this.CANCELED_STATE) &amp;&amp; !lastUtterance) {
+                lastUtterance = {
+                    "utterance": utterance,
+                    "task": task
+                };
+            }
+
+            if (!closingOutcomeUpdated &amp;&amp; closeConversation &amp;&amp; (utterance !== closeUtterance)) {
+                open_nlu_predict_intent_feedback_gr.setValue("nlu_discovery_outcome", this.EXITED_WITH_NO_CONFIRMATION);
+                open_nlu_predict_intent_feedback_gr.update();
+                closingOutcomeUpdated = true;
+            }
+
+            if (events["idToUtteranceMap"] &amp;&amp; events["idToUtteranceMap"][utterance]) {
+                var searchId = events["idToUtteranceMap"][utterance];
+                var eventMetrics = events[searchId] &amp;&amp; events[searchId]["metrics"];
+                // Priority of events to log.
+                if (eventMetrics.indexOf("SEARCH_CATALOG_REQUESTED_EVENT") !== -1) {
+                    aiSearchFallbackUtterances.push(utterance);
+                    this.updateNluDiscoveryOutcome(open_nlu_predict_intent_feedback_gr, this.SEARCH_CATALOG_REQUESTED_EVENT);
+                } else if (eventMetrics.indexOf("SEARCH_RESULT_CLICKED") !== -1) {
+                    aiSearchFallbackUtterances.push(utterance);
+                    this.updateNluDiscoveryOutcome(open_nlu_predict_intent_feedback_gr, this.SEARCH_RESULT_CLICKED);
+                } else if (eventMetrics.indexOf("SEARCH_COMPLETED_EVENT") !== -1) {
+                    aiSearchFallbackUtterances.push(utterance);
+                    this.updateNluDiscoveryOutcome(open_nlu_predict_intent_feedback_gr, this.SEARCH_COMPLETED_EVENT);
+                } else if (eventMetrics.indexOf("SEARCH_RESULT_DISPLAYED") !== -1) {
+                    aiSearchFallbackUtterances.push(utterance);
+                    this.updateNluDiscoveryOutcome(open_nlu_predict_intent_feedback_gr, this.AI_SEARCH_FALLBACK);
+                }
+            }
+        }
+
+        if ((cancelTopic &amp;&amp; !closeConversation) || state === this.FAULTED_STATE || state === this.CANCELED_STATE) {
+            if (aiSearchFallbackUtterances.indexOf(lastUtterance.utterance) === -1) {
+                this.updateOutcomeWithNoConfirmation(lastUtterance);
+            }
+        }
+    },
+
+    updateNluDiscoveryOutcome: function(gr, value) {
+        gr.setValue("nlu_discovery_outcome", value);
+        gr.update();
+    },
+
+    updateOutcomeWithNoConfirmation: function(lastUtterance) {
+        var nlu_predict_intent_feedback_gr = new GlideRecord("open_nlu_predict_intent_feedback");
+        nlu_predict_intent_feedback_gr.addQuery("app_document", lastUtterance.task);
+        nlu_predict_intent_feedback_gr.addQuery("utterance", lastUtterance.utterance);
+        nlu_predict_intent_feedback_gr.query();
+        if (nlu_predict_intent_feedback_gr.next()) {
+            this.updateNluDiscoveryOutcome(nlu_predict_intent_feedback_gr, this.EXITED_WITH_NO_CONFIRMATION);
+        }
+    },
+
+    getAISearchFallbackEvents: function(conversationId) {
+        var events = {};
+        var analytics = new GlideRecord("sys_ci_analytics");
+        analytics.addQuery("conversation", conversationId);
+        analytics.query();
+
+        while (analytics.next()) {
+            var metrics = analytics.getValue("metric");
+            var metricsJSON = JSON.parse(metrics);
+            var searchId = metricsJSON["Search Id"];
+            var eventName = metricsJSON["Name"];
+
+            if (events[searchId] == null) {
+                events[searchId] = {
+                    "metrics": [eventName]
+                };
+            } else {
+                events[searchId]["metrics"].push(eventName);
+            }
+            if ("SEARCH_TRIGGERED" === eventName) {
+                events["idToUtteranceMap"] = events["idToUtteranceMap"] == null ? {} : events["idToUtteranceMap"];
+                var searchTerm = metricsJSON["Search Term"];
+                events["idToUtteranceMap"][searchTerm] = searchId;
+                events[searchId]["searchTerm"] = metricsJSON["Search Term"];
+                events[searchId]["taskId"] = analytics.getValue("document_id");
+            }
+        }
+        return events;
+    },
+
+    type: 'NluPredictOutcomeUtils'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-03-13 14:39:34&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;18d763a9776921101b53c5ed3c5a9933&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;37&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;NluPredictOutcomeUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Proxy agent for connecting to Natural Language Understanding (NLU) providers" source="com.glide.nlu.proxy"&gt;5e8db8203c75311068bcf327dfe37f62&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_18d763a9776921101b53c5ed3c5a9933&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-05-03 04:26:22&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:01</sys_created_on>
+        <sys_id>e3a03cd583b01210c6695855eeaad3e3</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>NluPredictOutcomeUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_e3a03cd583b01210c6695855eeaad3e3</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:01</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

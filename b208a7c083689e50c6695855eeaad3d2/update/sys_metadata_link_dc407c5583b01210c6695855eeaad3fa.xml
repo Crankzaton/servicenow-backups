@@ -1,0 +1,467 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>046c1a8653301110dd8eddeeff7b126e</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_vsc.SCComparisonUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;SCComparisonUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var SCComparisonUtil = Class.create();
+SCComparisonUtil.prototype = {
+    constants: new sn_vsc.SecurityCenterConstants(),
+    initialize: function() {},
+
+    /*
+     *
+     *Input params (timeStamp1 = first comparison timeStamp)
+     *Input params (timeStamp2 = second comparison timeStamp)
+     *Create new comparison and associate it with logged in user
+     */
+    compareWithUserId: function(timeStamp1, timeStamp2) {
+        var compare = this.createUserComparison(timeStamp1, timeStamp2, gs.getUserID(), false);
+        var paramList = compare + ',' + timeStamp1 + ',' + timeStamp2;
+        gs.eventQueue('sn_vsc.sec.hardening.comparison', null, 'sn_vsc_changed_hardening_settings', paramList);
+    },
+
+    /*
+     *
+     *Input params (timeStamp1 = first comparison timeStamp)
+     *Input params (timeStamp2 = second comparison timeStamp)
+     *Runs new comparison against given timeStamps
+     */
+    runComparison: function(timeStamp1, timeStamp2) {
+        var queryCondition = "u_setting!=NULL^sys_created_on&gt;javascript:gs.dateGenerate('" + timeStamp1 + "','" + this.getDateTimeStamp(timeStamp1) + "')^sys_created_on&lt;=javascript:gs.dateGenerate('" + timeStamp2 + "','" + this.getDateTimeStamp(timeStamp2) + "')";
+        var settings = [];
+        var tableRec = new GlideAggregate("sn_vsc_updated_settings");
+        tableRec.addEncodedQuery(queryCondition);
+        tableRec.groupBy("u_setting");
+        tableRec.query();
+        while (tableRec.next()) {
+            settings.push(tableRec.u_setting.sys_id);
+        }
+        return settings;
+    },
+
+    //get time stamp of latest job run for given date
+    getDateTimeStamp: function(date) {
+        var gr = new GlideRecord('sn_vsc_hardening_compliance_scores');
+        gr.orderBy('harc_collected');
+        gr.addEncodedQuery("harc_collected&gt;=javascript:gs.dateGenerate('" + date + "','" + "00:00:00" + "')");
+        gr.query();
+        if (gr.next()) {
+            if (gr.harc_collected.getDisplayValue().split(" ")[0] == date) {
+                return gr.harc_collected.getDisplayValue().split(" ")[1];
+            }
+        }
+    },
+
+    //Runs every time new score is generated, captures new score
+    recordComplianceScore: function() {
+        var score = Math.round((this.getScore(this.constants.SUM_OF_COMPLIANT_HARDENING_SETTING_WEIGHT) / this.getScore(this.constants.TOTAL_HARDENING_SETTING_WEIGHT)) * 100).toString();
+        var gr = new GlideRecord('pa_job_logs');
+        gr.addQuery('job', this.constants.SCPAJob);
+        gr.orderByDesc('sys_created_on');
+        gr.query();
+        if (gr.next()) {
+            var grC = new GlideRecord('sn_vsc_hardening_compliance_scores');
+            grC.orderByDesc('harc_collected');
+            grC.query();
+            if (grC.next()) {
+                var jobDate = new GlideDateTime(gr.sys_created_on).getDisplayValue();
+                if (jobDate.split(" ")[0] == grC.harc_collected.getDisplayValue().split(" ")[0]) {
+                    grC.harc_score = score;
+                    grC.harc_collected = new GlideDateTime(gr.sys_created_on).getDisplayValue();
+                    grC.harc_compliant = this.getNonCompliant();
+                    grC.update();
+                    return;
+                } else {
+                    this.insertScore(new GlideDateTime(gr.sys_created_on).getDisplayValue(), score, this.getNonCompliant());
+                    return;
+                }
+
+            } else {
+                this.insertScore(new GlideDateTime(gr.sys_created_on).getDisplayValue(), score, this.getNonCompliant());
+                return;
+            }
+        }
+    },
+
+    //Insert new score collection
+    insertScore: function(createdOn, score, compliance) {
+        var gr = new GlideRecord('sn_vsc_hardening_compliance_scores');
+        gr.initialize();
+        gr.harc_collected = createdOn;
+        gr.harc_score = score;
+        gr.harc_compliant = compliance;
+        gr.insert();
+    },
+
+    //Get latest score on indicator
+    getScore: function(indicatorId) {
+        var gr = new GlideRecord('pa_scores_l1');
+        gr.addQuery('indicator', this.getId(indicatorId));
+        gr.orderByDesc('start_at');
+        gr.query();
+        if (gr.next()) {
+            return gr.value;
+        }
+    },
+
+    //Get indicator id
+    getId: function(indicatorSysId) {
+        var gr = new GlideRecord('pa_indicators');
+        gr.addQuery('sys_id', indicatorSysId);
+        gr.query();
+        if (gr.next()) {
+            return gr.id;
+        }
+    },
+
+    //Get total non-compliant settings
+    getNonCompliant: function() {
+        var gr = new GlideRecord('sn_vsc_instance_hardening_settings');
+        gr.addQuery('compliance_status', 'non-compliant');
+        gr.query();
+        return gr.getRowCount();
+    },
+
+    /*
+     *
+     *Create new comparison for most recent Job run
+     */
+    defaultComparison: function() {
+        var gr = new GlideRecord('pa_job_logs');
+        gr.addQuery('job', this.constants.SCPAJob);
+        gr.orderByDesc('sys_created_on');
+        gr.query();
+        if (gr.next()) {
+            var dates = [];
+            while (gr.next() &amp;&amp; dates.length &lt; 2) {
+				var jobDate = new GlideDateTime(gr.sys_created_on).getDisplayValue().split(" ")[0];
+                if (dates.length == 0 || dates[0] != jobDate) {
+                    dates.push(jobDate);
+                }
+            }
+            if (dates.length == 2 &amp;&amp; dates[1] != null &amp;&amp; dates[0] != null) {
+                var currDate = new GlideDateTime().getDisplayValue().split(" ")[0];
+                var users = "";
+                if (dates[0] == currDate) {
+                    var gComp = new GlideRecord("sn_vsc_user_comparisons");
+                    gComp.addQuery('usr_name', 'CONTAINS', currDate);
+                    gComp.query();
+                    while (gComp.next()) {
+                        if (gComp.usr_name.split(",")[1] == currDate) {
+                            users += gComp.usr_list.toString();
+                            gComp.deleteRecord();
+                        }
+                    }
+                    var gSet = new GlideRecord("sn_vsc_changed_hardening_settings");
+                    gSet.addEncodedQuery('set_comp=NULL');
+                    gSet.query();
+                    gSet.query();
+                    while (gSet.next()) {
+                        gSet.deleteMultiple();
+                    }
+                    this.updateDefaultState();
+                    var compa = this.createUserComparison(dates[1], dates[0], users, true);
+                    var param = compa + ',' + dates[1] + ',' + dates[0];
+                    gs.eventQueue('sn_vsc.sec.hardening.comparison', null, 'sn_vsc_changed_hardening_settings', param);
+                } else {
+                    this.updateDefaultState();
+                    var com = this.createUserComparison(dates[1], dates[0], " ", true);
+                    var paramList = com + ',' + dates[1] + ',' + dates[0];
+                    gs.eventQueue('sn_vsc.sec.hardening.comparison', null, 'sn_vsc_changed_hardening_settings', paramList);
+                }
+            }
+        }
+    },
+
+    //Set default state on previous default comparison
+    updateDefaultState: function() {
+        var gU = new GlideRecord("sn_vsc_user_comparisons");
+        gU.addQuery('usr_default', true);
+        gU.query();
+        while (gU.next()) {
+            gU.usr_default = false;
+            gU.update();
+        }
+    },
+
+    /*
+     *
+     *Input params (timeStamp1 = first comparison timeStamp)
+     *Input params (timeStamp2 = second comparison timeStamp)
+     *Check if comparison already exist, update user assignment respectively
+     */
+    lookForComparison: function(timeStamp1, timeStamp2) {
+        if (timeStamp1 != null &amp;&amp; timeStamp2 != null) {
+            var compId = timeStamp1 + "," + timeStamp2; //need to handle reverse comparision
+            var grUser = new GlideRecord("sn_vsc_user_comparisons");
+            grUser.addQuery('usr_name', compId);
+            grUser.query();
+            if (grUser.next()) { //Comparison found
+                if (!grUser.usr_list.toString().includes(gs.getUserID())) {
+                    this.removeUserFromComparisons(gs.getUserID());
+                    if (grUser.usr_list.toString() != '') {
+                        grUser.usr_list = grUser.usr_list.toString() + ',' + gs.getUserID();
+                    } else {
+                        grUser.usr_list = gs.getUserID();
+                    }
+                    grUser.update();
+                }
+            } else { //Comparison not found
+                this.compareWithUserId(timeStamp1, timeStamp2);
+            }
+        }
+    },
+
+    /*
+     *
+     *Remove user associated to comparision
+     */
+    removeUserFromComparisons: function(userId) {
+        var gr = new GlideRecord("sn_vsc_user_comparisons");
+        var eQ = "usr_listLIKE" + userId;
+        gr.addEncodedQuery(eQ);
+        gr.query();
+        while (gr.next()) {
+            var Uarr = gr.usr_list.split(",");
+            var index = Uarr.indexOf(userId.toString());
+            if (index !== -1) {
+                Uarr.splice(index, 1);
+            }
+            gr.usr_list = Uarr.toString();
+            gr.update();
+        }
+    },
+
+    /*
+     *
+     *Input params (timeStamp1 = first comparison timeStamp)
+     *Input params (timeStamp2 = second comparison timeStamp)
+     *Create new comparison and associate it with given user
+     */
+    createUserComparison: function(timeStamp1, timeStamp2, userId, isDefault) {
+        if (timeStamp1 != "" &amp;&amp; timeStamp1 != null &amp;&amp; timeStamp2 != "" &amp;&amp; timeStamp2 != null) {
+            if (userId != " ") {
+                this.removeUserFromComparisons(gs.getUserID());
+            }
+            var grUser = new GlideRecord("sn_vsc_user_comparisons");
+            grUser.initialize();
+            grUser.setValue("usr_name", timeStamp1 + "," + timeStamp2);
+            grUser.setValue("usr_default", isDefault);
+            if (userId != "") {
+                grUser.setValue("usr_list", userId);
+            }
+            grUser.setValue("usr_status", "progress");
+            return grUser.insert();
+        }
+    },
+
+    /*
+     *
+     *Input params (compare = reference to user comparison record)
+     *Input params (settings = list of changed settings)
+     *Associate chnaged settings to comparison
+     */
+    createChangedSettings: function(compare, settings) {
+        for (var stg in settings) {
+            var chgSetting = new GlideRecord("sn_vsc_changed_hardening_settings");
+            chgSetting.initialize();
+            chgSetting.setValue("set_comp", compare);
+            chgSetting.setValue("set_setting", settings[stg]);
+            chgSetting.insert();
+        }
+    },
+
+    /*
+     *
+     *Assign default comparison upon login for admin users
+     */
+    loginEvent: function(uId) {
+        var gC = new GlideRecord("sn_vsc_user_comparisons");
+        gC.query();
+        if (gC.getRowCount() &gt; 0) {
+            this.removeUserFromComparisons(uId);
+        }
+    },
+
+    /*
+     *
+     * Returns changed hardening settings glide record
+     */
+    getChangedRecord: function() {
+        var dates = [];
+        var grPA = new GlideRecord('pa_job_logs');
+        grPA.addQuery('job', "aead645c53911110dd8eddeeff7b12e9");
+        grPA.orderByDesc('sys_created_on');
+        grPA.setLimit(2);
+        grPA.query();
+        while (grPA.next()) {
+            var date = new GlideDateTime(grPA.sys_created_on).getDisplayValue();
+            dates.push(date);
+        }
+
+        var date1 = dates[1].split(" ")[0].toString();
+        var time1 = dates[1].split(" ")[1].toString();
+        var date2 = dates[0].split(" ")[0].toString();
+        var time2 = dates[0].split(" ")[1].toString();
+
+        var grSettings = new GlideRecord('sn_vsc_updated_settings');
+        var records = "u_setting!=NULL^sys_created_onBETWEENjavascript:gs.dateGenerate('" + date1 + "','" + time1 + "')@javascript:gs.dateGenerate('" + date2 + "','" + time2 + "')";
+        grSettings.addEncodedQuery(records);
+        grSettings.query();
+        return grSettings;
+    },
+
+    /*
+     *
+     * Returns number of settings changed between most recent scores n &amp; n-1 
+     */
+    totalChangedSettings: function() {
+        var settingsRecord = this.getChangedRecord();
+        return settingsRecord.getRowCount();
+    },
+
+    /*
+     *
+     * Returns most repeated security area in number of settings changed 
+     */
+    mostRepeatedSecurityArea: function(currScoreDate, prevScoreDate) {
+        var resultArea = {};
+        var securityArea = {};
+        var mostRepeatedSecurityArea = '';
+        var settingsRecord = this.getUpdatedSettings(currScoreDate, prevScoreDate);
+        while (settingsRecord.next()) {
+            var secArea = settingsRecord.u_setting.security_check_category.getDisplayValue();
+            if (resultArea[secArea]) {
+                resultArea[secArea]++;
+            } else {
+                // otherwise, add the word to the result object with a count of 1
+                resultArea[secArea] = 1;
+            }
+        }
+
+        if (resultArea) {
+            // Create items array
+            var items = Object.keys(resultArea).map(function(key) {
+                return [key, resultArea[key]];
+            });
+
+            // Sort the array based on the second element
+            items.sort(function(first, second) {
+                return second[1] - first[1];
+            });
+
+            // Create a new array with only the first 3 items
+            var slicedArray = items.slice(0, 3);
+            securityArea = slicedArray.map(function(area) {
+                return area[0];
+            });
+        }
+
+
+        return securityArea;
+    },
+
+    /*
+     *
+     * Returns most repeated priority for the security area in number of settings changed 
+     */
+    getAllPriorityForSecurityArea: function(securityArea, currScoreDate, prevScoreDate) {
+        var mostRepeatedSecurityAreaArray = securityArea;
+        var mostRepeatedPriority = '';
+        var resultPriority = {};
+        var settingsRecord = this.getUpdatedSettings(currScoreDate, prevScoreDate);
+        while (settingsRecord.next()) {
+            var secArea = settingsRecord.u_setting.security_check_category.getDisplayValue();
+            for (var i = 0; i &lt; mostRepeatedSecurityAreaArray.length; i++) {
+                if (secArea == mostRepeatedSecurityAreaArray[i]) {
+                    var priority = settingsRecord.u_setting.check.priority.getDisplayValue();
+                    if (resultPriority[priority]) {
+                        resultPriority[priority]++;
+                    } else {
+                        // otherwise, add the word to the result object with a count of 1
+                        resultPriority[priority] = 1;
+                    }
+
+                }
+            }
+        }
+
+        return resultPriority;
+
+    },
+
+    getUpdatedSettings: function(currScoreDate, prevScoreDate) {
+        var encodedQuery = "";
+        if (currScoreDate != prevScoreDate) {
+            encodedQuery = "u_setting!=NULL^sys_created_on&gt;javascript:gs.dateGenerate('" + prevScoreDate.split(' ')[0] + "','23:59:59')";
+        var grSettings = new GlideAggregate('sn_vsc_updated_settings');
+        grSettings.addEncodedQuery(encodedQuery);
+        grSettings.groupBy('u_setting');
+        grSettings.query();
+        return grSettings;
+	}
+    },
+
+    getScoreTrendDates: function() {
+        var startDate = new GlideDateTime();
+        var currDate = new GlideDateTime();
+        var endDate = new GlideDateTime();
+        var gr = new GlideRecord('sn_vsc_hardening_compliance_scores');
+        gr.addEncodedQuery('harc_score!=0');
+        gr.orderBy('harc_collected');
+        gr.setLimit(1);
+        gr.query();
+        if (gr.next()) {
+            startDate = new GlideDateTime(gr.getValue('harc_collected'));
+        }
+        var startYear = startDate.getYearLocalTime();
+        var currYear = currDate.getYearLocalTime();
+
+        if (currYear - startYear &gt; 1) {
+            startDate.setYear(currYear - 1);
+        }
+        return [{
+            "startDate": startDate.getDisplayValueInternal().split(" ")[0],
+            "endDate": endDate.getDisplayValueInternal().split(" ")[0]
+        }];
+    },
+    type: 'SCComparisonUtil'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-07-21 15:13:39&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;046c1a8653301110dd8eddeeff7b126e&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;SCComparisonUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Security Center" source="sn_vsc"&gt;a51d46e3f2014110366b10017c5ba675&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Security Center"&gt;a51d46e3f2014110366b10017c5ba675&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_046c1a8653301110dd8eddeeff7b126e&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;maint&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-08-04 00:17:26&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:09</sys_created_on>
+        <sys_id>dc407c5583b01210c6695855eeaad3fa</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>SCComparisonUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_dc407c5583b01210c6695855eeaad3fa</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:09</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

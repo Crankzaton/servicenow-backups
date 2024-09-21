@@ -1,0 +1,268 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1981ea29c7c01010f74c784c95c260a6</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.ProcessStockRules&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;ProcessStockRules&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ProcessStockRules = Class.create();
+ProcessStockRules.prototype = Object.extendsObject(global.AssetManagementPerGlideRecordBaseJob, {
+	CONS_MODEL: 'cmdb_consumable_product_model',
+	TRACK_CONS: 'track_as_consumable',
+	initialize: function() {
+        this.transfer = new StockRuleTransfer();
+        this.jobLog = new global.AssetJobLogUtil();
+        this.JOBLOG_DETAILS = {
+            JOBNAME: 'Stock Rule Runner',
+            STOCK_RULE_BATCH_SIZE: this.getBatchSize(),
+            TOTAL_STOCK_RULES_COUNT: 0,
+            STOCKROOM_RULE_COUNT: 0,
+            VENDOR_RULE_COUNT: 0,
+            CURR_COUNT: 0,
+            STEP_LOG_NAME: '',
+			JOB_STATUSES: {
+				COMPLETED: 'completed',
+				FAILED: 'failed',
+			}
+        };
+    },
+    getBatchSize: function() {
+        var batchSize = gs.getProperty('sn_itam_stockrulejob_batch_size');
+        return ((batchSize &gt; 0) ? batchSize : 1000);
+    },
+    getRecords: function() {
+        this.jobLog.startJobLog(this.JOBLOG_DETAILS.JOBNAME);
+        var stockRules = new GlideRecord('alm_stock_rule');
+        stockRules.addQuery('active', 'true');
+        stockRules.orderBy('restocking_option');
+        stockRules.query();
+        return stockRules;
+    },
+    runJobForRecord: function(stockRuleGr) {
+       
+		this.JOBLOG_DETAILS.CURR_COUNT++;
+
+		if (((this.JOBLOG_DETAILS.CURR_COUNT % this.JOBLOG_DETAILS.STOCK_RULE_BATCH_SIZE) === 1)) {
+			this.JOBLOG_DETAILS.STEP_LOG_NAME = "Stock Rules batch started " +
+				parseInt(this.JOBLOG_DETAILS.CURR_COUNT / this.JOBLOG_DETAILS.STOCK_RULE_BATCH_SIZE);
+			this.jobLog.startJobStep(this.JOBLOG_DETAILS.STEP_LOG_NAME);
+		}
+
+		if (stockRuleGr.getValue('restocking_option') === 'stockroom') {
+			this.JOBLOG_DETAILS.STOCKROOM_RULE_COUNT++;
+			this._processStockoomStockrule(stockRuleGr);
+		} else {
+			this.JOBLOG_DETAILS.VENDOR_RULE_COUNT++;
+			this._processVendorStockrule(stockRuleGr);
+		}
+
+		if (((this.JOBLOG_DETAILS.CURR_COUNT % this.JOBLOG_DETAILS.STOCK_RULE_BATCH_SIZE) === 0)) {
+			this.jobLog.stopJobStep(this.JOBLOG_DETAILS.STEP_LOG_NAME, this.JOBLOG_DETAILS.CURR_COUNT + 
+			' Processed. Stockroom Rule:' + this.JOBLOG_DETAILS.STOCKROOM_RULE_COUNT +
+			' ,Vendor Rule:' + this.JOBLOG_DETAILS.VENDOR_RULE_COUNT);
+		}      
+    },
+
+	postRunJobOnSuccess: function() {
+		this.jobLog.stopJobStep(this.JOBLOG_DETAILS.STEP_LOG_NAME, this.JOBLOG_DETAILS.CURR_COUNT + 
+			' Processed. Stockroom Rule:' + this.JOBLOG_DETAILS.STOCKROOM_RULE_COUNT +
+			' ,Vendor Rule:' + this.JOBLOG_DETAILS.VENDOR_RULE_COUNT);
+
+		var comments = "PROCESS COMPLETED.\nTOTAL STOCK RULES = " + this.JOBLOG_DETAILS.CURR_COUNT +
+			"\n STOCKROOM RULE = " + this.JOBLOG_DETAILS.STOCKROOM_RULE_COUNT +
+			"\n VENDOR RULE = " + this.JOBLOG_DETAILS.VENDOR_RULE_COUNT;
+		this.jobLog.stopJobLog(this.JOBLOG_DETAILS.JOB_STATUSES.COMPLETED, comments);
+	},
+	
+	postRunJobOnError: function() {
+		this.jobLog.stopJobLog(this.JOBLOG_DETAILS.JOB_STATUSES.FAILED,  'stock rule job failed');
+	},
+
+	_processStockoomStockrule: function(stockRuleGr) {
+		var parent = stockRuleGr.parent_stockroom;
+		var stockroom = stockRuleGr.stockroom;
+		var model = stockRuleGr.model;
+		var supply = this.transfer.getTotalRecordCount(stockroom, model);
+		var thresh = parseInt(stockRuleGr.threshold, 10);
+		var need = thresh - supply;
+		var order = 0;
+		var size = parseInt(stockRuleGr.order_size, 10);
+		if (need &gt; 0) {
+			if (size &lt;= 0) {
+				order = need;
+			} else {
+				while (order &lt; need) {
+					order += size;
+				}
+			}
+			var stock = this.transfer.checkStockroomTransferAvailability(parent, model);
+			if (stock &gt;= order) {
+				if (model.sys_class_name.toString() === this.CONS_MODEL ||
+					model.asset_tracking_strategy.toString() === this.TRACK_CONS) {
+					this.transfer.consumableTransfer(parent, stockroom, model, order);
+				} else {
+					this.transfer.assetTransfer(parent, stockroom, model, order);
+				}
+			}
+			// if it does not have enough, it will run each night until the parent stockroom has enough supply
+		}
+	},
+	_processVendorStockrule: function(stockRuleGr) {
+		/*
+		If quantity is below threshold and pending_delivery is false, send email &amp; create task/purchaseOrder
+		If quantity is below threshold and pending_delivery is true, check if there is existing purchaseOrder
+		If quantity is above threshold and pending_delivery is false, do nothing
+		If quantity is above threshold and pending_delivery is true, change pending_delivery to false
+		*/
+		var threshold = stockRuleGr.threshold;
+		var stockroom = stockRuleGr.stockroom;
+		var model = stockRuleGr.model;
+		var quantity = this.transfer.getTotalRecordCount(stockroom, model);
+		var size = parseInt(stockRuleGr.order_size, 10);
+
+		//check if quantity below treshold and pending delivery is false	
+		if ((quantity &lt; threshold) &amp;&amp; stockRuleGr.pending_delivery.toString() === 'true') {
+
+			var pending_order = false;
+
+			if ((GlidePluginManager.isActive('com.sn_eam') &amp;&amp; sn_eam.EAMUtils.isEnterpriseModel(model)) || (GlidePluginManager.isActive('com.sn_hamp') &amp;&amp; !sn_hamp.HAMUtils.checkIfEAMClass(stockRuleGr.model.sys_class_name, sn_hamp.HAMConstants.EAM_MODEL_BASE_CLASS))) {
+				gr = new GlideRecord('sc_req_item');
+				gr.addQuery('active', 'true');
+				gr.addQuery('cat_item',sn_hamp.HAMConstants.HARDWARE_INVENTORY_STOCK_ORDER).addOrCondition('cat_item',sn_eam.EAMConstants.ENTERPRISE_STOCK_ORDER_CAT_ITEM);// checking for item = hardware/enterprise inventory stock orders
+				gr.addQuery('stage', 'IN', ['waiting_for_approval', 'fulfillment', 'awaiting_delivery']);
+				gr.query();
+				while (gr.next()) {
+					if ((gr.variables.model == model) &amp;&amp; (gr.variables.stockroom == stockroom)) {
+						pending_order = true;
+					}
+				}
+			} else if (GlidePluginManager.isActive('com.snc.procurement')) {
+				new GlideQuery('proc_po_item')
+					.where('model', model) //checking purchaseOrderLines for model from stockrule
+					.where('status', 'IN', ['requested', 'ordered', 'pending'])
+					.where('sys_created_by', 'system')
+					.where('purchase_order.ship_to', stockroom)
+					.selectOne()
+					.ifPresent(function() {
+						pending_order = true;
+					});
+			}
+			if (pending_order == false) {
+				// No existing purchase order or stock order but pending delivery is true
+				stockRuleGr.pending_delivery = 'false';
+			}
+		}
+
+		// Quantity below threshold
+		if ((quantity &lt; threshold) &amp;&amp; stockRuleGr.pending_delivery.toString() !== 'true') {
+			var need = threshold - quantity;
+			var order = 0;
+			if (size &lt;= 0) {
+				order = need;
+			} else {
+				while (order &lt; need) {
+					order += size;
+				}
+			}
+			// Trigger event
+			gs.eventQueue('asset.restock', stockRuleGr, order, threshold);
+			// STRY52899577 - If model belongs to EAM, order is handled by EAM
+			if (GlidePluginManager.isActive('com.sn_eam') &amp;&amp; sn_eam.EAMUtils.isEnterpriseModel(model)) {
+				sn_eam.StockOrderUtils.createStockOrderReq(stockRuleGr, quantity, order);
+			} else if (GlidePluginManager.isActive('com.sn_hamp') &amp;&amp; !sn_hamp.HAMUtils.checkIfEAMClass(stockRuleGr.model.sys_class_name, sn_hamp.HAMConstants.EAM_MODEL_BASE_CLASS)) {
+				sn_hamp.StockOrderUtils.createStockOrderReq(stockRuleGr, quantity, order);
+			} else {
+				this._createPurchaseOrder(stockRuleGr, quantity, order);
+			}
+			// Set "pending_delivery" to true
+			stockRuleGr.pending_delivery = 'true';
+		} else if ((quantity &gt; threshold) &amp;&amp; stockRuleGr.pending_delivery.toString() === 'true') {
+			// Quantity above threshold
+			stockRuleGr.pending_delivery = 'false';
+		}
+		stockRuleGr.update();
+	},
+	_createPurchaseOrder: function(stockLevel, quantity, order) {
+		var stockroom = stockLevel.stockroom;
+		var model = stockLevel.model;
+		var threshold = stockLevel.threshold;
+		// Add Task
+		// we keep adding task because:
+		// if procurement plugin is not enabled, then we create TASK for existing Stock Rule records
+		// if procurement plugin is enabled, then we create TASK for the user who have been used to TASK
+		var task = new GlideRecord('task');
+		task.initialize();
+		task.assigned_to = stockroom.manager;
+		task.short_description = 'Quantity threshold breached: ' + stockroom.name;
+		task.description = 'Stockroom: ' + stockroom.name + '\nItem: ' + model.display_name + '\nQuantity: ' +
+			quantity + '\nThreshold: ' + threshold;
+		task.insert();
+		if (GlidePluginManager.isActive('com.snc.procurement')) {
+			// Add Purchase Order
+			var po = new GlideRecord('proc_po');
+			po.initialize();
+			po.ship_to = stockroom;
+			po.short_description = 'Quantity threshold breached: ' + stockroom.name;
+			po.description = '-- Created by Stock Rule --\nStockroom: ' + stockroom.name + '\nItem: ' +
+				model.display_name + '\nQuantity: ' + quantity + '\nThreshold: ' + threshold;
+			var poId = po.insert();
+			// Add Purcahse Order Line Item
+			var poli = new GlideRecord('proc_po_item');
+			poli.initialize();
+			poli.purchase_order = poId;
+			poli.model = model;
+			poli.list_price = model.cost;
+			poli.cost = model.cost;
+			poli.ordered_quantity = order;
+			poli.total_cost = order * model.cost;
+			poli.insert();
+		}
+	},
+	getRefQualCondition: function(stockRuleGr) {
+		/*
+		 * Description: Used as RefQual for model and stockroom list in Stock Rule when domain separation is enabled
+		 */
+		if (this.fIsDomainDataSeparationEnabled) {
+			return stockRuleGr.getValue('sys_domain') === 'global' ? 'sys_domain=global' : 'sys_domain=' +
+				stockRuleGr.sys_domain + '^ORsys_domain=global';
+		}
+		return '';
+	},
+	type: 'ProcessStockRules',
+});]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-04-08 10:56:40&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1981ea29c7c01010f74c784c95c260a6&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;7&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ProcessStockRules&lt;/sys_name&gt;
+        &lt;sys_package display_value="Asset Management" source="com.snc.asset_management"&gt;3e467ca03cb1311068bcf327dfe37f49&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1981ea29c7c01010f74c784c95c260a6&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-12-05 05:40:20&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:04</sys_created_on>
+        <sys_id>14b0bcd583b01210c6695855eeaad3ca</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ProcessStockRules</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_14b0bcd583b01210c6695855eeaad3ca</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:04</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

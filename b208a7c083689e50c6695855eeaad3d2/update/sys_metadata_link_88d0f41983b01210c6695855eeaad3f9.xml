@@ -1,0 +1,533 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1de5e64fdb27001014465c55dc961922</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.OnCallNotifyUtilSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;OnCallNotifyUtilSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var OnCallNotifyUtilSNC = Class.create();
+OnCallNotifyUtilSNC.prototype = {
+
+    initialize: function() {
+        this.notifyUtils = new global.NotifyUtil();
+    },
+
+    _getOnCallNotifyEscalationHandler: function(sourceTableName, inputData) {
+        var ON_CALL_NOTIFY_ESCALATION_EXTENTION_POINT = "global.OnCallNotifyEscalationHandler";
+
+        var exPointImplementations = new GlideScriptedExtensionPoint().getExtensions(ON_CALL_NOTIFY_ESCALATION_EXTENTION_POINT);
+        if (exPointImplementations) {
+            for (i = 0; i &lt; exPointImplementations.length; i++) {
+                var handler = exPointImplementations[i];
+                if (handler.canHandle(sourceTableName, inputData)) {
+                    return handler;
+                }
+            }
+        }
+        return;
+    },
+
+    onConference: function(inputData) {
+        if (typeof inputData == 'string') {
+            try {
+                inputData = JSON.parse(inputData);
+            } catch (e) {}
+        }
+        if (inputData.items.length == 0)
+            return;
+        var confGr = new GlideRecord("notify_conference_call");
+        if (!confGr.get(inputData.confId))
+            return;
+
+        var sourceTableName = inputData.table;
+        var sourceSysId = inputData.sysId;
+        var handler = this._getOnCallNotifyEscalationHandler(sourceTableName, inputData);
+        if (!handler) {
+            gs.error("Unable to find handler to process OnCallNotifyEscalation. InputData: {0}", inputData);
+            return;
+        }
+
+        if (!handler.abortProcessing(sourceTableName, inputData)) {
+            gs.info("OnCallNotifyUtilSNC: Script action processing aborted as it was aborted by " + handler.type);
+            return;
+        }
+
+        //Call preWorkflowExecution of the handler.
+        handler.preWorkflowExecution(inputData);
+
+        if (handler.isFollowOnCallEscalationEnabled(sourceTableName, sourceSysId)) {
+            var confGroups = [];
+            for (var i = 0; i &lt; inputData.items.length; i++) {
+                var thisItem = inputData.items[i];
+                if (!thisItem.users)
+                    continue;
+                if (thisItem.users.length == 0)
+                    continue;
+                confGroups.push(inputData.items[i].id);
+            }
+            if (confGroups.length &gt; 0)
+                this._attachConferenceCallEscalationWorkflow(handler, confGr, confGroups);
+        }
+
+        //Call preWorkflowExecution of the handler.
+        handler.postWorkflowExecution(inputData);
+    },
+
+    /**
+     * attach Conference Call Escalation Workflow
+     */
+    _attachConferenceCallEscalationWorkflow: function(handler, conferenceCallGr, conferenceGroups) {
+        if (!conferenceGroups)
+            return;
+        if (!Array.isArray(conferenceGroups))
+            return;
+        if (conferenceGroups.length == 0)
+            return;
+
+        var workFlowContextsGroupsInProgress = [];
+        var workFlowContextsInProgressGr = new global.Workflow().getRunningFlows(conferenceCallGr);
+        while (workFlowContextsInProgressGr.next()) {
+            if (workFlowContextsInProgressGr.scratchpad.group &amp;&amp; workFlowContextsInProgressGr.scratchpad.group.sys_id) {
+                if (workFlowContextsGroupsInProgress.indexOf(workFlowContextsInProgressGr.scratchpad.group.sys_id) == -1)
+                    workFlowContextsGroupsInProgress.push(workFlowContextsInProgressGr.scratchpad.group.sys_id);
+            }
+        }
+        for (var i = 0; i &lt; conferenceGroups.length; i++) {
+            var groupSysId = conferenceGroups[i];
+            if (workFlowContextsGroupsInProgress.indexOf(groupSysId) == -1) {
+                var inputs = handler.generateEscalationWFInputs(conferenceCallGr, groupSysId);
+                var workflowSysId = inputs.workflowSysId;
+                if (workflowSysId) {
+                    var wf = new global.Workflow();
+                    var wfc = wf.startFlow(workflowSysId, conferenceCallGr, conferenceCallGr.operation(), inputs);
+                    if (!wfc) {
+                        gs.warn("[attachConferenceCallEscalationWorkflow] - Failed to attach workflow context");
+                    } else {
+                        workFlowContextsGroupsInProgress.push(groupSysId);
+                    }
+                }
+            } else {
+                var groupName = '';
+                var groupGr = new GlideRecord('sys_user_group');
+                if (groupGr.get(groupSysId))
+                    groupName = groupGr.getDisplayValue();
+                gs.info("[attachConferenceCallEscalationWorkflow] - conference call escalation workflow context for group " + groupName + " is already in progress.");
+            }
+        }
+    },
+
+    /**
+     * Add a participant into a conference call
+     *
+     * @param participant
+     * @param {NotifyConferenceCallGR} conferenceCall
+     * @returns {boolean}
+     * @private
+     */
+    addParticipantToCall: function(participant, conferenceCall, groupId) {
+        var sourceGr = conferenceCall.source.getRefRecord();
+
+        if (!sourceGr.canRead()) {
+            gs.addErrorMessage(gs.getMessage('Do not have enough permissions to make a call'));
+            return false;
+        }
+
+        /**
+         * @type {SysUserGR}
+         */
+        var user = this._getUserByID(participant);
+        var to = this.getPhoneNumber(participant);
+
+        // define the number to call
+        if (!to) {
+            // participant is a device
+            to = participant;
+            var contactPrefUtils = new OnCallContactPreferenceUtil();
+            var userId = contactPrefUtils.getUserFromDeviceOrContactSource(participant, 'Voice');
+            if (userId)
+                user = this._getUserByID(userId + "");
+        }
+
+        // got a number?
+        if (to) {
+
+            // This code is meant for scenario where customers are upgrading from pre-New York instance and so the new API
+            // NotifyConferenceUtils (introduced in NY) is not yet available.
+            if (typeof global.NotifyConferenceUtils == 'undefined') {
+                if (conferenceCall.service_provider &amp;&amp; conferenceCall.service_provider != "Telephony")
+                    return false;
+
+                var from = conferenceCall.getDisplayValue("notify_number");
+                var notify = new SNC.Notify();
+                notify.call(from, to, conferenceCall, (!user ? null : user.getUniqueValue()), (!groupId ? null : groupId));
+                return true;
+            } else {
+                var confUtils = new global.NotifyConferenceUtils();
+                // add to conference call
+                var data = confUtils.getConferenceInputDataTemplate();
+                data.confId = conferenceCall.getUniqueValue();
+                data.serviceProvider = conferenceCall.service_provider + '';
+                var item = {
+                    phoneNumber: to,
+                    email: '',
+                    id: '',
+                    groupId: ''
+                };
+                if (user) {
+                    item.id = user.getUniqueValue();
+                    item.email = user.email + '';
+                }
+                if (groupId)
+                    item.groupId = groupId;
+
+                data.items.push(item);
+                var actionResult = confUtils.doConferenceAction('multiJoin', data);
+                return actionResult.status;
+            }
+        } else {
+            gs.addErrorMessage(gs.getMessage('participant {0} could not be added to conference call {1}', [(user ? user.name : participant), conferenceCall.getValue('number')]));
+            return false;
+        }
+    },
+
+    getPhoneNumber: function(userId) {
+        var user = this._getUserByID(userId);
+        var to = '';
+
+        if (user) {
+            var numbers = this.notifyUtils.getUniquePhoneNumbersForUsersAndGroups([], [userId], [], this.notifyUtils.numberType.voice);
+            if (numbers.length &gt; 0)
+                to = numbers[0];
+        }
+        return to;
+    },
+
+    _getEscalateeDisplayProps: function(userId, groupGr, escalateeType, isEscalation, rosterId) {
+        var props = {
+            name: '',
+            color: 'black'
+        };
+
+        var rosterName = this._getRosterName(rosterId);
+        if (!rosterName)
+            rosterName = "";
+
+        if (isEscalation) {
+            var userGr = this._getUserByID(userId);
+            if (userGr)
+                props.name = userGr.name;
+            return props;
+        }
+        var name = '';
+        var additionalInformation = '';
+        if (escalateeType == 'user') {
+            var userGr = this._getUserByID(userId);
+            additionalInformation = gs.getMessage('{0} ({1} {2})', [userGr.name, rosterName, groupGr.name]);
+            // lookup the voice numbers for this contact
+            numbers = this.notifyUtils.getUniquePhoneNumbersForUsersAndGroups([], [userId], [], this.notifyUtils.numberType.voice);
+            if (numbers.length == 0)
+                props.color = 'tomato'; // has no number, mark as red
+        } else if (escalateeType == 'phone_number') {
+            additionalInformation = gs.getMessage('{0} ({1} {2})', [userId, rosterName, groupGr.name]);
+        }
+
+        props.name = additionalInformation;
+        return props;
+    },
+
+    addEscalatee: function(escalatee, currentOncallEscalatees, groupGr, isEscalation) {
+        if (escalatee.userId &amp;&amp; this._isUserActive(escalatee.userId)) {
+            var props = this._getEscalateeDisplayProps(escalatee.userId, groupGr, 'user', isEscalation, escalatee.rosterId);
+            currentOncallEscalatees.push({
+                id: escalatee.userId,
+                level: escalatee.order,
+                group: groupGr.name,
+                groupId: groupGr.sys_id,
+                type: 'user',
+                name: props.name,
+                color: props.color
+            });
+        }
+        for (var i = 0; i &lt; escalatee.userIds.length; i++) {
+            var user = escalatee.userIds[i];
+            if (user &amp;&amp; this._isUserActive(user)) {
+                var props = this._getEscalateeDisplayProps(user, groupGr, 'user', isEscalation, escalatee.rosterId);
+                currentOncallEscalatees.push({
+                    id: user,
+                    level: escalatee.order,
+                    group: groupGr.name,
+                    groupId: groupGr.sys_id,
+                    type: 'user',
+                    name: props.name,
+                    color: props.color
+                });
+            }
+        }
+        if (escalatee.deviceId) {
+            var deviceGr1 = new GlideRecord('cmn_notif_device');
+            deviceGr1.addActiveQuery();
+            if (deviceGr1.get(escalatee.deviceId)) {
+                if (deviceGr1.phone_number + '' &amp;&amp; deviceGr1.type == "Voice") {
+                    var props1 = this._getEscalateeDisplayProps(deviceGr1.phone_number + '', groupGr, 'phone_number', isEscalation, escalatee.rosterId);
+                    currentOncallEscalatees.push({
+                        id: deviceGr1.phone_number + '',
+                        level: escalatee.order,
+                        group: groupGr.name,
+                        groupId: groupGr.sys_id,
+                        type: 'phone_number',
+                        name: props1.name,
+                        color: props1.color
+                    });
+                }
+            }
+        }
+        for (var j = 0; j &lt; escalatee.deviceIds.length; j++) {
+            var deviceSysId = escalatee.deviceIds[j];
+            var deviceGr = new GlideRecord('cmn_notif_device');
+            deviceGr.addActiveQuery();
+            if (deviceGr.get(deviceSysId)) {
+                if (deviceGr.phone_number + '' &amp;&amp; deviceGr.type == "Voice") {
+                    var props = this._getEscalateeDisplayProps(deviceGr.phone_number + '', groupGr, 'phone_number', isEscalation, escalatee.rosterId);
+                    currentOncallEscalatees.push({
+                        id: deviceGr.phone_number + '',
+                        level: escalatee.order,
+                        group: groupGr.name,
+                        groupId: groupGr.sys_id,
+                        type: 'phone_number',
+                        name: props.name,
+                        color: props.color
+                    });
+                }
+            }
+        }
+    },
+
+    fetchUsersOnEscalateesPreferences: function(groupId, inputData, currentOncallEscalatees, type) {
+        var result = [];
+
+        if (!currentOncallEscalatees)
+            return;
+
+        for (var i = 0; i &lt; currentOncallEscalatees.length; i++) {
+            var thisItem = currentOncallEscalatees[i];
+            var grpId = thisItem.groupId + '';
+            if (grpId !== groupId) {
+                gs.warn("Got information about another group " + grpId + " while trying to get info about group " + groupId + ". Ignoring.");
+                continue;
+            }
+            var itemType = thisItem.type + '';
+            var thisResult = {
+                name: thisItem.name + '',
+                id: thisItem.id + ''
+            };
+            if (itemType == 'user') {
+                var userGr = new GlideRecord("sys_user");
+                if (!userGr.get(thisItem.id + ''))
+                    continue;
+                if (!userGr.active)
+                    continue;
+
+                if (this.isFollowOnCallEscalationEnabled(inputData.table)) {
+                    var occpUtil = new global.OnCallContactPreferenceUtil();
+                    var userPrefs = occpUtil.getUserPreferences(thisItem.id, 1, null, type === this.notifyUtils.numberType.voice ? occpUtil.COMMUNICATION_TYPES.VOICE : occpUtil.COMMUNICATION_TYPES.SMS);
+                    if (userPrefs.length &gt; 0) {
+                        var allNumbers = [];
+                        for (var k = 0; k &lt; userPrefs.length; k++) {
+                            var pref = userPrefs[k];
+                            if (allNumbers.indexOf(pref.number) == -1) {
+                                var id = k ? id = thisResult.id + '_' + k : id = thisResult.id;
+                                allNumbers.push(pref.number);
+                                result.push({
+                                    name: userGr.getDisplayValue(),
+                                    id: id,
+                                    sysId: thisResult.id,
+                                    phoneNumber: pref.number
+                                });
+                            }
+                        }
+                    } else {
+                        numbers = this.notifyUtils.getUniquePhoneNumbersForUsersAndGroups([], [userGr.getUniqueValue()], [], type);
+                        thisResult.phoneNumber = numbers.length &gt; 0 ? numbers[0] : '';
+                        result.push(thisResult);
+                    }
+                } else {
+                    numbers = this.notifyUtils.getUniquePhoneNumbersForUsersAndGroups([], [userGr.getUniqueValue()], [], type);
+                    thisResult.phoneNumber = numbers.length &gt; 0 ? numbers[0] : '';
+                    result.push(thisResult);
+                }
+            } else if (itemType == 'phone_number') {
+                thisResult.phoneNumber = thisItem.id + '';
+                result.push(thisResult);
+            } else {
+                // if any other type comes in future , need to be handled.
+                continue;
+            }
+        }
+        return result;
+    },
+
+    _getRosterName: function(rosterId) {
+        var rosterGr = new GlideRecord('cmn_rota_roster');
+        if (rosterGr.get(rosterId))
+            return rosterGr.name;
+    },
+
+    _getUserByID: function(id) {
+        return this._getRecordBySysID('sys_user', id);
+    },
+
+    _getRecordBySysID: function(table, id) {
+        var record = new GlideRecord(table);
+        if (record.get(id))
+            return record;
+    },
+
+    _isUserActive: function(userId) {
+        var gr = new GlideRecord("sys_user");
+        return gr.get(userId) &amp;&amp; gr.active == true;
+    },
+
+
+    PROPERTIES: {
+        DEFAULT_ESCALATION_LEVEL: 'com.snc.notify.default.on_call_escalation_level',
+        DEFAULT_ESCALATE_CONFERENCE: 'com.snc.notify.default.conference_call_follow_on_call_escalation',
+        DEFAULT_ESCALATION_WORKFLOW: 'com.snc.notify.default.conference_call_escalation_workflow',
+        DEFAULT_NO_ROTA_ADD_ALL_GROUP_MEMBERS: 'com.snc.notify.default.add_all_members_on_no_rota_defined',
+
+        _getConferenceCallEscalationWorkflowSysId: function(sourceTableName) {
+            var pattern = /[0-9A-F]{32}/i;
+
+            if (!sourceTableName)
+                return;
+
+            var NOTIFY_BASE_PREFIX = 'com.snc.notify.';
+            var CONFERENCE_CALL_ESCALATION_WORKFLOW_SUFFIX = '.conference_call_escalation_workflow';
+
+            var propKey = NOTIFY_BASE_PREFIX + sourceTableName + CONFERENCE_CALL_ESCALATION_WORKFLOW_SUFFIX;
+            var workflowSysID = gs.getProperty(propKey);
+            if (workflowSysID &amp;&amp; pattern.test(workflowSysID.trim())) {
+                return workflowSysID.trim();
+            } else {
+                gs.warn("Configured workflow sysid for property '{0}' is not valid, hence using default property '{1}' value, if exists. ", propKey, this.DEFAULT_ESCALATION_WORKFLOW);
+            }
+
+            var defaultWorkflowSysID = gs.getProperty(this.DEFAULT_ESCALATION_WORKFLOW);
+            if (defaultWorkflowSysID &amp;&amp; pattern.test(defaultWorkflowSysID.trim()))
+                return defaultWorkflowSysID.trim();
+            else
+                gs.warn("Configured workflow sysid for property '{0}' is NOT valid.", this.DEFAULT_ESCALATION_WORKFLOW);
+
+            return;
+        },
+
+        _getOnCallEscalationLevel: function(sourceTableName) {
+            if (!sourceTableName)
+                return;
+
+            var NOTIFY_BASE_PREFIX = 'com.snc.notify.';
+            var ESCALATION_LEVEL_SUFFIX = '.on_call_escalation_level';
+
+            var propKey = NOTIFY_BASE_PREFIX + sourceTableName + ESCALATION_LEVEL_SUFFIX;
+            if (gs.getProperty(propKey) &amp;&amp; !isNaN(gs.getProperty(propKey)))
+                return gs.getProperty(propKey) * 1;
+
+            return gs.getProperty(this.DEFAULT_ESCALATION_LEVEL, 2) * 1;
+        },
+
+        _isFollowOnCallEscalationEnabled: function(sourceTableName) {
+            if (!sourceTableName)
+                return;
+
+            var NOTIFY_BASE_PREFIX = 'com.snc.notify.';
+            var ESCALATE_CONFERENCE_SUFFIX = '.conference_call_follow_on_call_escalation';
+            var propKey = NOTIFY_BASE_PREFIX + sourceTableName + ESCALATE_CONFERENCE_SUFFIX;
+
+            var propValue = gs.getProperty(propKey, "");
+            if (propValue != "") {
+                if (propValue == "true")
+                    return true;
+                else if (propValue == "false")
+                    return false;
+                else {
+                    gs.warn("Invalid property value. The value for the property '{0}' should be either true or false but is '{1}'", propKey, propValue);
+                    return;
+                }
+            }
+            return gs.getProperty(this.DEFAULT_ESCALATE_CONFERENCE) == "true";
+        },
+
+        _isAddAllMembersOnNoRotaEnabled: function(sourceTableName) {
+            if (!sourceTableName)
+                return;
+            var NOTIFY_BASE_PREFIX = 'com.snc.notify.';
+            var ADD_ALL_MEMBERS_ON_NO_ROTA = '.add_all_members_on_no_rota_defined';
+            var propKey = NOTIFY_BASE_PREFIX + sourceTableName + ADD_ALL_MEMBERS_ON_NO_ROTA;
+            var propValue = gs.getProperty(propKey, "");
+            if (propValue != "") {
+                if (propValue == "true")
+                    return true;
+                else if (propValue == "false")
+                    return false;
+                else {
+                    gs.warn("Invalid property value. The value for the property '{0}' should be either true or false but is '{1}'", propKey, propValue);
+                    return;
+                }
+            }
+            return gs.getProperty(this.DEFAULT_NO_ROTA_ADD_ALL_GROUP_MEMBERS) == "true";
+        }
+    },
+
+    isAddAllMembersOnNoRotaEnabled: function(sourceTableName) {
+        return this.PROPERTIES._isAddAllMembersOnNoRotaEnabled(sourceTableName);
+    },
+
+    getOnCallEscalationLevel: function(sourceTableName) {
+        return this.PROPERTIES._getOnCallEscalationLevel(sourceTableName);
+    },
+
+    isFollowOnCallEscalationEnabled: function(sourceTableName) {
+        return this.PROPERTIES._isFollowOnCallEscalationEnabled(sourceTableName);
+    },
+
+    getConferenceCallEscalationWorkflowSysId: function(sourceTableName) {
+        return this.PROPERTIES._getConferenceCallEscalationWorkflowSysId(sourceTableName);
+    },
+
+    type: 'OnCallNotifyUtilSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;kirankumar.nunna@snc&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-03-19 06:26:36&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1de5e64fdb27001014465c55dc961922&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;70&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;OnCallNotifyUtilSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Global" source="global"&gt;global&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1de5e64fdb27001014465c55dc961922&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-04-19 16:04:19&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:36</sys_created_on>
+        <sys_id>88d0f41983b01210c6695855eeaad3f9</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>OnCallNotifyUtilSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_88d0f41983b01210c6695855eeaad3f9</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:36</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

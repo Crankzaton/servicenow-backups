@@ -1,0 +1,1370 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>14b43246eb712100eae001e64206fe14</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.PlannedMaintenanceUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;SM Maintenance utilities&lt;/description&gt;
+        &lt;name&gt;PlannedMaintenanceUtils&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var PlannedMaintenanceUtils = Class.create();
+
+PlannedMaintenanceUtils.prototype = {
+
+    debug : gs.getProperty("planned_maintenance.debug",'false') == 'true',
+    fixedInterval : gs.getProperty("planned_maintenance.fixed_interval",'false'),
+    fixedMeter : gs.getProperty("planned_maintenance.fixed_meter",'false'),
+    checkDuplicate : gs.getProperty("planned_maintenance.check_duplicate",'false'),
+
+    initialize: function() {
+
+    },
+
+    //////////Dictionary filters/////////
+
+    getCommonParent: function(modelList) {
+        var modelArray = modelList.split(",");
+        var len = modelArray.length;
+        var tableParents = [];
+        var modelCatSys = "";
+        if (len == 0)
+            return;
+
+        if (len == 1) {
+            var model = new GlideRecord("cmdb_model");
+            return this._getCIClass(modelList);
+        }
+
+        var minSize = Infinity;
+
+        for(var i = 0 ; i &lt; len; i++) {
+            tableParents[i] = GlideDBObjectManager.get().getTables(this._getCIClass(modelArray[i])).toArray();
+            if (tableParents[i].length &lt; minSize )
+                minSize = tableParents[i].length;
+        }
+        var index = 0;
+        var pruneTree =  tableParents[0];
+        for (i = 1; i &lt; len ; i++ ) {
+            var compareTree = tableParents[i];
+            var pruneInd = pruneTree.length - minSize;
+            var compInd = compareTree.length - minSize;
+
+            while (pruneInd &lt; pruneTree.length){
+                if(pruneTree[pruneInd] == compareTree[compInd]){
+                    //prune both branches
+                    pruneTree = pruneTree.slice(pruneInd);
+                    break;
+                }
+                pruneInd++;
+                compInd++;
+            }
+        }
+        return pruneTree[0];
+    },
+
+    _getCIClass: function(modelList) {
+        var model = new GlideRecord("cmdb_model");
+        model.get(modelList);
+        var modelCatSys = model.cmdb_model_category.split(",")[0];
+        var gr = new GlideRecord("cmdb_model_category");
+        gr.get(modelCatSys);
+        return gr.cmdb_ci_class;
+    },
+
+    getModelFilter: function() {
+        var refQual = "";
+        var cat = new GlideRecord("cmdb_model_category");
+        cat.addQuery("cmdb_ci_class","!=" ,"");
+        cat.query();
+
+        while (cat.next())
+            refQual += "cmdb_model_categoryLIKE" + cat.sys_id + "^OR";
+
+        return refQual;
+    },
+
+    //////////ACL usage to determine if maint plan has schedule/////////
+
+    checkSchedule: function(current) {
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,current);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint.canUpdatePlanFilter(current);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: canUpdatePlanFilter - {0}", err);
+        }
+    },
+
+    hasAssociatedRecords: function(/*GlideRecord*/ record) {
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,record);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint.hasAssociatedRecords(record);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: hasAssociatedRecords - {0}", err);
+        }
+    },
+
+    hasAssociatedTemplates: function(/*GlideRecord*/ record) {
+
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,record);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint.hasAssociatedTemplates(record);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: hasAssociatedTemplates - {0}", err);
+        }
+    },
+
+    /////////UI Action calls ////////////
+    // link schedule to records
+
+    addPlan: function(current) {
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,current);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint.addPlan(current);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: AddPlan - {0}", err);
+        }
+    },
+
+    addSchedule: function(current) {
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,current);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint.addSchedule(current);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: AddSchedule - {0}", err);
+        }
+    },
+
+    // determining next run value
+    _addIntervalAndMeterTriggerData: function(scheduleGr, assetGr, newPlanGr) {
+        // Meter processing
+        this._computeMeterTriggerData(scheduleGr, assetGr, newPlanGr);
+
+        //Duration processing
+        this._computeIntervalTriggerData(scheduleGr, assetGr, newPlanGr);
+    },
+
+    // determining next run value
+    _computeMeterTriggerData: function(scheduleGr, assetGr, newPlanGr) {
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,scheduleGr);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint._computeMeterTriggerData(scheduleGr, assetGr, newPlanGr);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: _computeMeterTriggerData - {0} ", err);
+        }
+    },
+
+    // determining next run value
+    _addMeterTriggerData: function(scheduleGr, assetGr, newPlanGr) {
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,scheduleGr);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint._addMeterTriggerData(scheduleGr, assetGr, newPlanGr);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: _addMeterTriggerData - {0} ", err);
+        }
+    },
+
+    // get next run time
+    _computeIntervalTriggerData: function(scheduleGr, assetGr, newPlanGr, next_action) {
+        // Only Interval durations are calculated based on last run time.
+        // Scheduled durations should be calculated normally.  The next_action value is
+        // only used in the interval type glide recurrence
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,scheduleGr);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint._computeIntervalTriggerData(scheduleGr, assetGr, newPlanGr, next_action);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: _computeIntervalTriggerData - {0} ", err);
+        }
+    },
+
+    // get next run time
+    _addIntervalTriggerData: function(scheduleGr, assetGr, newPlanGr, next_action) {
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,scheduleGr);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint._addIntervalTriggerData(scheduleGr, assetGr, newPlanGr, next_action);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: _addIntervalTriggerData - {0} ", err);
+        }
+    },
+
+    // Syncs the maintenance plan and auto generated business rule on selected table
+    applyPlanToNewRecords: function(current) {
+        var businessRule = current.business_rule;
+        var applyToNew = current.apply_to_new;
+        var modelBased = (current.type == "model_based" || current.type == "install_base") ? true : false;
+
+        // If apply to new is false &amp;&amp; business rule is not empty
+        // Delete business rule from "current"
+        if ((!applyToNew || modelBased) &amp;&amp; businessRule)
+            this._deleteBusinessRule(current.business_rule);
+
+        // If apply to new is true
+        // Add Business rule onto "table"
+        else if (applyToNew &amp;&amp; !modelBased)
+            this._addForeignBusinessRule(current);
+
+        // Case 3 - If apply to new is false &amp;&amp; business rule is empty --&gt; Do nothing
+
+        // Case 4 - If apply to new is true &amp;&amp; business rule is not empty --&gt; Do nothing
+    },
+
+    _deleteBusinessRule: function(brId) {
+        var brGr = new GlideRecord('sys_script');
+        brGr.get(brId);
+        // Inactivating the BR, instead of deleting.
+        brGr.active = false;
+        brGr.update();
+    },
+
+    _addForeignBusinessRule: function(planGr) {
+        var brGr = new GlideRecord('sys_script');
+        if (!planGr.business_rule.nil()) {
+            brGr.get(planGr.business_rule);
+            if (this._wrongBusinessRule(brGr, planGr)) {
+                // Deleting the child table BR
+                this._deleteBusinessRule(planGr.business_rule);
+                planGr.business_rule = "";
+            } else {
+                if(!brGr.script.includes(PlannedMaintenanceConstants.AUTO_MAINTENANCE_RULE_METHOD)){
+                    // Deleting the child table BR
+                    this._deleteBusinessRule(planGr.business_rule);
+                    planGr.business_rule = "";
+                } else {
+                    return;
+                }
+            }
+        }
+
+        brGr.name = PlannedMaintenanceConstants.AUTO_MAINTENANCE_RULE;
+        if ( (planGr.type).equals("general")) {
+            brGr.collection = planGr.table;
+            // Looking for the existing BR on absolute base table of selected table on given Plan.
+            var _existingBr = this._getExistingGeneralAutoMaintenanceBR(planGr);
+            if(_existingBr.next()) {
+                // If there is existing BR on absolute base table, then reusing the same for current plan.
+                // Making sure updating the latest condition and script on the BR
+                this._addConditionAndScript(_existingBr);
+                _existingBr.update();
+                // Updating the plan with existing BR
+                planGr.business_rule = _existingBr.sys_id;
+                planGr.update();
+                return;
+            }
+            brGr.action_insert = true;
+            brGr.action_update = true;
+            brGr.active = true;
+            brGr.when = 'after';
+            // Adding condition and script.
+            this._addConditionAndScript(brGr);
+            var br;
+            if (planGr.business_rule.nil()) {
+                br = brGr.insert();
+                planGr.business_rule = br;
+                planGr.update();
+            } else {
+                br = brGr.update();
+            }
+        }
+    },
+
+    _addConditionAndScript : function (autoBrGr) {
+        autoBrGr.condition = "(new global.PlannedMaintenanceUtils().isGeneralMatchingPlans(current));";	// need to check plans that have this record.
+        autoBrGr.script = "(new global.PlannedMaintenanceUtils().associateSourceToMatchingGeneralPlanRecords(current));";	// need to add maint plan to this record.  Assumes this record matches some plan's filter.  Apply schedule to each element
+        return;
+    },
+
+    _getExistingGeneralAutoMaintenanceBR : function (planGr) {
+        var gr = new GlideRecord('sys_script');
+        gr.addQuery("collection", planGr.table);
+        gr.addQuery("name", PlannedMaintenanceConstants.AUTO_MAINTENANCE_RULE);
+        gr.addQuery("script", "CONTAINS" ,PlannedMaintenanceConstants.AUTO_MAINTENANCE_RULE_METHOD);
+        gr.addActiveQuery();
+        gr.setLimit(1);
+        gr.query();
+        return gr;
+    },
+
+    _getBaseTable : function (tableName) {
+        var table = new TableUtils(tableName);
+        return table.getAbsoluteBase();
+    },
+
+    // verifying auto generate business rule
+    _wrongBusinessRule: function(brGr, planGr) {
+        return brGr.collection != planGr.table;
+    },
+
+
+    //////////////////////////Maintenance plan calculations//////////////////
+    // Check current and see if it falls under any Maintenance Plan's table filter condition
+    conditionCheck: function(current, planId) {
+        var retVal = true;
+
+        // Get plans
+        var plan = new GlideRecord(PlannedMaintenanceConstants.SM_MAINT_PLAN);
+        plan.get(planId);
+
+        // Have the plan, check if it is model or general
+        // if model, check if it exists in the specified table first, then check against conidition
+        if (plan.type.equals("model_based")) {
+            var table = plan.table;
+            if (global.JSUtil.nil(table))
+                return false;
+            var modelTable = new GlideRecord(table);
+            if (!modelTable.isValid())
+                return false;
+
+            if (!modelTable.get("sys_id", current.sys_id))
+                return false;
+
+            if ((plan.model.toString()).indexOf(current.model_id) &lt; 0)
+                return false;
+        }
+
+        //If current record is already under the given plan's -&gt; maintenance plan record, skip the updates
+
+        var isAssetPresent = this.isAssetInMaintPlanRecTable(current,planId);
+        if(isAssetPresent == true)
+            return false;
+
+        if (!(plan.filter_condition.nil())) {
+            var f = new GlideFilter(plan.filter_condition, "rule-condition");
+            f.setCaseSensitive(false);
+            retVal = f.match(current, true);
+        }
+
+        return retVal;
+    },
+
+    // used when this new record should be associated to some maintenance plans
+    associateRecord: function(current, planId) {
+        var planGr = new GlideRecord(PlannedMaintenanceConstants.SM_MAINT_PLAN);
+        planGr.get(planId);
+
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,planGr);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint.associateRecord(current, planId);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: associateRecord - {0}", err);
+        }
+    },
+
+    // Called by business rule to update m2m records when a schedule is modified
+    updateScheduleRecords: function(current, previous) {
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,current);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint.updateScheduleRecords(current,previous);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: updateScheduleRecords - {0}", err);
+        }
+    },
+
+    // Check if any of the meter or run time values have changed.  If so we need to update the run time/value on associated records
+    _checkRunParams: function(current, previous) {
+        var retVal = ((current.repetition.toString()  !=  previous.repetition.toString()) ||
+            (current.every.toString()  !=  previous.every.toString()) ||
+            (current.field.toString()  !=  previous.field.toString()) ||
+            (current.repeat.toString()  !=  previous.repeat.toString()) ||
+            (current.lead_time.toString()  !=  previous.lead_time.toString()) ||
+            (current.trigger_type.toString()  !=  previous.trigger_type.toString()) ||
+            (current.run_dayofweek.toString()  !=  previous.run_dayofweek.toString()) ||
+            (current.run_dayofmonth.toString()  !=  previous.run_dayofmonth.toString()) ||
+            (current.run_month.toString() !=  previous.run_month.toString()) ||
+            (current.run_time.toString() !=  previous.run_time.toString()) ||
+            (current.run_weekinmonth.toString() !=  previous.run_weekinmonth.toString()));
+        return retVal;
+    },
+
+    checkRepetition: function(current) {
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,current);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint.checkRepetition(current);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: checkRepetition - {0}", err);
+        }
+    },
+
+    _creatingm2mForNewAssets : function(assetGr, m2mGr) {
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,m2mGr);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint._creatingm2mForNewAssets(assetGr, m2mGr);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: _creatingm2mForNewAssets - {0}", err);
+        }
+    },
+
+    // Function to update next run time/run value ONLY when all Service Orders on an m2m record are complete
+    updateMaintPlanRecords: function(serviceOrder) {
+
+        if (serviceOrder.maintenance_plan.nil() || serviceOrder.maintenance_schedule.nil())
+            return;
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,serviceOrder.maintenance_schedule);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint.updateMaintPlanRecords(serviceOrder);
+            }
+        } catch (err) {
+            gs.error("Error in PlannedMaintenanceExtPoint: updateMaintPlanRecords - "+ err);
+        }
+    },
+
+    _updateMeterPlanRecords: function(scheduleGr, assetGr, m2mGr) {
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,scheduleGr);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint._updateMeterPlanRecords(scheduleGr, assetGr, m2mGr);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: _updateMeterPlanRecords - {0}", err);
+        }
+    },
+
+    _updateDurationPlanRecords: function(scheduleGr, assetGr, m2mGr, nightly) {
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,scheduleGr);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint._updateDurationPlanRecords(scheduleGr, assetGr, m2mGr, nightly);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: _updateDurationPlanRecords - {0}", err);
+        }
+
+    },
+
+    _recalcDurationRunAndRequestTime: function(scheduleGr, m2mGr) {
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,scheduleGr);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint._recalcDurationRunAndRequestTime(scheduleGr, m2mGr);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: _recalcDurationRunAndRequestTime - {0}", err);
+        }
+    },
+
+    // Helper function to see if this m2m record has any open service orders still (Do not update run time/value until all
+    // associated work orders are finished (ie: the schedule has 2 order models attached)
+    _isOpenM2mCreatedOrders: function(recordTable, recordId, schedule) {
+        var order = new GlideRecord('sm_order');
+        order.addQuery('record_table', recordTable);
+        order.addQuery('record_id', recordId);
+        order.addQuery('maintenance_schedule', schedule);
+        order.addQuery('state', 'NOT IN', '3,4,7');
+        order.setLimit(1);
+        order.query();
+
+        return (order.getRowCount() &gt; 0);
+    },
+
+    // Add asset CI's to m2m record if required
+    _addAssetRecord: function(m2mGr, docTable, sourceId) {
+        var CI = new GlideRecord(docTable);
+        CI.get(sourceId);
+        m2mGr.asset = CI.asset;
+    },
+
+    //////////////////// Scheduled job functions/////////////////
+    scheduleAdhoc: function(/*GlideRecord?*/ record, dateStr) {
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,record);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint.scheduleAdhoc(record, dateStr);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: scheduleAdhoc - {0}", err);
+        }
+    },
+
+    _updateM2MSchedule: function(/*GlideRecord*/ m2mGr){
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,m2mGr);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint._updateM2MSchedule(m2mGr);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: _updateM2MSchedule - {0}", err);
+        }
+    },
+
+    _updateM2MMeterSchedule: function(/*GlideRecord*/ m2mGr){
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,m2mGr);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint._updateM2MMeterSchedule(m2mGr);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: _updateM2MMeterSchedule - {0}", err);
+        }
+    },
+
+    checkSchedules: function(/*GlideRecord?*/ record,generateWO, runDateTime) {
+
+        var planId, scheduleId, onDemand = false;
+        if (record) {
+            if(gs.nil(generateWO) || !generateWO)
+                onDemand = true;
+            var table = new TableUtils(record.getTableName());
+            var baseTable = table.getAbsoluteBase();
+            if (baseTable == PlannedMaintenanceConstants.SM_MAINT_PLAN)
+                planId = record.sys_id + '';
+            else if (baseTable == PlannedMaintenanceConstants.SM_SCHEDULE)
+                scheduleId = record.sys_id + '';
+        }
+
+        // Creat orders for all active plans
+        this.createOrderForMaintenancePlans(record, planId, scheduleId, onDemand, runDateTime);
+    },
+
+    _createOrdersForScheduleMeterMatchingAssets: function(/*GlideRecord?*/ record, planId, scheduleId, onDemand) {
+        var m2m = new GlideRecord(PlannedMaintenanceConstants.SM_M2M_PLAN_RECORD);
+        m2m.addNotNullQuery("next_run_value");
+        m2m.addNullQuery("next_run_time");
+        m2m.addQuery("active", true);
+        if (planId)
+            m2m.addQuery("schedule.plan", planId);
+        else if (scheduleId)
+            m2m.addQuery("schedule", scheduleId);
+        m2m.query();
+        while (m2m.next()) {
+            try{
+                var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,m2m);
+                if (pmExtPoint){
+                    pmExtPoint.initialize();
+                    pmExtPoint._createOrdersForScheduleMeterMatchingAssets(m2m, planId, scheduleId, onDemand);
+                }
+            }
+			catch (err) {
+                gs.error("PlannedMaintenanceExtPoint: _createOrdersForScheduleMeterMatchingAssets - {0}", err);
+            }
+        }
+    },
+    _createOrdersForScheduleDurationMatchingAssets: function(/*GlideRecord?*/ record, planId, scheduleId, onDemand, runDateTime) {
+        var m2m = new GlideRecord(PlannedMaintenanceConstants.SM_M2M_PLAN_RECORD);
+        m2m.addNotNullQuery("next_run_time");
+        m2m.addNullQuery("next_run_value");
+        m2m.addQuery("active", true);
+        if (planId)
+            m2m.addQuery("schedule.plan", planId);
+        else if (scheduleId)
+            m2m.addQuery("schedule", scheduleId);
+        if(!onDemand){
+            if(gs.nil(runDateTime)){
+                runDateTime = new GlideDateTime(gs.endOfToday());
+            } else {
+                var selectedRunDateTime = runDateTime;
+                runDateTime = new GlideDateTime();
+                runDateTime.setDisplayValue(selectedRunDateTime);
+            }
+            m2m.addQuery("next_run_time", "&lt;=", new GlideDateTime(runDateTime));
+        }
+        m2m.query();
+        while(m2m.next()){
+            try {
+                var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,m2m);
+                if (pmExtPoint){
+                    pmExtPoint.initialize();
+                    pmExtPoint.createOrdersForScheduleDurationMatchingAssetsHelper(m2m,onDemand);
+                }
+            } catch (err) {
+                gs.error("PlannedMaintenanceExtPoint: createOrdersForScheduleDurationMatchingAssetsHelper - {0}", err);
+            }
+        }
+    },
+    _createOrdersForScheduleDurationOrMeterMatchingAssets: function(/*GlideRecord?*/ record, planId, scheduleId, onDemand) {
+        var m2m = new GlideRecord(PlannedMaintenanceConstants.SM_M2M_PLAN_RECORD);
+        m2m.addNotNullQuery("next_run_time");
+        m2m.addNotNullQuery("next_run_value");
+        m2m.addQuery("active", true);
+        if (planId)
+            m2m.addQuery("schedule.plan", planId);
+        else if (scheduleId)
+            m2m.addQuery("schedule", scheduleId);
+        m2m.query();
+        while(m2m.next()){
+            try {
+                var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,m2m);
+                if (pmExtPoint){
+                    pmExtPoint.initialize();
+                    pmExtPoint._createOrdersForScheduleDurationOrMeterMatchingAssets(m2m, planId, scheduleId, onDemand);
+                }
+            }
+			catch(err) {
+                gs.error("PlannedMaintenanceExtPoint: _createOrdersForScheduleDurationOrMeterMatchingAssets - {0}", err);
+            }
+        }
+    },
+    /**
+     * Create orders for assets that have m2m records that are tied to
+     * a schedule with repetition = condition.  If an asset matches that
+     * condition, follow the standard flow for creating a work order.
+     */
+    _createOrdersForScheduleConditionMatchingAssets: function(/*GlideRecord?*/ record, planId, scheduleId) {
+        var scheduleGr = new GlideRecord("sm_schedule");
+        scheduleGr.addQuery("repetition", "condition");
+        scheduleGr.addQuery("active", true);
+        if (planId)
+            scheduleGr.addQuery("plan", planId);
+        else if (scheduleId)
+            scheduleGr.addQuery("sys_id", scheduleId);
+        scheduleGr.query();
+        while(scheduleGr.next()){
+            try {
+                var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,scheduleGr);
+                if (pmExtPoint){
+                    pmExtPoint.initialize();
+                    pmExtPoint.processScheduleConditionMatchingAssets(scheduleGr);
+                }
+            } catch (err) {
+                gs.error("PlannedMaintenanceExtPoint: processScheduleConditionMatchingAssets - {0}", err);
+            }
+        }
+    },
+    _createOrdersForScheduleScriptMatchingAssets: function(/*GlideRecord?*/ record, planId, scheduleId) {
+        var scheduleGr = new GlideRecord("sm_schedule");
+        scheduleGr.addQuery("repetition", "script");
+        scheduleGr.addQuery("active", true);
+        if (planId)
+            scheduleGr.addQuery("plan", planId);
+        else if (scheduleId)
+            scheduleGr.addQuery("sys_id", scheduleId);
+        scheduleGr.query();
+        while (scheduleGr.next()) {
+            try {
+                var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,scheduleGr);
+                if (pmExtPoint){
+                    pmExtPoint.initialize();
+                    pmExtPoint.processScheduleScriptMatchingAssets(scheduleGr);
+                }
+            } catch (err) {
+                gs.error("PlannedMaintenanceExtPoint: processScheduleScriptMatchingAssets - {0}", err);
+            }
+        }
+    },
+
+    createOrderForMaintenancePlans : function (record, planId, scheduleId, onDemand, runDateTime){
+        if(onDemand) {
+            if(this.isEmptyValue(planId) &amp;&amp; this.isEmptyValue(scheduleId)) {
+                return;
+            }
+        } else {
+            if(gs.nil(runDateTime)){
+                runDateTime = new GlideDateTime(gs.endOfToday());
+            } else {
+                var selectedRunDateTime = runDateTime;
+                runDateTime = new GlideDateTime();
+                runDateTime.setDisplayValue(selectedRunDateTime);
+            }
+        }
+        if(!gs.nil(planId)) {
+            var planGr = this.getPlan(planId);
+            this.performBatchProcessingByPlan (planGr,onDemand, runDateTime);
+        } else if(!gs.nil(scheduleId)) {
+            var schduleGr = this.getSchedule(scheduleId);
+            this.performBatchProcessingBySchedule(schduleGr,onDemand, runDateTime);
+        } else {
+            var _planGr = this.getActivePlans();
+            while(_planGr.next()) {
+                // Raise a event to perform order generation at each plan
+                gs.eventQueue(PlannedMaintenanceConstants.BATCH_GENERATE_ORDER_PLAN_EVENT, _planGr, onDemand, runDateTime,PlannedMaintenanceConstants.BATCH_GENERATE_ORDER_QUEUE);
+            }
+        }
+    },
+
+    _createOrdersForScheduleDurationMatchingAssets: function(/*GlideRecord?*/ record, planId, scheduleId, onDemand, runDateTime) {
+
+        if(onDemand) {
+            if(this.isEmptyValue(planId) &amp;&amp; this.isEmptyValue(scheduleId)) {
+                return;
+            }
+        } else {
+            if(gs.nil(runDateTime)){
+                runDateTime = new GlideDateTime(gs.endOfToday());
+            } else {
+                var selectedRunDateTime = runDateTime;
+                runDateTime = new GlideDateTime();
+                runDateTime.setDisplayValue(selectedRunDateTime);
+            }
+        }
+        if(!gs.nil(planId)) {
+            var planGr = this.getPlan(planId);
+            this.performBatchProcessingByPlan (planGr,runDateTime, PlannedMaintenanceConstants.DURATION_TRIGGER);
+        } else if(!gs.nil(scheduleId)) {
+            var schduleGr = this.getSchedule(scheduleId);
+            this.performBatchProcessingBySchedule(schduleGr,onDemand, runDateTime);
+        } else {
+            var _planGr = this.getActivePlans();
+            while(_planGr.next()) {
+                // Raise a event to perform order generation at each plan
+                gs.eventQueue(PlannedMaintenanceConstants.BATCH_GENERATE_ORDER_PLAN_EVENT, _planGr, onDemand, runDateTime, PlannedMaintenanceConstants.BATCH_GENERATE_ORDER_QUEUE);
+            }
+        }
+    },
+
+    isEmptyValue : function (value) {
+        return (gs.nil(value) || value == 'undefined' || value == 'null');
+    },
+
+    getPlan : function (planId) {
+        var plan = new GlideRecord(PlannedMaintenanceConstants.SM_MAINT_PLAN);
+        plan.get(planId);
+        return plan;
+    },
+
+    getSchedule : function (scheduleId) {
+        var scheduleGr = new GlideRecord(PlannedMaintenanceConstants.SM_SCHEDULE);
+        scheduleGr.get(scheduleId);
+        return scheduleGr;
+    },
+
+    _isDurationBasedSchedule : function (scheduleGr) {
+        return (scheduleGr.repetition == PlannedMaintenanceConstants.DURATION_TRIGGER || scheduleGr.repetition == PlannedMaintenanceConstants.DURATIONORMETER_TRIGGER);
+    },
+
+    getActivePlans : function () {
+        var plan = new GlideRecord(PlannedMaintenanceConstants.SM_MAINT_PLAN);
+        plan.addActiveQuery();
+        //plan.addQuery("sys_id","d62ebc261b2f2d90bcd1ed33604bcbeb");
+        plan.query();
+        return plan;
+    },
+
+    getActiveSchedulesByPlan : function (planId, trigger) {
+        var scheduleGr = new GlideRecord(PlannedMaintenanceConstants.SM_SCHEDULE);
+        if(!gs.nil(trigger)) {
+            scheduleGr.addQuery("repetition", trigger);
+        }
+        scheduleGr.addQuery("active", true);
+        scheduleGr.addQuery("plan", planId);
+        scheduleGr.query();
+        return scheduleGr;
+    },
+
+    performBatchProcessingByPlan : function (planGr, onDemand, runDateTime) {
+        var runDateTimeStr = PlannedMaintenanceConstants.EMPTY_STRING;
+        if(!this.isEmptyValue(runDateTime)){
+            runDateTime = new GlideDateTime(runDateTime);
+            runDateTimeStr = runDateTime.getValue();
+        }
+        // Get all active duration based schedules
+        var scheduleGr = this.getActiveSchedulesByPlan(planGr.sys_id);
+        while (scheduleGr.next()) {
+			var pmExtPoint = null;
+            try {
+                if (gs.nil(pmExtPoint)) {
+                    pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT, scheduleGr);
+                }
+                if (!gs.nil(pmExtPoint)) {
+                    pmExtPoint.initialize();
+                    pmExtPoint.generateEventForScheduleBatchProcess(scheduleGr, onDemand, runDateTimeStr);
+                }
+            } catch (err) {
+                gs.error("PlannedMaintenanceExtPoint: generateEventForScheduleBatchProcess - {0}", err);
+            }
+        }
+    },
+
+    performBatchProcessingBySchedule : function ( scheduleGr, onDemand, runDateTime) {
+        try {
+            var m2m = new GlideRecord(PlannedMaintenanceConstants.SM_M2M_PLAN_RECORD);
+            if(!this.isEmptyValue(runDateTime) &amp;&amp; this._isDurationBasedSchedule(scheduleGr)) {
+                m2m.addQuery("next_run_time", "&lt;=", new GlideDateTime(runDateTime));
+            }
+            m2m.addQuery("active", true);
+            m2m.addQuery("schedule", scheduleGr.sys_id);
+            m2m.query();
+            if(m2m.hasNext()) {
+                while(m2m.next()){
+                    // Raise a event to perform order generation at each plan record set level.
+                    gs.eventQueue(PlannedMaintenanceConstants.BATCH_GENERATE_ORDER_EVENT, m2m, PlannedMaintenanceConstants.EMPTY_STRING, onDemand, PlannedMaintenanceConstants.BATCH_GENERATE_ORDER_QUEUE);
+                }
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceUtil: performBatchProcessingBySchedule - {0}", err);
+        }
+    },
+
+	performBatchProcessingByWMSchedule: function(scheduleGr, onDemand, runDateTime) {
+        try {
+            var m2m = new GlideRecord(PlannedMaintenanceConstants.WM_M2M_PLAN_RECORD);
+            m2m.addQuery("active", true);
+            m2m.addQuery("schedule", scheduleGr.sys_id);
+            m2m.query();
+            if (m2m.hasNext()) {
+                while (m2m.next()) {
+                    // Raise a event to perform order generation at each plan record set level.
+                    gs.eventQueue(PlannedMaintenanceConstants.BATCH_GENERATE_ORDER_EVENT, m2m, PlannedMaintenanceConstants.EMPTY_STRING, onDemand, PlannedMaintenanceConstants.BATCH_GENERATE_ORDER_QUEUE);
+                }
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceUtil: performBatchProcessingByWMSchedule - {0}", err);
+        }
+    },
+
+    // planRecords is of type List refer to GR-&gt;sm_m2m_maint_plan_to_record
+    // onDemand will be true when "Run on demand" UI action is being used.
+    createOrdersByPlanRecords : function (planRecords, onDemand) {
+        var _onDemand = false;
+        if(this.isEmptyValue(planRecords)) {
+            return;
+        }
+        if(onDemand == PlannedMaintenanceConstants.BOOLEAN_TRUE || onDemand == true){
+            _onDemand = true;
+        }
+        var pmExtPoint = null;
+        for (var i in planRecords) {
+            try {
+                if(gs.nil(pmExtPoint)) {
+                    pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,planRecords[i]);
+                }
+                if (!gs.nil(pmExtPoint)){
+                    pmExtPoint.initialize();
+                    this.createOrderBasedOnTrigger(planRecords[i], _onDemand, pmExtPoint );
+                }
+            } catch (err) {
+                gs.error("PlannedMaintenanceExtPoint: createOrdersByPlanRecords - {0}", err);
+            }
+        }
+    },
+
+    createOrderBasedOnTrigger :function ( planRecord, onDemand, pmExtPoint ) {
+        if(gs.nil(pmExtPoint)) {
+            pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,planRecord);
+        }
+        var trigger = planRecord.schedule.repetition+PlannedMaintenanceConstants.EMPTY_STRING;
+        switch (trigger) {
+            case PlannedMaintenanceConstants.DURATION_TRIGGER:
+                pmExtPoint.createOrdersForScheduleDurationMatchingAssetsHelper(planRecord, onDemand);
+                break;
+            case PlannedMaintenanceConstants.METER_TRIGGER:
+                pmExtPoint._createOrdersForScheduleMeterMatchingAssets(planRecord,null,null, onDemand);
+                break;
+            case PlannedMaintenanceConstants.DURATIONORMETER_TRIGGER:
+                pmExtPoint._createOrdersForScheduleDurationOrMeterMatchingAssets(planRecord,null,null, onDemand);
+                break;
+            case PlannedMaintenanceConstants.CONDITION_TRIGGER:
+                pmExtPoint.createOrderForConditionSchedulePlanRecord(planRecord);
+                break;
+            case PlannedMaintenanceConstants.SCRIPT_TRIGGER:
+                pmExtPoint.createOrderForScriptSchedulePlanRecord(planRecord);
+                break;
+            default:
+                return;
+        }
+    },
+
+
+
+    _checkM2mRecordsValid : function(/*GlideRecord?*/ record, planId, scheduleId) {
+        var scheduleGr = new GlideRecord(PlannedMaintenanceConstants.SM_SCHEDULE);
+        if (planId)
+            scheduleGr.addQuery("plan", planId);
+        else if (scheduleId)
+            scheduleGr.addQuery("sys_id", scheduleId);
+        scheduleGr.query();
+        while (scheduleGr.next()){
+            try {
+                var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,scheduleGr);
+                if (pmExtPoint){
+                    pmExtPoint.initialize();
+                    pmExtPoint._removem2mRecordsForDeletedAssets(scheduleGr);
+                }
+            } catch (err) {
+                gs.error("PlannedMaintenanceExtPoint: _removem2mRecordsForDeletedAssets - {0}", err);
+            }
+        }
+    },
+
+    _getScheduleRecord : function (planSysId, scheduleSysId){
+        var scheduleGr = new GlideRecord(PlannedMaintenanceConstants.SM_SCHEDULE);
+        if (!gs.nil(planSysId)){
+            scheduleGr.addQuery("plan", planSysId);
+        } else if (!gs.nil(scheduleSysId)) {
+            scheduleGr.addQuery("sys_id", scheduleSysId);
+        }
+        scheduleGr.setLimit(1);
+        scheduleGr.query();
+        scheduleGr.next();
+        return scheduleGr;
+    },
+
+    _getCurrentValue: function(gr) {
+        var fieldName = gr.field_name+'';
+        var table = gr.document_table+'';
+        var sys = gr.source_id+'';
+        var tableRecord = new GlideRecord(table);
+        tableRecord.get(sys);
+        var currVal = tableRecord.getValue(fieldName);
+        return currVal;
+    },
+
+    _createOrder: function(gr) {
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,gr);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint._createOrder(gr);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: _createOrder - {0}", err);
+        }
+    },
+
+    _createOrderBasedOnModel:function(scheduleSys, planSys, modelSys, itemTable, itemSys, requestedDueBy, leadTime) {
+        try {
+            // Getting Schedule based schedule sys Id
+            var scheduleGr = new GlideRecord(PlannedMaintenanceConstants.SM_SCHEDULE);
+            scheduleGr.get(scheduleSys);
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,scheduleGr);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint._createOrderBasedOnModel(scheduleSys, planSys, modelSys, itemTable, itemSys, requestedDueBy, leadTime);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: _createOrderBasedOnModel - {0}", err);
+        }
+    },
+
+    _createWorkOrderFromTemplate: function(model, mainTable, itemTable, itemSys, planSys, scheduleSys, requestedDueBy, leadTime) {
+        try {
+            // Getting Schedule based schedule sys Id
+            var scheduleGr = new GlideRecord(PlannedMaintenanceConstants.SM_SCHEDULE);
+            scheduleGr.get(scheduleSys);
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,scheduleGr);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint._createWorkOrderFromTemplate(model, mainTable, itemTable, itemSys, planSys, scheduleSys, requestedDueBy, leadTime);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: _createWorkOrderFromTemplate - {0}", err);
+        }
+    },
+
+    _cancelExistingMaintenanceOrders: function(schedule, recordTable, recordId) {
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,schedule);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint._cancelExistingMaintenanceOrders(schedule, recordTable, recordId);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: _cancelExistingMaintenanceOrders - {0}", err);
+        }
+    },
+
+    _skipCreatingMaintenanceOrder: function(schedule, recordTable, recordId, requestedDueBy) {
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,schedule);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint._skipCreatingMaintenanceOrder(schedule, recordTable, recordId, requestedDueBy);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: _skipCreatingMaintenanceOrder - {0}", err);
+        }
+    },
+
+    _hasOpenMaintRecords: function(schedule, recordTable, recordId) {
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,schedule);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint._hasOpenMaintRecords(schedule, recordTable, recordId);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: _hasOpenMaintRecords - {0}", err);
+        }
+    },
+
+    _removem2mRecordsForDeletedAssets: function(scheduleGr) {
+        // get all m2m records
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,scheduleGr);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint._removem2mRecordsForDeletedAssets(scheduleGr);
+            }
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: _removem2mRecordsForDeletedAssets - {0}", err);
+        }
+    },
+
+    checkMaintSchedulesExist: function(current) {
+        try {
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,current);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint.checkMaintSchedulesExist(current);
+            }
+
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: checkMaintSchedulesExist - {0}", err);
+        }
+    },
+
+    //////////// Code for associating records based on cmdb_ci ////////////
+
+    // Check current (cmdb_ci glide record) and see if it falls under any Maintenance Plan's table filter condition
+
+    isCIMatchingPlans : function(currentSourceItem, previousSourceItem) {
+        var retVal = false;
+        // If model Id is null then returning false.
+        if(gs.nil(current.model_id)) {
+            return retVal;
+        }
+        // Verifying the model field.
+        if( gs.nil(currentSourceItem.model_id) &amp;&amp; (gs.nil(previousSourceItem) || gs.nil(previousSourceItem.model_id)) ) {
+            return retVal;
+        }
+        var plan = this.getMatchedPlanGRsBasedOnTable(currentSourceItem, PlannedMaintenanceConstants.PLAN_TYPE_MODEL_BASED);
+        while(plan.next()){
+            retVal = this.isMatchingPlanFilterCondition(plan,currentSourceItem);
+            if(retVal) {
+                break;
+            }
+        }
+        if(!retVal &amp;&amp; this.isActiveSourcePresent(currentSourceItem)){
+            retVal = true;
+        }
+        return retVal;
+    },
+
+    isGeneralMatchingPlans : function(sourceItem) {
+        var retVal = false;
+        var plan = this.getMatchedPlanGRsBasedOnTable(sourceItem, PlannedMaintenanceConstants.PLAN_TYPE_GENERAL);
+        while(plan.next()){
+            retVal = this.isMatchingPlanFilterCondition(plan,sourceItem);
+            if(retVal) {
+                break;
+            }
+        }
+        if(!retVal &amp;&amp; this.isActiveSourcePresent(sourceItem)){
+            retVal = true;
+        }
+        return retVal;
+    },
+
+
+
+    // Check current (cmdb_ci glide record) and return Maintenance Plan's records that matches filter condition
+    getMatchingPlanRecords : function(sourceItem){
+        var planIds = [];
+        var plan = this.getModelBasedPlanGRs(sourceItem);
+        while(plan.next()){
+            if(this.isMatchingPlanFilterCondition(plan,sourceItem)) {
+                planIds.push(plan.sys_id+'');
+            }
+        }
+        return planIds;
+    },
+
+    getMatchingPlanRecordsForSelectedItem : function(sourceItem, planType){
+        // planIds - List of all plans with condition matched.
+        var planIds = [];
+        var plan = this.getMatchedPlanGRsBasedOnTable(sourceItem, planType);
+        while(plan.next()){
+            var isAssetPresent = this.isAssetInMaintPlanRecTable(sourceItem,plan.sys_id);
+            var isMatchingPlanFilterCondition = this.isMatchingPlanFilterCondition(plan,sourceItem);
+            if(plan.sys_class_name == 'wm_planned_work_plan'){
+                // For plan work management we allow all updates since schedule occurence is created if WO is not created.
+                // Only when plan is not matching condition and asset is also not present then there is no m2m to update/create.
+                if((!isMatchingPlanFilterCondition &amp;&amp; !isAssetPresent)){
+                    continue;
+                }
+				else{
+                    planIds.push(plan.sys_id+PlannedMaintenanceConstants.EMPTY_STRING);
+                }
+            }
+			else{
+                // For maintenance plans don't allow changes when asset is //already present as work order is not created. Hence allowing only when:
+                // 1. Plan is matcing filter condition and asset is already not present in which case new m2m would be created.
+                // 2. plan is not matching filter condition but asset is already present in plan (This is because the update to asset was such that now its not matching filter condition anymore.)
+                //   In this case the plan will remove m2m for deleted assets going forward into the associateRecord function.
+                if((isMatchingPlanFilterCondition &amp;&amp; !isAssetPresent) || (!isMatchingPlanFilterCondition &amp;&amp; isAssetPresent)){
+                    planIds.push(plan.sys_id+PlannedMaintenanceConstants.EMPTY_STRING);
+                }
+            }
+        }
+        return planIds;
+    },
+
+    isAssetInMaintPlanRecTable : function(assetGr, planId){
+        var m2mGr = new GlideRecord(PlannedMaintenanceConstants.SM_M2M_PLAN_RECORD);
+        m2mGr.addQuery("schedule.plan",planId);
+        m2mGr.addQuery("source_id",assetGr.sys_id);
+        m2mGr.setLimit(1);
+        m2mGr.query();
+        if(m2mGr.hasNext())
+            return true;
+        return false;
+    },
+
+    // Associate plan records for all the matching plan records
+    associateMatchingCIPlanRecords : function(sourceItem){
+        var planIds = this.getMatchingPlanRecordsForSelectedItem(sourceItem, PlannedMaintenanceConstants.PLAN_TYPE_MODEL_BASED);
+        for(var i=0 ; i &lt; planIds.length; i++){
+            this.associateRecord(sourceItem,planIds[i]);
+        }
+    },
+
+    associateSourceToMatchingGeneralPlanRecords : function(sourceItem){
+        var planIds = this.getMatchingPlanRecordsForSelectedItem(sourceItem, PlannedMaintenanceConstants.PLAN_TYPE_GENERAL);
+        for(var i=0 ; i &lt; planIds.length; i++){
+            this.associateRecord(sourceItem,planIds[i]);
+        }
+    },
+
+    getModelBasedPlanGRs : function(current){
+        var plan = new GlideRecord(PlannedMaintenanceConstants.SM_MAINT_PLAN);
+        plan.addActiveQuery();
+        plan.addQuery("type",PlannedMaintenanceConstants.PLAN_TYPE_MODEL_BASED);
+        plan.addQuery("model","CONTAINS",current.model_id);
+        plan.addQuery("apply_to_new","true");
+        plan.query();
+
+        return plan;
+    },
+
+    getMatchedPlanGRsBasedOnTable : function(sourceItem, planType){
+
+        var planGr = new GlideRecord(PlannedMaintenanceConstants.SM_MAINT_PLAN);
+        planGr.addActiveQuery();
+        planGr.addQuery("type",planType);
+        if(planType == PlannedMaintenanceConstants.PLAN_TYPE_MODEL_BASED){
+            planGr.addQuery("model","IN",sourceItem.model_id);
+        }
+        planGr.addQuery("table",this._getBaseTable(sourceItem.getTableName())).addOrCondition('table', sourceItem.getTableName());
+        planGr.addQuery("apply_to_new","true");
+        planGr.query();
+
+        return planGr;
+    },
+
+    getPlansWithActivePlanRecords : function (sourceItem, limit) {
+        var planRecordGr = new GlideRecord(PlannedMaintenanceConstants.SM_M2M_PLAN_RECORD);
+        planRecordGr.addActiveQuery();
+        planRecordGr.addQuery("source_id",sourceItem.sys_id);
+        planRecordGr.addQuery("document_table",this._getBaseTable(sourceItem.getTableName())).addOrCondition('document_table', sourceItem.getTableName());
+        if(!gs.nil(limit)){
+            planRecordGr.setLimit(limit);
+        }
+        planRecordGr.query();
+        return planRecordGr;
+    },
+
+    isActiveSourcePresent : function (sourceItem) {
+        var planRecordGr = this.getPlansWithActivePlanRecords(sourceItem, 1);
+        return planRecordGr.hasNext();
+
+    },
+
+    isMatchingPlanFilterCondition : function(plan,sourceItem){
+        if (gs.nil(plan.filter_condition))
+            return true;
+        else{
+            var f = new GlideFilter(plan.filter_condition, "rule-condition");
+            f.setCaseSensitive(false);
+            if(f.match(sourceItem, true)){
+                return true;
+            }
+        }
+        return false;
+    },
+
+    // This method is being called from event - "cleanup.planrecords"
+    cleanUpPlanRecords : function (record, windowLimit) {
+        new global.PlannedWorkMgmtAPIHelperUtil().cleanUpPlanRecords(record, windowLimit);
+    },
+
+    deleteBulkPlanRecords : function (deletePlanRecordsArr, plan) {
+        try {
+            var planGr = this.getPlan(plan.sys_id+PlannedMaintenanceConstants.EMPTY_STRING);
+            var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,planGr);
+            if (pmExtPoint){
+                pmExtPoint.initialize();
+                return pmExtPoint.deleteBulkPlanRecords(deletePlanRecordsArr, planGr);
+            }
+
+        } catch (err) {
+            gs.error("PlannedMaintenanceExtPoint: deleteBulkPlanRecords - {0}", err);
+        }
+    },
+
+    isValidSource : function (planRecordGr) {
+        var assetGr = new GlideRecord(planRecordGr.document_table);
+        if (!assetGr.isValid()){
+            return false;
+        }
+        assetGr.addQuery("sys_id",planRecordGr.source_id);
+        if(!gs.nil(planRecordGr.schedule.plan.filter_condition)) {
+            assetGr.addQuery(planRecordGr.schedule.plan.filter_condition);
+        }
+        if (planRecordGr.schedule.plan.type.toString() == "model_based"){
+            assetGr.addQuery("model_id", "IN", planRecordGr.schedule.plan.model);
+        }
+        assetGr.setLimit(1);
+        assetGr.query();
+
+        return assetGr.hasNext();
+    },
+    getTableScopeValue : function(tableName){
+        var scope = '';
+        var gr = new GlideRecord("sys_db_object");
+        gr.addQuery("name",tableName);
+        gr.setLimit(1);
+        gr.query();
+
+        if(gr.next())
+            scope = gr.getValue("sys_scope");
+
+        return scope;
+    },
+
+    createCrossScopeRecords: function(current,sourceScope){
+
+        var tableScopeVal = this.getTableScopeValue(current.table);
+
+        var gr = new GlideRecord('sys_scope_privilege');
+        gr.addQuery('source_scope', sourceScope);
+        gr.addQuery('sys_scope', sourceScope);
+        gr.addQuery('target_scope', tableScopeVal);
+        gr.addQuery('target_name', current.table);
+        gr.addQuery('target_type', 'sys_db_object');
+        gr.addQuery('status', 'allowed');
+        gr.addQuery('operation', 'read');
+        gr.setLimit(1);
+        gr.query();
+        if(!gr.hasNext()){
+            gr.initialize();
+            gr.setValue('source_scope', sourceScope);
+            gr.setValue('sys_scope', sourceScope);
+            gr.setValue('target_scope', tableScopeVal);
+            gr.setValue('target_name', current.table);
+            gr.setValue('target_type', 'sys_db_object');
+            gr.setValue('status', 'allowed');
+            gr.setValue('operation', 'read');
+            gr.insert();
+        }
+    },
+
+    getOpenWoCount: function(table, recordId, stateEncodedQuery){
+        var woGr = new GlideAggregate("wm_order");
+        if(table == 'plan'){
+            woGr.addQuery("maintenance_plan", recordId);
+        } else if(table == 'schedule'){
+            woGr.addQuery("maintenance_schedule", recordId);
+        }
+        if(!gs.nil(stateEncodedQuery)){
+            woGr.addEncodedQuery(stateEncodedQuery);
+        }
+        woGr.addAggregate('COUNT');
+        woGr.query();
+        if (woGr.next())
+            return parseInt(woGr.getAggregate('COUNT') + '');
+        return 0;
+
+    },
+
+    isAssetInMaintPlanRecTable : function(assetGr, planId){
+        var m2mGr = new GlideRecord(PlannedMaintenanceConstants.SM_M2M_PLAN_RECORD);
+        m2mGr.addQuery("schedule.plan",planId);
+        m2mGr.addQuery("source_id",assetGr.sys_id);
+        m2mGr.setLimit(1);
+        m2mGr.query();
+        if(m2mGr.hasNext())
+            return true;
+        return false;
+    },
+
+		enableRunOnDemand : function (schedule) {
+            try {
+                var pmExtPoint = new PlannedMaintenanceExtPointUtil().getExtensionPoint(PlannedMaintenanceConstants.PMEXTPOINT,schedule);
+                if (pmExtPoint){
+                    pmExtPoint.initialize();
+                    return pmExtPoint.enableRunOnDemand(schedule);
+                }
+            } catch (err) {
+                gs.error("PlannedMaintenanceExtPoint: enableRunOnDemand - {0}", err);
+            }
+        },
+
+    type: 'PlannedMaintenanceUtils'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2014-07-10 19:17:35&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;14b43246eb712100eae001e64206fe14&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;516&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;PlannedMaintenanceUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="SM Planned Maintenance" source="com.snc.planned_maintenance"&gt;b78bdafb4722c210cd4e1ce4316d43b9&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_14b43246eb712100eae001e64206fe14&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-11-17 17:40:18&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:10:40</sys_created_on>
+        <sys_id>da9038d583b01210c6695855eeaad3d6</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>PlannedMaintenanceUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_da9038d583b01210c6695855eeaad3d6</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:10:40</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

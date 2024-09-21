@@ -1,0 +1,329 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>12cfefda3b231010aaec0896c3efc4ac</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.SystemCloneUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Defines utility methods for clone profile configuration.&lt;/description&gt;
+        &lt;name&gt;SystemCloneUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var SystemCloneUtil = Class.create();
+SystemCloneUtil.prototype = {
+	initialize: function() {
+	},
+	type: 'SystemCloneUtil'
+};
+
+/*
+ * Validates whether clone request can be submitted. 
+ */
+SystemCloneUtil.validateCloneRequest = function(cloneProfileSysId) {
+	var preserverTables = [],
+		excludedTables = [];
+	
+	if(JSUtil.nil(cloneProfileSysId)) {
+		var preserverGr = new GlideAggregate(CloneConstants.tableName.CLONE_DATA_PRESERVER);
+		preserverGr.addAggregate('COUNT', 'table');
+		preserverGr.addOrderBy('table');
+		preserverGr.query();
+		if(!preserverGr.hasNext())
+			return CloneConstants.errorMsg.EMPTY_PRESERVERS;
+		
+		while(preserverGr.next()) 
+			preserverTables.push(preserverGr.getValue('table'));
+		
+		var exclusionGr = new GlideAggregate(CloneConstants.tableName.CLONE_DATA_EXCLUSION);
+		exclusionGr.addAggregate('COUNT', 'name');
+		exclusionGr.addOrderBy('name');
+		exclusionGr.query();
+		while(exclusionGr.next()) 
+			excludedTables.push(exclusionGr.getValue('name'));
+		
+	} else {
+		var profilePreserverGr = new GlideAggregate(CloneConstants.tableName.CLONE_PROFILE_PRESERVER);
+		profilePreserverGr.addQuery('profile', cloneProfileSysId);
+		profilePreserverGr.addAggregate('COUNT', 'preserver.table');
+		profilePreserverGr.addOrderBy('preserver.table');
+		profilePreserverGr.query();
+		if(!profilePreserverGr.hasNext())
+			return CloneConstants.errorMsg.EMPTY_PRESERVERS;
+		
+		while(profilePreserverGr.next()) 
+			preserverTables.push(profilePreserverGr.getValue('preserver.table'));
+		
+		var profileExclusionGr = new GlideAggregate(CloneConstants.tableName.CLONE_PROFILE_EXCLUSION);
+		profileExclusionGr.addQuery('profile', cloneProfileSysId);
+		profileExclusionGr.addAggregate('COUNT', 'exclusion.name');
+		profileExclusionGr.addOrderBy('exclusion.name');
+		profileExclusionGr.query();
+		while(profileExclusionGr.next()) 
+			excludedTables.push(profileExclusionGr.getValue('exclusion.name'));
+	}
+	
+	var errMsg = SystemCloneUtil.validateSysDbView(preserverTables);
+	if(JSUtil.nil(errMsg))
+		return SystemCloneUtil.validateExclusionTablesNotAllowed(excludedTables);
+	
+	return errMsg;
+};
+
+/*
+ * Validates the cleanup scripts.
+ */
+SystemCloneUtil.validateCleanupScript = function(current) {
+	if(gs.nil(current.getValue('name')))
+		return false;
+	
+	var cleanupScriptsGr = new GlideRecord(CloneConstants.tableName.CLONE_CLEANUP_SCRIPT);
+	cleanupScriptsGr.addQuery('name', current.getValue('name'));
+	cleanupScriptsGr.addQuery('sys_id', '!=', current.getValue('sys_id'));
+	cleanupScriptsGr.query();
+	
+	if(cleanupScriptsGr.next()) 
+		return false;
+	
+	return true;
+};
+
+SystemCloneUtil.populateProfileName = function(current) {
+	var sourceTable = current.getValue('source_table');
+	var profileSysId = current.getValue('profile');
+	
+	if(!gs.nil(sourceTable) &amp;&amp; !gs.nil(profileSysId)) {
+		var gr = new GlideRecord(sourceTable);
+		if(gr.get(profileSysId))
+			return gr.getValue('name');
+	}
+	return '';
+};
+
+/*
+ * Validates the exclusions.
+ */
+SystemCloneUtil.validateExclusion = function(current) {
+	var tableName = current.getValue('name'),
+		table = current.getValue('table'),
+		excludedTable = [];
+	
+	if(gs.nil(tableName) &amp;&amp; gs.nil(table))
+		return false;
+	
+	var exclusionGr = new GlideRecord(CloneConstants.tableName.CLONE_DATA_EXCLUSION);
+	if(!gs.nil(tableName)) {
+		excludedTable.push(tableName);
+		exclusionGr.addQuery('name', tableName);
+	} else {
+		excludedTable.push(table);
+		exclusionGr.addQuery('table', table);
+		exclusionGr.addQuery('condition', current.getValue('condition'));
+	}
+	
+	exclusionGr.addQuery('sys_id', '!=', current.getValue('sys_id'));
+	exclusionGr.query();
+	if(exclusionGr.next()) 
+		return CloneConstants.errorMsg.EXCLUSION_EXISTS;
+
+	return SystemCloneUtil.validateExclusionTablesNotAllowed(excludedTable);
+};
+
+/*
+ * Validates the exclusion against the tables that are not allowed to be excluded.
+ */
+SystemCloneUtil.validateExclusionTablesNotAllowed = function(tables) {
+	var tablesNotAllowedList = [];
+	tablesNotAllowedList.push('sys_db_object');
+	tablesNotAllowedList.push('sys_db_object.*');
+	
+	if(gs.nil(tables) || !Array.isArray(tables))
+		return '';
+	
+	var arrUtil = new ArrayUtil();
+	var matchingArray = arrUtil.intersect(tablesNotAllowedList, tables);
+	if(matchingArray.length == 0)
+		return '';
+	else
+		return CloneConstants.errorMsg.EXCLUSIONS_NOT_ALLOWED + matchingArray;
+};
+
+SystemCloneUtil.validateSysDbView = function(tables) {
+	if(gs.nil(tables) || !Array.isArray(tables))
+		return '';
+	
+	if (gs.tableExists("sys_db_view")) {
+		while(tables.length &gt; 0) {
+			var tablesList = tables.splice(0, 30);
+			var grView = new GlideRecord("sys_db_view");
+			grView.addQuery('name', 'IN', tablesList);
+			grView.query();
+			if(grView.next())
+				return CloneConstants.errorMsg.PRESERVER_DB_VIEW;
+		}
+	}
+	
+	return '';
+};
+
+/*
+ * Validates the preservers.
+ */
+SystemCloneUtil.validatePreserver = function(current) {
+	if(gs.nil(current.getValue('table')))
+		return;
+	
+	var preserverGr = new GlideRecord(CloneConstants.tableName.CLONE_DATA_PRESERVER);
+	preserverGr.addQuery('table', current.getValue('table'));
+	preserverGr.addQuery('condition', current.getValue('condition'));
+	preserverGr.addQuery('sys_id', '!=', current.getValue('sys_id'));
+	preserverGr.query();
+	if(preserverGr.next()) 
+		return CloneConstants.errorMsg.PRESERVER_EXISTS;
+	
+	var tablesList = [];
+	tablesList.push(current.getValue('table'));
+	
+	return SystemCloneUtil.validateSysDbView(tablesList);
+};
+
+SystemCloneUtil.fixSystemProfileConfigForQuebec = function() {
+	var securityGr = new GlideRecord('sys_security_acl');
+	securityGr.addEncodedQuery('nameLIKEclone_cleanup_script.*^ORnameLIKEclone_data_exclude.*^ORnameLIKEclone_data_preserver.*^ORnameLIKEclone_profile_exclusions.*^ORnameLIKEclone_profile_preservers.*^ORnameLIKEclone_profile_cleanup_scripts.*');
+	securityGr.query();
+	while(securityGr.next()) {
+		gs.info('ACL with sys_id ' + securityGr.getValue('sys_id') + ' deactivated.');
+		securityGr.active = false;
+		securityGr.update();
+	}
+	
+	var exclusionGr = new GlideRecord(CloneConstants.tableName.CLONE_DATA_EXCLUSION);
+	exclusionGr.addEncodedQuery('include_in_system_cloneISEMPTY');
+	exclusionGr.query();
+	while(exclusionGr.next()) {
+		exclusionGr['include_in_system_clone'] = true;
+		exclusionGr.setWorkflow(false);
+		exclusionGr.update();
+	}
+
+	var preserverGr = new GlideRecord(CloneConstants.tableName.CLONE_DATA_PRESERVER);
+	preserverGr.addEncodedQuery('include_in_system_cloneISEMPTY');
+	preserverGr.query();
+	while(preserverGr.next()) {
+		preserverGr['include_in_system_clone'] = true;
+		preserverGr.setWorkflow(false);
+		preserverGr.update();
+	}
+
+	var cleanupScriptGr = new GlideRecord(CloneConstants.tableName.CLONE_CLEANUP_SCRIPT);
+	cleanupScriptGr.addEncodedQuery('include_in_system_cloneISEMPTY');
+	cleanupScriptGr.query();
+	while(cleanupScriptGr.next()) {
+		cleanupScriptGr['include_in_system_clone'] = true;
+		cleanupScriptGr.setWorkflow(false);
+		cleanupScriptGr.update();
+	}
+	
+	var profileExclusionGr = new GlideRecord(CloneConstants.tableName.CLONE_PROFILE_EXCLUSION);
+	profileExclusionGr.addEncodedQuery('source_tableISEMPTY');
+	profileExclusionGr.query();
+	while(profileExclusionGr.next()) {
+		profileExclusionGr['source_table'] = 'clone_profile';
+		profileExclusionGr.setWorkflow(false);
+		profileExclusionGr.update();
+	}
+	
+	var profilePreserverGr = new GlideRecord(CloneConstants.tableName.CLONE_PROFILE_PRESERVER);
+	profilePreserverGr.addEncodedQuery('source_tableISEMPTY');
+	profilePreserverGr.query();
+	while(profilePreserverGr.next()) {
+		profilePreserverGr['source_table'] = 'clone_profile';
+		profilePreserverGr.setWorkflow(false);
+		profilePreserverGr.update();
+	}
+	
+	var profileCleanupScriptGr = new GlideRecord(CloneConstants.tableName.CLONE_PROFILE_CLEANUP_SCRIPT);
+	profileCleanupScriptGr.addEncodedQuery('source_tableISEMPTY');
+	profileCleanupScriptGr.query();
+	while(profileCleanupScriptGr.next()) {
+		profileCleanupScriptGr['source_table'] = 'clone_profile';
+		profileCleanupScriptGr.setWorkflow(false);
+		profileCleanupScriptGr.update();
+	}
+	
+	var cloneProfileExclusionGr = new GlideRecord(CloneConstants.tableName.CLONE_PROFILE_EXCLUSION);
+	cloneProfileExclusionGr.addEncodedQuery('exclusion.default=false^ORexclusion.defaultISEMPTY');
+	cloneProfileExclusionGr.addQuery('profile', CloneConstants.SYSTEM_PROFILE_SYS_ID);
+	cloneProfileExclusionGr.query();
+
+	while(cloneProfileExclusionGr.next()) {
+		exclusionGr = cloneProfileExclusionGr.exclusion.getRefRecord();
+		if(!gs.nil(exclusionGr.getValue('sys_id'))) {
+			exclusionGr['default'] = true;
+			exclusionGr.setWorkflow(false);
+			gs.info('Exclusion ' + exclusionGr.getValue('name') + ' default checkbox updated to true.');
+			exclusionGr.update();
+		}
+	}
+
+	var cloneProfilePreserverGr = new GlideRecord(CloneConstants.tableName.CLONE_PROFILE_PRESERVER);
+	cloneProfilePreserverGr.addEncodedQuery('preserver.default=false^ORpreserver.defaultISEMPTY');
+	cloneProfilePreserverGr.addQuery('profile', CloneConstants.SYSTEM_PROFILE_SYS_ID);
+	cloneProfilePreserverGr.query();
+
+	while(cloneProfilePreserverGr.next()) {
+		preserverGr = cloneProfilePreserverGr.preserver.getRefRecord();
+		if(!gs.nil(preserverGr.getValue('sys_id'))) {
+			preserverGr['default'] = true;
+			preserverGr.setWorkflow(false);
+			gs.info('Preserver ' + preserverGr.getValue('name') + ' default checkbox updated to true.');
+			preserverGr.update();
+		}
+	}
+
+	var cloneProfileCleanupScriptGr = new GlideRecord(CloneConstants.tableName.CLONE_PROFILE_CLEANUP_SCRIPT);
+	cloneProfileCleanupScriptGr.addEncodedQuery('cleanup_script.default=false^ORcleanup_script.defaultISEMPTY');
+	cloneProfileCleanupScriptGr.addQuery('profile', CloneConstants.SYSTEM_PROFILE_SYS_ID);
+	cloneProfileCleanupScriptGr.query();
+
+	while(cloneProfileCleanupScriptGr.next()) {
+		cleanupScriptGr = cloneProfileCleanupScriptGr.cleanup_script.getRefRecord();
+		if(!gs.nil(cleanupScriptGr.getValue('sys_id'))) {
+			cleanupScriptGr['default'] = true;
+			cleanupScriptGr.setWorkflow(false);
+			gs.info('Cleanup Script ' + cleanupScriptGr.getValue('name') + ' default checkbox updated to true.');
+			cleanupScriptGr.update();
+		}
+	}
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-10-02 00:03:21&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;12cfefda3b231010aaec0896c3efc4ac&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;26&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;SystemCloneUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="High Availability Cloning" source="com.snc.ha"&gt;ba533ca03c31311068bcf327dfe37f7a&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_12cfefda3b231010aaec0896c3efc4ac&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-08-12 01:24:49&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:10:29</sys_created_on>
+        <sys_id>3f80f0d583b01210c6695855eeaad30d</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>SystemCloneUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_3f80f0d583b01210c6695855eeaad30d</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:10:29</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

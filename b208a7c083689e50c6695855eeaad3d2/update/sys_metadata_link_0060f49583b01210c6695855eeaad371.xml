@@ -1,0 +1,141 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0a3548940bc300104e67ed3ab4673ad7</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.ResourceShiftSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;ResourceShiftSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ResourceShiftSNC = Class.create();
+ResourceShiftSNC.prototype = {
+    initialize: function(resPlanId, userId, breakdowns, bookingTypes, timespan, allocationEndDate) {
+		this.resPlanId = resPlanId;
+		this.planRecord = new GlideRecord("resource_plan");
+		this.planRecord.get(this.resPlanId);
+		this.userId = userId;
+		this.breakdowns = breakdowns;
+		this.bookingTypes = bookingTypes;
+		this.timespan = timespan;
+		this.allocationEndDate = new GlideDate();
+		this.allocationEndDate.setValue(allocationEndDate);
+		this.firstDateOfShiftAlloc = new GlideDate();
+		this.resPlanLogHelper = new ResourcePlanLogHelper(this.planRecord, false);
+		this.resReplaceHelper = new ResourceReplaceHelper(resPlanId, userId, timespan, this.resPlanLogHelper);
+    },
+	
+	_updateBreakdowns: function(fromDate, toDate){
+		var sourceDate = new GlideDate();
+		sourceDate.setValue(fromDate);
+		this.firstDateOfShiftAlloc.setValue(fromDate);
+		var shiftDate = new GlideDate();
+		shiftDate.setValue(toDate);
+		var updatedBreakdowns = {};
+		var updatedBookingTypes = {};
+		while(sourceDate.getNumericValue() &lt;= this.allocationEndDate.getNumericValue()){
+			if(sourceDate.getValue()+"_allocated_hours" in this.breakdowns){
+				updatedBreakdowns[shiftDate.getValue()+"_allocated_hours"] = this.breakdowns[sourceDate.getValue()+"_allocated_hours"];
+				updatedBookingTypes[shiftDate.getValue()+"_booking_type"] = this.bookingTypes[sourceDate.getValue()+"_booking_type"];
+			}
+			if(this.timespan === "month"){
+				sourceDate.addMonthsUTC(1);
+				sourceDate.setDayOfMonthUTC(1);
+				shiftDate.addMonthsUTC(1);
+				shiftDate.setDayOfMonthUTC(1);
+			}
+			else{
+				sourceDate.addDaysUTC(7);
+				shiftDate.addDaysUTC(7);
+			}
+		}
+		this.breakdowns = updatedBreakdowns;
+		this.bookingTypes = updatedBookingTypes;
+		shiftDate.addDaysUTC(-1);
+		this.lastDateOfShiftAlloc = shiftDate;
+	},
+	
+	_updateResPlanEndDate: function(){
+		if(this.planRecord.end_date.getGlideObject().getNumericValue() &lt; this.lastDateOfShiftAlloc.getNumericValue()){
+			this.planRecord.setValue("end_date",this.lastDateOfShiftAlloc.getValue());
+			this.planRecord.setWorkflow(false);
+			this.planRecord.update();
+		}
+	},
+	
+	shift: function(fromDate, toDate){
+		var message = {};
+		var maxDuration = new ResourceManagementProperties().getMaxPlanDuration();
+		maxDuration = parseInt(maxDuration);
+		var startDate = new GlideDate();
+        startDate.setValue(fromDate);
+        var endDate = new GlideDate();
+        endDate.setValue(toDate);
+		this._updateBreakdowns(fromDate, toDate);
+		if(!RMUtil.isRPLiesInTaskDuration(this.planRecord, endDate, this.lastDateOfShiftAlloc)){
+			message.error = ResourceConstants.RP_DATES_DOES_NOT_LIE_IN_TASK_DATES.getErrorMsg(this.planRecord, 'shiftAlloc');
+			return message;
+		}
+		this._updateResPlanEndDate();
+		var newResPlanEndDate = new GlideDate();
+		newResPlanEndDate.setValue(this.planRecord.end_date.getValue());
+		if ((GlideDateTime.subtract(startDate,newResPlanEndDate).getDayPart() + 1) &gt; maxDuration) {
+			message.error = gs.getMessage("The duration between the from and to dates to which the allocations are shifted is more than {0}, which is the maximum duration in days set in resource properties.",maxDuration);
+			return message;
+		}
+		
+		var resAllocs = this.resReplaceHelper.createAllocObjects(this.breakdowns, this.planRecord, '', this.bookingTypes);
+		this.resReplaceHelper.updateSourceUserAllocDailies("resource_allocation_daily",this.firstDateOfShiftAlloc,this.lastDateOfShiftAlloc,false);
+		this.resReplaceHelper.updateSourceAllocations("resource_allocation",this.firstDateOfShiftAlloc,this.lastDateOfShiftAlloc,false);
+		this.resReplaceHelper.setAllowOverAllocation(true);
+		this.resReplaceHelper.updateResAllocations(resAllocs, this.userId, false, this.planRecord);
+		
+		ResourcePlanRollupHelper.rollupResourcePlan(this.resPlanId);
+        ResourceGridAggregatesHelper.updateAggregates([this.userId], fromDate , this.lastDateOfShiftAlloc.getValue(), ResourceGridAggregatesHelper.actionCategoriesMap['replaceUser'], this.planRecord.getValue("task"));
+		this.resPlanLogHelper.populateLogs({'type':'resourceShift', 'fromDate': startDate, 'toDate': endDate, 'userId': this.userId});
+		var errorMessage = this.resPlanLogHelper.getErrorMsg();
+		var logMessage = this.resPlanLogHelper.getInfoMsg();
+		if(JSUtil.notNil(errorMessage))
+			message.error = errorMessage;
+		else if(JSUtil.notNil(logMessage))
+			message.info = logMessage;
+		if(JSUtil.nil(errorMessage) &amp;&amp; JSUtil.nil(logMessage))//successful message            
+			message.info = gs.getMessage("The resource allocation is shifted from {0} to {1}",[startDate.getDisplayValue(),endDate.getDisplayValue()]);
+		return message;
+	},
+
+    type: 'ResourceShiftSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-02-14 09:08:15&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0a3548940bc300104e67ed3ab4673ad7&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;58&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ResourceShiftSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Resource Management" source="com.snc.resource_management"&gt;7200da2b47e64210cd4e1ce4316d438e&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0a3548940bc300104e67ed3ab4673ad7&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2021-01-19 14:08:16&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:42</sys_created_on>
+        <sys_id>0060f49583b01210c6695855eeaad371</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ResourceShiftSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_0060f49583b01210c6695855eeaad371</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:42</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

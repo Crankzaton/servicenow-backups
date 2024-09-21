@@ -1,0 +1,233 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules">
+    <x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection/>
+        <condition>current.operation() == 'insert' || (current.quantity_requested.changes() || current.from_stockroom.changes() || current.asset.changes() || current.model.changes())</condition>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>Validate TOL and check availibility</name>
+        <order>50</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[validateTOLandCheckAvailability();
+
+function validateTOLandCheckAvailability() {
+   if (!isValidChange())
+      return;
+   processChange();
+}
+
+function isValidChange() {
+   if (current.stage != 'draft' && current.asset.changes()) {
+      return false;
+   }
+   
+   if (current.stage != 'draft') {
+      // no change other than state change can be made after transfer order
+      // left draft stage
+      gs.addErrorMessage(gs.getMessage('Transfer order line definition cannot be changed in stage other than draft'));
+      current.setAbortAction(true);
+      return false;
+   }
+   
+   if (current.quantity_requested <= 0 && current.asset.nil()) {
+      gs.addErrorMessage(gs.getMessage('Transfer order line must request a quantity greater than 0'));
+      current.setAbortAction(true);
+      return false;
+   }
+   return true;
+}
+
+function processChange() {
+   // determine source stockroom
+   var fromStockroom = current.from_stockroom;
+   if (!current.transfer_order.nil())
+      fromStockroom = current.transfer_order.from_stockroom;
+   
+   // the substatus that we consider available is different for FSM returns
+   var availableSubstatus = new AssetUtils().determineAvailableStatus(current);
+   
+   var isRealAsset = (!current.asset.nil() && current.asset.sys_class_name != 'alm_consumable');
+   if (isRealAsset)
+      processRealAsset(fromStockroom, availableSubstatus);
+   else
+      processConsumable(fromStockroom, availableSubstatus);
+   
+   // only run for consumables
+   if (current.stage == 'draft'  && (current.quantity_requested.changes() || current.model.changes() || current.operation() == 'insert')) {
+      if (previous.model.sys_class_name == 'cmdb_consumable_product_model' || previous.model.asset_tracking_strategy == 'track_as_consumable') {
+         releaseConsumable(previous.asset);
+      }
+      
+      if (current.model.sys_class_name == 'cmdb_consumable_product_model' || current.model.asset_tracking_strategy == 'track_as_consumable')
+         updateConsumableUsed();
+      
+   }
+}
+
+/*
+ * Check quantity is in sync between asset and transfer order line Check
+ * location, model and state are compatible between asset and transfer order
+ * line
+ */
+function processRealAsset(fromStockroom, availableSubstatus) {
+   var asset = current.asset;
+   // Check for Insert and Stay on an Asset TOL
+   if (asset.active_to == true && current.operation() == 'insert') {
+      if(current.return_from_tol.nil()) {
+         gs.addErrorMessage(gs.getMessage('You have attempted to add an asset already on an active transfer order line'));
+         current.setAbortAction(true);
+      } else {
+         // Return tols are read-only and have no 'insert-and-stay' option.
+         // The real asset associate with the rtol has already been managed
+         // when it was added to the tol that the return is from.
+         return;
+      }
+   }
+   
+   // ensure quantity requested follows asset quantity constraints
+   if (parseInt(current.quantity_requested, 10) != parseInt(asset.quantity, 10))
+      current.quantity_requested = asset.quantity;
+   
+   // last sanity check that asset is valid for this transfer
+   // we should never enter one of those cases so I lump them together
+   if (asset.model != current.model || asset.stockroom != fromStockroom ||
+      asset.install_status != '6' || !(asset.substatus == availableSubstatus ||
+   asset.substatus == 'pre_allocated' || asset.substatus == 'defective')) {
+      // severe inconsistency, should never happen, abort action and log
+      // details
+      gs.print('Inventory Management - Severe inconsistency between asset [id ' +
+      asset.sys_id + '] and transfer order line[id ' + current.sys_id + '], aborting action');
+      gs.addErrorMessage(gs.getMessage('Severe inconsistency between asset and transfer order line'));
+      current.setAbortAction(true);
+   }
+   
+   if (current.asset.changes())
+      releaseAsset(previous.asset);
+}
+
+function processConsumable(fromStockroom, availableSubstatus) {
+   if (current.operation() == 'insert')
+      current.asset = "";
+   // check availability of consumable in desired stockroom
+   // compute available quantity for the requested model ( = already attached
+   // when applicable + still in stock)
+   var availableQuantity = !current.asset.nil() ? parseInt(
+   current.asset.quantity, 10) : 0;
+   availableQuantity += parseInt(new Consumables().getMaxInState(
+   current.model, fromStockroom, '6', availableSubstatus, ''), 10);
+   
+   if (availableQuantity < parseInt(current.quantity_requested, 10)) {
+      // not enough stok in this stockroom
+      gs.addErrorMessage(gs.getMessage('Not enough stock, maximum available in the selected stockroom is {0}', availableQuantity));
+      current.setAbortAction(true);
+   }
+}
+
+function updateConsumableUsed() {
+   var quantity_requested_int = parseInt(current.quantity_requested,10);
+   // the substatus that we consider available is different for FSM returns
+   var availableSubstatus = new AssetUtils().determineAvailableStatus(current);
+   if ('pending_transfer' != availableSubstatus) {
+      var con = getConsumable(quantity_requested_int, availableSubstatus);
+      if (con != '') {
+         var consumable = new Consumables().split(con.sys_id,
+         quantity_requested_int, '6', 'pending_transfer', '',
+         con.stockroom, con.location, con.assigned_to);
+         current.asset = consumable;
+      }
+   } else {
+      // this path is only exercised when inserting a return tol consumable
+      var asset = current.return_from_tol.asset;
+      current.asset = new Consumables().split(asset, quantity_requested_int, '6',
+      'pending_transfer', '', asset.stockroom,
+      asset.location, asset.assigned_to);
+   }
+}
+
+function releaseAsset(sysid) {
+   var ci = new GlideRecord('alm_asset');
+   ci.addQuery('sys_id', sysid);
+   ci.query();
+   
+   if (ci.next()) {
+      ci.install_status = '6';
+      if (ci.substatus != "pre_allocated")
+         ci.substatus = 'available';
+      ci.active_to = false;
+      // DEF0444410: While releasing old asset, clearing out reserved for value
+      if (!current.request_line.nil() && !current.request_line.request.nil() && !gs.nil(ci.reserved_for)) {
+         ci.reserved_for = 'NULL';
+      }
+      ci.update();
+   }
+}
+
+function releaseConsumable(sysid) {
+   var ci = new GlideRecord('alm_consumable');
+   ci.addQuery('sys_id', sysid);
+   ci.query();
+   
+   if (ci.next()) {
+      ci.install_status = '6';
+      ci.substatus = 'available';
+      ci.active_to = false;
+      ci.update();
+   }
+}
+
+function getConsumable(qty, availableSubstatus) {
+   var con = new GlideRecord('alm_consumable');
+   if (current.transfer_order.from_stockroom != "")
+      con.addQuery('stockroom', current.transfer_order.from_stockroom);
+   else
+      con.addQuery('stockroom', current.from_stockroom);
+   con.addQuery('quantity', '>=', qty);
+   con.addQuery('model', current.model);
+   con.addQuery('install_status', '6');
+   con.addQuery('substatus', availableSubstatus);
+   con.query();
+   
+   if (con.next())
+      return con;
+   else
+      return '';
+}]]></script>
+        <sys_class_name>x_938076_now_utils_now_utils_business_rules</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:47:21</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>bc4b245183701210c6695855eeaad399</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Validate TOL and check availibility</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>x_938076_now_utils_now_utils_business_rules_bc4b245183701210c6695855eeaad399</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:47:21</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </x_938076_now_utils_now_utils_business_rules>
+    <sys_translated_text action="delete_multiple" query="documentkey=bc4b245183701210c6695855eeaad399"/>
+</record_update>

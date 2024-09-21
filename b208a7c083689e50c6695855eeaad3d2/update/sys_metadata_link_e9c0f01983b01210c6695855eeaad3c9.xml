@@ -1,0 +1,244 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1c9aaae3872313005087af1e36cb0bc2</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.ProblemV2UtilSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;ProblemV2UtilSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ProblemV2UtilSNC = Class.create();
+ProblemV2UtilSNC.prototype = {
+
+	COPY_ATTACHMENT_PROPERTY_MAP: {
+		'incident': 'com.snc.problem.create_from_incident.copy_attachments'
+	},
+
+	TABLES: {
+		M2M_KB_TASK: 'm2m_kb_task'
+	},
+
+	COLUMNS: {
+		TASK: 'task',
+		KB_KNOWLEDGE: 'kb_knowledge'
+	},
+
+	initialize: function(argument) {
+		var fixes = gs.getProperty("problem.fix.records");
+		if (fixes)
+			this.fixTasks = fixes.split(",");
+		else
+			this.fixTasks = "";
+		this.fixTasksMap = this.dotCommaToMap(this.fixTasks);
+	},
+
+	dotCommaToMap: function(Arr) {
+		var map = {};
+		for (var i = 0; i &lt; Arr.length; i++) {
+			map[Arr[i].split(".")[0]] = Arr[i].split(".")[1];
+		}
+		return map;
+	},
+
+	isRelatedFix: function(current) {
+		if (!current.active.changesTo(false) || !this.fixTasks)
+			return false;
+		if (!this.fixTasksMap[current.sys_class_name])
+			return false;
+		if (current.sys_class_name + '' === 'sn_cim_register' &amp;&amp; !this.isCIMRelatedToProblem(current))
+			return false;
+		if (current.sys_class_name + '' !== 'sn_cim_register' &amp;&amp; !current[this.fixTasksMap[current.sys_class_name]])
+			return false;
+		return true;
+	},
+
+	isCIMRelatedToProblem: function(current) {
+		var gr = new GlideRecord('sn_cim_inbound_m2m');
+		gr.addQuery('cim_register', current.getUniqueValue());
+		gr.addQuery('source_table', 'problem');
+		gr.query();
+		return gr.hasNext();
+	},
+
+	checkRelatedFixes: function(current) {
+		if (current.sys_class_name + '' === 'sn_cim_register')
+			this.checkAllProblemsForCIM(current);
+		else {
+			var problem = current[this.fixTasksMap[current.sys_class_name]].getRefRecord();
+			if (!this.hasRemainingFixes(this.fixTasksMap, problem))
+				gs.eventQueue('problem.fixes', problem);
+		}
+	},
+
+	checkAllProblemsForCIM: function(current) {
+		var gr = new GlideRecord('sn_cim_inbound_m2m');
+		gr.addQuery('cim_register', current.getUniqueValue());
+		gr.addQuery('source_table', 'problem');
+		gr.query();
+		while (gr.next()) {
+			var problem = gr.source_id.getRefRecord();
+			if (!this.hasRemainingFixes(this.fixTasksMap, problem))
+				gs.eventQueue('problem.fixes', problem);
+		}
+	},
+
+	hasRemainingFixes: function(fixTasksMap, problem) {
+		var problemId = problem.getUniqueValue() + '';
+		for (var key in fixTasksMap) {
+			if (key === 'sn_cim_register' &amp;&amp; this._hasCIMRelatedActiveFix(problemId))
+				return true;
+			if (key !== 'sn_cim_register' &amp;&amp; this._hasOthersRelatedActiveFix(key, fixTasksMap[key], problemId))
+				return true;
+		}
+		return false;
+	},
+
+	_hasCIMRelatedActiveFix: function(problemId) {
+		var gr = new GlideRecord('sn_cim_inbound_m2m');
+		if (gr.isValid()) {
+			gr.addQuery('source_id', problemId);
+			gr.query();
+			while (gr.next()) {
+				var cimRecord = gr.cim_register.getRefRecord();
+				if (cimRecord.active &amp;&amp; cimRecord.getUniqueValue() + '' !== problemId)
+					return true;
+			}
+		}
+		return false;
+	},
+
+	_hasOthersRelatedActiveFix: function(table, field, problemId) {
+		var taskGr = new GlideAggregate(table);
+		if (!taskGr.isValid())
+			return false;
+		taskGr.addQuery('active', true);
+		taskGr.addQuery('sys_id', '!=', problemId);
+		taskGr.addQuery(field, problemId);
+		taskGr.addAggregate('COUNT');
+		taskGr.query();
+		if (taskGr.next())
+			return taskGr.getAggregate('COUNT') &gt; 0;
+	},
+	// If making any changes related to movement, check if moveAndCloseRecords would also need the same. 
+	moveRecords: function(tableName, problemRelatedField, duplicateProblemGr, originalProblemGr) {
+		var gr = new GlideRecord(tableName);
+		if (!gr.isValid())
+			return false;
+		gr.addQuery(problemRelatedField, duplicateProblemGr.getUniqueValue());
+		gr.query();
+		while (gr.next()) {
+			gr.setValue(problemRelatedField, originalProblemGr.getUniqueValue());
+			gr.work_notes = gs.getMessage("{0} now associated with {1} based on closure of {2}", [gr.getDisplayValue("sys_class_name"), originalProblemGr.getDisplayValue(), duplicateProblemGr.getDisplayValue()]);
+			gr.update();
+		}
+	},
+	// Added to faciliate moving and closing PTASKs in one go. DEF0190002
+	moveAndCloseRecords: function(tableName, problemRelatedField, duplicateProblemGr, originalProblemGr) {
+		var gr = new GlideRecord(tableName);
+		if (!gr.isValid())
+			return false;
+		gr.addQuery(problemRelatedField, duplicateProblemGr.getUniqueValue());
+		gr.query();
+		while (gr.next()) {
+			gr.setValue(problemRelatedField, originalProblemGr.getUniqueValue());
+			gr.work_notes = gs.getMessage("{0} now associated with {1} based on closure of {2}", [gr.getDisplayValue("sys_class_name"), originalProblemGr.getDisplayValue(), duplicateProblemGr.getDisplayValue()]);
+			// Additional to moveRecords - closing of active records
+			if (gr.active) {
+				gr.setValue("state", ProblemTaskState.States.CLOSED);
+				gr.setValue("close_code", "canceled");
+				gr.setValue("close_notes", gs.getMessage("Problem Task is Canceled based on closure of {0}.", originalProblemGr.getDisplayValue()));
+			}
+			gr.update();
+		}
+	},
+
+	/**
+	 * Copy Attachments from one gliderecord to another
+	 * 
+	 * @param srcGr        {GlideRecord}
+	 * @param targetGr     {GlideRecord}
+	 * @param userSelection Boolean     If true then copy all attachments ignoring any property value    
+	 */
+	copyAttachments: function(srcGr, targetGr, userSelection) {
+		if (!srcGr.isValidRecord() || !targetGr.isValidRecord())
+			return;
+		var srcTable = srcGr.getTableName();
+		var targetTable = targetGr.getTableName();
+		var copyEnabled = gs.nil(userSelection) ? gs.getProperty(this.COPY_ATTACHMENT_PROPERTY_MAP[srcTable], 'false') === 'true' : userSelection + '' === 'true';
+		if (copyEnabled) {
+			if (srcGr.canRead()) {
+				var res = [];
+				if (srcGr.hasAttachments())
+					res = j2js(GlideSysAttachment.copy(srcTable, srcGr.sys_id + '', targetTable, targetGr.sys_id + ''));
+				return res;
+			} else
+				gs.warn('copyAttachments: User is not authorized to perform this action');
+		}
+	},
+
+	/**
+	 * Copy Attached Knowledge from one Task gliderecord to another
+	 * 
+	 * @param srcGr        {GlideRecord}
+	 * @param targetGr     {GlideRecord}
+	 * @param userSelection Boolean     If true then copy all attached knowledge articles ignoring any property value    
+	 */
+	copyAttachedKnowledge: function(srcGr, targetGr, userSelection) {
+		if (!srcGr.isValidRecord() || !targetGr.isValidRecord())
+			return;
+		var srcSysId = srcGr.sys_id + '';
+		var targetSysId = targetGr.sys_id + '';
+		var copyEnabled = gs.nil(userSelection) ? gs.getProperty(this.COPY_ATTACHMENT_PROPERTY_MAP[srcGr.getTableName()], 'false') === 'true' : userSelection + '' === 'true';
+		if (copyEnabled) {
+			if (srcGr.canRead()) {
+				var kbTaskGr = new GlideRecord(this.TABLES.M2M_KB_TASK);
+				kbTaskGr.addQuery(this.COLUMNS.TASK, srcSysId);
+				kbTaskGr.query();
+				while (kbTaskGr.next()) {
+					var newKbTaskGr = new GlideRecord(this.TABLES.M2M_KB_TASK);
+					newKbTaskGr.initialize();
+					newKbTaskGr.setValue(this.COLUMNS.TASK, targetSysId);
+					newKbTaskGr.setValue(this.COLUMNS.KB_KNOWLEDGE, kbTaskGr.kb_knowledge);
+					newKbTaskGr.insert();
+				}
+			} else
+				gs.warn('copyAttachedKnowledge: User is not authorized to perform this action');
+		}
+	},
+
+	type: 'ProblemV2UtilSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2018-08-02 07:29:00&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1c9aaae3872313005087af1e36cb0bc2&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;56&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ProblemV2UtilSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Problem Management Best Practice - Madrid" source="com.snc.best_practice.problem.madrid"&gt;1f1b30a03c35311068bcf327dfe37f6d&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1c9aaae3872313005087af1e36cb0bc2&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-09-15 16:02:25&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:26</sys_created_on>
+        <sys_id>e9c0f01983b01210c6695855eeaad3c9</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ProblemV2UtilSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_e9c0f01983b01210c6695855eeaad3c9</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:26</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,438 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0c13aac253320010a0bdddeeff7b1229</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.AWAStatsUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;true&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;AWAStatsUtils&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var AWAStatsUtils = Class.create();
+AWAStatsUtils.prototype = {
+    initialize: function () {
+    },
+
+    getAllStats: function () {
+		var stats = {
+			agents: this.getAgents(),
+			channels: this.getChannels()
+		};
+
+		stats['workloadCalculation'] = sn_awa.StatsUtil.getWorkloadRecalculateProcessingTime();
+		return stats;
+    },
+
+    getAgents: function () {
+        var agents = {};
+        // Get agents
+        var agg = new GlideAggregate('awa_agent_presence');
+        agg.setWorkflow(false);
+        agg.addAggregate('COUNT', 'current_presence_state');
+        agg.query();
+        while (agg.next() &amp;&amp; agg.canRead()) {
+            var ps = agg.current_presence_state.name;
+            var stateCount = agg.getAggregate('COUNT', 'current_presence_state');
+            agents[ps] = stateCount;
+        }
+        return agents;
+    },
+
+    getChannels: function () {
+        var channels = [];
+        var gr = new GlideRecordSecure('awa_service_channel');
+        gr.setWorkflow(false);
+        gr.query();
+        while (gr.next()) {
+            var channel = {
+                sys_id: gr.getUniqueValue(),
+                name: gr.getValue('name'),
+                active: gr.getValue('active') === '1',
+                condition: gr.getValue('condition') || '',
+                utilization_condition: gr.getValue('utilization_condition') || '',
+                workitem_table: gr.getValue('workitem_table'),
+            };
+            channel.responders = this.getChannelResponders(gr);
+            channel.responderSummary = this.getChannelResponderSummary(channel);
+            channel.queryPerformance = this.getChannelQueryPerformanceMetrics(channel);
+            channel.queues = this.getChannelQueues(gr);
+            channel.queueSummary = this.getChannelQueueSummary(channel.queues);
+            channel.agents = this.getChannelAgents(gr);
+            channel.agentSummary = this.getChannelAgentSummary(channel.agents);
+            channel.workItemSummary = this.getChannelWorkItemSummary(channel);
+            channels.push(channel);
+        }
+        var self = this;
+        channels.forEach(function (channel) {
+            self.updateChannelWorkItemSummaryWithDuplicateInformation(channel.queues, channel.workItemSummary);
+        });
+        return channels;
+    },
+
+    getChannelQueryPerformanceMetrics: function (channel) {
+        return {
+            maxQueryTime: sn_awa.StatsUtil.getMaxQueryTimeForChannel(channel.sys_id),
+            minQueryTime: sn_awa.StatsUtil.getMinQueryTimeForChannel(channel.sys_id),
+            meanQueryTime: Math.round(sn_awa.StatsUtil.getMeanQueryTimeForChannel(channel.sys_id)),
+            medianQueryTime: sn_awa.StatsUtil.getMedianQueryTimeForChannel(channel.sys_id),
+            totalQueryCount: sn_awa.StatsUtil.getTotalQueryCountForChannel(channel.sys_id),
+        };
+    },
+
+    getChannelResponderSummary: function (channel) {
+        return {
+            respondersExist: (channel.responders).length === 3,
+            "ChannelEligibilityResponderStats": {
+                entryCount: sn_awa.StatsUtil.getTotalOnEntryCountForChannelAndResponder(channel.sys_id, "ChannelEligibilityResponder"),
+                exitCount: sn_awa.StatsUtil.getTotalOnExitCountForChannelAndResponder(channel.sys_id, "ChannelEligibilityResponder"),
+                changeCount: sn_awa.StatsUtil.getTotalOnChangeCountForChannelAndResponder(channel.sys_id, "ChannelEligibilityResponder"),
+            },
+            "WorkItemResponderStats": {
+                entryCount: sn_awa.StatsUtil.getTotalOnEntryCountForChannelAndResponder(channel.sys_id, "WorkItemResponder"),
+                exitCount: sn_awa.StatsUtil.getTotalOnExitCountForChannelAndResponder(channel.sys_id, "WorkItemResponder"),
+                changeCount: sn_awa.StatsUtil.getTotalOnChangeCountForChannelAndResponder(channel.sys_id, "WorkItemResponder"),
+            },
+            "WorkloadResponderStats": {
+                entryCount: sn_awa.StatsUtil.getTotalOnEntryCountForChannelAndResponder(channel.sys_id, "WorkloadResponder"),
+                exitCount: sn_awa.StatsUtil.getTotalOnExitCountForChannelAndResponder(channel.sys_id, "WorkloadResponder"),
+                changeCount: sn_awa.StatsUtil.getTotalOnChangeCountForChannelAndResponder(channel.sys_id, "WorkloadResponder"),
+            }
+        };
+    },
+
+    getChannelResponders: function (channelGr) {
+        var recordWatcherResponders = [];
+        var gr = new GlideRecordSecure('sys_rw_action');
+        gr.setWorkflow(false);
+        gr.addQuery('context', 'CONTAINS', channelGr.sys_id);
+        gr.query();
+        while (gr.next()) {
+            var recordWatcherResponder = {
+                sys_id: gr.getUniqueValue(),
+                responder_key: gr.getValue('responder_key')
+            };
+            recordWatcherResponders.push(recordWatcherResponder);
+        }
+        return recordWatcherResponders;
+    },
+
+    getChannelAgents: function (channelGr) {
+        var channelAgents = [];
+        var gr = new GlideRecordSecure('awa_agent_channel_availability');
+        gr.addQuery('service_channel', channelGr.getUniqueValue());
+        gr.setWorkflow(false);
+        gr.query();
+        while (gr.next()) {
+            var agent = {
+                sys_id: gr.getUniqueValue(),
+                agent: gr.getValue('agent'),
+                available: gr.getValue('available') === '1',
+                presence_state: gr.getValue('presence_state')
+            };
+            channelAgents.push(agent);
+        }
+        return channelAgents;
+    },
+
+    getChannelAgentSummary: function (channelAgents) {
+        var agentSummary = {};
+        var agg = new GlideAggregate('awa_agent_presence');
+        agg.setWorkflow(false);
+        var agentIds = channelAgents.map(function (agent) { return agent.agent; });
+        agg.addQuery('agent', agentIds);
+        agg.addAggregate('COUNT', 'current_presence_state');
+        agg.query();
+        while (agg.next() &amp;&amp; agg.canRead()) {
+            var ps = agg.current_presence_state.name;
+            var stateCount = agg.getAggregate('COUNT', 'current_presence_state');
+            agentSummary[ps] = stateCount;
+        }
+        return agentSummary;
+    },
+
+    getChannelQueueSummary: function (channelQueues) {
+        return {
+            total: channelQueues.length,
+            inSchedule: channelQueues.filter(function (queue) { return queue.queueInSchedule === true; }).length,
+            outOfSchedule: channelQueues.filter(function (queue) { return queue.queueInSchedule === false; }).length,
+            inactive: channelQueues.filter(function (queue) { return queue.active === false; }).length
+        };
+    },
+
+    getChannelQueues: function (channelGr) {
+        var queues = [];
+        var gr = new GlideRecordSecure('awa_queue');
+        gr.setWorkflow(false);
+        gr.addQuery('service_channel', channelGr.getUniqueValue());
+        gr.query();
+        while (gr.next()) {
+            var queue = {
+                sys_id: gr.getUniqueValue(),
+                name: gr.getValue('name'),
+                active: gr.getValue('active') === '1',
+                agents: this.getQueueAgents(gr),
+                queueInSchedule: this.getQueueInSchedule(gr),
+                serviceChannel: channelGr.getUniqueValue(),
+            };
+            queue.agentSummary = this.getQueueAgentSummary(queue);
+            queue.workItemSummary = this.getQueueWorkItemSummary(queue);
+            queue.queuePerformanceSummary = this.getQueuePerformanceSummary(queue);
+            queues.push(queue);
+        }
+        return queues;
+    },
+
+    getQueuePerformanceSummary: function (queue) {
+        return {
+            maxRoutingTime: sn_awa.StatsUtil.getMaxRoutingTimeForQueue(queue.sys_id),
+            minRoutingTime: sn_awa.StatsUtil.getMinRoutingTimeForQueue(queue.sys_id),
+            meanRoutingTime: Math.round(sn_awa.StatsUtil.getMeanRoutingTimeForQueue(queue.sys_id)),
+            medianRoutingTime: sn_awa.StatsUtil.getMedianRoutingTimeForQueue(queue.sys_id),
+            totalRoutingCount: sn_awa.StatsUtil.getTotalRoutingCountForQueue(queue.sys_id),
+        };
+    },
+
+    updateChannelWorkItemSummaryWithDuplicateInformation: function (queues, workItemSummary) {
+        // Get all duplicate items in the queues
+        var agg = new GlideAggregate('awa_work_item');
+        agg.setWorkflow(false);
+        agg.addQuery('queue', queues.map(function (queueObj) { return queueObj.sys_id; }));
+        agg.addNullQuery('previous_work_item', null);
+        agg.addNotNullQuery('document_id');
+        agg.addAggregate('COUNT', '*');
+        agg.groupBy('document_id');
+        agg.query();
+
+        var numberOfDuplicates = 0;
+        while (agg.next() &amp;&amp; agg.canRead()) {
+            if (agg.getAggregate('COUNT', '*') &gt; 1) { // Duplicate Found
+                numberOfDuplicates++;
+            }
+        }
+        workItemSummary.numberOfDuplicates = numberOfDuplicates;
+    },
+
+    getQueueInSchedule: function (queueGr) {
+        var queueInSchedule = true;
+        var scheduleId = queueGr.getValue('schedule');
+
+        if (!scheduleId)
+            return true;
+
+        var schedule = new GlideSchedule(scheduleId);
+        return schedule.isInSchedule(new GlideDateTime());
+    },
+
+    getQueueAgents: function (queueGr) {
+        var queueAgents = [];
+        var aepGr = new GlideRecordSecure('awa_eligibility_pool');
+        aepGr.setWorkflow(false);
+        aepGr.addQuery('queue', queueGr.getUniqueValue());
+        aepGr.query();
+        while (aepGr.next()) {
+            var groupId = aepGr.getValue('groups');
+            var sugGr = new GlideRecordSecure('sys_user_grmember');
+            sugGr.setWorkflow(false);
+            sugGr.addQuery('group', groupId);
+            sugGr.query();
+            while (sugGr.next()) {
+                queueAgents.push(this.getAgentAvailabilityInfo(sugGr.getValue('user')));
+            }
+        }
+        return queueAgents;
+    },
+
+    getAgentAvailabilityInfo: function (agentSysId) {
+        var agentAvailabilityInfo = {
+            'sysId': agentSysId,
+            'presenceState': -1,
+            'maxCapacity': -1,
+            'workload': -1
+        };
+
+        var aagGr = new GlideRecordSecure('awa_agent_presence');
+        aagGr.setWorkflow(false);
+        aagGr.addQuery('agent', agentSysId);
+        aagGr.query();
+
+        while (aagGr.next()) {
+            var apsGr = new GlideRecordSecure('awa_presence_state');
+            apsGr.setWorkflow(false);
+            apsGr.addQuery('sys_id', aagGr.getValue('current_presence_state'));
+            apsGr.query();
+            while (apsGr.next()) {
+                agentAvailabilityInfo.presenceState = apsGr.getValue('name');
+            }
+
+            var aacGr = new GlideRecordSecure('awa_agent_capacity');
+            aacGr.setWorkflow(false);
+            aacGr.addQuery('user', agentSysId);
+            aacGr.query();
+            while (aacGr.next()) {
+                agentAvailabilityInfo.maxCapacity = aacGr.getValue('max_capacity') || 0;
+                agentAvailabilityInfo.workload = aacGr.getValue('workload') || 0;
+            }
+        }
+
+        return agentAvailabilityInfo;
+    },
+
+    getQueueAgentSummary: function (queueObj) {
+        var queueAgentSummary = {
+            agentsAvailable: 0,
+        };
+
+        var acaGr = new GlideRecordSecure('awa_agent_channel_availability');
+        acaGr.setWorkflow(false);
+        acaGr.addQuery('service_channel', queueObj.serviceChannel);
+        acaGr.addQuery('available', 1);
+        acaGr.query();
+
+        var agentIdsInQueue = (queueObj.agents).map(function (agentObj) { return agentObj.sysId; });
+        while (acaGr.next()) {
+            queueAgentSummary.agentsAvailable = agentIdsInQueue.indexOf(acaGr.getValue('agent')) !== -1 ? queueAgentSummary.agentsAvailable + 1 : queueAgentSummary.agentsAvailable;
+        }
+
+        return queueAgentSummary;
+    },
+
+    /**
+     * Queries the database and returns a summary of the work pending, queued, rejected,
+     * and total work items for the queue.
+     * @param {Object} queue object
+     */
+    getQueueWorkItemSummary: function (queue) {
+        var queueSysID = queue.sys_id;
+
+        var workItemSummary = {
+            numberPendingAcceptance: 0,
+            numberQueued: 0,
+            numberRejected: 0,
+            numberOfTotalWorkItems: 0
+        };
+
+        // Count queued and pending acceptance
+        var stateGA = new GlideAggregate('awa_work_item');
+        stateGA.addQuery('queue', queueSysID);
+        stateGA.addQuery('state', 'IN', 'pending_accept,queued');
+        stateGA.addActiveQuery();
+        stateGA.addAggregate('COUNT', 'state');
+        stateGA.query();
+
+        while (stateGA.next()) {
+            var count = stateGA.getAggregate('COUNT', 'state');
+            var state = stateGA.getValue('state');
+            if (state === 'pending_accept') {
+                workItemSummary.numberPendingAcceptance = parseInt(count, 10);
+            } else if (state == 'queued') {
+                workItemSummary.numberQueued = parseInt(count, 10);
+            }
+        }
+
+        // Count rejected
+        var rejectedGA = new GlideAggregate('awa_work_item');
+        rejectedGA.addQuery('rejected', true);
+        rejectedGA.addQuery('queue', queueSysID);
+        rejectedGA.addAggregate('COUNT');
+        rejectedGA.query();
+        rejectedGA.next();
+        workItemSummary.numberRejected = parseInt(rejectedGA.getAggregate('COUNT'), 10);
+
+        // Count total work items for this queue
+        var totalGA = new GlideAggregate('awa_work_item');
+        totalGA.addAggregate('COUNT');
+        totalGA.addQuery('queue', queueSysID);
+        totalGA.query();
+        totalGA.next();
+        workItemSummary.numberOfTotalWorkItems = parseInt(totalGA.getAggregate('COUNT'), 10);
+
+        return workItemSummary;
+    },
+
+    getChannelWorkItemSummary: function (channel) {
+        var workItemSummary = {
+            numberPendingAcceptance: 0,
+            numberQueued: 0,
+            numberOfDuplicates: 0,
+            numberRejected: 0,
+            numberOfTotalWorkItems: 0,
+            numberOfItemsMeetingChannelConditions: 0,
+            numberOfItemsMeetingUtilizationCondition: 0,
+            numberOfItemsMeetingChannelAndUtilzationConditions: 0,
+        };
+
+        (channel.queues).forEach(function (queue) {
+            workItemSummary.numberPendingAcceptance += queue.workItemSummary.numberPendingAcceptance;
+            workItemSummary.numberQueued += queue.workItemSummary.numberQueued;
+            workItemSummary.numberOfDuplicates += queue.workItemSummary.numberOfDuplicates;
+            workItemSummary.numberRejected += queue.workItemSummary.numberRejected;
+            workItemSummary.numberOfTotalWorkItems += queue.workItemSummary.numberOfTotalWorkItems;
+        });
+
+        // Get all records matching condition
+        var aggCondition = new GlideAggregate(channel.workitem_table);
+        aggCondition.addEncodedQuery(channel.condition);
+        aggCondition.setWorkflow(false);
+        aggCondition.addAggregate('COUNT');
+        aggCondition.query();
+        if (aggCondition.next() &amp;&amp; aggCondition.canRead()) {
+            workItemSummary.numberOfItemsMeetingChannelConditions = aggCondition.getAggregate('COUNT');
+        }
+        // Get all records matching utilization condition
+        var aggUtilization = new GlideAggregate(channel.workitem_table);
+        aggUtilization.addEncodedQuery(channel.utilization_condition);
+        aggUtilization.setWorkflow(false);
+        aggUtilization.addAggregate('COUNT');
+        aggUtilization.query();
+        if (aggUtilization.next() &amp;&amp; aggUtilization.canRead()) {
+            workItemSummary.numberOfItemsMeetingUtilizationCondition = aggUtilization.getAggregate('COUNT');
+        }
+
+        // Get all records matching both condition and utilization condition
+        var bothConditions = new GlideAggregate(channel.workitem_table);
+        bothConditions.addEncodedQuery(channel.condition);
+        bothConditions.addEncodedQuery(channel.utilization_condition);
+        bothConditions.setWorkflow(false);
+        bothConditions.addAggregate('COUNT');
+        bothConditions.query();
+        if (bothConditions.next() &amp;&amp; bothConditions.canRead()) {
+            workItemSummary.numberOfItemsMeetingChannelAndUtilzationConditions = bothConditions.getAggregate('COUNT');
+        }
+
+        return workItemSummary;
+    },
+    type: 'AWAStatsUtils'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-02-07 20:51:34&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0c13aac253320010a0bdddeeff7b1229&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;180&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AWAStatsUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Advanced Work Assignment" source="com.glide.awa"&gt;d13c46ab47664210cd4e1ce4316d4391&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0c13aac253320010a0bdddeeff7b1229&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-11-27 22:28:03&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:52</sys_created_on>
+        <sys_id>ae60789583b01210c6695855eeaad303</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AWAStatsUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_ae60789583b01210c6695855eeaad303</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:52</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

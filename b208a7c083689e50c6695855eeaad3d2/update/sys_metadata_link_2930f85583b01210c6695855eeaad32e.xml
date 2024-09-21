@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>021d065d73333300cddda4fa54f6a7f0</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_ml_ui.MLApplyClassificationTargetValues&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;This will update Classification Solution level stats (Precision, Coverage, Recall )  based on   solution, target metric and target metric value specified&lt;/description&gt;
+        &lt;name&gt;MLApplyClassificationTargetValues&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var MLApplyClassificationTargetValues = Class.create();
+MLApplyClassificationTargetValues.prototype = {
+    initialize: function() {},
+	// DO NOT MODIFY THIS SCRIPT INCLUDE NAME, FOLLOWING METHOD NAME AND PARAMETERS
+	// THIS METHOD IS BEING INVOKED FROM JAVA CLASS - CLASSIFICATIONSOLUTIONVERSION
+    applyClassificationTargetValues: function(solutionId, targetMetric, targetMetricValue) {
+
+        var applyPcLookup = new global.ApplyPcLookupInstantiator().getApplyPcLookup();
+
+        var userTargets = this._getMetricInStringFormat(targetMetric, targetMetricValue);
+        gs.info(gs.getMessage('Target Metric Values {0}', userTargets));
+
+        //PC lookup info along with distribution per class
+        var pc = {};
+        gs.info(gs.getMessage('Solution id: {0}', solutionId));
+        //Get the class distribution
+
+        var mlClass = new GlideRecordSecure("ml_class");
+        mlClass.addQuery("solution", solutionId);
+        mlClass.query();
+        var classDistr = {};
+        while (mlClass.next()) {
+            var className = mlClass.getValue("name");
+            gs.info(gs.getMessage('Class: {0}', className));
+            var classid = mlClass.getValue("sys_id");
+            var distribution = mlClass.getValue("distribution");
+            classDistr[classid] = {
+                "className": className,
+                "distribution": distribution
+            };
+        }
+        gs.info(classDistr);
+
+        //Get all pc lookups per class
+        var pcl = new GlideRecordSecure("ml_pc_lookup");
+        pcl.addQuery("solution", solutionId);
+        pcl.query();
+        while (pcl.next()) {
+            var classSys_id = pcl.getValue("class_name");
+            var coverage = pcl.getValue("coverage");
+            var precision = pcl.getValue("precision");
+            var recall = pcl.getValue("recall");
+            var threshold = pcl.getValue("threshold");
+
+            var pcl_rec = {
+                "precision": precision,
+                "coverage": coverage,
+                "recall": recall,
+                "threshold": threshold,
+                "distribution": classDistr[classSys_id].distribution,
+                "sys_id": classSys_id,
+                "pcl_ref": pcl.getValue("sys_id")
+            };
+            if (classDistr[classSys_id].className in pc) {
+                var pcl_val = pc[classDistr[classSys_id].className];
+                pcl_val.push(pcl_rec);
+                pc[classDistr[classSys_id].className] = pcl_val;
+            } else {
+                var pcl_val_new = [];
+                pcl_val_new.push(pcl_rec);
+                pc[classDistr[classSys_id].className] = pcl_val_new;
+            }
+        }
+
+        //Find the closest combination per class according to user given targets
+        var estimates = applyPcLookup.getCombinationsCloserToUserTarget(pc, JSON.parse(userTargets), false);
+        gs.info(JSON.stringify(estimates));
+
+        gs.info(gs.getMessage("Updating solution estimates based on user targets"));
+        for (var class_name in estimates) {
+            if (estimates[class_name] !== null) {
+                applyPcLookup.updateSolution(estimates[class_name].pcl_ref);
+            } else {
+                gs.info(gs.getMessage('No default combination found for class {0}', class_name));
+            }
+        }
+
+
+    },
+    _getMetricInStringFormat: function(metricName, metricValue) {
+
+        var metric = {};
+        metric.solution = {};
+        metric.solution[metricName] = metricValue;
+        return global.JSON.stringify(metric);
+
+    },
+
+    validateInputs: function(targetMetricName, targetMetricValue) {
+        var errorMessage = '';
+        if (!(targetMetricName === 'precision' || targetMetricName === 'coverage' || targetMetricName === 'recall'))
+            errorMessage = 'Invalid Metric Name : ' + targetMetricName;
+        if (isNaN(targetMetricValue))
+            errorMessage = targetMetricName[0].toUpperCase() + targetMetricName.slice(1) + 'should be valid number';
+
+        if (targetMetricValue &lt; 0 || targetMetricValue &gt; 100)
+            errorMessage = targetMetricName[0].toUpperCase() + targetMetricName.slice(1) + 'should be between 0 and 100';
+
+        if (errorMessage !== '') {
+            gs.info(gs.getMessage('Solution Update Failed . Error: {0}', errorMessage));
+            throw (errorMessage);
+        }
+
+    },
+    //Checks whether class recall is specified for a solution pre-training
+    isClassRecallSpecified: function(solutionId) {
+        var classRecallSpecified = {};
+        classRecallSpecified.solution_id = solutionId;
+        classRecallSpecified.classRecallSpecified = 'false';
+        var gr = new GlideRecordSecure('ml_solution');
+        gr.get(solutionId);
+
+        if (!gs.nil(gr)) {
+            var parametersElement = gr.getValue('advanced_solution_params');
+            if (!gs.nil(parametersElement) &amp;&amp; parametersElement !== '') {
+                var parameters = parametersElement.split(';');
+                for (var i = 0; i &lt; parameters.length; i++) {
+                    var parameter = parameters[i];
+                    if (parameter.indexOf('Class-Recall') !== -1) {
+                        var classRecallElement = parameter.split('=');
+                        if (classRecallElement.length === 2) {
+                            var classNameRecallValue = classRecallElement[1].split(':');
+                            if (classNameRecallValue.length === 2) {
+                                classRecallSpecified.classRecallSpecified = 'true';
+                                break;
+                            }
+                        }
+
+                    }
+                }
+
+            }
+        }
+
+        return classRecallSpecified;
+    },
+
+    type: 'MLApplyClassificationTargetValues'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2019-09-09 08:26:46&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;021d065d73333300cddda4fa54f6a7f0&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;17&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;MLApplyClassificationTargetValues&lt;/sys_name&gt;
+        &lt;sys_package display_value="ML UI" source="sn_ml_ui"&gt;21f30bcdb7d03300d1dcf8b8ee11a9eb&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="ML UI"&gt;21f30bcdb7d03300d1dcf8b8ee11a9eb&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_021d065d73333300cddda4fa54f6a7f0&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2019-09-20 08:12:05&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:08:58</sys_created_on>
+        <sys_id>2930f85583b01210c6695855eeaad32e</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>MLApplyClassificationTargetValues</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_2930f85583b01210c6695855eeaad32e</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:08:58</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

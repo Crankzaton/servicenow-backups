@@ -1,0 +1,744 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0946b5a987fb51101bf7a64d0ebb35bd</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_skill_cfg_page.ManageSkillsUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;For use in skill matrix of Manage Skills configurable page &lt;/description&gt;
+        &lt;name&gt;ManageSkillsUtils&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ManageSkillsUtils = Class.create();
+ManageSkillsUtils.prototype = {
+
+    /* 
+    simple usage for testing:
+
+    var s = new sn_skill_cfg_page.ManageSkillsUtils();
+    var parentDepartment = "221f79b7c6112284005d646b76ab978c";
+    var parentSkill = "2eb1c2029f100200a3bc1471367fcfe4";
+    var params = {
+        groupBy: department/group,
+        parentDepartment,
+        isRecursiveDepartment: true,
+        parentSkill,
+        isRecursiveSkill: true,
+        pageNumber: 0,
+        pageSize: 100,  // number of user rows to display
+        skillCount: 50, // number of skill columns to display
+        showLocation: true
+    };
+   var result = s.getUserSkillRows(params);
+
+    */
+
+    initialize: function() {
+        this.SKILL_RECURSION_LIMIT = 1000; // hardcoded limit on skills recursion
+        this.util = new global.UserSkillAPI();
+        this.skillManager = new global.SkillManager();
+        this.TABLE = {
+            DEPARTMENT: 'cmn_department',
+            SKILL: 'cmn_skill',
+            GROUP: 'sys_user_group',
+            GROUP_MEMBER: 'sys_user_grmember',
+            USER: 'sys_user'
+        };
+    },
+
+    type: 'ManageSkillsUtils',
+
+    /*
+     * params:
+     * - SkillFilter
+     * - UserFilter/search
+     * - parentDepartment (isRecursiveDepartment)
+     * - parentSkill (isResursiveSkill)
+     * - 
+     * - assignmentGroup
+     * - pageNumber
+     * - pageSize (chooseWindow for users)
+     * - skillCount (how many columns)
+     * - showLocation (boolean for showing location from user profile)
+     * - filter (for filtering users and/or skills using sidepanel filter)
+     */
+    getUserSkillRows(params) {
+        const colorMap = JSON.parse(gs.getProperty('com.snc.skills_management.skill_level_color_map'));
+
+        const skillCount = params.skillCount;
+        const parentSkill = params.parentSkill;
+
+        // load all skill levels and level types into map
+        var skillLevelTypesMap = this.loadSkillLevelTypes();
+
+        // search only skills in filter if provided, or choose window of all skills
+        var selectedSkillsMap;
+        if (params.filter &amp;&amp; params.filter.cmn_skill &amp;&amp; params.filter.cmn_skill.sys_id.length) {
+            selectedSkillsMap = this.getFilteredSkills(params.filter.cmn_skill.sys_id);
+        } else {
+            if(!this.getSkillGr(parentSkill)){
+                gs.warn("Could not find parent skill");
+                return {
+                    error: true,
+                    errorMessage: gs.getMessage("Could not find parent skill")
+                };
+            }
+            selectedSkillsMap = this.getSkillsByParentSkill(parentSkill, params.isRecursiveSkill, skillCount);
+        }
+
+        let usersList = [];
+        let totalRowCount = 0;
+        let grpMembers = {};
+        var implementations = new GlideScriptedExtensionPoint().getExtensions('sn_skill_cfg_page.ManageSkillsExtnPt');
+        if (implementations) {
+            for (let i = 0; i &lt; implementations.length; i++) {
+                let implementation = implementations[i];
+                if (implementation.canHandle(params)) {
+                    const result = implementation.getUsers(params);
+                    if(!result || result.error){
+                        return {
+                            error: true,
+                            errorMessage: result.errorMessage
+                        };
+                    }
+                    usersList = result.usersList;
+                    totalRowCount = result.totalRowCount;
+                    grpMembers = result.grpMembers;
+                    break;
+                }
+            }
+        } else {
+            gs.error("unable to find extension point for ManageSkillsExtnPt");
+            return {
+                error: true
+            };
+        }
+
+        var userGr = new GlideRecordSecure("sys_user");
+        userGr.addQuery("sys_id", "IN", usersList.join());
+        userGr.orderBy("name");
+        userGr.query();
+
+        var users = new Map();
+        while (userGr.next()) {
+            let record = {};
+            record.id = userGr.getUniqueValue();
+            record.label = userGr.getValue("name");
+            record.skills = {};
+            let userDepartment = userGr.getValue("department");
+            if (!gs.nil(userDepartment)) {
+                record.department = {
+                    id: userDepartment,
+                    label: userGr.getDisplayValue("department")
+                };
+            }
+            users.set(record.id, record);
+        }
+
+        users = this.getSkillLevelsForUsers(users, selectedSkillsMap, skillLevelTypesMap);
+        this.getUserCountBySkillPerGroup(grpMembers, selectedSkillsMap, skillLevelTypesMap); // updates grpMembers with userCount by skill for each group
+
+        var result = {
+            skills: Object.fromEntries(selectedSkillsMap),
+            skillLevelTypes: Object.fromEntries(skillLevelTypesMap),
+            userRows: Object.fromEntries(users),
+            colorMap,
+            totalRowCount,
+            grpMembers
+        };
+        return result;
+    },
+
+    /*
+     * Build a map
+     * Map of just the columns to display (these require more queries to get level types)
+     */
+    getSkillsByParentSkill(parentSkill, isRecursive, skillCount) {
+        var selectedSkillsMap = new Map();
+        var parentGr = this.getSkillGr(parentSkill);
+        if (parentGr == null) {
+            gs.warn("Could not find parent Skill");
+            return;
+        }
+
+        this._getSkillsRecursive(selectedSkillsMap, parentSkill, isRecursive, skillCount);
+
+        return selectedSkillsMap;
+    },
+
+    /*
+     * helper for getSkillsByParentSkill() when recurive option is true
+     */
+    _getSkillsRecursive(selectedSkillsMap, parentSkill, isRecursive, skillCount) {
+
+        var gr = new GlideAggregate("cmn_skill_contains");
+        gr.addQuery("contains", parentSkill);
+        gr.addQuery("skill.active", true);
+        gr.query();
+        while (gr.next()) {
+            if (selectedSkillsMap.size &gt;= skillCount || selectedSkillsMap.size &gt;= this.SKILL_RECURSION_LIMIT) { // hard cap on skills works if singlethreaded
+                return;
+            }
+            const skillId = gr.getValue("skill");
+            if (!selectedSkillsMap.get(skillId)) {
+                let skillRecord = {};
+                skillRecord = this.getSkillInfoById(skillId);
+                selectedSkillsMap.set(skillId, skillRecord);
+                if (isRecursive)
+                    this._getSkillsRecursive(selectedSkillsMap, skillId, true, skillCount);
+            }
+        }
+    },
+
+    getSkillInfoById(skillId) {
+        var gr = new GlideRecordSecure("cmn_skill");
+        gr.get(skillId);
+        var record = {};
+        const skillLevelType = gr.getValue("level_type");
+        record.id = skillId;
+        record.name = gr.getValue("name");
+        record.levelType = skillLevelType;
+        record.description = gr.getDisplayValue("description");
+        return record;
+    },
+
+    _getBasicSkillInfoById(skillId) {
+        var gr = new GlideRecordSecure("cmn_skill");
+        gr.get(skillId);
+        var record = {};
+        record.id = skillId;
+        record.name = gr.getValue("name");
+        return record;
+    },
+
+    getSkillGr(skillId) {
+        var gr = new GlideRecordSecure("cmn_skill");
+        if (gr.get(skillId))
+            return gr;
+
+        return null;
+    },
+
+    getFilteredSkills(filteredSkills) {
+        var skillsMap = new Map();
+        var skillsGr = new GlideRecordSecure(this.TABLE.SKILL);
+        if (gs.nil(filteredSkills) || filteredSkills.length === 0)
+            return skillsMap;
+        skillsGr.addQuery('sys_id', 'IN', filteredSkills.join(','));
+        skillsGr.query();
+        while (skillsGr.next()) {
+            var skillId = skillsGr.getUniqueValue();
+            skillsMap.set(skillId, {
+                id: skillId,
+                name: skillsGr.getValue('name'),
+                levelType: skillsGr.getValue("level_type")
+            });
+        }
+        return skillsMap;
+    },
+
+    /*
+     * given the object of users and list of skills (rows x columns)
+     * find out whether the user has that skill, and at what level
+     */
+    getSkillLevelsForUsers(users, skillsMap, levelTypeMap) {
+
+        let hasSkill = new GlideAggregate("sys_user_has_skill");
+        hasSkill.addQuery('active', true);
+        hasSkill.addQuery("user", "IN", Array.from(users.keys()).join());
+        hasSkill.addQuery("skill", "IN", Array.from(skillsMap.keys()).join());
+        hasSkill.query();
+        // for each sys_user_has_skill, see if it is the highest value skill that user has.
+        while (hasSkill.next()) {
+            let record = {};
+            let skillId = hasSkill.getValue("skill");
+            let levelId = hasSkill.getValue("skill_level");
+            let recordId = hasSkill.getValue("sys_id");
+            let userId = hasSkill.getValue("user");
+            record.level = levelId;
+            const user = users.get(hasSkill.getValue('user'));
+            let skills = user.skills;
+            record.sys_id = skillId;
+            let skillRecord = skillsMap.get(skillId);
+            if (levelId) { // Level exists
+                const levelInfo = this._getLevelInfoFromSkillLevelType(skillsMap, levelTypeMap, skillId, levelId);
+                if (!levelInfo) {
+                    gs.warn("No information found for this level " + levelId + " and skill " + skillId);
+                    skills[skillId] = {
+                        value: null,
+                        userId: userId,
+                        userName: user.label,
+                        level: null,
+                        skillId: skillId,
+                        skillName: skillRecord.name,
+                        levelTypeId: skillRecord.levelType,
+                        recordId: recordId
+                    }; // value null
+                }
+                //if skill not inserted yet, had no level due to malformed data, or found a higher value
+                else if (!skills[skillId] || skills[skillId].value == null || skills[skillId].value &lt; levelInfo.value) {
+                    skills[skillId] = {
+                        level: levelId,
+                        value: levelInfo.value,
+                        name: levelInfo.name,
+                        userId: userId,
+                        userName: user.label,
+                        skillId: skillId,
+                        skillName: skillRecord.name,
+                        levelTypeId: skillRecord.levelType,
+                        recordId: recordId
+                    };
+                }
+            } else { // simply default value when there is no level
+                if (!skills[skillId]) {
+                    skills[skillId] = {
+                        value: null,
+                        userId: userId,
+                        userName: user.label,
+                        level: null,
+                        skillId: skillId,
+                        skillName: skillRecord.name,
+                        levelTypeId: skillRecord.levelType,
+                        recordId: recordId
+                    }; // value null
+                }
+            }
+        }
+
+        Array.from(users.keys()).forEach(function(userId) {
+            const user = users.get(userId);
+            let skills = user.skills;
+            Array.from(skillsMap.keys()).forEach(function(skillId) {
+                let skillRecord = skillsMap.get(skillId);
+                if (!skills[skillId]) {
+                    skills[skillId] = {
+                        userId: userId,
+                        userName: user.label,
+                        level: null,
+                        value: null,
+                        levelTypeId: skillRecord.levelType,
+                        skillId: skillId,
+                        skillName: skillRecord.name,
+                        recordId: '-1'
+                    }; // value null
+                }
+            });
+        });
+        return users;
+    },
+
+    /* 
+     * helper to access our stored skill type information, to get the numerical value of a skill level 
+     */
+    _getLevelInfoFromSkillLevelType(skillsMap, skillLevelTypesMap, skill, level) {
+        let skillRecord = skillsMap.get(skill);
+        if (!skillRecord) {
+            gs.warn("sys_user_has_skill not within set of skills");
+            return null;
+        }
+        if (skillRecord.levelType) {
+            let levelType = skillLevelTypesMap.get(skillRecord.levelType);
+            if (!levelType) {
+                gs.warn("Level type expected but not saved in skilLevelTypes");
+            }
+            return levelType[level]; // numerical value for this Level sysId within this Level Type
+        } else {
+            gs.warn("expected level type to exist for level " + level);
+            return null; // no level type for this skill, so it is just a default value
+        }
+    },
+
+    loadSkillLevelTypes: function() {
+        var levelTypesMap = new Map();
+        var typeGr = new GlideRecordSecure("cmn_skill_level_type");
+        typeGr.query();
+        while (typeGr.next()) {
+            let levelTypeId = typeGr.getUniqueValue();
+            if (!levelTypesMap.get(levelTypeId)) {
+                levelTypesMap.set(levelTypeId, this.getLevelInfoByLevelType(levelTypeId));
+            }
+        }
+        return levelTypesMap;
+    },
+
+    getLevelInfoByLevelType: function(levelTypeId) {
+        var levelInfo = {};
+        var levelGR = new GlideRecordSecure("cmn_skill_level");
+        levelGR.addQuery("skill_level_type", levelTypeId);
+        levelGR.orderBy("value");
+        levelGR.query();
+        while (levelGR.next()) {
+            var level = {};
+            level.name = levelGR.getValue("name");
+            level.sys_id = levelGR.getValue("sys_id");
+            level.value = levelGR.getValue("value");
+            level.colorDisplayValue = levelGR.getDisplayValue('color');
+            level.colorValue = levelGR.getValue('color');
+            var type = levelGR.getValue("skill_level_type");
+            var levels = {};
+            if (levelInfo.hasOwnProperty(type)) {
+                levels = levelInfo[type];
+            }
+            levels[level.sys_id] = level; // Use key later to sort by skill level value instead of during query
+            levelInfo[type] = levels;
+        }
+        return levelInfo[type];
+    },
+
+    getDepartmentGr: function(department) {
+        var gr = new GlideRecordSecure("cmn_department");
+        if (gr.get(department))
+            return gr;
+
+        return null;
+    },
+
+    canReadTable: function(table) {
+        var gr = new GlideRecord(table);
+        return gr.canRead();
+    },
+    //[{sys_id: '46d44a23a9fe19810012d100cca80666', selectedLevel: '4e0ac4d6b3332300290ea943c6a8dc4e'}]
+    getUserSkillLevelsByUserId(users) {
+        const userSkillLevels = new Map();
+        for (let i = 0; i &lt; users.length; i++) {
+            const user = users[i];
+            if (user.hasOwnProperty('sys_id') &amp;&amp; user.sys_id) {
+                userSkillLevels.set(user.sys_id, user.selectedLevel);
+            }
+        }
+        return userSkillLevels;
+    },
+    //get existing user skill pairs
+    getSkilledUsers(skillId, userIds) {
+        const skilledUsersByUserId = new Map();
+        var gr = new GlideRecordSecure("sys_user_has_skill");
+        gr.addActiveQuery();
+        gr.addQuery("skill", skillId);
+        gr.addQuery("user", "IN", userIds.join(','));
+        gr.orderByDesc("skill_level.value");
+        gr.query();
+        while (gr.next()) {
+            let userId = gr.getValue("user");
+            if (!skilledUsersByUserId.has(userId)) {
+                let user = {};
+                user.userId = userId;
+                user.level = gr.getValue("skill_level");
+                skilledUsersByUserId.set(userId, user);
+            }
+        }
+        return skilledUsersByUserId;
+    },
+    //only update user skill if selected level is different from the existing skill level
+    //or insert if there is no this user skill pair
+    updateSkilledUsers(skillId, userSkillLevelsByUserId) {
+        const dbSkillLevelsBySkillId = this.getSkilledUsers(skillId, Array.from(userSkillLevelsByUserId.keys()));
+        for (let [key, value] of userSkillLevelsByUserId) {
+            const userId = key;
+            const selectedLevel = value;
+            if (!dbSkillLevelsBySkillId.has(userId) ||
+                selectedLevel != dbSkillLevelsBySkillId.get(userId).level) {
+                this.util.updateUserSkill(skillId, userId, selectedLevel);
+            }
+        }
+    },
+    //insert user skill or update skill level
+    //[{sys_id: '46d44a23a9fe19810012d100cca80666', selectedLevel: '4e0ac4d6b3332300290ea943c6a8dc4e'}]
+    updateSkill(skillId, users) {
+        const userSkillLevelsByUserId = this.getUserSkillLevelsByUserId(users);
+        this.updateSkilledUsers(skillId, userSkillLevelsByUserId);
+    },
+
+    deleteUserSkillsBySkillId(skillId, usersToBeDeleted) {
+        this.util.deleteUserSkill(usersToBeDeleted, [skillId]);
+    },
+
+    deleteUserSkillsByUserId(userId, skillsToBeDeleted) {
+        this.util.deleteUserSkill([userId], skillsToBeDeleted);
+
+    },
+
+    _findValidRecord: function(table, sysId) {
+        var gr = new GlideRecord(table);
+        return gr.get(sysId);
+
+    },
+
+    addParentSkillAndCategory(data) {
+        var newSkillId = data.newSkillId;
+        var skillCategories = data.skillCategories;
+        var parentSkill = data.parentSkill;
+        var response = {};
+        try {
+            if (this._findValidRecord('cmn_skill', parentSkill)) {
+                var res = this.skillManager.addParentSkill(newSkillId, parentSkill);
+                if (res.status === 'error') {
+                    throw new Error(res.errorMessage);
+                }
+                skillCategories.forEach(function(category) {
+                    var result = new global.SkillManager().createM2MSkillCategory(newSkillId, category.id);
+                    if (result.status === 'error') {
+                        throw new Error(result.errorMessage);
+                    }
+                });
+            }
+        } catch (error) {
+            gs.warn(error.message);
+            response = {
+                error: error,
+                success: false
+            };
+            return response;
+        }
+        response = {
+            newSkillId: newSkillId,
+            success: true
+        };
+        return response;
+    },
+
+    /*
+     * Get details of all the departments that contain parentDepartment if isRecursive is true
+     * Else, get the department details of parentDepartment
+     */
+    getAllDepartments(parentDepartment, isRecursiveDepartment) {
+        if (gs.nil(parentDepartment)) {
+            gs.warn("Parent department not provided");
+        }
+        let departmentMap = {};
+        let deptGR = new GlideRecordSecure(this.TABLE.DEPARTMENT);
+        deptGR.get(parentDepartment);
+        deptGR.query();
+        if (deptGR.next()) {
+            departmentMap[deptGR.getUniqueValue()] = deptGR.getValue('name');
+        }
+        this.getRecursiveDepartments(parentDepartment, departmentMap, isRecursiveDepartment);
+        return Object.keys(departmentMap);
+    },
+
+    getRecursiveDepartments(parentDepartment, departmentMap, isRecursiveDepartment) {
+        if (gs.nil(parentDepartment))
+            return;
+        let deptGR = new GlideRecordSecure(this.TABLE.DEPARTMENT);
+        deptGR.addActiveQuery();
+        deptGR.addQuery("parent", parentDepartment);
+        deptGR.query();
+        if (!deptGR) {
+            gs.warn("Parent department not found");
+        }
+        while (deptGR.next()) {
+            const depSysId = deptGR.getUniqueValue();
+            if (!departmentMap[depSysId]) {
+                departmentMap[depSysId] = deptGR.getValue('name');
+                if (isRecursiveDepartment)
+                    this.getRecursiveDepartments(depSysId, departmentMap, isRecursiveDepartment);
+            }
+        }
+    },
+
+    // Get number of users in a group that have a skill
+    getUserCountBySkillPerGroup: function(grpMembers, skillMap) {
+        var userCountBySkills = {};
+        var skillAndUserKeysMap = {}; // to avoid duplicate count
+        var skills = Array.from(skillMap.keys());
+
+        //for each group calculate user count skills
+        for (var group in grpMembers) {
+            var users = grpMembers[group].users.map(user =&gt; {
+                return user.userID;
+            });
+            // Get skill levels associated with the skills of parentSkill that users in this group/department have
+            var skillLevels = this.getDistinctSkillLevels(users, skills);
+            userCountBySkills = {};
+            for (var i = 0; i &lt; skillLevels.length; i++) {
+                //Get available skill level count for skills of parentSkill that the users in the group/department have
+                this.getUserCountBySkillLevel(users, skills, skillLevels[i], userCountBySkills, skillAndUserKeysMap);
+            }
+            var userCountBySkillWithNoLevelType = this.getUserCountBySkillWithNoLevelType(users, skills);
+            var userCountBySkillLevel = {};
+            //Construct skill level count for each skill level for a skill per group
+            for (var j in skills) {
+                var skill = skills[j];
+                if (!gs.nil(userCountBySkills[skill])) // get skill level count for each group if level type is associated with the skill
+                    userCountBySkillLevel[skill] = this.flattenSkillLevelCounts(userCountBySkills[skill]);
+            }
+            grpMembers[group] = {
+                'userCountBySkillLevel': userCountBySkillLevel,
+                'userCountBySkillWithNoLevelType': userCountBySkillWithNoLevelType,
+                ...grpMembers[group]
+            };
+        }
+    },
+
+    getDistinctSkillLevels: function(users, skills) {
+        if (gs.nil(users) || gs.nil(skills) || users.length === 0 || skills.length === 0)
+            return [];
+        var skillLevelIds = [];
+        var skillLevels = [];
+        var ga = new GlideAggregate("sys_user_has_skill");
+        ga.addQuery('user', 'IN', users.join(','));
+        ga.addQuery('skill', 'IN', skills.join(','));
+        ga.addQuery("active", true);
+        ga.groupBy("skill_level");
+        ga.query();
+
+        while (ga.next()) {
+            var skillLevel = ga.getValue("skill_level");
+            if (!gs.nil(skillLevel))
+                skillLevelIds.push(skillLevel);
+        }
+
+        var gr = new GlideRecordSecure("cmn_skill_level");
+        gr.addQuery("sys_id", "IN", skillLevelIds);
+        gr.orderByDesc("value");
+        gr.query();
+
+        while (gr.next()) {
+            skillLevels.push({
+                id: gr.getValue("sys_id"),
+                name: gr.getValue("name"),
+                rank: gr.getValue("value")
+            });
+        }
+        return skillLevels;
+    },
+
+    // Get skill level count for each skill in a group
+    getUserCountBySkillLevel: function(users, skills, skillLevel, userCountBySkills, skillAndUserKeysMap) {
+        var ga = new GlideAggregate("sys_user_has_skill");
+        ga.addQuery("skill_level", skillLevel.id);
+        ga.addQuery('user', 'IN', users.join(','));
+        ga.addQuery('skill', 'IN', skills.join(','));
+        ga.addQuery("active", true);
+        ga.orderBy("skill");
+        ga.orderBy("user");
+        ga.query();
+
+        while (ga.next()) {
+            var skillId = ga.getValue("skill");
+            var userId = ga.getValue("user");
+            var uniqueKey = skillId + "-" + userId;
+
+            // continue if user already has skill = skillId and skill_level = skillLevel.id
+            if (uniqueKey in skillAndUserKeysMap) {
+                continue;
+            }
+            skillAndUserKeysMap[uniqueKey] = true;
+
+            // begin to populate skill data to userCountBySkills
+            var skill = userCountBySkills[skillId];
+            if (!skill) {
+                userCountBySkills[skillId] = skill = {
+                    skill_id: skillId,
+                    skill_levels: [],
+                };
+            }
+
+            var lastSkillLevel = skill.skill_levels[skill.skill_levels.length - 1];
+            var nextSkillLevel = lastSkillLevel ?
+                lastSkillLevel.skill_level_id === skillLevel.id ?
+                lastSkillLevel :
+                null :
+                null;
+
+            if (!nextSkillLevel) {
+                nextSkillLevel = {
+                    skill_level_id: skillLevel.id,
+                    skill_level_name: skillLevel.name,
+                    skill_level_rank: skillLevel.rank,
+                    user_count: 0,
+                };
+                skill.skill_levels.push(nextSkillLevel);
+            }
+
+            nextSkillLevel.user_count++;
+        }
+    },
+
+    getUserCountBySkillWithNoLevelType: function(users, skills) {
+        var userSkillCount = {};
+        var userSkillGA = new GlideAggregate('sys_user_has_skill');
+        userSkillGA.addQuery('user', 'IN', users.join(','));
+        userSkillGA.addQuery('skill', 'IN', skills.join(','));
+        userSkillGA.addQuery('active', true);
+        userSkillGA.addNullQuery('skill_level');
+        userSkillGA.addAggregate('COUNT', 'user');
+        userSkillGA.groupBy('skill');
+        userSkillGA.query();
+        while (userSkillGA.next()) {
+            userSkillCount[userSkillGA.getValue('skill')] = userSkillGA.getAggregate('COUNT', 'user');
+        }
+        return userSkillCount;
+    },
+
+    /**
+     * Get user count per skill grouped by skill level
+     */
+    flattenSkillLevelCounts: function(skillLevelCounts) {
+        var simplifiedResult = {};
+        if (gs.nil(skillLevelCounts) || gs.nil(skillLevelCounts.skill_levels) || skillLevelCounts.skill_levels.length === 0)
+            return simplifiedResult;
+        skillLevelCounts.skill_levels.forEach(skill_level =&gt; {
+            (simplifiedResult[skill_level.skill_level_id] =
+                skill_level.user_count);
+        });
+
+        return simplifiedResult;
+    },
+
+    groupsManagedByMe: function() {
+        var groups = [];
+        var groupGR = new GlideRecord(this.TABLE.GROUP);
+        groupGR.addQuery('manager', gs.getUserID());
+        groupGR.addActiveQuery();
+        groupGR.query();
+        while (groupGR.next())
+            groups.push(groupGR.getUniqueValue());
+
+        return groups;
+    },
+
+    getUsersIManage: function() {
+        var users = [];
+        var groups = this.groupsManagedByMe();
+
+        var userGR = new GlideRecord(this.TABLE.GROUP_MEMBER);
+        userGR.addActiveQuery();
+        userGR.addQuery('group', 'IN', groups.join(','));
+        userGR.query();
+        while (userGR.next())
+            users.push(userGR.getValue('user'));
+        return users;
+    }
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-12-16 02:17:35&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0946b5a987fb51101bf7a64d0ebb35bd&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;117&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ManageSkillsUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Manage Skills Configurable Page" source="sn_skill_cfg_page"&gt;4208aef477331110045b526faa106102&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Manage Skills Configurable Page"&gt;4208aef477331110045b526faa106102&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0946b5a987fb51101bf7a64d0ebb35bd&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-03-15 23:35:44&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:37</sys_created_on>
+        <sys_id>cb50349583b01210c6695855eeaad3a2</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ManageSkillsUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_cb50349583b01210c6695855eeaad3a2</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:37</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,225 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>17f59cb90bf300104e67ed3ab4673a4e</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.ResourcePlanMoveSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Customers should not change this script include directly&amp;#13;
+This is never called directly.&lt;/description&gt;
+        &lt;name&gt;ResourcePlanMoveSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ResourcePlanMoveSNC = Class.create();
+ResourcePlanMoveSNC.prototype = {
+    initialize: function(resourcePlanGr, logParams) {
+		this.resourcePlanGr = resourcePlanGr;
+		this.rpId = resourcePlanGr.getValue('sys_id');
+		this.logParams = logParams;
+    },
+	
+	_setDatesInLogParams: function(oldStartDate,newStartDate){
+		var fromDate = new GlideDate();
+		fromDate.setValue(oldStartDate.getValue());
+		var toDate = new GlideDate();
+		toDate.setValue(newStartDate.getValue());
+		this.logParams.fromDate = fromDate;
+		this.logParams.toDate = toDate;
+	},
+	
+	//moving of resource plan by mainting planned/requested hours contour at the daily level
+	move: function(newSD, oldSD, isResPlanLevel) {
+        var newStartDateTime = new GlideDateTime(newSD);
+        var newStartDate = newStartDateTime.getLocalDate();
+        var oldStartDateTime = new GlideDateTime(oldSD);
+        var oldStartDate = oldStartDateTime.getLocalDate();
+		
+        var resPlanOldEndDate = new GlideDate();
+        resPlanOldEndDate.setValue(this.resourcePlanGr.getValue("end_date"));
+        var resPlanOldStartDate = new GlideDate();
+        resPlanOldStartDate.setValue(this.resourcePlanGr.getValue("start_date"));
+        var difference = GlideDateTime.subtract(oldStartDate, newStartDate);
+        var resPlanNewStartDate = new GlideDate();
+        resPlanNewStartDate.setValue(resPlanOldStartDate.getValue());
+        resPlanNewStartDate.add(difference);
+		this._setDatesInLogParams(resPlanOldStartDate, resPlanNewStartDate);
+
+        var prevScheduledHours = ResourceManagementUtils.getScheduleHours(this.resourcePlanGr, resPlanOldStartDate, resPlanOldEndDate);
+        var rmHourAggregator = new RMHoursAggregator();
+        var dateRanges = [new RMDateRange(resPlanOldStartDate, resPlanOldEndDate)];
+        var workingDays = rmHourAggregator.calculateWorkingDaysByDateRange(dateRanges, prevScheduledHours);
+        var newPlanObj = rmHourAggregator.getNewScheduleHoursAndEndDateBasedOnWorkingDays(workingDays[0], resPlanNewStartDate, this.resourcePlanGr);
+        var finalEndDateOfResPlan = newPlanObj.newEndDate;
+        var newScheduleHours = newPlanObj.newScheduleHours;
+		
+		//Need to check if RP dates lies within the project dates only when the RP is moved, and skip this check in case of Move Project action
+		if(isResPlanLevel &amp;&amp; !RMUtil.isRPLiesInTaskDuration(this.resourcePlanGr, resPlanNewStartDate, finalEndDateOfResPlan)){
+			return ResourceConstants.RP_DATES_DOES_NOT_LIE_IN_TASK_DATES.getErrorMsg(this.resourcePlanGr,'moveResPlan');
+		}
+
+        this._calculateHoursToAllocateForNewDates(prevScheduledHours, newScheduleHours, resPlanNewStartDate);
+        var resourcePlan = new ResourcePlan(this.resourcePlanGr);
+        this.userIds = resourcePlan.getUsersFromAllocations('', this.resourcePlanGr.getValue('start_date'), this.resourcePlanGr.getValue('end_date'));
+
+        this._deleteReqAllocs();
+        var moveStateToReq = false;
+        if (this.resourcePlanGr.getValue('state') == ResourcePlanState.ALLOCATED || this.resourcePlanGr.getValue('state') == ResourcePlanState.CONFIRMED) {
+            this._deletePrevResAllocationsAndRollupCostAndHours();
+            moveStateToReq = true;
+        }
+		
+		this._updateResPlanDates(resPlanNewStartDate, finalEndDateOfResPlan, moveStateToReq);
+		this._createReqAllocsAndRollupCostAndHours(resPlanNewStartDate, finalEndDateOfResPlan);
+
+        
+    },
+	
+	_calculateHoursToAllocateForNewDates: function(prevScheduledHours, newScheduleHours, resPlanNewStartDate) {
+        var reqAllocDailyArray = ResourceGridQueries.getRequestedAllocationDailyArray(this.resourcePlanGr);
+        this.hoursToAllocate = {};
+        var i = 0;
+        var j = 0;
+        var reqAllocDailyDate = new GlideDate();
+        reqAllocDailyDate.setValue(resPlanNewStartDate.getValue());
+        while (i &lt; reqAllocDailyArray.length) {
+            if (!(reqAllocDailyDate in this.hoursToAllocate) &amp;&amp; prevScheduledHours[i] &gt; 0) {
+                if (newScheduleHours[j] &gt; 0) {
+                    this.hoursToAllocate[reqAllocDailyDate.getValue()] = reqAllocDailyArray[i];
+                    reqAllocDailyDate.addDaysUTC(1);
+                    j++;
+                } else {
+                    reqAllocDailyDate.addDaysUTC(1);
+                    j++;
+                    continue;
+                }
+            }
+            i++;
+        }
+    },
+
+	_deleteReqAllocs: function() {
+        var reqAllocGr = new GlideRecord('requested_allocation');
+        reqAllocGr.addQuery('resource_plan', this.rpId);
+        reqAllocGr.query();
+        reqAllocGr.setWorkflow(false);
+        reqAllocGr.deleteMultiple();
+    },
+	
+	_deletePrevResAllocationsAndRollupCostAndHours: function() {
+        var rmAggHelper = new RMAggregateHelper();
+        var categories = rmAggHelper.getCategoriesToUpdateFromPlan(this.resourcePlanGr);
+
+        var resAllocGr = new GlideRecord('resource_allocation');
+        resAllocGr.addQuery('resource_plan', this.rpId);
+        resAllocGr.query();
+        resAllocGr.setWorkflow(false);
+        resAllocGr.deleteMultiple();
+
+        ResourcePlanRollupHelper.rollupAllocatedCostAndHours(this.resourcePlanGr);
+        ResourcePlanRollupHelper.rollupAllocatedCostToTask(this.resourcePlanGr);
+
+        rmAggHelper.updateAggregatesForMultipleUsers(this.resourcePlanGr, this.userIds, categories);
+    },
+	
+	_updateResPlanDates: function(resPlanNewStartDate, finalEndDateOfResPlan, moveStateToReq) {
+        this.rpGr = new GlideRecord('resource_plan');
+        this.rpGr.get(this.rpId);
+        if (moveStateToReq)
+            this.rpGr.setValue('state', ResourcePlanState.REQUESTED);
+        this.rpGr.setValue('start_date', resPlanNewStartDate.getValue());
+        this.rpGr.setValue('end_date', finalEndDateOfResPlan.getValue());
+        this.rpGr.setWorkflow(false);
+        this.rpGr.update();
+		if (!moveStateToReq){
+			var logHelper = new ResourcePlanLogHelper(this.rpGr,true,false);
+			logHelper.populateLogs(this.logParams);
+		}
+    },
+	
+	_createReqAllocsAndRollupCostAndHours: function(resPlanNewStartDate, finalEndDateOfResPlan) {
+        var rmRates = new RMRates(this.rpGr);
+        var dailyRate = rmRates.getDailyRatesForPlan(resPlanNewStartDate.getValue(), finalEndDateOfResPlan.getValue());
+        var allocationEditor = new ResourceGridAllocationEditor('requested_allocation', this.rpGr, this.rpGr.getValue('distribution'));
+        var allocIds = allocationEditor.createNewDailies(this.hoursToAllocate, dailyRate);
+        ResourcePlanRollupHelper.rollupFromRequestedDailiesToAllocations(allocIds);
+        ResourcePlanRollupHelper.rollupPlannedCostAndHours(this.rpGr);
+        ResourcePlanRollupHelper.rollupPlannedCostToTask(this.rpGr);
+    },
+	
+	updateCostPlan: function() {
+        //gs.info("Into updateCostPlan -&gt; this.rpGr: " + this.rpGr.getValue("sys_id"));
+        var gr = new GlideRecord('cost_plan');
+        var costPlanExists = gr.get('resource_plan', this.rpGr.getValue('sys_id'));
+        if (costPlanExists) {
+            var costPlan = new CostPlan(gr);
+            costPlan.syncChangesFromResourcePlan(this.rpGr);
+        }
+    },
+	
+	updateResourcePlanState: function(previousState,async) {
+		if(async){
+			var param1 = {};
+			param1['previousAllocatedUsers'] = this.userIds;
+			param1['previousState'] = previousState;
+			this.logParams.fromDate = this.logParams.fromDate.getValue();
+			this.logParams.toDate = this.logParams.toDate.getValue();
+			this.logParams.action_by = gs.getUserID();
+				param1['logParams'] = this.logParams;
+			if (previousState == ResourcePlanState.CONFIRMED) {
+				this.resourcePlanGr.setValue("state",ResourcePlanState.CONFIRMATION_IN_PROGRESS);
+				this.resourcePlanGr.update();
+				gs.eventQueue('resource_plan.confirmed',this.resourcePlanGr , JSON.stringify(param1), true);
+			} else if (previousState == ResourcePlanState.ALLOCATED) {
+				this.resourcePlanGr.setValue("state",ResourcePlanState.ALLOCATION_IN_PROGRESS);
+				this.resourcePlanGr.update();
+				gs.eventQueue('resource_plan.allocated', this.resourcePlanGr,  JSON.stringify(param1), true);
+			}
+		}
+		else{
+			this.resourcePlanGr = new GlideRecord("resource_plan");
+			this.resourcePlanGr.get(this.rpId);
+			this.resourcePlanGr.setValue("state",previousState);
+			this.resourcePlanGr.setWorkflow(false);
+			this.resourcePlanGr.update();
+			var resourcePlan = new ResourcePlan();
+			resourcePlan.get(this.rpId);
+			var bookingType = previousState == ResourcePlanState.CONFIRMED ? ResourceConstants.SOFT_BOOKING : ResourceConstants.HARD_BOOKING;
+			resourcePlan.usersToAllocate = this.userIds;
+			resourcePlan.createAllocations(bookingType,true,false,this.logParams);
+		}
+    },
+	
+    type: 'ResourcePlanMoveSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-03-27 08:59:34&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;17f59cb90bf300104e67ed3ab4673a4e&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;34&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ResourcePlanMoveSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Resource Management" source="com.snc.resource_management"&gt;7200da2b47e64210cd4e1ce4316d438e&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_17f59cb90bf300104e67ed3ab4673a4e&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2021-01-20 10:49:41&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:10:57</sys_created_on>
+        <sys_id>a2a0f8d583b01210c6695855eeaad390</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ResourcePlanMoveSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_a2a0f8d583b01210c6695855eeaad390</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:10:57</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

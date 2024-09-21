@@ -1,0 +1,211 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>29f0f223eb121100eac006a2f206fe16</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.OnCallReminderEmailGenerator&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Generates an HTML email used to send reminders to users that have on-call duty&lt;/description&gt;
+        &lt;name&gt;OnCallReminderEmailGenerator&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var OnCallReminderEmailGenerator = Class.create();
+OnCallReminderEmailGenerator.prototype = {
+    initialize: function() {
+    },
+	util: {
+		getName: function (id, table) {
+			var record = new GlideRecord(table);
+			if(record.get(id))
+				return record.name;
+			return null;
+		},
+		getNumber: function (id) {
+			var record = new GlideRecord('sys_user');
+			if(record.get(id))
+				return record.mobile_phone;
+			return null;
+		},
+		dayOfWeekAsInteger: function(day) {
+			//servicenow getDay works from 1 - 7
+			var days = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"];
+			return days[day-1];
+		},
+		monthOfYearAsInteger: function(month) {
+			var months = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+			return months[month-1];
+		},
+		getHourAndMinute: function(time) {
+			//get the time, in a foul way there is no getHours() on GlideDateTime and strip away seconds
+			return  (time.getDisplayValue()).split(' ')[1].slice(0, -3);
+		},
+		getRotaName: function(rotaId){
+			var rota = new GlideRecord("cmn_rota");
+			rota.get(rotaId);
+			return rota.name;
+		}
+	},
+
+	buildHeader: function(roster) {
+		//Group name and roster column
+		var html = '&lt;tr&gt;';
+		html += '&lt;th colspan="2" class="box align-middle"&gt;&lt;h3&gt;Group&lt;br&gt;On-Call Schedule&lt;/h3&gt;&lt;/th&gt;';
+
+		//Dates columns
+		for(var day = 0; day &lt; roster.dates.length; day++) {
+			html += '&lt;th class="cell"&gt;&lt;b&gt;' + roster.dates[day].day + '&lt;/b&gt;';
+			html += '&lt;br&gt;' + new GlideDateTime(roster.dates[day].date).getDayOfMonth() + ' ' + this.util.monthOfYearAsInteger(new GlideDateTime(roster.dates[day].date).getMonth());
+			html += '&lt;/th&gt;';
+		}
+		html += '&lt;/tr&gt;';
+		return html;
+	},
+	buildBody: function(dates, group) {
+		//first column is name of roster
+		//rowspan will be sum of shifts * their spans
+		var html = '&lt;tr&gt;';
+		var lineupSize = dates[0].members.length + 1;
+		html += '&lt;td rowspan="'+ lineupSize +'" class="box align-middle thick-border-top"&gt;' + 
+			this.util.getName(group, 'sys_user_group') + "&lt;br&gt;" +
+			dates[0].members[0].rotaName + '&lt;/td&gt;';
+		var i18nTo = gs.getMessage(' to ');
+		for(var row in dates[0].members) {
+			//for each day, show escalation plan
+			html += '&lt;tr&gt;';
+			var shiftStart = 
+				this.util.getHourAndMinute(new GlideDateTime(dates[row].shift.from.getDisplayValue()));
+			var shiftEnd = 
+				this.util.getHourAndMinute(new GlideDateTime(dates[row].shift.to.getDisplayValue()));
+			
+			//only add a thick border to the first row
+			if(row == 0)
+				html += '&lt;td class="cell thick-border-top"&gt;' + shiftStart + i18nTo + shiftEnd + '&lt;/td&gt;';
+			else
+				html += '&lt;td class="cell"&gt;' + shiftStart + i18nTo + shiftEnd + '&lt;/td&gt;';
+
+			for(var date in dates) {
+				//show member lineup
+				html += '&lt;td class="cell';
+				if(dates[date].members[row].highlight)
+					html += ' highlight';
+				if (row == 0)
+					html += ' thick-border-top';
+				if (row == dates[date].members.length)
+					html += ' thick-border-bottom';
+				
+				html += '"&gt;';
+				
+				html += dates[date].members[row].name;
+				html += '&lt;br&gt;' + dates[date].members[row].roster;
+				html += '&lt;br&gt;' + dates[date].members[row].number;
+				html += '&lt;/td&gt;';
+			}
+			html += '&lt;/tr&gt;';
+		}
+		return html;
+	},
+	buildFooter: function(link) {
+		var i18nMsg = gs.getMessage('See your schedule');
+		return "&lt;tr&gt;&lt;td&gt;&lt;a href='" + link + "'&gt;" + i18nMsg + "&lt;/a&gt;&lt;/td&gt;&lt;/tr&gt;";
+	},
+	buildRoster: function(roster, dates, group, link) {
+		var html = "&lt;table cellspacing='0'&gt;";
+		html += this.buildHeader(roster);
+		html += this.buildBody(dates, group);
+		html += this.buildFooter(link);
+		html += "&lt;/table&gt;";
+		return html;
+	},
+	buildMail: function(user, group, plans, link) {
+		
+		//this is needed for scoping
+		var me = this;
+		//only relevant in this function
+		//and very coupled, so keep in here
+		function getDates() {
+			var dates = [];
+			for(var key in plans) {
+				var plan = plans[key].plan;
+				var date = plans[key].date;
+				var shift = plans[key].shift;
+				var rota = plans[key].rota;
+				
+				var members = [];
+				for(var i = 0; i &lt; plan.size(); i++) {
+					var highlight = false;
+					var member = plan.get(i).userId;
+
+					if(user == member)
+						highlight = true;
+					
+					member = { 
+						name : me.util.getName(member, 'sys_user'),
+						roster : me.util.getName(plan.get(i).rosterId, 'cmn_rota_roster'),
+						number : me.util.getNumber(member),
+						highlight : highlight,
+						rotaName : me.util.getRotaName(rota)
+					};
+					members.push(member);
+				}
+				
+				var dateObj = {
+					date : date,
+					day : me.util.dayOfWeekAsInteger(new GlideDateTime(date).getDayOfWeek()),
+					shift : shift,
+					members : members
+				};
+				dates.push(dateObj);
+			}
+			return dates;
+		}
+		
+		var roster = {
+			name : "roster",
+			dates : getDates(),
+			timezone : "CET"
+		};
+		
+		var html = '';
+		html += this.buildRoster(roster, roster.dates, group, link);
+		
+		return html + this.buildStyle();
+	},
+	
+	buildStyle : function() {
+		return "&lt;style type='text/css'&gt;.box {border: 1px solid black;border-top: 1px solid black;padding: 10px;}.cell {border: 1px solid black;text-align: center;padding: 10px}.align-middle{text-align: center;vertical-align: middle;}.primary {color: red;}.thick-border-top {border-top: 4px solid black;}thick-border-bottom{border-bottom: 4px solid black;}.highlight{background-color: #BAF2AE;}&lt;/style&gt;";
+	},
+
+    type: 'OnCallReminderEmailGenerator'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2014-03-04 16:12:38&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;29f0f223eb121100eac006a2f206fe16&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;1&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;OnCallReminderEmailGenerator&lt;/sys_name&gt;
+        &lt;sys_package display_value="On-Call Scheduling" source="com.snc.on_call_rotation"&gt;4bca78ec3cf1311068bcf327dfe37f86&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_29f0f223eb121100eac006a2f206fe16&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2021-04-07 02:10:54&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:52</sys_created_on>
+        <sys_id>6e11bc5983b01210c6695855eeaad31f</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>OnCallReminderEmailGenerator</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_6e11bc5983b01210c6695855eeaad31f</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:52</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

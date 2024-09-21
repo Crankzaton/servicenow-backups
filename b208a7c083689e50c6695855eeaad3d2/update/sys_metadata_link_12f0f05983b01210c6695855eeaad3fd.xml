@@ -1,0 +1,493 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>2470061e9333220064f572edb67ffbe6</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.RMAggregateHelper&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;RMAggregateHelper&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var RMAggregateHelper = Class.create();
+RMAggregateHelper.prototype = {
+    initialize: function() {
+		this.propertiesUtil = new ResourceManagementProperties();
+    },
+	
+	updateFromAllocationDaily: function(grDaily) {
+		var excludedType = false;
+		var excludeTypes = gs.getProperty('com.snc.resource_management.exclude_events_from_schedule');
+		excludedType = JSUtil.notNil(excludeTypes) &amp;&amp; excludeTypes.indexOf(grDaily.getValue('type')) &gt; -1;
+		if (excludedType){
+			if(this.propertiesUtil.getPropertyToGenerateDailyAggregates() == 'true') {
+				var rmDailyAggregate = new RMDailyAggregate(grDaily.getValue('user'), grDaily.getValue('date'), grDaily.getValue('date'));
+				rmDailyAggregate.updateCapacity();
+			} else
+				this.updateWeeklyAndMonthlyAggregates(grDaily.getValue('user'), grDaily.getValue('date'), grDaily.getValue('date'), ['capacity']);
+		}
+		else {
+			var categories = this.getCategoriesToUpdateFromAllocation(grDaily);
+			this.updateAllAggregates(grDaily.getValue("user"),grDaily.getValue("date"),grDaily.getValue("date"),categories,grDaily.getValue("task"));
+		}
+	},
+	
+	updateFromAllocationDailies: function(user, fromDate, toDate, type, taskId) {
+		if (JSUtil.nil(user))
+			return;
+		var excludedType = false;
+		var excludeTypes = gs.getProperty('com.snc.resource_management.exclude_events_from_schedule');
+		excludedType = JSUtil.notNil(excludeTypes) &amp;&amp; excludeTypes.indexOf(type) &gt; -1;
+
+		if (excludedType) {
+			if(this.propertiesUtil.getPropertyToGenerateDailyAggregates() == 'true') {
+				var rmDailyAggregate = new RMDailyAggregate(user, fromDate, toDate);
+				rmDailyAggregate.updateCapacity();
+			} else
+				this.updateWeeklyAndMonthlyAggregates(user, fromDate, toDate, ['capacity']);
+		}
+		else {
+			var categories = this.getCategoriesToUpdateFromType(type);
+			var parm1 = user + ',' + fromDate + ',' + toDate + ',' + taskId;
+			var parm2 = categories.join(',');
+			gs.eventQueue('resource_daily_hours.changed', null, parm1, parm2);
+		}
+	},
+	
+	allCategories: function() {
+		// Updating capacity automatically updates availability. So no need to add it explicitly
+		var allCategories = ['capacity', 'project_allocated', 'project_confirmed', 'non_project_time', 'project_actual', 'non_project_actual'];
+		return allCategories;
+	},
+	
+	getCategoriesToUpdateFromType: function(type) {
+		var categories = [];
+		var projectWork = type == 'project_work';
+		if (projectWork)
+			categories.push('project_allocated');
+		else
+			categories.push('non_project_time');
+		categories.push('availability');
+		return categories;
+	},
+	
+	getCategoriesToUpdateFromAllocation: function(allocation) {
+		var categories = [];
+		var projectWork = false;
+		var bookingType = '1';
+		var operationalWorkType = '';
+		var excludedEvents = [];
+		excludedEvents = RMUtil.excludedEventsArray();
+		if (allocation.instanceOf('resource_allocation_daily')) {
+			projectWork = allocation.getValue('type') == 'project_work';
+			if (projectWork &amp;&amp; !allocation.allocation.nil())
+				bookingType = allocation.booking_type;
+			if (!projectWork &amp;&amp; !allocation.allocation.nil())
+				operationalWorkType = (allocation.allocation.resource_plan.getRefRecord()).getValue('operational_work_type');
+		}
+		else if (allocation.instanceOf('resource_allocation')) {
+			var task = allocation.task.getRefRecord();
+			var resourcePlan = allocation.resource_plan.getRefRecord();
+			if (task.isValidRecord()) {
+				projectWork = RMUtil.isProjectWork(task);
+				bookingType = allocation.booking_type;
+			} else if (resourcePlan.isValidRecord() &amp;&amp; RMUtil.isAttributeBasedPlan(resourcePlan)) {
+				var topTaskOnRP = resourcePlan.top_task.getRefRecord();
+				if(topTaskOnRP.isValidRecord()) {
+					projectWork = RMUtil.isProjectWork(topTaskOnRP);
+					bookingType = allocation.booking_type;
+				}
+			}
+			if (!projectWork)
+				operationalWorkType = (allocation.resource_plan.getRefRecord()).getValue('operational_work_type');
+		}
+		if (projectWork)
+			if (bookingType == '1')
+				categories.push('project_allocated');
+			else
+				categories.push('project_confirmed');
+		else
+			categories.push('non_project_time');
+		if (excludedEvents.indexOf(operationalWorkType) != -1)
+			categories.push('capacity');
+		categories.push('availability');
+		return categories;
+	},
+	
+	getCategoriesToUpdateFromPlan: function(plan) {
+		var categories = [];
+		var projectWork = false;
+		var excludedEvents = [];
+		excludedEvents = RMUtil.excludedEventsArray();
+		
+		if (!plan.task.nil()) {
+			var task = plan.task.getRefRecord();
+			projectWork = RMUtil.isProjectWork(task);
+		}
+		
+		var operationalWorkType = '';
+		if (!projectWork)
+			operationalWorkType = plan.getValue('operational_work_type');
+
+		if (projectWork) {
+			var alloctions = GlideAggregate('resource_allocation');
+			alloctions.addQuery('resource_plan',plan.getValue('sys_id'));
+			alloctions.addAggregate('count');
+			alloctions.groupBy('booking_type');
+			alloctions.query();
+			while (alloctions.next()) {
+				if (alloctions.getValue('booking_type') == '1')
+					categories.push('project_allocated');
+				else
+					categories.push('project_confirmed');
+			}
+		}
+		else
+			categories.push('non_project_time');
+		
+		if (excludedEvents.indexOf(operationalWorkType) != -1)
+			categories.push('capacity');
+		
+		categories.push('availability');
+		return categories;
+	},
+	
+	getCategoriesToUpdateForActuals: function(allocation) {
+		var categories = [];
+		var projectWork = false;
+		if (allocation.instanceOf('resource_allocation_daily')) {
+			projectWork = allocation.getValue('type') == 'project_work';
+		}
+		if (projectWork)
+			categories.push('project_actual');
+		else
+			categories.push('non_project_actual');
+		return categories;
+	},
+	
+	updateAggregates: function(gr, categories) {
+		if (!gr)
+			return;
+		var tableName = gr.getTableName();
+		if (tableName != 'resource_allocation' &amp;&amp; tableName != 'resource_allocation_daily')
+			return;
+		
+		var userId = gr.getValue('user');
+		if (JSUtil.nil(userId))
+			return;
+		var startDate = new GlideDate();
+		var endDate = new GlideDate();
+
+		var taskId = JSUtil.nil(gr.getValue('task')) ? '' : gr.getValue('task');
+		if (tableName == 'resource_allocation') {
+			startDate.setValue(gr.getValue('start_date'));
+			endDate.setValue(gr.getValue('end_date'));
+			var resourcePlan = gr.resource_plan.getRefRecord();
+			var task = gr.task.getRefRecord();
+			if(!task.isValidRecord() &amp;&amp; resourcePlan.isValidRecord() &amp;&amp; RMUtil.isAttributeBasedPlan(resourcePlan)) {
+				var topTaskOnRP = resourcePlan.top_task.getRefRecord();
+				if(topTaskOnRP.isValidRecord())
+					taskId = resourcePlan.getValue('top_task');
+			}
+		} else {
+			startDate.setValue(gr.getValue('date'));
+			endDate.setValue(gr.getValue('date'));
+		}
+		
+		var parm1 = userId + ',' + startDate.getValue() + ',' + endDate.getValue() + ',' + taskId;
+		var parm2 = categories.join(',');
+		gs.eventQueue('resource_daily_hours.changed', null, parm1, parm2);
+	},
+	
+	updateAggregatesForMultipleUsers: function(resourcePlan, users, categories, fromDate, toDate) {
+		if (!resourcePlan)
+			return;
+		
+		if (users.length &lt;= 0)
+			return;
+		
+		if (categories.length &lt;= 0)
+			return;
+		
+		var startDate = new GlideDate();
+		
+		if(JSUtil.notNil(fromDate))
+            startDate = fromDate;
+        else
+            startDate.setValue(resourcePlan.getValue('start_date'));
+        
+        var endDate = new GlideDate();
+		
+        if(JSUtil.notNil(toDate))
+            endDate = toDate;
+        else
+            endDate.setValue(resourcePlan.getValue('end_date'));
+		
+		var taskId = JSUtil.nil(resourcePlan.getValue('task')) ? '' : resourcePlan.getValue('task');
+		
+		users.forEach(function(userId){
+			var parm1 = userId + ',' + startDate.getValue() + ',' + endDate.getValue() + ',' + taskId;
+			var parm2 = categories.join(',');
+			gs.eventQueue('resource_daily_hours.changed', null, parm1, parm2);
+		});
+	},
+	
+	updateResourceAggregatesFromResourceAllocationAndTask: function(resourceAllocRec, taskId) {
+		var userId = resourceAllocRec.getValue('user');
+		var startDate = resourceAllocRec.getValue('start_date');
+		var endDate = resourceAllocRec.getValue('end_date');
+		var categoriesToBeChecked = resourceAllocRec.booking_type;
+		var categories = ['non_project_time'];
+		if(categoriesToBeChecked == 1){
+			categories.push('project_allocated');
+		}
+		else if(categoriesToBeChecked == 2){
+			categories.push('project_confirmed');
+		}
+		this.updateAllAggregatesAsync(userId, startDate, endDate, categories, taskId);
+	},
+	
+	
+	
+	getUsersToUpdateAggregates : function(users,date){
+		var usersToUpdate = [];
+		var glideDate = new GlideDate();
+		glideDate.setValue(date);
+		var table;
+		var dateCol;
+		if(this.propertiesUtil.getPropertyToGenerateDailyAggregates() == 'true') {
+			table = 'resource_aggregate_daily';
+			dateCol = 'date';
+		} else {
+			table = 'resource_aggregate_weekly';
+			dateCol = 'week_starts_on';
+			var dateRangeHelper = new RMDateRangeHelper();
+			dateRangeHelper.resetToWeekStartAndEnd('', glideDate);
+		}
+		
+		var userMaxDates = this.maxPopulatedDate(users, table, dateCol);
+		for(var i = 0; i &lt; users.length; i++){
+			var user = users[i];
+			if(!(user in userMaxDates) || JSUtil.nil(userMaxDates[user]) || glideDate.after(userMaxDates[user]))
+				usersToUpdate.push(user);
+		}
+		return usersToUpdate;
+	},
+	
+	maxPopulatedDate: function(users, table, dateCol){
+		var ga = new GlideRecord(table);
+		ga.addQuery('category', 'capacity');
+		ga.addQuery('user','IN', users.join(','));
+		ga.orderByDesc(dateCol);
+		ga.setLimit(1);
+		ga.query();
+		var userMaxDates = {};
+		while(ga.next()) {
+			var maxDate = ga.getValue(dateCol);
+			var gdt = new GlideDate();
+			gdt.setValue(maxDate);
+			userMaxDates[ga.user] = gdt;
+		}
+		return userMaxDates;
+	},
+	
+	fetchAllTaskIdsFromDailies: function(userId, startDate, endDate) { 
+		var _startDate = new GlideDate(); 
+		_startDate.setValue(startDate); 
+		var _endDate = new GlideDate(); 
+		_endDate.setValue(endDate); 
+		var gaDailies = new GlideAggregate('resource_allocation_daily'); 
+		gaDailies.groupBy('task'); 
+		gaDailies.addQuery('user', userId); 
+		gaDailies.addQuery('date', '&gt;=', _startDate); 
+		gaDailies.addQuery('date', '&lt;=', _endDate); 
+		gaDailies.query(); 
+
+		var taskIdsInDailies = []; 
+		while (gaDailies.next()) { 
+			if (gs.nil(gaDailies.getValue('task'))) { 
+				taskIdsInDailies.push({ id: undefined, isProjectWork: false }); 
+			} else { 
+				taskIdsInDailies.push({ id: gaDailies.getValue('task'), isProjectWork: RMUtil.isProjectWork(gaDailies.task.getRefRecord()) }); 
+			} 
+		} 
+		return taskIdsInDailies; 
+	}, 
+	updateAllAggregatesForAllTasks: function(userId, startDate, endDate, updateAggForGivenDuration, generateDailyAggregates) {
+		var taskIds = this.fetchAllTaskIdsFromDailies(userId, startDate, endDate); //Fetches All taskids from dailies for a user
+		for (var i = 0; i &lt; taskIds.length; i++) { 
+			if (JSUtil.notNil(taskIds[i].id)) { 
+				if (taskIds[i].isProjectWork) 
+					this.updateAllAggregates(userId, startDate, endDate, ['project_allocated', 'project_confirmed', 'project_actual'], taskIds[i].id, updateAggForGivenDuration, generateDailyAggregates); //updates proj,proj tasks,sub projs
+				else 
+					this.updateAllAggregates(userId, startDate, endDate, ['non_project_time', 'non_project_actual'], taskIds[i].id, updateAggForGivenDuration, generateDailyAggregates); //updates incidents
+			} else { 
+				this.updateAllAggregates(userId, startDate, endDate, ['non_project_time', 'non_project_actual'], null, updateAggForGivenDuration, generateDailyAggregates); //updates operational res plans
+			} 
+		} 
+		this.updateAllAggregates(userId, startDate, endDate, ['capacity', 'availability'], null, updateAggForGivenDuration, generateDailyAggregates); //Updates capacity and availability for all
+	},
+	
+	onDailyHoursChanged: function(parm1, parm2) {
+		var parms = parm1.split(',');
+		var userId = parms[0];
+		var startDate = parms[1];
+		var endDate = parms[2];
+		var taskId = (typeof(parms[3]) == 'undefined' || (typeof(parms[3]) == 'string' &amp;&amp; (parms[3] == 'undefined' || parms[3] == 'null')))?'':parms[3];
+		var deleteDuplicateAggregates = (typeof parms[4] == 'undefined') ? '' : parms[4];
+		var updateAggForGivenDuration = (typeof parms[5] == 'undefined') ? '' : parms[5];
+		var generateDailyAggregates = (typeof parms[6] == 'undefined') ? '' : (parms[6] == 'true');
+		var categories = parm2.split(',');
+		
+		var validationObject = RMUtil.validateResourcePlanDuration(startDate,endDate);
+		if(!validationObject.result){
+			gs.log(validationObject.message);
+			return;
+		}
+		if (JSUtil.nil(userId) || userId == 'null' || userId == 'undefined')
+			return; 
+		if (typeof(taskId) == 'string' &amp;&amp; taskId == 'all') {
+			if(JSUtil.notNil(deleteDuplicateAggregates) &amp;&amp; deleteDuplicateAggregates) {
+				var rmDailyAggregate = new RMDailyAggregate(userId, startDate, endDate);
+				rmDailyAggregate.deleteDuplicateAggregatesWithoutTask(['project_confirmed', 'project_allocated', 'project_actual']);
+				var rmWeeklyAggregate = new RMWeeklyAggregate(userId, startDate, endDate);
+				rmWeeklyAggregate.deleteDuplicateAggregatesWithoutTask(['project_confirmed', 'project_allocated', 'project_actual']);
+				var rmMonthlyAggregate = new RMMonthlyAggregate(userId, startDate, endDate);
+				rmMonthlyAggregate.deleteDuplicateAggregatesWithoutTask(['project_confirmed', 'project_allocated', 'project_actual']);
+			}
+			this.updateAllAggregatesForAllTasks(userId, startDate, endDate, updateAggForGivenDuration, generateDailyAggregates);
+		}
+		else 
+			this.updateAllAggregates(userId, startDate, endDate, categories, taskId, updateAggForGivenDuration, generateDailyAggregates);
+	},
+	
+	updateAllAggregatesAsync: function(userId, startDate, endDate, categories, taskId, deleteDuplicateAggregates, updateAggForGivenDuration, generateDailyAggregates) {
+		if (JSUtil.nil(userId))
+			return;
+		var parm1 = userId + ',' + startDate + ',' + endDate + ',' + taskId+ ',' + deleteDuplicateAggregates + ','+ updateAggForGivenDuration + ','+ generateDailyAggregates;
+		var parm2 = categories.join(',');
+		gs.eventQueue('resource_daily_hours.changed', null, parm1, parm2);
+	},
+	
+	updateAllAggregates: function(userId, startDate, endDate, categories, taskId, updateAggForGivenDuration, generateDailyAggregates) {
+		if(this.propertiesUtil.getPropertyToGenerateDailyAggregates() == 'true' || (JSUtil.notNil(generateDailyAggregates) &amp;&amp; generateDailyAggregates)) {
+			this.updateDailyAggregates(userId, startDate, endDate, categories, taskId, updateAggForGivenDuration);
+		}
+		this.updateWeeklyAggregates(userId, startDate, endDate, categories, taskId, updateAggForGivenDuration);
+		this.updateMonthlyAggregates(userId, startDate, endDate, categories, taskId, updateAggForGivenDuration);
+	},
+	
+	updateDailyAggregates: function(userId, startDate, endDate, categories, taskId, updateAggForGivenDuration) {
+		var rmDailyAggregate = new RMDailyAggregate(userId, startDate, endDate, taskId, updateAggForGivenDuration);
+		rmDailyAggregate.update(categories);
+	},
+	
+	updateWeeklyAggregates: function(userId, startDate, endDate, categories, taskId, updateAggForGivenDuration) {
+		var rmWeeklyAggregate = new RMWeeklyAggregate(userId, startDate, endDate, taskId, updateAggForGivenDuration);
+		rmWeeklyAggregate.update(categories);
+	},
+	
+	updateMonthlyAggregates: function(userId, startDate, endDate, categories, taskId, updateAggForGivenDuration) {
+		var rmMonthlyAggregate = new RMMonthlyAggregate(userId, startDate, endDate, taskId, updateAggForGivenDuration);
+		rmMonthlyAggregate.update(categories);
+	},
+	
+	updateWeeklyAndMonthlyAggregates: function(userId, startDate, endDate, categories, taskId) {
+		this.updateWeeklyAggregates(userId, startDate, endDate, categories, taskId);
+		this.updateMonthlyAggregates(userId, startDate, endDate, categories, taskId);
+	},
+	
+	updateWeeklyAggregatesInBatches: function(userId, startDate, endDate, categories, taskId) {
+        var rmWeeklyAggregate = new RMWeeklyAggregate(userId, startDate, endDate, taskId);
+        rmWeeklyAggregate.setDatastore(this.datastore);
+        rmWeeklyAggregate.setBatching(this.isBatchingEnabled);
+        rmWeeklyAggregate.update(categories); // update - adds to datastore 
+    },
+	
+     updateMonthlyAggregatesInBatches: function(userId, startDate, endDate, categories, taskId) {
+        var rmMonthlyAggregate = new RMMonthlyAggregate(userId, startDate, endDate, taskId);
+        rmMonthlyAggregate.setDatastore(this.datastore);
+        rmMonthlyAggregate.setBatching(this.isBatchingEnabled);
+        rmMonthlyAggregate.update(categories); // update - adds to datastore 
+    },
+	
+     setDatastore: function (datastore) {
+        this.datastore = datastore;
+    },
+	
+     setBatching: function (batching) {
+        this.isBatchingEnabled = batching;
+    },
+	
+	deleteAggregates: function(parm1, parm2) {
+		var parms = parm1.split(',');
+		var userId = parms[0];
+		var startDate = parms[1];
+		var endDate = parms[2];
+		var taskId = parms[3];
+		var categories = gs.nil(parm2) ? [] : parm2.split(',');
+		if(gs.nil(userId) || gs.nil(startDate) || gs.nil(endDate) || gs.nil(taskId) || categories.length === 0)
+			return;
+		var rmDailyAggregate = new RMDailyAggregate(userId, startDate, endDate, taskId);
+		rmDailyAggregate.deleteAggregates(categories);
+		var rmWeeklyAggregate = new RMWeeklyAggregate(userId, startDate, endDate, taskId);
+		rmWeeklyAggregate.deleteAggregates(categories);
+		var rmMonthlyAggregate = new RMMonthlyAggregate(userId, startDate, endDate, taskId);
+		rmMonthlyAggregate.deleteAggregates(categories);
+	},
+	
+	updateMultipleCalenderEventAggregates : function(calenderEventsSysIds, taskId, newProjectType){
+		var gr = new GlideAggregate('resource_allocation_daily');
+		gr.addQuery('user_event', 'IN', calenderEventsSysIds.join());
+		gr.addAggregate('MIN','date');
+		gr.addAggregate('MAX','date');
+		gr.groupBy('user');
+		gr.groupBy('user_event');
+		gr.query();
+		while(gr.next()){
+			var startDate = gr.getAggregate('MIN','date');
+			var endDate = gr.getAggregate('MAX','date');
+			var user = gr.getValue('user');
+			var type = newProjectType;
+			var oldType = (newProjectType == 'project_work')? 'task_work' : 'project_work';
+			this.updateFromAllocationDailies(user, startDate, endDate, newProjectType, taskId);
+			this.updateFromAllocationDailies(user, startDate, endDate, oldType, taskId);
+		}
+	},
+	
+	
+
+    type: 'RMAggregateHelper'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2016-12-22 06:32:17&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;2470061e9333220064f572edb67ffbe6&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;166&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;RMAggregateHelper&lt;/sys_name&gt;
+        &lt;sys_package display_value="Resource Management" source="com.snc.resource_management"&gt;7200da2b47e64210cd4e1ce4316d438e&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_2470061e9333220064f572edb67ffbe6&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-03-27 13:55:14&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:18</sys_created_on>
+        <sys_id>12f0f05983b01210c6695855eeaad3fd</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>RMAggregateHelper</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_12f0f05983b01210c6695855eeaad3fd</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:18</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

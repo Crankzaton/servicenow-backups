@@ -1,0 +1,526 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>16a5c5080fc30010b25fea12ff767e79</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.ISCNotificationTemplateUtility&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;ISCNotificationTemplateUtility&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ISCNotificationTemplateUtility = Class.create();
+ISCNotificationTemplateUtility.prototype = {
+    constants: new ISCConstants(),
+    initialize: function() {
+    },
+    /**
+     * This function will be used to gather and return the weekly digest information.
+     */
+    weeklyDigest: function() {
+        // Reference to self
+        var that = this;
+
+        // Collect information for weekly digest
+        var lastWeekDateTime = gs.daysAgo(7);
+
+        // Collect info from security dashboard events
+        var failedLogins = _getDashboardEvent(lastWeekDateTime, this.constants.dashEvents.LOGIN_FAILED);
+        var externalLogins = _getDashboardEvent(lastWeekDateTime, this.constants.dashEvents.LOGIN_EXTERNAL);
+        var securityElevations = _getDashboardEvent(lastWeekDateTime, this.constants.dashEvents.SECURITY_ELEVATION);
+        var sncLogins = _getDashboardEvent(lastWeekDateTime, this.constants.dashEvents.LOGIN_SNC);
+        var adminLogins = _getDashboardEvent(lastWeekDateTime, this.constants.dashEvents.LOGIN_ADMIN);
+        var impersonations = _getDashboardEvent(lastWeekDateTime, this.constants.dashEvents.IMPERSONATION);
+        var exports = _getDashboardEvent(lastWeekDateTime, this.constants.dashEvents.EXPORT);
+
+        // Everything else
+        var complianceScore = _getComplianceScore();
+        var quarantinedFiles = _getQuarantinedFiles(lastWeekDateTime);
+        var virusTypes = _getVirusTypes(lastWeekDateTime);
+        var adminUsersAdded = _getAdminUsersAdded(lastWeekDateTime);
+        var spamEmails = _getSpamEmails(lastWeekDateTime);
+        var inactiveHpUsers = _getHpInactiveUsers();
+
+        return {
+            failedLogins: failedLogins.toString(),
+            externalLogins: externalLogins.toString(),
+            securityElevations: securityElevations.toString(),
+            sncLogins: sncLogins.toString(),
+            adminLogins: adminLogins.toString(),
+            complianceScore: complianceScore.toString(),
+            quarantinedFiles: quarantinedFiles.toString(),
+            virusTypes: virusTypes.toString(),
+            adminUsersAdded: adminUsersAdded.toString(),
+            impersonations: impersonations.toString(),
+            spamEmails: spamEmails.toString(),
+            inactiveHpUsers: inactiveHpUsers.toString(),
+            exports: exports.toString(),
+        };
+
+        function _getDashboardEvent(past, event) {
+            // Get the appropriate event table and return the event count
+            var eventTable = that.constants.dashEventToTable[event];
+            var iscEventGr = new GlideRecord(eventTable);
+            iscEventGr.addQuery('sys_created_on', '&gt;=', past);
+
+            // Filter down for login events
+            if (event.includes('login')) {
+                iscEventGr.addQuery('login_type', event);
+            }
+
+            iscEventGr.query();
+            return iscEventGr.getRowCount();
+        }
+    
+        // Get compliance score
+        // Calculation: .75 * (# of High Configured / # of High Available) +
+        //  .15 (# of Mid Configured / # of Mid Available) + .1 (# of Low Configured / # of Low Available)
+        function _getComplianceScore() {
+            var REQUIREMENT = {
+                HIGH: 1,
+                MEDIUM: 2,
+                LOW: 3
+            };
+    
+            var numHighConfig = _getNumConfig(REQUIREMENT.HIGH);
+            var numHigh = _getNum(REQUIREMENT.HIGH);
+            var numMedConfig = _getNumConfig(REQUIREMENT.MEDIUM);
+            var numMed = _getNum(REQUIREMENT.MEDIUM);
+            var numLowConfig = _getNumConfig(REQUIREMENT.LOW);
+            var numLow = _getNum(REQUIREMENT.LOW);
+    
+            return _calculateComplianceScore(numHighConfig, numHigh, numMedConfig, numMed, numLowConfig, numLow);
+    
+            function _getNumConfig(requirement) {
+                var ga = new GlideAggregate(that.constants.tables.ISC_SECURITY_CONFIGURATIONS);
+                ga.addQuery('harc_compliance_state', 'Pass');
+                ga.addQuery('harc_requirement', requirement);
+                ga.addAggregate('COUNT');
+                ga.query();
+        
+                if (ga.next()) {
+                    return ga.getAggregate('COUNT');
+                } else {
+                    return 0;
+                }
+            }
+    
+            function _getNum(requirement) {
+                ga = new GlideAggregate(that.constants.tables.ISC_SECURITY_CONFIGURATIONS);
+                ga.addQuery('harc_requirement', requirement);
+                ga.addAggregate('COUNT');
+                ga.query();
+        
+                if (ga.next()) {
+                    return ga.getAggregate('COUNT');
+                } else {
+                    return 0;
+                }
+            }
+    
+            function _calculateComplianceScore(numHighConfig, numHigh, numMedConfig, numMed, numLowConfig, numLow) {
+                // If there are no compliance items under the requirement then this formula will break
+                if (numHigh === 0 || numMed === 0 || numLow === 0) {
+                    return -1;
+                } else {
+                    return Math.floor(100 * (.005 + .75 * (numHighConfig / numHigh) + 
+                        .15 * (numMedConfig / numMed) +
+                        .1 * (numLowConfig / numLow)));
+                }
+            }
+        }
+        
+        // Get quarantined files since past
+        function _getQuarantinedFiles(past) {
+            var quarantinedFilesGa = new GlideAggregate("attachment_scan_history");
+            quarantinedFilesGa.addQuery('sys_created_on', '&gt;=', past);
+            quarantinedFilesGa.addQuery('status', 'infected');
+            quarantinedFilesGa.addAggregate('COUNT');
+            quarantinedFilesGa.query();
+            if (quarantinedFilesGa.next()) {
+                return quarantinedFilesGa.getAggregate('COUNT');
+            } else {
+                return 0;
+            }
+        }
+    
+        // Get all viruses detected since past
+        function _getVirusTypes(past) {
+            var quarantinedFilesGa = new GlideAggregate("attachment_scan_history");
+            quarantinedFilesGa.addQuery('sys_created_on', '&gt;=', past);
+            quarantinedFilesGa.addAggregate('COUNT(DISTINCT', 'virus');
+            quarantinedFilesGa.query();
+            if (quarantinedFilesGa.next()) {
+                return quarantinedFilesGa.getAggregate('COUNT(DISTINCT', 'virus');
+            } else {
+                return 0;
+            }
+        }
+    
+        // Get admin users since past
+        function _getAdminUsersAdded(past) {
+            var sysUserHasRoleGa = new GlideAggregate(that.constants.tables.USER_HAS_ROLE);
+            sysUserHasRoleGa.addQuery('role', that.constants.ADMIN_ROLE_SYS_ID);
+            sysUserHasRoleGa.addQuery('sys_created_on', '&gt;=', past);
+            sysUserHasRoleGa.addAggregate('COUNT');
+            sysUserHasRoleGa.query();
+    
+            if (sysUserHasRoleGa.next()) {
+                return sysUserHasRoleGa.getAggregate('COUNT');
+            } else {
+                return 0;
+            }
+        }
+    
+        // Get spam emails since past
+        function _getSpamEmails(past) {
+            var sysEmailGa = new GlideAggregate(that.constants.tables.EMAIL);
+            sysEmailGa.addQuery('mailbox.name', 'Junk');
+            sysEmailGa.addQuery('sys_created_on', '&gt;=', past);
+            sysEmailGa.addAggregate('COUNT');
+            sysEmailGa.query();
+    
+            if (sysEmailGa.next()) {
+                return sysEmailGa.getAggregate('COUNT');
+            } else {
+                return 0;
+            }
+        }
+
+        // Get number of inactive High Privilege Users (admin, security_admin, impersonator, oauth_admin)
+        function _getHpInactiveUsers() {
+            var sysUserGr = new GlideAggregate(that.constants.tables.SYS_USER);
+            var lastLoginQuery = 'last_login_time&lt;javascript:gs.beginningOfLast30Days()^roles=admin^ORroles=security_admin^ORroles=oauth_admin^ORroles=impersonator';
+            sysUserGr.addEncodedQuery(lastLoginQuery);
+            sysUserGr.addAggregate('COUNT');
+            sysUserGr.query();
+
+            return sysUserGr.next() ? sysUserGr.getAggregate('COUNT') : 0;
+        }
+    },
+    /**
+     * This function will return the styling for the ISC notification emails
+     */
+    getStyling: function() {
+        // Take bootstrap CSS to match rest of instanceÍ
+        var styles = "&lt;style&gt;" +
+                "* { box-sizing: border-box }" +
+                "table { border-collapse: collapse; padding: 0; }" +
+                "th { text-align: inherit; }" +
+                ".table { width: 100%; max-width: 100%; margin-bottom: 1rem; background-color: transparent; font-size: 14px; color: #293e40; }" +
+                ".table thead th { vertical-align: bottom; border-bottom: 2px solid #dee2e6 }" +
+                ".table td { padding: .75rem; vertical-align: top; border-top: 1px solid #dee2e6; padding: 0px; }" +
+                ".email-content .title { font-weight: 600; }" +
+                ".email-content .body { font-size: 14px }" +
+                "a { text-decoration: none; color: #1f8476; } " +
+                "h4 { margin-top: 10px; margin-bottom: 10px; }" +
+                "p { margin: 0 0 10px; font-size: 14px; } " +
+                ".progress { overflow: hidden; height: 20px; margin-bottom: 20px; border-radius: 4px; " + 
+                "-webkit-box-shadow: inset 0 1px 2px rgba (0, 0, 0, .1); box-shadow: inset 0 1px 2px rgba(0, 0, 0, .1); }" +
+                ".progress-bar { float: left; width: 0%; height: 100%; font-size: 12px; line-height: 20px; color: #000; text-align: center; " +
+                    "background-color: #1f8476; -webkit-box-shadow: inset 0 -1px 0 rgba(0, 0, 0, .15); box-shadow: inset 0 -1px 0 rgba(0, 0, 0, .15); " +
+                    "-webkit-transition: width: .6 ease; -0-transition: width .6 ease; transition: width .6s ease; }" +
+                ".progress-bar-success { background-color: #4CA965; }" +
+                ".progress-bar-warning { background-color: #F9C642; }" +
+                ".progress-bar-danger { background-color: #E83C36; }" +
+                ".flex-column { display: -ms-flexbox; display: -moz-flex; display: -webkit-box; display: -webkit-flex; display: flex; " +
+                "-ms-flex-flow: column nowrap; -moz-flex-flow: column nowrap; -webkit-flex-flow: column nowrap; flex-flow: column nowrap }" +
+                ".flex-row { display: -ms-flexbox; display: -moz-flex; display: -webkit-box; display: -webkit-flex; display: flex; " +
+                    "-ms-flex-flow: row nowrap; -moz-flex-flow: row nowrap; -webkit-flex-flow: row nowrap; flex-flow: row nowrap }" +
+                ".card { height: 90px; background-color: #F1F1F1; margin: 10px; }" +
+                ".card .card-image { width: 90px; height: 90px; background-color: #293e40; text-align: center; align-items: center; justify-content: center; } " +
+                ".card .card-image .number { align-items: center; justify-content: center; color: white; font-size: 30px; } " +
+                ".card .card-content { margin-left: 1rem; padding: 10px; font-size: 14px; }" +
+                ".card .card-content h5 { font-weight: 600; } " +
+                ".card .card-content h5, p { margin: 0; line-height: 24px; font-size: 14px; } " +
+                ".card .link { font-size: 12px; } " +
+                ".table.wrap-content { width: fit-content; margin: auto; }" +
+            "&lt;/style&gt;";
+
+        return styles;
+    },
+    /**
+     * This function will check if the sys_id is for a valid user
+     * @param {string} userSysId - sys_id of sys_user
+     */
+    verifyEmail: function(userSysId) {
+        var userGr = new GlideRecord(this.constants.tables.SYS_USER);
+        return userGr.get(userSysId);
+    },
+    /**
+     * This function will create the appropriate link for the specific event
+     * @param {string} type - The type of security event
+     * @param {object} data - The data object that will contain each event's specific information
+     */
+    getLink: function(type, data) {
+        var link = gs.getProperty(this.constants.property.SERVLET_URI);
+        var secDashEvents = {
+            failedLogins: this.constants.dashEvents.LOGIN_FAILED,
+            externalLogins: this.constants.dashEvents.LOGIN_EXTERNAL,
+            securityElevations: this.constants.dashEvents.SECURITY_ELEVATION,
+            sncLogins: this.constants.dashEvents.LOGIN_SNC,
+            adminLogins: this.constants.dashEvents.LOGIN_ADMIN,
+            impersonations: this.constants.dashEvents.IMPERSONATION,
+            exports: this.constants.dashEvents.EXPORT,
+        };
+
+        // Get the date a week ago from the event
+        var gdt = new GlideDateTime(data.time);
+        gdt.addDays(-7);
+        var lastWeekDateTime = gdt.getValue();
+
+        // Return link based on event/report combination
+        if (type === this.constants.events.LOGIN_FAILED_NOTIFICATION) {
+            var userName = data.userName,
+                time = data.time;
+            link += 'isc?id=security_report_details&amp;table=sysevent&amp;filter=name=login.failed^parm1=' +
+                userName + '^sys_created_on&lt;=' + time + '^ORDERBYDESCsys_created_on';
+        } else if(type === this.constants.events.IMPERSONATION_NOTIFICATION) {
+            var userName = data.userName,
+                time = data.time;
+            link += 'isc?id=security_report_details&amp;table=sysevent&amp;filter=name=impersonation.start^parm2=' +
+                userName + '^sys_created_on&lt;=' + time + '^ORDERBYDESCsys_created_on';
+        } else if(type === this.constants.events.NEW_ADMIN_LOGIN_NOTIFICATION) {
+            var userName = data.userName,
+                time = data.time;
+            link += "isc?id=security_report_details&amp;table=sysevent&amp;filter=name=login^parm1=" + userName +
+                '^sys_created_on&lt;=' + time + "^ORDERBYDESCsys_created_on";
+        } else if(type === this.constants.events.SECURITY_ELEVATION_NOTIFICATION) {
+            var userName = data.userName,
+                time = data.time;
+            link += 'isc?id=security_report_details&amp;table=sysevent&amp;filter=name=security.elevated_role.enabled^parm1='
+                + userName + '^sys_created_on&lt;=' + time + '^ORDERBYDESCsys_created_on';
+        } else if(type === this.constants.events.HP_ROLE_ADDED_NOTIFICATION) {
+            var userSysId = data.userSysId,
+            time = data.time;
+            link += 'isc?id=security_report_details&amp;table=sys_user_has_role&amp;filter=user=' +
+                userSysId + '^sys_created_on&lt;=' + time + '^ORDERBYDESCsys_created_on';
+        } else if(type === this.constants.events.ADMIN_UNLOCK_NOTIFICATION) {
+            var unlockerUserName = data.unlockerUserName,
+            time = data.time;
+            link += 'isc?id=security_report_details&amp;table=sys_user&amp;filter=sys_updated_by=' +
+                unlockerUserName + '^ORDERBYDESCsys_updated_on';
+        } else if (type === this.constants.events.EXPORT_NOTIFICATION) {
+            var exporterUserName = data.userName,
+            time = data.time;
+            link += 'isc?id=security_report_details&amp;table=isc_export_event&amp;filter=user.name=' +
+                exporterUserName + '^sys_created_on&lt;=' + time + '^classificationISNOTEMPTY^ORDERBYDESCsys_updated_on';
+        } else if(type === this.constants.events.WEEKLY_DIGEST_NOTIFICATION) {
+            var id = data.id,
+                time = data.time;
+            switch(id) {
+                case 'failedLogins':
+                case 'externalLogins':
+                case 'securityElevations':
+                case 'sncLogins':
+                case 'adminLogins':
+                case 'impersonations':
+                case 'exports':
+                    var eventTable = this.constants.dashEventToTable[secDashEvents[id]];
+                    var additionalQuery = this._getWeeklyDigestEventFilter(secDashEvents[id], eventTable);
+                    link += 'isc?id=security_report_details&amp;table=' + eventTable + '&amp;filter=sys_created_on&gt;' + lastWeekDateTime +
+						'^sys_created_on&lt;=' + time + '^ORDERBYDESCsys_created_on' + additionalQuery;
+                    break;
+                case 'quarantinedFiles':
+                case 'virusTypes':
+                    link += 'isc?id=security_report_details&amp;table=quarantined_file&amp;filter=sa_sys_created_on&gt;'
+                        + lastWeekDateTime + '^sa_sys_created_on&lt;=' + time + '^ORDERBYDESCsys_created_on';
+                    break;
+                case 'adminUsersAdded':
+                    link += 'isc?id=security_report_details&amp;table=sys_user_has_role&amp;filter=role.name=admin^sys_created_on&gt;'
+                        + lastWeekDateTime + '^sys_created_on&lt;=' + time + '^ORDERBYDESCsys_created_on';
+                    break;
+                case 'spamEmails':
+                    link += 'isc?id=security_report_details&amp;table=sys_email&amp;filter=mailbox.name=Junk^sys_created_on&gt;'
+                        + lastWeekDateTime + '^sys_created_on&lt;=' + time + '^ORDERBYDESCsys_created_on';
+                    break;
+                case 'inactiveHpUsers':
+                    gdt = new GlideDateTime(time);
+                    gdt.addDays(-30);
+                    var timeThirtyDaysAgo = gdt.getValue();
+                    link += 'isc?id=security_report_details&amp;table=sys_user&amp;filter=last_login_time&lt;' + timeThirtyDaysAgo
+                        + '^roles=admin^ORroles=security_admin^ORroles=oauth_admin^ORroles=impersonator^ORDERBYDESClast_login_time';
+                    break;
+                default:
+                    break;
+            }
+        }
+
+
+        return link;
+    },
+    /**
+     * This function will convert the time passed to it to the lexical month/day time
+     * @param {GlideDateTime} gdt - The GlideDateTime object to be converted to lexical time
+     */
+    convertToLexicalTime: function(gdt) {
+        var monthNames = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
+        var month = monthNames[gdt.getMonthLocalTime() - 1];
+        var day = gdt.getDayOfMonthLocalTime();
+
+        return month + ' ' + day;
+    },
+    /**
+     * This function will generate the appropriate template for the messaging channel found
+     * @param {GlideRecord} current - The glide record attached to the event queue
+     * @param {GlideRecord} event - This contains the event information from the event fired
+     * @param {any} funcs - This contains the functions used to generate the specific notification information
+     */
+    generateNotification: function(current, event, funcs) {
+        // Current record information
+        var that = this;
+        var userSysId = current.user.sys_id.toString();
+        var data = current.data.toString();
+        var dateCreated = current.sys_created_on.toString();
+        var notificationName = this.eventNameToNotifPref[current.event.toString()];
+
+        // Get user and generate notification
+        var userGr = new GlideRecord(this.constants.tables.SYS_USER);
+        var foundUser = userGr.get(userSysId);
+
+        if(foundUser) {
+            // Get data to populate template
+            var templateData = funcs.getTemplateData(userGr, data, dateCreated);
+
+            // Check which messaging channel to generate for. No event defined means email,
+            // otherwise it must be slack or teams
+            if (event) {
+                funcs.generateEmailTemplate(templateData);
+            } else {
+                // Check which notification type is enabled
+                var type = _checkNotificationType(userGr, notificationName);
+                funcs.generateMessagingTemplate(templateData, type);
+            }
+        }
+
+        // This function will verify the type of messaging notification the user has enabled (Slack/Teams)
+        function _checkNotificationType(userGr, notificationName) {
+            var userPrefsQuery = "user=" + userGr.sys_id + "^notification.nameLIKE" + notificationName +
+                "^device.nameLIKEslack^ORdevice.nameLIKEteams^notification_filter=^ORDERBYDESCsys_updated_on";
+            var userNotificationSettingsGr = new GlideRecord(that.constants.tables.USER_NOTIF_PREFS);
+            userNotificationSettingsGr.addEncodedQuery(userPrefsQuery);
+            userNotificationSettingsGr.query();
+
+            while(userNotificationSettingsGr.next()) {
+                // Check for the one that is active
+                var deviceName = userNotificationSettingsGr.device.name.toString().toLowerCase();
+                var deviceActive = userNotificationSettingsGr.device.active.toString();
+                if (deviceActive === "true") {
+                    if (deviceName.contains(that.constants.messagingTypes.SLACK)) {
+                        return that.constants.messagingTypes.SLACK;
+                    } else if (deviceName.contains(that.constants.messagingTypes.TEAMS)) {
+                        return that.constants.messagingTypes.TEAMS;
+                    }	
+                }
+            }
+
+            return null;
+        }
+    },
+    /**
+     * This function will generate an activity and unsubscribe link for the messaging notifications
+     * @param {any} templateData - The data to populate the template
+     * @param {string} type - The messaging channel type
+     */
+    generateMessagingFooter: function(templateData, type) {
+        // Generate footer message
+        var footerMessage = "";
+        var link = gs.getProperty(this.constants.property.SERVLET_URI);
+        if (type === this.constants.messagingTypes.SLACK) {
+            footerMessage = "&lt;" + encodeURI(templateData.link) + "|View Activity&gt;"
+                + "\t&lt;" + encodeURI(link + this.constants.UNSUBSCRIBE_ROUTE) + "|Unsubscribe&gt;";
+        } else if (type === this.constants.messagingTypes.TEAMS) {
+            footerMessage = "&lt;/br&gt;&lt;a href='" + encodeURI(templateData.link) + "'&gt;View Activity&lt;/a&gt; &lt;a href='" +
+                encodeURI(link + this.constants.UNSUBSCRIBE_ROUTE) + "'&gt;Unsubscribe&lt;/a&gt;";
+        }
+
+        return footerMessage;
+    },
+    /**
+     * This function will add on any additional query parameters if an event
+     * requires additional filtering
+     * @param {string} event - ISC event type
+     * @param {string} table - event table
+     */
+    _getWeeklyDigestEventFilter: function(event, table) {
+        if (table === this.constants.tables.ISC_LOGIN) {
+            return '^login_type=' + event;
+        }
+
+        return '';
+    },
+    type: 'ISCNotificationTemplateUtility'
+};
+
+ISCNotificationTemplateUtility.prototype.weeklyDigestTitles = {
+    failedLogins: 'Failed Logins',
+    externalLogins: 'External Logins',
+    securityElevations: 'Security Elevations',
+    sncLogins: 'SNC Logins',
+    adminLogins: 'Admin Logins',
+    quarantinedFiles: 'Quarantined Files',
+    virusTypes: 'Virus Types',
+    adminUsersAdded: 'Admin Users Added',
+    impersonations: 'Impersonations',
+    spamEmails: 'Spam Emails',
+    inactiveHpUsers: 'Inactive High Privilege Users',
+    exports: 'Exports'
+};
+
+ISCNotificationTemplateUtility.prototype.weeklyDigestDesc = {
+    failedLogins: 'Number of attempted logins that failed',
+    externalLogins: 'Number of successful user logins with snc_external role',
+    securityElevations: 'Number of times that an admin has elevated to security_admin role',
+    sncLogins: 'Number of ServiceNow logins',
+    adminLogins: 'Number of successful user logins with admin role',
+    quarantinedFiles: 'Number of files that were quarantined from running Antivirus Scan',
+    virusTypes: 'Number of different virus types found during antivirus scan',
+    adminUsersAdded: 'Number of users with an admin role that were added',
+    impersonations: 'Number of impersonation login',
+    spamEmails: 'Number of incoming emails to the instance marked as spam',
+    inactiveHpUsers: 'Number of high privilege users not logged in the past 30 days',
+    exports: 'Number of exports'
+};
+
+ISCNotificationTemplateUtility.prototype.eventNameToNotifPref = {
+    'appsec.notification.login.failed': 'Failed Login',
+    'appsec.notification.impersonation': 'Impersonation',
+    'appsec.notification.login.new_ip': 'Admin Login',
+    'appsec.notification.security.elevation': 'Security Elevation',
+    'appsec.notification.weekly_digest': 'Weekly Digest',
+    'appsec.notification.hp_role_added': 'HP Role Added',
+    'appsec.notification.admin_unlock': 'Admin Unlock',
+    'appsec.notification.export': 'Export'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-02-13 19:11:11&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;16a5c5080fc30010b25fea12ff767e79&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;79&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ISCNotificationTemplateUtility&lt;/sys_name&gt;
+        &lt;sys_package display_value="Instance Security Center" source="com.glide.instance_sec_center"&gt;387a706c3cf1311068bcf327dfe37f96&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_16a5c5080fc30010b25fea12ff767e79&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;pete.tran@snc&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2021-03-29 18:13:52&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:10:50</sys_created_on>
+        <sys_id>74a0b8d583b01210c6695855eeaad3b4</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ISCNotificationTemplateUtility</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_74a0b8d583b01210c6695855eeaad3b4</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:10:50</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules">
+    <x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>false</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection/>
+        <condition>current.run_calc_brs != false</condition>
+        <description>BR for synchronizing the approved dates to planned dates and constraint date.</description>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>Sync Approved,Plannned &amp; Constrain Dates</name>
+        <order>10</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function executeRule(current, previous /*null when async*/ ) {
+    var APPROVED_START_DATE = 'approved_start_date',
+        APPROVED_END_DATE = 'approved_end_date',
+        CONSTRAINT_DATE = 'constraint_date',
+        PLANNED_START_DATE = 'start_date',
+        PLANNED_END_DATE = 'end_date',
+        TIME_CONSTRAINT = 'time_constraint',
+        DURATION = 'duration',
+        SCHEDULE = 'schedule';
+
+    syncApprovedPlannedAndConstraintDates();
+
+    function syncApprovedPlannedAndConstraintDates() {
+        var util = new ProjectTaskManagerUtil();
+        var scheduleId = getScheduleId(util);
+        util.setSchedule(scheduleId);
+
+        var duration = current.getValue(DURATION);
+
+        var isValid = calcPlannedStartAndApprovedDates(util, duration, scheduleId);
+        if (isValid) {
+            syncConstraintDates(util, scheduleId, current.getValue(PLANNED_START_DATE));
+        }
+    }
+
+    function syncConstraintDates(util, scheduleId, apprvStartDateStr) {
+        var approvedStartDate = new GlideDateTime();
+        approvedStartDate.setValue(apprvStartDateStr);
+        var constraintType = current.getValue(TIME_CONSTRAINT);
+        if (isForwardPlanning(constraintType)) {
+            current.setValue(CONSTRAINT_DATE, approvedStartDate);
+        } else {
+            current.setValue(CONSTRAINT_DATE, current.getValue(PLANNED_END_DATE));
+        }
+    }
+
+    function isForwardPlanning(constraintType) {
+        return gs.nil(constraintType) ||
+            "asap" == constraintType ||
+            "start_on" == constraintType ||
+            "start_no_later" == constraintType ||
+            "start_no_earlier" == constraintType;
+    }
+
+ // Sets Provided Approved dates to planned start date, calculates the duration if needed.
+    function calcPlannedStartAndApprovedDates(util, duration, scheduleId) {
+  
+  // if project is creating from demand
+  if(!current.demand.nil() && !current.start_date.nil() && !current.end_date.nil()) {
+   if(current.approved_start_date.nil())
+    current.setValue(APPROVED_START_DATE, current.getValue(PLANNED_START_DATE));
+   if(current.approved_end_date.nil())
+    current.setValue(APPROVED_END_DATE, current.getValue(PLANNED_END_DATE));
+   return true;
+  }
+  
+        var approvedStartDate = new GlideDateTime(),
+            approvedEndDate = new GlideDateTime();
+        if (current.approved_start_date.nil() && current.approved_end_date.nil()) {
+            current.setValue(APPROVED_START_DATE, current.getValue(PLANNED_START_DATE));
+            calculateAndSetApprovedEndDate(util, duration, scheduleId);
+        } else if (current.approved_end_date.nil()) {
+            current.setValue(PLANNED_START_DATE, current.getValue(APPROVED_START_DATE));
+            calculateAndSetApprovedEndDate(util, duration, scheduleId);
+        } else {
+            approvedStartDate.setValue(current.getValue(APPROVED_START_DATE));
+            approvedEndDate.setValue(current.getValue(APPROVED_END_DATE));
+            if (approvedStartDate.after(approvedEndDate)) {
+                current.setAbortAction(true);
+                gs.error("Approved start date: " + approvedStartDate + " is after the Approved end date: " + approvedEndDate);
+                gs.addErrorMessage(gs.getMessage("Approved end date shouldn't be before the Approved start date"));
+                return false;
+            }
+            current.setValue(PLANNED_START_DATE, approvedStartDate);
+   var resp = util.RecalculateDurationFromEndDatePerScheduleInternal(approvedStartDate.getValue(), approvedEndDate.getValue(), scheduleId);
+   resp = JSON.parse(resp);
+   if(resp.status != 'success') {
+    gs.addErrorMessage(resp.message);
+    gs.error("Sync Approved,Plannned & Constrain Dates:calcPlannedStartAndApprovedDates -> " + resp.message);
+    current.setAbortAction(true);
+    return false;
+   }
+   duration = new GlideDuration(resp.duration);
+   current.setValue(DURATION, duration);
+        }
+        return true;
+    }
+
+ // If the provided approved dates is in schedule sets it as constraint dates; if not finds the next possible date
+    function caclculateApprovedEndDate(util, approvedStartDate, duration, scheduleId) {
+        var resp = util.RecalculateEndDateFromAbsoluteDurationPerScheduleInternal(approvedStartDate, duration, scheduleId);
+        resp = JSON.parse(resp);
+        if (resp.status == 'success') {
+            var apprvEndDate = new GlideDateTime();
+            apprvEndDate.setDisplayValue(resp.date);
+            return apprvEndDate;
+        } else {
+            gs.addErrorMessage(resp.message);
+            gs.error("Sync Approved,Plannned & Constrain Dates: caclculateApprovedEndDate -> " + resp.message);
+            current.setAbortAction(true);
+        }
+    }
+ 
+ // Caclulates Approved end date from Approved start date and duration.
+    function calculateAndSetApprovedEndDate(util, duration, scheduleId) {
+        var apprEndDate = caclculateApprovedEndDate(util, current.getValue(APPROVED_START_DATE), duration, scheduleId);
+        current.setValue(APPROVED_END_DATE, apprEndDate);
+    }
+
+    function getScheduleId(util) {
+        var scheduleId;
+        if (current.top_task != current.sys_id) {
+            scheduleId = current.top_task.schedule;
+        } else if (current.schedule) {
+            scheduleId = current.schedule;
+        } else {
+            scheduleId = SNC.PPMConfig.getProperty('com.snc.project.default_schedule', current.getTableName(), '7aa3e10c8f70010040f82ab2f0f9234d');
+        }
+        return scheduleId;
+    }
+})(current, previous);]]></script>
+        <sys_class_name>x_938076_now_utils_now_utils_business_rules</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:51:32</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>8e3ca8d583701210c6695855eeaad3a0</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Sync Approved,Plannned &amp; Constrain Dates</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>x_938076_now_utils_now_utils_business_rules_8e3ca8d583701210c6695855eeaad3a0</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:51:32</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </x_938076_now_utils_now_utils_business_rules>
+    <sys_translated_text action="delete_multiple" query="documentkey=8e3ca8d583701210c6695855eeaad3a0"/>
+</record_update>

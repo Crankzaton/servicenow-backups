@@ -1,0 +1,841 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1c43c952eb010200216a87b9d106fef0</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.NotifyUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;NotifyUtils&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var NotifyUtils = Class.create();
+NotifyUtils.prototype = {
+    notificationsAreActive: false,
+    errors: [],
+    arrayUtil: new global.ArrayUtil(),
+    numberType: {
+        sms     : 'sms',
+        voice   : 'voice'
+    },
+	/** Dev Note: Ensure same name methods are not defined in both NotifyUtils &amp; NotifyUtilSNC **/
+
+    /**
+     * properties
+     */
+    properties: {
+        maxVars: 20
+    },
+
+    /**
+     * Class initialization
+     */
+    initialize: function() {
+        this.log = new GSLog("com.snc.notify.log.level", this.type);
+        // check if subscription based notifications are active
+        this.notificationsAreActive = GlidePluginManager.isActive('com.glide.notification');
+
+        // cache reusable instances locally
+        this.arrayUtil = new ArrayUtil();
+        this.loggedInUserID = gs.getUserID();
+    },
+
+    /**
+     * Utility method to check if a variable is defined and not null
+     *
+     * @param item
+     * @returns {boolean}
+     */
+    isDefined: function(item) {
+        // JSUtil.nil borks on a GlideElementPhoneNumber
+        if (item !== null &amp;&amp; typeof item === 'object' &amp;&amp; typeof item.toString === 'function')
+            return true;
+        return JSUtil.notNil(item);
+    },
+	
+	_isFunction: function (val) {
+		return typeof val === 'function';
+	},
+
+    /**
+     * Uniquely append elements to a base array
+     *
+     * @param base      Array
+     * @param toAppend  Array / String (comma separated)
+     * @param areNumbers   Boolean
+     * @returns {*}
+     */
+    appendUniquely: function(base, toAppend, areNumbers) {
+        // check if toAppend is a string or an array
+        if (typeof toAppend === 'string' &amp;&amp; GlideStringUtil.notNil(toAppend))
+            toAppend = toAppend.trim().split(',');
+
+        // iterate over elements to append to the base array
+        for (var i = 0; i &lt; toAppend.length; i++) {
+            var element = (typeof toAppend[i] === 'string') ? toAppend[i].trim() : toAppend[i];
+
+
+			if ((element.toString().indexOf("${") == 0) &amp;&amp; (element.toString().substring(element.length - 1) == "}")) {
+				element = element.toString();
+				element = GlideController.evaluateString("current." + element.substring(2, element.length - 1));
+				element = element.toString();
+			}
+
+            // check if this a phone number
+            if (areNumbers) {
+                var gep = this._getGlideElementPhoneNumber(element);
+                if (typeof gep === 'object' &amp;&amp; !this.arrayUtil.contains(base, gep.getValue()))
+                    base.push(gep.getValue());
+            } else if (typeof element === 'string' &amp;&amp; !this.arrayUtil.contains(base, element)) {
+                base.push(element);
+            } else if (typeof element === 'object' &amp;&amp; element.hasOwnProperty('id')) {
+                var elementID = element.id;
+
+                // iterate over all elements in base array
+                var found = false;
+                for (var j = 0; j &lt; base.length; j++) {
+                    var baseElement = base[j];
+
+                    // match on string or object (id)
+                    if ((typeof baseElement === 'string' &amp;&amp; baseElement == elementID) || (typeof baseElement === 'object' &amp;&amp; baseElement.hasOwnProperty('id') &amp;&amp; baseElement.id === elementID))
+                        found = true;
+                }
+
+                // add the object if it does not exist
+                if (!found)
+                    base.push(element);
+            }
+        }
+
+        return base;
+    },
+
+    /**
+     * Remove values from an array by array
+     *
+     * @param source    {Array}
+     * @param toRemove  {Array} values to remove from source array
+     * @returns {Array}
+     */
+    removeFromArray: function(source, toRemove) {
+        var result = [];
+
+        for (var i = 0; i &lt; source.length; i++) {
+            var element = source[i];
+            if (!this.arrayUtil.contains(toRemove, element)) {
+                result.push(element);
+            }
+        }
+
+        return result;
+    },
+
+    /**
+     * Get the unique numbers for users and groups
+     *
+     * @param numbers   array
+     * @param users     array
+     * @param groups    array
+     * @param type      string (sms/voice)
+     * @param getData   {boolean=}
+     * @returns {Array&lt;string&gt;}
+     */
+    getUniquePhoneNumbersForUsersAndGroups: function(numbers, users, groups, type, getData) {
+        this.log.debug("[getUniquePhoneNumbersForUsersAndGroups] numbers: " + numbers);
+        this.log.debug("[getUniquePhoneNumbersForUsersAndGroups] users: " + users);
+        this.log.debug("[getUniquePhoneNumbersForUsersAndGroups] groups: " + groups);
+        this.log.debug("[getUniquePhoneNumbersForUsersAndGroups] type: " + type);
+        this.log.debug("[getUniquePhoneNumbersForUsersAndGroups] getData: " + getData);
+
+        // get unique users and add them to the users array
+        var numbersObj = {};
+        if (numbers) {
+            for (var j = 0; j &lt; numbers.length; j++) {
+                numbersObj[numbers[j]] = null;
+            }			
+        }
+
+        if (groups)
+            users = this._getUniqueUsersForGroups(users, groups);
+
+        var result = [];
+
+        // iterate over users
+        for (var i = 0; i &lt; users.length; i++) {
+            var user = users[i];
+            var userID = user + '';
+
+            // get the first number for this user (max = 1)
+            var userNumbers = this._getNumbersForUser(user, type, 1);
+
+            // check if we have a number for this user
+            if (userNumbers.length &gt; 0) {
+                var number = userNumbers[0];
+                if (!numbersObj.hasOwnProperty(number)) {
+                    numbersObj[number] = null;
+                    result.push({type: "u", sysId: userID, number: number, valid: true});
+                }
+            } else if (userID == this.loggedInUserID) {
+                this.addError(gs.getMessage('you do not have a valid E.164 compliant phone number'), user);
+                result.push({type: "u", sysId: userID, valid: false});
+            } else {
+                this.addError(gs.getMessage(' does not have a valid E.164 phone number'), user);
+                result.push({type: "u", sysId: userID, valid: false});
+            }
+        }
+
+        var phoneNumbers = Object.keys(numbersObj);
+        // determine return value
+        if (typeof getData !== 'undefined' &amp;&amp; getData === true)
+            phoneNumbers = {'numbers': phoneNumbers, 'result': result};
+        this.log.debug("[getUniquePhoneNumbersForUsersAndGroups] phoneNumbers: " + phoneNumbers);
+        return phoneNumbers;
+    },
+	
+	/**
+	 * @param number		String
+	 * @param getUserRecord Boolean
+	 * @returns {*}
+	 */
+	getUserFromCMNNotifDevice: function(number, getUserRecord, numberType) {
+		if (!number)
+			return;
+		var all = !numberType;
+		// check if a boolean was passed
+		if (typeof getUserRecord !== 'boolean')
+			getUserRecord = false;
+		// try to lookup any device matching this number
+		var device = new GlideRecord('cmn_notif_device');
+		device.setLimit(1);
+		device.addQuery('phone_number', number);
+		if (!all) {
+			if (numberType === this.numberType.sms)
+				device.addQuery('type', 'SMS');
+			else if (numberType === this.numberType.voice)
+				device.addQuery('type', 'Voice');
+		}
+		device.query();
+		// check if we have any results
+		if (device.next()) {
+			var owner = device.getValue('user');
+			return (getUserRecord) ? this._getUserByID(owner) : owner;
+		}
+	},
+	
+	/**
+	 * @param number		String
+	 * @param getUserRecord Boolean
+	 * @returns {*}
+	 */
+	getSysUserByNumber: function(number, getUserRecord, numberType) {
+		if (!number)
+			return;
+		var all = !numberType;
+		// check if a boolean was passed
+		if (typeof getUserRecord !== 'boolean')
+			getUserRecord = false;
+		// check if any user record matched this number
+		var user = new GlideRecord('sys_user');
+		var condition = user.addQuery('mobile_phone', number);
+		if (all || numberType === this.numberType.voice) // Business phones are considered landlines with no ability to receive SMS
+			condition.addOrCondition('phone', number);
+		user.setLimit(1);
+		user.query();
+
+		// check if we have any results
+		if (user.next())
+			return (getUserRecord) ? user : user.getUniqueValue();
+	},
+
+	/**
+	 * Do a reverse  lookup by  number to get the associated  user. Note that
+	 * this is currently error prone as the phone  number fields for the user
+	 * and  its notification  devices (sms, voice) are  not E164 phone number
+	 * fields. Also, when multiple  users have the same number configured the
+	 * first matching user will be returned. To improve the behaviour of this
+	 * method,  upgrade the phone numbers  fields to the E164 compliant phone
+	 * number field.
+	 *
+	 * @param number		String
+	 * @param getUserRecord Boolean
+	 * @returns {*}
+	 */
+	getUserByNumber: function(number, getUserRecord, numberType) {
+		var user = null;
+		// check if subscription based notification device is available
+		if (this.notificationsAreActive) {
+			user = this.getUserFromCMNNotifDevice(number, getUserRecord, numberType);
+			if(user)
+				return user;
+		}
+		// check if any sys_user record matched this number
+		user = this.getSysUserByNumber(number, getUserRecord, numberType);
+		if(user)
+			return user;
+		// check if any user record matched from NotifyUtils extension point
+		var exPoints = this.__getNotifyUtilsExtensionPoints();
+		for (var i=0; i&lt;exPoints.length; i++){
+			if (!this._isFunction(exPoints[i].getUserByNumber))
+				continue;
+			exPoints.initialize();
+			try{
+				user = exPoints[i].getUserByNumber(number, getUserRecord, numberType);
+				if(user)
+					return user;
+			}
+			catch(e){
+				if (this._addErrorMessage)
+					this._addErrorMessage(gs.getMessage("User By Number retrieval failed {0}", [e]));
+				gs.error("Error in " + exPoints[i].type + ".getUserByNumber: " + e);
+			}
+		}
+	},
+
+    /**
+     * Get the outbound Notify phone number used for Notify On Task
+     *
+     * @returns {*}
+     */
+    getNotifyOnTaskOutboundPhoneNumber: function() {
+        var number = gs.getProperty('glide.notify.task.phone_number', '');
+        return number;
+    },
+
+	validateOutboundNotifyPhoneNumber_throws: function (number) {
+		if (number &amp;&amp; number.length) {
+            var notifyNumber = new GlideRecord("notify_number");
+            notifyNumber.addQuery("number", number);
+            notifyNumber.query();
+            if (notifyNumber.next()) {
+                // check if the number has a group
+                if (!this.isDefined(notifyNumber.notify_group) || notifyNumber.notify_group == '')
+                    throw gs.getMessage('Notify number {0} does not have a notify group configured', [number]);
+
+                // check if the number is active
+                if (!notifyNumber.active)
+                    throw gs.getMessage('Notify number {0} is not active', [number]);
+            } else
+                throw gs.getMessage('Notify number {0} is not a valid notify number', [number]);
+        }
+	},
+
+    /**
+     * Reset the error messages
+     */
+    resetErrors: function() {
+        this.errors = [];
+    },
+
+    /**
+     * Get all error messages
+     *
+     * @returns {Array}
+     */
+    getErrors: function() {
+        return this.errors;
+    },
+
+    /**
+     * Append an error to the error messages array
+     *
+     * @param message
+     * @param userID
+     */
+    addError: function(message, userID) {
+        if (this.isDefined(userID)) {
+            var user = new GlideRecord('sys_user');
+            if (user.get(userID)) {
+                this.errors.push(user.getValue('name') + " (" + user.getValue('user_name') + ") " + message);
+            } else {
+                this.errors.push(message);
+            }
+        } else {
+            this.errors.push(message);
+        }
+    },
+
+    /**
+     * Utility method to expand variables
+     *
+     * e.g. ${user.name} where workflow.scratchpad.user.name = 'Fred'
+     *
+     * @param text
+     * @returns {*}
+     */
+    expandVariables: function(text, sources) {
+        // matches variables ${a.b.c}
+        var pattern = /\$\{[A-Za-z0-9\.-_}]+\}/gi;
+        // infinite loop protection
+        var count = 0;
+        while (text.search(pattern) &gt;= 0 &amp;&amp; count &lt; this.properties.maxVars) {
+            count++;
+            text = text.replace(pattern, function(match) {
+                match = match.replace(/\$\{/g, '');  // remove leading ${
+                match = match.replace(/\}$/g, '');   // remove trailing }
+                var vars = match.split('.');         // split to array
+                var result;
+                for (var i = 0; i &lt; sources.length; i++) {
+                    var source = sources[i];
+                    if (source.hasOwnProperty(vars[0]))
+                        result = new Function('source', 'return source.' + match)(source);
+                }
+                return (typeof result !== 'undefined') ? result : '';
+            });
+        }
+        return text;
+    },
+
+    /**** private methods ****/
+
+    /**
+     * Get unique users for groups
+     *
+     * @param users     array
+     * @param groups    array
+     * @returns         array
+     * @private
+     */
+    _getUniqueUsersForGroups: function(users, groups) {
+        this.log.debug("[_getUniqueUsersForGroups] users: " + users);
+        this.log.debug("[_getUniqueUsersForGroups] groups: " + groups);
+        var uniqueUsersObj = {};
+
+        // get unique users
+        for (var j = 0; j &lt; users.length; j++) {
+            uniqueUsersObj[users[j]] = null;
+        }
+
+        var uniqueUsersArr;
+        // get unique users for groups
+        for (var i = 0; i &lt; groups.length; i++)
+            uniqueUsersArr = this._getUniqueUsersForGroup(uniqueUsersObj, groups[i]);
+        this.log.debug("[_getUniqueUsersForGroups] uniqueUsersArr: " + uniqueUsersArr);
+        return uniqueUsersArr;
+    },
+
+    /**
+     * Get unique users for a group
+     *
+     * @param usersObj     object
+     * @param group     array
+     * @returns         array
+     * @private
+     */
+    _getUniqueUsersForGroup: function(usersObj, group) {
+        // get group members
+        var member = new GlideRecord('sys_user_grmember');
+        member.addQuery('group', group);
+        member.query();
+        while (member.next()) {
+            // and add the user if it does not yet exist
+            usersObj[member.user + ''] = null;
+        }
+        return Object.keys(usersObj);
+    },
+
+    /**
+     * Get all numbers for a user
+     *
+     * @param userID
+     * @param type
+     * @param max
+     * @returns {*|Array}
+     * @private
+     */
+    _getNumbersForUser: function(userIdOrGr, type, max) {
+        var numbers         = [];
+        var availableNumbers= [];
+        var smsDevices      = (type === this.numberType.sms);
+
+        if (!userIdOrGr) {
+            gs.error("[_getNumbersForUser] Invalid parameters. Expected a User GlideRecord or SysID.");
+            return;
+        }
+        var userID;
+        var userGr;
+        if (typeof userIdOrGr === "string")
+            userID = userIdOrGr;
+        if (typeof userIdOrGr === "object" &amp;&amp; userIdOrGr["isValidRecord"]) {
+            userGr = userIdOrGr;
+            userID = userGr.getUniqueValue();
+        }
+        this.log.debug("[_getNumbersForUser] userID: " + userID);
+        this.log.debug("[_getNumbersForUser] type: " + type);
+        this.log.debug("[_getNumbersForUser] max: " + max);
+
+        // get the subscription based notification devices (if available)
+        if (this.notificationsAreActive) {
+			if (!this.checkAccess) {
+				var devices = new SNC.UserNotificationDevices(userID);
+				availableNumbers = (type === this.numberType.sms) ? devices.getCurrentlyAvailableSMSNumbers() : devices.getCurrentlyAvailableVoiceNumbers();
+			}
+			else if (this.checkAccess){
+				if (typeof userGr !== "object") {
+					userGr = new GlideRecord('sys_user');
+					userGr.get(userID)
+				}
+				if (userGr.isValidRecord() &amp;&amp; userGr.mobile_phone.canRead()) {
+					var devices = new SNC.UserNotificationDevices(userID);
+					availableNumbers = (type === this.numberType.sms) ? devices.getCurrentlyAvailableSMSNumbers() : devices.getCurrentlyAvailableVoiceNumbers();
+				}
+			}
+        }
+
+        // iterate over SMS devices
+        for (var i = 0; i &lt; availableNumbers.length; i++) {
+            var gep = this._getGlideElementPhoneNumber(availableNumbers[i]);
+            if (this.isDefined(gep) &amp;&amp; !this.arrayUtil.contains(numbers, gep.getValue()))
+                numbers.push(gep.getValue());
+            if (numbers.length == max)
+                return numbers;
+        }
+
+        // get user record if userGr is not passed
+        if (!userGr) {
+            userGr = new GlideRecord('sys_user');
+            userGr.get(userID);
+        }
+       
+        if (userGr.isValidRecord()) {
+            // use mobile phone?
+            var mobilePhone = this._getGlideElementPhoneNumber(userGr.getValue('mobile_phone'));
+            if (this.isDefined(mobilePhone) &amp;&amp; !this.arrayUtil.contains(numbers, mobilePhone.getValue()) &amp;&amp; (!this.checkAccess || userGr.mobile_phone.canRead()))
+                numbers.push(mobilePhone.getValue());
+            if (numbers.length == max)
+                return numbers;
+
+            // get business phone
+            if (!smsDevices) {
+                var businessPhone = this._getGlideElementPhoneNumber(userGr.getValue('phone'));
+                if (this.isDefined(businessPhone) &amp;&amp; !this.arrayUtil.contains(numbers, businessPhone.getValue()) &amp;&amp; (!this.checkAccess || userGr.phone.canRead()))
+                    numbers.push(businessPhone.getValue());
+                if (numbers.length == max)
+                    return numbers;
+            }
+        }
+        return [];
+    },
+
+	/**
+     * Validate a given number
+     *
+     * @param number    String
+     * @public
+	 * @returns         bool
+     */
+	validatePhoneNumber: function(number) {
+		var phoneNumber = new GlideElementPhoneNumber();
+		if (phoneNumber.setPhoneNumber(number, true) &amp;&amp; phoneNumber.getValue() + "" === number + "")
+			return true;
+		return false;
+	},
+
+    /**
+     *
+     * @param userGrOrId    User GlideRecord or Sys ID
+     * @returns {*}     String/null User's Number for SMS or null
+     */
+
+	getSMSNumberForUser: function (userGrOrId) {
+		if (!userGrOrId) {
+			gs.error("[getSMSNumberForUser] Invalid parameters. Expected userGrOrId to be a User GlideRecord or SysID");
+			return;
+		}
+
+		var number = this._getNumbersForUser(userGrOrId, this.numberType.sms, 1);
+		if (number &amp;&amp; Array.isArray(number)) {
+			number = number[0] ? number[0] : "";
+			return number;
+		}
+	},
+
+    /**
+     * Get a GlideElementPhoneNumber instance by phone number
+     *
+     * @param number    String
+     * @returns {*}     String
+     * @private
+     */
+    _getGlideElementPhoneNumber: function(number) {
+        if (!this.isDefined(number))
+            return;
+
+        // fix number
+        number = number.replace(/^([0]{2})/, '');   // remove trailing 00
+        number = number.replace(/^([^\+])/, '+$1'); // prefix with + if needed
+
+        // get GlideElementPhoneNumber instance (if possible)
+        var gep = new GlideElementPhoneNumber();
+        if (gep.setPhoneNumber(number, true))
+            return gep;
+    },
+
+    /**
+     * Get a user record by sys id
+     *
+     * @param sysID
+     * @returns {GlideRecord}
+     * @private
+     */
+    _getUserByID: function(sysID) {
+        var user = new GlideRecord('sys_user');
+        if (user.get(sysID))
+            return user;
+    },
+
+	__getConfExtensionPoints: function () { // Referenced by sub-classes too
+		return new GlideScriptedExtensionPoint().getExtensions("global.ConferenceParticipants");
+	},
+	
+	__getNotifyUtilsExtensionPoints: function () { // Referenced by sub-classes too
+		return new GlideScriptedExtensionPoint().getExtensions("global.NotifyUtilsExtPt");
+	},
+	
+	/**
+	 * @param {GlideRecord} current
+	 * @param {string=} userId
+	 */
+	isConferenceLeader: function(current, /* optional */ userId) {
+		// For backwards compatibility we still have this API at this level.
+		if (current &amp;&amp; current.getTableName() == "notify_participant" &amp;&amp; current.notify_conference_call) {
+			if (!userId)
+				userId = gs.getUserID();
+			var gr = new GlideRecord("notify_participant");
+			gr.addQuery("user", userId);
+			gr.addQuery("notify_conference_call", current.notify_conference_call);
+			gr.addQuery("host", true);
+			gr.setLimit(1);
+			gr.query();
+			if (gr.hasNext())
+				return true;
+		}
+
+		return this.isConferenceLeaderInternal(current, userId);
+	},
+
+	isConferenceLeaderInternal: function(current, /* optional */ userId) { // FOR INTERNAL SERVICENOW USE ONLY
+		// For backwards compatibility we still have this API at this level.
+		if (current == null || typeof current != 'object' || !current.getRecordClassName)
+			return false;
+
+		if(!userId)
+			userId = gs.getUserID();
+		var gUser = GlideUser.getUserByID(userId);
+		if (gUser.hasRole('notify_admin'))
+			return true;
+
+		var exPoints = this.__getConfExtensionPoints();
+		var src;
+		var tableName = current.getTableName();
+		var table;
+		var id;
+		switch (tableName) {
+			case "notify_participant":
+				table = current.notify_conference_call.table;
+				id = current.notify_conference_call.source;
+				if (!table)
+					return false;
+				src = new GlideRecord(table);
+				if (!src.get(id))
+					return false;
+				break;
+			case "notify_conference_call":
+				table = current.table;
+				id = current.source;
+				if (!table)
+					return false;
+				src = new GlideRecord(table);
+				if (!src.get(id))
+					return false;
+				break;
+			default:
+				src = current;
+		}
+		for(var i = 0; i &lt; exPoints.length; i++) {
+			if (typeof exPoints[i].isConferenceLeader !== 'function')
+				continue;
+			exPoints[i].initialize();
+			try {
+				var ret = exPoints[i].isConferenceLeader(src, userId) + '';
+				if (ret === 'true')
+					return true;
+				else if (ret === 'false')
+					return false;
+			} catch(e) {
+				if (this._addErrorMessage)
+					this._addErrorMessage(gs.getMessage("Conference leader could not be reliably determined due to exception {0}", [e]));
+				gs.error("Error in " + exPoints[i].type + ".getGroupMembers: " + e);
+			}
+		}
+		return false;
+	},
+
+	formatContent: function(current, template, isHTML){
+		var formatter = new GlideEmailFormatter(current, null, null, {});
+		var content = formatter.evaluateTemplateScript(template);
+		if(!isHTML)
+			isHTML = false;
+		return formatter.substitute(content, isHTML, isHTML);
+	},
+
+	getGlidePhoneElementProps: function (el) {
+		if (el)
+			return {
+				territory: el.getTerritory()
+			};
+		return {};
+	},
+	messageSent: function (notifyNumber, notifyMsgGr) {
+		new global.NotifyWorkflow().runOutgoingSMSWorkflow(notifyNumber, notifyMsgGr);
+	},
+
+	getNormalizedPhoneNumber: function(phoneNumber, phoneNumberCountry) {
+		if (phoneNumber &amp;&amp; phoneNumber.trim()) {
+			if (phoneNumber.startsWith('00'))
+				phoneNumber = '+' + phoneNumber.slice(2);
+			if (!phoneNumber.startsWith('+'))
+				phoneNumber = '+' + phoneNumber;
+			var gepn = new GlideElementPhoneNumber();
+			if (gepn.setPhoneNumber(phoneNumber, true))
+				return gepn.getValue();
+			var replaced = phoneNumber;
+			if (GlideProperties.getBoolean('glide.notify.fix_invalid_phone_number', true)) {
+				if (!gs.nil(phoneNumberCountry)) {
+					var format = new GlideRecord("sys_phone_format");
+					format.setLimit(1);
+					format.addQuery("name", "STARTSWITH", phoneNumberCountry + " ");
+					format.query();
+					if (format.next()) {
+						var phoneTeri = new GlideRecord("sys_phone_territory");
+						phoneTeri.get(format.getValue("phone_territory"));
+						if (phoneTeri.isValidRecord()) {
+							var teriName = phoneTeri.getValue("name");
+							var callCode = phoneTeri.getValue("ccc");
+							if (phoneNumber.startsWith("+" + callCode)) {
+								var clLen = callCode.length + 1;
+								replaced = "+" + phoneNumber.substr(clLen, phoneNumber.length);
+							}
+							if (gepn.setPhoneNumber(replaced, true)) {
+								gs.info(gs.getMessage("changed the invalid incoming phone number {0} into {1} by removing the international country code +{2} for {3}", [phoneNumber, replaced, callCode, teriName]));
+								return gepn.getValue();
+							}
+						}
+					}
+				}
+				else {
+					if (phoneNumber.startsWith("+1")) {
+						replaced = "+" + phoneNumber.substr(2, phoneNumber.length);
+						if (gepn.setPhoneNumber(replaced, true)) {
+							gs.info(gs.getMessage("changed the invalid incoming phone number {0} into {1} by removing the international country code +{2} for {3}", [phoneNumber, replaced, "1", "US"]));
+							return gepn.getValue();
+						}
+					}
+				}
+			}
+			var anonymousMsg = this.getAnonymousNumber(phoneNumber);
+			var logMsg = anonymousMsg? anonymousMsg: " is not an E.164 compliant phone number";
+			gs.error(phoneNumber + logMsg);
+		}
+		return phoneNumber;
+	},
+
+	getAnonymousNumber: function(phoneNumber) {
+		/*
+		* https://shaun.net/notes/solving-the-mystery-of-calls-from-266696687/
+		*/
+		var anonymousNumbers = {
+			"+86282452253": " is reported as an unavailable phone number which is not supported by the carrier",
+			"+266696687": " is reported as an anonymous phone number which is not supported by the carrier",
+			"+7378742833": " is reported as an restricted phone number which is not supported by the carrier",
+			"+2562533": " is reported as an blocked phone number which is not supported by the carrier",
+			"+8656696": " is reported as an unknown phone number which is not supported by the carrier"
+		};
+		return anonymousNumbers[phoneNumber];
+	},
+	/**
+	 * @param {string} phoneNumber
+	 * @param {string} confId
+	 */
+	isParticipantSessionActiveForPhoneNumber: function (phoneNumber, confId) {
+		if (!phoneNumber)
+			return false;
+		if (!confId)
+			return false;
+		var sessionGr = new GlideRecord("notify_participant_session");
+		sessionGr.addActiveQuery();
+		sessionGr.addQuery("notify_participant.phone_number", phoneNumber);
+		sessionGr.addQuery('notify_participant.notify_conference_call', confId);
+		sessionGr.setLimit(1);
+		sessionGr.query();
+		return sessionGr.hasNext();
+	},
+	/**
+	 * @param {string} userId
+	 * @param {string=} confId
+	 */
+	isParticipantSessionActive: function (userId, confId) {
+		if (!userId)
+			return false;
+		var sessionGr = new GlideRecord("notify_participant_session");
+		sessionGr.addQuery("active", true);
+		sessionGr.addQuery('notify_participant.user', userId);
+		sessionGr.setLimit(1);
+		if(confId)
+			sessionGr.addQuery('notify_participant.notify_conference_call', confId);
+		sessionGr.query();
+		return sessionGr.hasNext();
+	},
+
+	__isDebugging: function () { // Can be invoked by sub-classes
+		return this.log.atLevel('debug');
+	},
+	
+	isOutgoingSMSCapableNumber: function (number) {
+		var numberGr = new GlideRecord('notify_number');
+		numberGr.addActiveQuery();
+		numberGr.addQuery("number", number);
+		numberGr.addQuery("has_sms_out", "IN", "yes,unknown");
+		numberGr.setLimit(1);
+		numberGr.query();
+		return numberGr.hasNext();
+	},
+	
+	setCheckAccess: function(checkAccess) {
+		this.checkAccess = checkAccess;
+		return this;
+	},
+
+    type: 'NotifyUtils'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2015-07-06 16:04:17&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1c43c952eb010200216a87b9d106fef0&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;222&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;NotifyUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Notify" source="com.snc.notify"&gt;f0dfd45447320210cd4e1ce4316d4394&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1c43c952eb010200216a87b9d106fef0&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-09-12 17:54:53&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:23</sys_created_on>
+        <sys_id>85c0f01983b01210c6695855eeaad385</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>NotifyUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_85c0f01983b01210c6695855eeaad385</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:23</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

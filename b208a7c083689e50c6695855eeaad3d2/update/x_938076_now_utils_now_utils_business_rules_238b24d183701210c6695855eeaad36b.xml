@@ -1,0 +1,288 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules">
+    <x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection/>
+        <condition>current.topic == 'SystemCommand' &amp;&amp;( current.source == 'grabLog' || current.source == 'grabSettings') &amp;&amp; current.queue == 'input'</condition>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>Get All MID logs</name>
+        <order>100</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function() {
+ var parsed, parms, saGr, sa, filepath, isCurrent, fileNum,
+  StringReader = Packages.java.io.StringReader,
+  InputSource = Packages.org.xml.sax.InputSource,
+  xmlHelper = new XMLHelper(),
+  parser = Packages.javax.xml.parsers.DocumentBuilderFactory.newInstance().newDocumentBuilder(),
+  
+  // regex below matches line format of the agent logs when using com.service_now.mid.logging.MidLogFormatter
+  // (introduced in Tokyo)
+  agentLine = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}:\d{2}:\d{2})\.\d{3}[-+]\d{4} (.*)/, // Matches yyyy-MM-ddTHH:mm:ss.SSS-ZZZZ or yyyy-MM-ddTHH:mm:ss.SSS+ZZZZ
+  
+  // regex below matches line format of the agent logs when using com.glide.util.DefaultLogFormatter
+  // (used by default prior to Tokyo)
+  agentLineLegacy = /^(\d\d)\/(\d\d)\/(\d\d)( \d\d:\d\d:\d\d)(.*)/,   // Matches MM/DD/YY HH:MM:SS
+  
+  wrapperLine = /^(\d\d\d\d)\/(\d\d)\/(\d\d)( \d\d:\d\d:\d\d)(.*)/, // Matches YYYY/MM/DD HH:MM:SS
+  midNamePattern = /^mid.server.(.*)/,
+  filenameRegex = /(agent0\.log|wrapper\.log)\.?(\d+)?/,
+  filename = current.name + '',
+  nextFilename = filenameRegex.exec(filename),
+  content = current.payload + '';
+
+
+ // Remove the relative path if present
+ filename = filename.split('/').pop();
+ if (current.source == 'grabSettings') {
+  var midName = current.agent ? midNamePattern.exec(current.agent)[1]: '';
+  filename = new MidSettingsUtil().getMidSettingsFileName(midName);
+ }
+
+ if (content == '<see_attachment/>') {
+  saGr = new GlideRecord('sys_attachment');
+  saGr.addQuery('table_sys_id', current.getUniqueValue());
+  saGr.addQuery('table_name', current.getTableName()); 
+  //there should be only one attachment in the record but name is not hard coded
+  saGr.query();
+  if (saGr.next()) {
+   sa = new GlideSysAttachmentInputStream(saGr.sys_id);
+   content = new Packages.java.io.ByteArrayOutputStream();
+   sa.writeTo(content, 0, 0);
+   content.close();
+  }
+ }
+
+ parsed = parser.parse(new InputSource(new StringReader(content)));
+ parser = 0;
+ content = xmlHelper.toObject(parsed, true);
+ xmlHelper = 0;
+ parsed = 0;
+
+ parms = content.parameters.parameter;
+ filepath = content.file_path;
+ content = (content.result && content.result.output + '') || '';
+
+ if (nextFilename) {
+  filename = nextFilename[1];
+  fileNum = nextFilename[2] || '0';
+  if (fileNum == 0)
+   isCurrent = true;
+  nextFilename = nextFilename[1] + '.' + (+fileNum + 1);
+ }
+
+ // We always want to save any logs we happen to get.  If we're
+ // updating an existing record then assume that we fetched
+ if (!saveRecord() || !nextFilename)
+  return;
+
+ // So the debugger is usable
+ content = '';
+
+ // We got an agent log, so try to get the next (previous) log also.
+ var midmanage = new MIDServerManage();
+ midmanage.grab_logs(current.agent, nextFilename);
+
+ ////////////////////////////////////////////////////////////////////////
+ function saveRecord() {
+  var startDate, endDate, mid, gr, newRecord, trimmedContent, payloadFilename, endDateFormatted;
+
+  if (!fixContent())
+   return;
+
+  mid = getMid();
+
+  gr = new GlideRecord('agent_file');
+  gr.addQuery('mid_server', mid);
+  gr.addQuery('start_date', startDate);
+  gr.addQuery('name', filename);
+  //there should only be one attachment in record, but filename is not hard coded
+  gr.query();
+
+  if (!gr.next()) {
+   gr = new GlideRecord('agent_file');
+   gr.mid_server = mid;
+   gr.start_date = startDate;
+   newRecord = true;
+  }
+
+  gr.content = trimmedContent || content;
+  gr.start_date = startDate;
+  if (isCurrent)
+   gr.end_date = null;
+  else
+   gr.end_date = endDate;
+  gr.name = filename;
+  gr.path = filepath;
+
+  gr.mid_server = getMid();
+  gr.update();
+  
+  if (trimmedContent) {
+   var deletedAttachmentSysId = deleteOldAttachment(gr.getUniqueValue(), gr.getTableName());
+   sa = new GlideSysAttachment(deletedAttachmentSysId);
+   if (current.source == 'grabSettings') {
+    // for grabSettings attachment type is json and name is different from MID log files
+    sa.write(gr, filename, 'json', content);
+   } else {
+    //naming attachment name to include more information about the file contents 
+    //attachment filename is in format: midservername_[start time]_[end time]_filename
+    //where start time and end time have format YYYY-MM-DD_XXhXXmXXs
+    //if most current log, end time will be show up as [empty]
+    endDateFormatted = isCurrent ? '[empty]' : formatDate(endDate);
+    payloadFilename = current.agent.substr(11).substr(-32) + '_' + formatDate(startDate) + '_' + endDateFormatted + '_' + filename;
+    sa.write(gr, payloadFilename, content);
+   }
+  } else if (current.source == 'grabSettings') {
+   //A json file containg the MID settings information in jsonformat will be attached to 
+   //the corresponding record in agent_file table
+   deletedAttachmentSysId = deleteOldAttachment(gr.getUniqueValue(), gr.getTableName());
+   sa = new GlideSysAttachment(deletedAttachmentSysId);
+   sa.write(gr, filename, 'json', content);
+  }
+
+  return newRecord;
+  
+  function deleteOldAttachment(tableSysId, tableName) {
+   saGr = new GlideRecord('sys_attachment');
+   saGr.addQuery('table_sys_id', gr.getUniqueValue());
+   saGr.addQuery('table_name', gr.getTableName());
+   //there should only be one attachment in the record, but filename is not hardcoded
+   saGr.query();
+   if (saGr.next()) {
+    sa = new GlideSysAttachment(saGr.sys_id);
+    sa.deleteAttachment(saGr.sys_id);
+   }
+   return saGr.sys_id;
+  }
+  function fixContent() {
+   var line, length, dateParsed,
+    i = 0,
+    trimmedNote1 = '<Omitted ',
+    trimmedNote2 = ' of ' + format(content.length) + ' characters.  Full content in attachment.>\n\n',
+    trimmedNoteLength = trimmedNote1.length + 10 + trimmedNote2.length;   // Reserves 10 characters for number omitted
+
+   if (!content)
+    return;
+
+   // I originally reversed the order of the log here (so most recent messages would be on top)
+   // but it was surprisingly confusing.  When I decided not to reverse the messages I just left
+   // the existing code (mostly) intact and removed the call to content.reverse().
+   content = content.split('\n');
+
+   while (i < content.length) {
+    line = content[i];
+    dateParsed = getDateTime(line);
+    if (dateParsed) {
+     startDate = startDate || dateParsed[0];
+     endDate = dateParsed[0];
+     content[i] = dateParsed[0].toString() + ' ' + dateParsed[1];
+    }
+    i++;
+   }
+
+   content = content.join('\n');
+
+   // There's a hard limit of 20,000 on the size of the content (that's the size of the column.)  If we
+   // have to truncate it we'll add a message like:
+   //         <Omitted 1,423,595 of 10,000 characters.  Full content in attachment.>
+   // This code will attempt to truncate at a line boundary and will put the corrent number of
+   // omitted characters into the truncation message.
+   if (content.length > 20000) {
+    trimmedContent = content.substr(content.length - (20000 - trimmedNoteLength));
+    trimmedContent = trimmedContent.split('\n');
+    // Truncating probably happened in the middle of a line.  Remove the partial line if
+    // it's a reasonable length.
+    if (trimmedContent[0].length < 5000)
+     trimmedContent.shift();
+    trimmedContent = trimmedContent.join('\n');
+    trimmedContent = trimmedNote1 + format(content.length - trimmedContent.length) + trimmedNote2 + trimmedContent;
+   }
+
+   return true;
+  }
+
+  function format(num) {
+   var pattern = /(-?\d+)(\d{3})/,
+    s = '' + num;
+
+   while (pattern.test(s))
+    s = s.replace(pattern, '$1,$2');
+   return s;
+  }
+ }
+
+ function getMid() {
+  var gr = new GlideRecord('ecc_agent');
+  gr.addQuery('name', current.agent.substr(11));   // Remove "mid.server."
+  gr.query();
+  gr.next();
+  return gr.sys_id;
+ }
+
+ function getDateTime(str) {
+  var date = wrapperLine.exec(str);
+
+  if (date)
+   return [ new GlideDateTime(date[1] + '-' + date[2] + '-' + date[3] + date[4]), date[5] ];
+  
+  date = agentLine.exec(str);
+  if (date)
+   return [ new GlideDateTime(date[1] + '-' + date[2] + '-' + date[3] + ' ' + date[4]), date[5] ];
+  
+  date = agentLineLegacy.exec(str);
+  if (date)
+   return [ new GlideDateTime('20' + date[3] + '-' + date[1] + '-' + date[2] + date[4]), date[5] ];
+ }
+ 
+ function formatDate(str) {
+  //input string is in the format YYYY-MM-DD XX:XX:XX
+  //formatting date in attachment filename to: [YYYY-MM-DD_XXhXXmXXs]
+  var date = '[' + str;
+  //replacing ':' since this is invalid filename in windows
+  date = date.replace(":", "h");
+  date = date.replace(":", "m");
+  date = date.replace(' ', '_');
+  date = date + 's]';
+  return date;
+ }
+
+})();]]></script>
+        <sys_class_name>x_938076_now_utils_now_utils_business_rules</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:48:38</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>238b24d183701210c6695855eeaad36b</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Get All MID logs</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>x_938076_now_utils_now_utils_business_rules_238b24d183701210c6695855eeaad36b</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:48:38</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </x_938076_now_utils_now_utils_business_rules>
+    <sys_translated_text action="delete_multiple" query="documentkey=238b24d183701210c6695855eeaad36b"/>
+</record_update>

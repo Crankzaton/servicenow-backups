@@ -1,0 +1,220 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>124f8426738123004a1f3ae234f6a723</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_hr_core.hr_caseMyRequestFilterUtil&lt;/api_name&gt;
+        &lt;caller_access&gt;2&lt;/caller_access&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;hr_caseMyRequestFilterUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var hr_caseMyRequestFilterUtil = Class.create();
+
+//HR Case Extension Tables
+hr_caseMyRequestFilterUtil.hrCaseTables = sn_hr_core.hr.TABLE_CASE_EXTENSIONS.toString();
+
+hr_caseMyRequestFilterUtil.prototype = {
+    initialize: function() {
+        this._user = gs.getUserID();
+        this.cases = [];
+    },
+
+    hr_caseMyRequestFilter: function(checkCompleted) {
+
+        var grCase = new GlideRecord('sn_hr_core_case');
+        grCase.addQuery('opened_for', this._user).addOrCondition('hr_service.subject_person_access', true).addCondition('subject_person', this._user);
+        grCase.addQuery('state', '!=', hr_Constants.CASE_DRAFT);
+        if (checkCompleted) {
+            grCase.addQuery('active', 'false');
+            grCase.addNotNullQuery('closed_at');
+        } else
+            grCase.addActiveQuery();
+
+        grCase.orderBy('number');
+        grCase.query();
+        while (grCase.next())
+            this._hrCaseParent(grCase, checkCompleted);
+
+        var grTask = new GlideRecord('sn_hr_core_task');
+        grTask.addQuery('assigned_to', this._user);
+        grTask.addQuery('state', '!=',hr_Constants.TASK_DRAFT);
+        grTask.addQuery('parent.sys_class_name', 'INSTANCEOF', 'sn_hr_core_case');
+        grTask.addQuery('parent.state', '!=',hr_Constants.CASE_DRAFT);
+        if (checkCompleted) {
+            grTask.addQuery('active', 'false');
+            grTask.addNotNullQuery('closed_at');
+            grTask.addQuery('parent.active', 'false');
+            grTask.orderByDesc('parent.closed_at');
+        } else {
+            grTask.addQuery('parent.active', 'true');
+            grTask.orderBy('number');
+        }
+        grTask.query();
+        while (grTask.next()) {
+            var grCaseParent = grTask.parent.getRefRecord();
+            this._hrCaseParent(grCaseParent, checkCompleted);
+        }
+
+        if (GlidePluginManager.isActive('com.snc.document_templates')) {
+            var grTask = new GlideRecord('sn_doc_task');
+            grTask.addQuery('assigned_to', this._user);
+            grTask.addQuery('state', '!=', hr_Constants.DOCTASK_DRAFT);
+            grTask.addQuery('parent.sys_class_name', 'INSTANCEOF', 'sn_hr_core_case');
+            grTask.addQuery('parent.state', '!=', hr_Constants.CASE_DRAFT);
+            if (checkCompleted) {
+            	var inQuery=[hr_Constants.DOCTASK_CLOSED_COMPLETE,hr_Constants.DOCTASK_CLOSED_INCOMPLETE,hr_Constants.DOCTASK_CANCELLED];
+            	
+                grTask.addQuery('state', 'IN', inQuery);
+                grTask.addQuery('active', 'false');
+                grTask.addNotNullQuery('closed_at');
+                grTask.addQuery('parent.active', 'false');
+                grTask.orderByDesc('parent.closed_at');
+                grTask.orderBy('number');
+            } else {
+            	var inQuery = [hr_Constants.DOCTASK_DRAFT,hr_Constants.DOCTASK_WORK_IN_PROGRESS];
+            	
+                grTask.addQuery('state', 'IN',inQuery);
+                grTask.addQuery('parent.active', 'true');
+                grTask.addQuery('active', 'true');
+                grTask.orderBy('number');
+            }
+            grTask.query();
+            while (grTask.next()) {
+                var grCaseParent = grTask.parent.getRefRecord();
+                this._hrCaseParent(grCaseParent, checkCompleted);
+            }
+        }
+
+        var grApproval = new GlideRecord('sysapproval_approver');
+        grApproval.addQuery('approver', this._user);
+        grApproval.addQuery('sysapproval.sys_class_name', 'INSTANCEOF', 'sn_hr_core_case');
+        if (checkCompleted) {
+            grApproval.addQuery('state', 'IN', 'approved, rejected,not_required');
+            grApproval.addQuery('sysapproval.active', 'false');
+            grApproval.orderByDesc('sysapproval.closed_at');
+        } else {
+            grApproval.addQuery('sysapproval.active', 'true');
+        }
+        grApproval.query();
+        while (grApproval.next()) {
+            var parentRecord = grApproval;
+            parentRecord = parentRecord.sysapproval.getRefRecord();
+            this._hrCaseParent(parentRecord, checkCompleted);
+
+        }
+
+        return this.cases;
+    },
+
+    //consider the case for the input GlideRecord if parent is not already considered. checkCompleted is false for getting open cases and true for closed cases
+    _hrCaseParent: function(grCase, checkCompleted) {
+        var parentRecord = grCase;
+        var addCase = true;
+        var level = 3;
+
+        while (addCase &amp;&amp; level &gt;= 1) {
+            level--;
+            if (checkCompleted &amp;&amp; (parentRecord.getValue('active') == 1) &amp;&amp; (parentRecord.getValue('opened_for') == this._user || sn_hr_core.hr_Case.userHasSubjectPersonAccess(parentRecord)))
+                addCase = false;
+            else if (GlidePluginManager.isActive('com.sn_jny') &amp;&amp; parentRecord.getValue('jny_context'))
+                addCase = false;
+            else if (parentRecord.getUniqueValue() &amp;&amp; parentRecord.isValidRecord() &amp;&amp; (hr_caseMyRequestFilterUtil.hrCaseTables.indexOf(parentRecord.getRecordClassName()) &gt;= 0)) { //Exclude the record for which parents are already considered for display
+                if (this.cases.indexOf(parentRecord.getUniqueValue().toString()) &gt;= 0 &amp;&amp; (parentRecord.getValue('opened_for') == this._user || sn_hr_core.hr_Case.userHasSubjectPersonAccess(parentRecord))) // choose not to display case only if its parent already display and is openedFor or Subject Person case
+                    addCase = false;
+                else
+                    parentRecord = parentRecord.parent.getRefRecord();
+            } else
+                break;
+
+        }
+
+        if (addCase)
+            this.cases.push(grCase.getUniqueValue().toString());
+    },
+
+    hr_scRequestMyRequestFilter: function(checkCompleted) {
+        var approvalTable = ['sc_request'];
+
+        var grApproval = new GlideRecord('sysapproval_approver');
+        grApproval.addQuery('approver', this._user);
+        grApproval.addQuery('sysapproval.sys_class_name', 'IN', approvalTable);
+        if (checkCompleted) {
+            grApproval.addQuery('state', 'IN', 'approved, rejected,not_required');
+            grApproval.addQuery('sysapproval.active', 'false');
+            grApproval.orderByDesc('sysapproval.closed_at');
+        } else
+            grApproval.addQuery('sysapproval.active', 'true');
+
+        grApproval.query();
+        while (grApproval.next()) {
+            var parentRecord = grApproval;
+            parentRecord = parentRecord.sysapproval.getRefRecord();
+
+            if (parentRecord.getUniqueValue() &amp;&amp; parentRecord.isValidRecord()) {
+                if (this.cases.indexOf(parentRecord.getUniqueValue().toString()) &lt; 0)
+                    this.cases.push(parentRecord.getUniqueValue().toString());
+            }
+        }
+
+        return this.cases;
+    },
+
+    hr_universalRequestMyRequestFilter: function(checkCompleted) {
+        var grCase = new GlideRecord('sn_hr_core_case');
+        grCase.addQuery('hr_service.subject_person_access', true);
+        grCase.addQuery('subject_person', this._user);
+        grCase.addEncodedQuery("opened_forNSAMEASsubject_person");
+        grCase.addQuery('state', '!=', hr_Constants.CASE_DRAFT);
+        grCase.addNotNullQuery('universal_request');
+        if (checkCompleted) {
+            grCase.addQuery('active', 'false');
+            grCase.addQuery('universal_request.active', 'false');
+            grCase.addNotNullQuery('closed_at');
+        } else {
+            grCase.addActiveQuery();
+            grCase.addQuery('universal_request.active', 'true');
+        }
+        grCase.orderBy('number');
+        grCase.query();
+
+        while (grCase.next()) {
+            this.cases.push(grCase.getUniqueValue().toString());
+        }
+
+        return this.cases;
+    },
+    type: 'hr_caseMyRequestFilterUtil'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2018-10-12 07:10:32&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;124f8426738123004a1f3ae234f6a723&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;136&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;hr_caseMyRequestFilterUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Human Resources: Core" source="sn_hr_core"&gt;d4ac3fff5b311200a4656ede91f91af2&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Human Resources: Core"&gt;d4ac3fff5b311200a4656ede91f91af2&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_124f8426738123004a1f3ae234f6a723&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-06-06 18:42:35&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:10:26</sys_created_on>
+        <sys_id>0f80b0d583b01210c6695855eeaad3ce</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>hr_caseMyRequestFilterUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_0f80b0d583b01210c6695855eeaad3ce</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:10:26</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,381 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>22543a140b001300283eed3ab4673a07</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.ResourceGridAllocator&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Allocates Hours from Resource Grid for selected users and give time spans&lt;/description&gt;
+        &lt;name&gt;ResourceGridAllocator&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ResourceGridAllocator = Class.create();
+ResourceGridAllocator.prototype = {
+    initialize: function(resPlanDetails, users, timeSpanStartDates, timeSpan) {
+        this.resPlanDetails = resPlanDetails;
+        this.respId = this.resPlanDetails.sys_id;
+        this.rpGR = this._getGR('resource_plan', this.resPlanDetails.sys_id);
+        this.rpSI = new ResourcePlan(this.rpGR);
+        this.taskId = this.rpGR.getValue('task');
+        this.topTaskId = this.rpGR.getValue('top_task');
+        this.taskGR = this._getGR('planned_task', this.taskId);
+        this.timeSpanStartDates = timeSpanStartDates;
+        this.users = users;
+        this.userIds = this._getUserIds(this.users);
+        this.activeUserIds = this._getActiveUserIds(this.userIds);
+        this.arrayUtil = new ArrayUtil();
+        this.inActiveUserIds = this.arrayUtil.diff(this.userIds, this.activeUserIds);
+        this.timeSpan = timeSpan;
+        this.timeSpanStartDates = this._adjustTimeSpanStartDates(this.resPlanDetails.start_date, this.resPlanDetails.end_date, this.timeSpanStartDates, this.timeSpan);
+        this.dateRanges = this._getDateRangesForConfirmOrAllocate(this.resPlanDetails.start_date, this.resPlanDetails.end_date, this.timeSpanStartDates, this.timeSpan);
+        this._adjustResPlanDetails();
+        this.allocator = this.rpGR.getValue('distribution_type') == 'front_load' ? ResourceGridFrontLoadAllocator : ResourceGridEvenSpreadAllocator;
+        this.editor = new ResourceGridAllocationEditor('resource_allocation', this.rpGR, this.timeSpan);
+        this.dailyEditor = new ResourceGridAllocationDailyEditor('resource_allocation_daily', this.rpGR, this.timeSpan);
+        this.capacityHelper = new RMResourceCapacityHelper(this.activeUserIds);
+        this.capacityHelper.fetchAvailabilityInfo(this.dateRanges);
+        this.editor.setCapacityHelper(this.capacityHelper);
+		this.resPlanLogHelper = new ResourcePlanLogHelper(this.rpGR,true,true);
+		this.hardBookedHours = 0;
+    },
+
+    _getGR: function(table, sysId) {
+        var gr = new GlideRecord(table);
+        gr.get(sysId);
+        return gr;
+    },
+
+    _getUserIds: function(users) {
+        var userIds = [];
+        for (var i = 0; i &lt; users.length; i++) {
+            if (userIds.indexOf(users[i].sys_id) &lt; 0)
+                userIds.push(users[i].sys_id);
+        }
+        return userIds;
+    },
+
+    _getActiveUserIds: function(userIds) {
+        var activeUserIds = [];
+        var activeUsers = new GlideRecord("sys_user");
+        activeUsers.addQuery("sys_id", "IN", userIds.join(","));
+        activeUsers.addActiveQuery();
+        activeUsers.query();
+        while (activeUsers.next()) {
+            activeUserIds.push(activeUsers.getValue("sys_id"));
+        }
+        return activeUserIds;
+    },
+
+    _getTimeSpanDateRange: function(date, timeSpan) {
+        var start = new GlideDate();
+        start.setValue(date);
+        var end = new GlideDate();
+        end.setValue(date);
+        var rmDateRangeHelper = new RMDateRangeHelper();
+        if (timeSpan == 'month' || timeSpan == 'monthly')
+            rmDateRangeHelper._resetToMonthStartAndEnd(start, end);
+        else
+            rmDateRangeHelper.resetToWeekStartAndEnd(start, end);
+
+        var dateRange = new RMDateRange(start, end);
+        return dateRange;
+    },
+
+    _adjustTimeSpanStartDates: function(startDate, endDate, timeSpanStartDates, timeSpan) {
+        var rpStartDate = new GlideDate();
+        rpStartDate.setValue(startDate);
+        var dateRangeForRPStartDate = this._getTimeSpanDateRange(rpStartDate.getValue(), timeSpan);
+        var rpEndDate = new GlideDate();
+        rpEndDate.setValue(endDate);
+        var dateRangeForRPEndDate = this._getTimeSpanDateRange(rpEndDate.getValue(), timeSpan);
+        timeSpanStartDates.sort(function(a, b) {
+            var aGD = new GlideDate();
+            aGD.setValue(a);
+            var bGD = new GlideDate();
+            bGD.setValue(b);
+            return aGD.getNumericValue() - bGD.getNumericValue();
+        });
+        var timeSpanFirstStartDate = new GlideDate();
+        timeSpanFirstStartDate.setValue(timeSpanStartDates[0]);
+        var timeSpanLastStartDate = new GlideDate();
+        timeSpanLastStartDate.setValue(timeSpanStartDates[timeSpanStartDates.length - 1]);
+
+        var startDateToSlice = timeSpanFirstStartDate &gt; dateRangeForRPStartDate.start ? String(timeSpanFirstStartDate.getValue()) : String(dateRangeForRPStartDate.start.getValue());
+        var endDateToSlice = timeSpanLastStartDate &lt; dateRangeForRPEndDate.start ? String(timeSpanLastStartDate.getValue()) : String(dateRangeForRPEndDate.start.getValue());
+        timeSpanStartDates = timeSpanStartDates.slice(timeSpanStartDates.indexOf(startDateToSlice), timeSpanStartDates.indexOf(endDateToSlice) + 1);
+        return timeSpanStartDates;
+    },
+
+    _getDateRangesForConfirmOrAllocate: function(startDate, endDate, timeSpanStartDates, timeSpan) {
+        var rpStartDate = new GlideDate();
+        rpStartDate.setValue(startDate);
+        var rpEndDate = new GlideDate();
+        rpEndDate.setValue(endDate);
+
+        var dateRanges = [];
+        for (var i = 0; i &lt; timeSpanStartDates.length; i++) {
+            dateRanges.push(this._getTimeSpanDateRange(timeSpanStartDates[i], timeSpan));
+        }
+        if (dateRanges[0].start &lt; rpStartDate)
+            dateRanges[0].start = rpStartDate;
+        if (dateRanges[dateRanges.length - 1].end &gt; rpEndDate)
+            dateRanges[dateRanges.length - 1].end = rpEndDate;
+        return dateRanges;
+    },
+
+    _adjustResPlanDetails: function() {
+        for (var i = 0; i &lt; this.timeSpanStartDates.length; i++) {
+            var startDate = this.timeSpanStartDates[i];
+            var allocatedHours = this.resPlanDetails[startDate + '_allocated_hours'];
+            this.resPlanDetails[startDate + '_allocated_hours'] = isNaN(allocatedHours) || JSUtil.nil(allocatedHours) ? 0 : Number(allocatedHours);
+        }
+    },
+
+    _hoursToAllocate: function(startDate) {
+        var plannedHours = Number(this.resPlanDetails[startDate + '_planned_hours']);
+        var allocatedHours = Number(this.resPlanDetails[startDate + '_allocated_hours']);
+        var hoursLeft = plannedHours - allocatedHours;
+        return hoursLeft;
+    },
+
+    _filterUsers: function(startDate, endDate, allocateType, userIds) { // skip users if already confirmed or allocated
+        var userIdsToAllocate = [];
+        var resPlanId = this.resPlanDetails.sys_id;
+        var taskId = this.taskId;
+        for (var j = 0; j &lt; userIds.length; j++) {
+            var resAllocs = this.editor.getAllocIdsByDailies(startDate, endDate, userIds[j], '2');
+            var isSoftAllocationExists = resAllocs.length &gt; 0;
+            if (isSoftAllocationExists) {
+                if (allocateType == 'allocate') {
+                    var allocatedObj = this.editor.convertToHardBooking(startDate, userIds[j], false, false);
+					this.hardBookedHours += allocatedObj.hardBookedHours;
+                    this.usersRequireUpdateAggregate.push(userIds[j]);
+                    this.status = 'success';
+                }
+            } else {
+                if (allocateType == 'confirm') {
+                    if (userIdsToAllocate.indexOf(userIds[j]) &lt; 0)
+                        userIdsToAllocate.push(userIds[j]);
+                } else if (allocateType == 'allocate') {
+                    resAllocs = this.editor.getAllocIdsByDailies(startDate, endDate, userIds[j], '1');
+                    var isHardAllocationExists = resAllocs.length &gt; 0;
+                    if (!isHardAllocationExists)
+                        if (userIdsToAllocate.indexOf(userIds[j]) &lt; 0)
+                            userIdsToAllocate.push(userIds[j]);
+                }
+            }
+        }
+        return userIdsToAllocate;
+    },
+
+    _getResAllocDates: function(date, distribution) {
+        var dr = this._getTimeSpanDateRange(date, distribution);
+        var startDate = new GlideDate();
+        startDate.setValue(this.rpGR.getValue("start_date"));
+        var endDate = new GlideDate();
+        endDate.setValue(this.rpGR.getValue("end_date"));
+        dr.start = dr.start &lt; startDate ? startDate : dr.start;
+        dr.end = dr.end &gt; endDate ? endDate : dr.end;
+        return dr;
+    },
+
+    _allocateHoursPerUser: function(userIds, hoursToAllocate, dateRange, allocateType) {
+        var resPlanId = this.resPlanDetails.sys_id;
+        var taskId = this.taskId;
+        var resAllocIds = [];
+        var allocator = new this.allocator(hoursToAllocate, dateRange.start.getValue(), dateRange.end.getValue(), userIds, this.capacityHelper);
+		allocator.totalHours = (this._isPercentBasedOperationalPlan())?this._getTotalHoursForPercentBasedPlan(allocator,this.rpGR.getValue('percent_capacity')):allocator.totalHours;
+        var hoursPerUserPerDate = allocator.hoursToAllocatePerUserPerDate(resPlanId,'','','',this.rpGR.getValue('percent_capacity'));
+        var usersNotAvailable = userIds;
+        for (var userId in hoursPerUserPerDate) {
+            if (!gs.nil(hoursPerUserPerDate[userId]) &amp;&amp; Object.keys(hoursPerUserPerDate[userId]).length &gt; 0) {
+                var dailyRate = this.rpSI.getDailyRatesForUser(userId);
+                if (usersNotAvailable.indexOf(userId) &gt; -1)
+                    usersNotAvailable.splice(usersNotAvailable.indexOf(userId), 1);
+                this.usersRequireUpdateAggregate.push(userId);
+                this.editor.setUserId(userId);
+                var bookingType = allocateType == 'allocate' ? '1' : '2';
+                this.editor.setBookingType(bookingType);
+                var allocIds = this.editor.createNewDailies(hoursPerUserPerDate[userId], dailyRate);
+                ResourcePlanRollupHelper.rollupFromResAllocationDailiesToAllocations(allocIds, this.editor.bookingType, this.capacityHelper);
+            }
+        }
+        for (var i = 0; i &lt; usersNotAvailable.length; i++) {
+            this._createAllocDailyWithZeroHours(dateRange, usersNotAvailable[i], allocateType);
+        }
+		this.resPlanLogHelper.updateHoursInfo(allocator.getHoursAllocatedPerUser(),allocator.getHoursLeft(),dateRange.start.getValue(), dateRange.end.getValue());
+    },
+	
+	_isPercentBasedOperationalPlan: function(){
+		return (this.rpGR.getValue('request_type') == 'percent_capacity');
+	},
+	
+	_getTotalHoursForPercentBasedPlan: function(allocator,percentageCapacity){
+		var totalHours = 0;
+		var totalHoursField = (this.rpGR.getValue('distribution_type') == 'front_load')?'totalHours':'totalUnits';
+		var minTimeUnit = parseInt(gs.getProperty('com.snc.resource_management.allocation_interval_minutes', '60'));
+		for(var userIndex = 0; userIndex&lt;allocator.userIds.length; userIndex++){
+			var userId = allocator.userIds[userIndex];
+			if(totalHoursField == 'totalHours')
+			totalHours+= ResourceManagementUtils.roundOffBasedOnCalendarEventProperty((allocator.users[userId]['capacity'][totalHoursField] * percentageCapacity)/100);	
+			else
+			totalHours+= ResourceManagementUtils.roundOffBasedOnCalendarEventProperty((allocator.users[userId]['capacity'][totalHoursField] * minTimeUnit * percentageCapacity)/(100*60));
+		}
+		return totalHours;
+	},
+
+    _createAllocDailyWithZeroHours: function(dateRange, userId, allocateType) {
+        var bookingType = allocateType == 'allocate' ? '1' : '2';
+        var resAllocDR = this._getResAllocDates(dateRange.start.getValue(), this.rpGR.getValue('distribution'));
+        var allocId = this.editor.createAllocation(resAllocDR.start.getValue(), resAllocDR.end.getValue(), userId, 0, this.taskId, bookingType);
+        var capacityPerDay = this.capacityHelper.getCapacityPerDay(userId, resAllocDR.start, resAllocDR.end);
+        var date = new GlideDate();
+        date.setValue(resAllocDR.start.getValue());
+        for (var i = 0; i &lt; capacityPerDay.length; i++) {
+            if (capacityPerDay[i] &gt; 0) {
+                this.dailyEditor.createDailyWithZeroHours(allocId, date.getValue(), this.taskId, bookingType, userId);
+            }
+            date.addDays(1);
+        }
+        this.status = 'success';
+    },
+
+    _getUserNames: function(userIds) {
+        var userNames = [];
+        for (var i = 0; i &lt; userIds.length; i++) {
+            var user = new GlideRecord('sys_user');
+            user.get(userIds[i]);
+            userNames.push(user.getDisplayValue('name'));
+        }
+        return userNames;
+    },
+
+    allocate: function(allocateType) { // allocateType can be 'confirm' or 'allocate'
+        var grStart = new GlideDateTime().getNumericValue();
+        var dateRange;
+        var allocationDetails = {};
+        this.status = 'failure';
+        this.usersAlreadyAllocated = [];
+        this.usersRequireUpdateAggregate = [];
+        this.usersNotAllocated = [];
+        for (var i = 0; i &lt; this.timeSpanStartDates.length; i++) { //looping over each period ex: Jan, Feb
+            var startDate = this.timeSpanStartDates[i];
+            var hoursToAllocate = this._hoursToAllocate(startDate);
+            dateRange = this.dateRanges[i];
+            var userIdsToAllocate = this._filterUsers(dateRange.start, dateRange.end, allocateType, this.activeUserIds);
+            if (userIdsToAllocate.length &gt; 0) {
+                if (hoursToAllocate &gt; 0 || this._isPercentBasedOperationalPlan()) {      // if it is a percentbased operational resource plan we should still allocate even if the hours are zero to handle addition of new user
+                    this._allocateHoursPerUser(userIdsToAllocate, hoursToAllocate, dateRange, allocateType);
+                    //this.usersRequireUpdateAggregate = this.usersRequireUpdateAggregate.concat(userIdsToAllocate);
+                } else {
+                    // 					for(var k=0;k&lt;userIdsToAllocate.length;k++)
+                    // 						this._createAllocDailyWithZeroHours(dateRange,userIdsToAllocate[k],allocateType);
+                    this.usersNotAllocated = this.usersNotAllocated.concat(userIdsToAllocate);
+                }
+            }
+            this.usersAlreadyAllocated = this.usersAlreadyAllocated.concat(this.arrayUtil.diff(this.activeUserIds, userIdsToAllocate));
+        }
+        var state = allocateType == 'allocate' ? ResourcePlanState.ALLOCATED : ResourcePlanState.CONFIRMED;
+        ResourcePlanRollupHelper.rollupResourcePlan(this.respId, state);
+        this.usersRequireUpdateAggregate = this.arrayUtil.unique(this.usersRequireUpdateAggregate);
+        this.usersNotAllocated = this.arrayUtil.unique(this.usersNotAllocated);
+        this.usersNotAllocated = this.arrayUtil.diff(this.usersNotAllocated, this.usersRequireUpdateAggregate);
+        if (this.usersRequireUpdateAggregate.length &gt; 0) {
+            var grStartAggregates = new GlideDateTime().getNumericValue();
+			var planType = this.rpGR.getValue('plan_type');
+			var workType = this.rpGR.getValue('operational_work_type');
+            ResourceGridAggregatesHelper.resPlanActionFromFinder(this.usersRequireUpdateAggregate, this.dateRanges[0].start.getValue(), this.dateRanges[i - 1].end.getValue(), this.taskId, allocateType, planType, workType);
+            var grEndAggregates = new GlideDateTime().getNumericValue();
+			gs.log("Difference: allocate_updatingAggregates " + (grEndAggregates - grStartAggregates) / 1000);
+           
+        }
+        this.usersAlreadyAllocated = this.arrayUtil.unique(this.usersAlreadyAllocated);
+        this.usersAlreadyAllocated = this.arrayUtil.diff(this.usersAlreadyAllocated, this.usersRequireUpdateAggregate);
+        allocationDetails.status = this.status;
+        allocationDetails.message = '';
+        allocationDetails.info = [];
+        if (this.inActiveUserIds &amp;&amp; this.inActiveUserIds.length &gt; 0) {
+            var userNames = this._getUserNames(this.inActiveUserIds);
+            if (state == ResourcePlanState.CONFIRMED)
+                allocationDetails.info.push(gs.getMessage("{0} cannot be confirmed because only active users can be confirmed.", userNames.join(' , ')));
+            else 
+                allocationDetails.info.push(gs.getMessage("{0} cannot be allocated because only active users can be allocated.", userNames.join(' , ')));
+        }
+
+        if (this.usersAlreadyAllocated &amp;&amp; this.usersAlreadyAllocated.length &gt; 0) {
+            var userNames = this._getUserNames(this.usersAlreadyAllocated);
+            allocationDetails.info.push(gs.getMessage("{0} not allocated because allocation already exists.", userNames.join(' , ')));
+        }
+        if (this.usersNotAllocated &amp;&amp; this.usersNotAllocated.length &gt; 0) {
+            var userNames = this._getUserNames(this.usersNotAllocated);
+            if (state == ResourcePlanState.CONFIRMED)
+                allocationDetails.info.push(gs.getMessage("{0} cannot be added because resource plan is fully confirmed.", userNames.join(' , ')));
+            else
+                allocationDetails.info.push(gs.getMessage("{0} cannot be added because resource plan is fully allocated.", userNames.join(' , ')));
+        }
+        if (JSUtil.notNil(this.topTaskId))
+            allocationDetails.taskId = this.topTaskId;
+        else
+            allocationDetails.taskId = this.taskId;
+		this.resPlanLogHelper.setRPState(state);
+		var type;
+		if(this.resPlanDetails.confOrAllocForSpecificPeriod)
+			type = 'partialConfOrAlloc';
+		else
+			type = 'stateChanged';
+		var fromDate = new GlideDate();
+		fromDate.setValue(this.timeSpanStartDates[0]);
+		var toDate = new GlideDate();
+		toDate.setValue(this.timeSpanStartDates[this.timeSpanStartDates.length-1]);
+		this.resPlanLogHelper.populateLogs({'type':type, 'hardBookedHours': this.hardBookedHours, 'fromDate': fromDate, 'toDate': toDate});
+		var errorMsg = this.resPlanLogHelper.getErrorMsg();
+		var infoMsg = this.resPlanLogHelper.getInfoMsg();
+		if(!gs.nil(errorMsg))
+			allocationDetails.error = errorMsg;
+		else if(!gs.nil(infoMsg))
+			allocationDetails.info.push(infoMsg);
+		this.rpSI.updateAllocatedMembersList(false);
+		if(this.usersRequireUpdateAggregate.length &gt; 0 &amp;&amp; this.rpGR.getValue('state') == ResourcePlanState.ALLOCATED &amp;&amp; this.rpGR.getValue('extension') == 'requested'){
+			this.rpGR.setValue('extension','completed');
+			this.rpGR.setWorkflow(false);
+			this.rpGR.update();
+		}
+		var grEnd = new GlideDateTime().getNumericValue();
+		gs.log("Difference: allocate" + (grEnd - grStart) / 1000);
+        return allocationDetails;
+    },
+
+    type: 'ResourceGridAllocator'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2018-01-30 06:12:16&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;22543a140b001300283eed3ab4673a07&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;283&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ResourceGridAllocator&lt;/sys_name&gt;
+        &lt;sys_package display_value="Resource Grid Interface" source="com.snc.resource_grid"&gt;7e00da2b47e64210cd4e1ce4316d438f&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_22543a140b001300283eed3ab4673a07&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2021-11-22 07:03:44&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:05</sys_created_on>
+        <sys_id>cfe0fc1983b01210c6695855eeaad387</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ResourceGridAllocator</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_cfe0fc1983b01210c6695855eeaad387</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:05</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

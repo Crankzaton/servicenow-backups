@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0351f5e1531201107f03ddeeff7b1234</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_aisearch_global.AisMigrationTableConfigHandler&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Handles the migration of table-level attributes and configurations&lt;/description&gt;
+        &lt;name&gt;AisMigrationTableConfigHandler&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var AisMigrationTableConfigHandler = Class.create();
+AisMigrationTableConfigHandler.prototype = {
+
+    AIS_INDEX_ATTACHMENT_DEFAULT: 'true',
+    AIS_INDEX_TRANSLATE_DEFAULT: 'false',
+    AIS_INDEX_TAGS_DEFAULT: 'none',
+
+    initialize: function(migrationSysID) {
+        this.migrationSysID = migrationSysID;
+        this.logger = new AisMigrationLogger(migrationSysID, 'TableConfigHandler');
+    },
+
+    migrateAttributes: function(tableName, indexSourceId) {
+        this._setAttachmentIndexValue(tableName, indexSourceId);
+        this._setIndexTranslatedValue(tableName, indexSourceId);
+        this._setIndexTagsValue(tableName, indexSourceId);
+    },
+
+    _setAttachmentIndexValue: function(tableName, indexSourceId) {
+        var attributeAttachmentIndexSysId = '748de53b53032300d0baddeeff7b123d'; // ID of attachment_index attribute for Zing
+        var indexAttachmentAttributeSysId = '2dd8f14753320010ffaaddeeff7b1293'; // Attribute ID for AIS
+
+        var gr = new GlideRecord('ts_table_attribute_map');
+        gr.addQuery('table', tableName);
+        gr.addQuery('name', attributeAttachmentIndexSysId);
+        gr.query();
+        var aisAttributeValue = 'false';
+        if (gr.next()) {
+            aisAttributeValue = gr.value;
+        }
+
+        if (aisAttributeValue == 'true') {
+            var rootTable = new GlideTableHierarchy(tableName).getRoot();
+            // task table attachments can bloat the size of AIS index. We will set it to false and let the customer set it to true if they wish
+            if (rootTable === 'task') {
+                aisAttributeValue = false;
+            }
+        }
+
+        if (aisAttributeValue != this.AIS_INDEX_ATTACHMENT_DEFAULT)
+            this._insertTableAttribute(indexSourceId, tableName, indexAttachmentAttributeSysId, aisAttributeValue);
+    },
+
+    _setIndexTranslatedValue: function(tableName, indexSourceId) {
+        var indexTranslatedSysId = '704da53b53032300d0baddeeff7b12a3'; // ID of text_index_translations attribute for Zing
+        var aisIndexTranslatedSysId = 'e2bd2451b7021010ba148481de11a970'; // ID of index_translated_fields attribute for AIS
+
+        var gr = new GlideRecord('ts_table_attribute_map');
+        gr.addQuery('table', tableName);
+        gr.addQuery('name', indexTranslatedSysId);
+        gr.query();
+        var zingIndexTranslated = 'false';
+        if (gr.next()) {
+            zingIndexTranslated = gr.value;
+        }
+        var aisAttributeValue = this.AIS_INDEX_TRANSLATE_DEFAULT;
+
+        if (zingIndexTranslated == 'true')
+            aisAttributeValue = true;
+
+        if (aisAttributeValue != this.AIS_INDEX_TRANSLATE_DEFAULT)
+            this._insertTableAttribute(indexSourceId, tableName, aisIndexTranslatedSysId, aisAttributeValue);
+    },
+
+    _setIndexTagsValue: function(tableName, indexSourceId) {
+        var indexTagsSysId = '332d653b53032300d0baddeeff7b128a'; // ID of text_index_tags attribute for Zing
+        var aisIndexTagsSysId = '158a3890b7221010ba148481de11a9d1'; // ID of index_tags attribute for for AIS
+
+        var gr = new GlideRecord('ts_table_attribute_map');
+        gr.addQuery('table', tableName);
+        gr.addQuery('name', indexTagsSysId);
+        gr.query();
+        var zingIndexTags = null;
+        if (gr.next()) {
+            zingIndexTags = gr.value;
+        }
+
+        var aisAttributeValue = this.AIS_INDEX_TAGS_DEFAULT;
+
+        if (zingIndexTags != null &amp;&amp; (zingIndexTags == 'all_shared' || zingIndexTags == 'everyone_only')) // Take valid values
+            aisAttributeValue = zingIndexTags;
+
+        if (aisAttributeValue != this.AIS_INDEX_TAGS_DEFAULT)
+            this._insertTableAttribute(indexSourceId, tableName, aisIndexTagsSysId, aisAttributeValue);
+    },
+
+    _insertTableAttribute: function(indexSourceSysId, tableName, attribute, attributeValue) {
+        var migrationRecord = new AisMigrationRecord(this.migrationSysID, 'ais_datasource_attribute');
+        migrationRecord.setValue('attribute', attribute);
+        migrationRecord.setValue('source', tableName);
+        migrationRecord.setValue('datasource', indexSourceSysId);
+        migrationRecord.setValue('value', attributeValue);
+        migrationRecord.insert();
+    },
+
+    addChildTables: function(tableName, indexSourceId) {
+        var childTables = new GlideTableHierarchy(tableName).getTableExtensions();
+
+        for (var i in childTables) {
+            var textIndex = true;
+            var dict = new GlideRecord('sys_dictionary');
+            dict.addEncodedQuery("nameIN" + childTables[i] + "^internal_type=collection^attributesLIKEno_text_index=true");
+            dict.query();
+            if (dict.next()) {
+                textIndex = false;
+                this.logger.info('Indexing disabled for child table: ' + childTables[i]);
+            }
+            this._insertChildTable(indexSourceId, childTables[i], textIndex);
+        }
+    },
+
+    _insertChildTable: function(indexSourceSysId, tableName, active) {
+        var migrationRecord = new AisMigrationRecord(this.migrationSysID, 'ais_child_table');
+        migrationRecord.setValue('datasource', indexSourceSysId);
+        migrationRecord.setValue('table', tableName);
+        migrationRecord.setValue('active', active);
+        migrationRecord.insert();
+    },
+
+    type: 'AisMigrationTableConfigHandler'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-03-17 16:11:06&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0351f5e1531201107f03ddeeff7b1234&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;10&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AisMigrationTableConfigHandler&lt;/sys_name&gt;
+        &lt;sys_package display_value="AI Search For Next Experience" source="sn_aisearch_global"&gt;3c467b5f0bf130109e0fa4e6e9c4c946&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="AI Search For Next Experience"&gt;3c467b5f0bf130109e0fa4e6e9c4c946&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0351f5e1531201107f03ddeeff7b1234&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-07-26 20:56:36&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:03</sys_created_on>
+        <sys_id>3a307c5583b01210c6695855eeaad338</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AisMigrationTableConfigHandler</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_3a307c5583b01210c6695855eeaad338</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:03</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,209 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>22c08ff988e42110fa9bf275d1a0432a</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.SweepEvent&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;SweepEvent&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[//https://github.com/mfogel/polygon-clipping/blob/v0.15.3/src/sweep-event.js
+var SweepEvent = Class.create();
+SweepEvent.prototype = {
+	// Warning: 'point' input will be modified and re-used (for performance)
+    initialize: function (point, isLeft) {
+		if (point.events === undefined) point.events = [this];
+		else point.events.push(this);
+		this.point = point;
+		this.isLeft = isLeft;
+    },
+    type: 'SweepEvent',
+	
+	
+  link: function(other) {
+    if (other.point === this.point) {
+      throw new Error('Tried to link already linked events');
+    }
+    var otherEvents = other.point.events;
+    for (var i = 0, iMax = otherEvents.length; i &lt; iMax; i++) {
+      var evt = otherEvents[i];
+      this.point.events.push(evt);
+      evt.point = this.point;
+    }
+    this.checkForConsuming();
+  },
+
+  /* Do a pass over our linked events and check to see if any pair
+   * of segments match, and should be consumed. */
+  checkForConsuming: function() {
+    // FIXME: The loops in this method run O(n^2) =&gt; no good.
+    //        Maintain little ordered sweep event trees?
+    //        Can we maintaining an ordering that avoids the need
+    //        for the re-sorting with getLeftmostComparator in geom-out?
+
+    // Compare each pair of events to see if other events also match
+    var numEvents = this.point.events.length;
+    for (var i = 0; i &lt; numEvents; i++) {
+      var evt1 = this.point.events[i];
+      if (evt1.segment.consumedBy !== undefined) continue;
+      for (var j = i + 1; j &lt; numEvents; j++) {
+        var evt2 = this.point.events[j];
+        if (evt2.consumedBy !== undefined) continue;
+        if (evt1.otherSE.point.events !== evt2.otherSE.point.events) continue;
+        evt1.segment.consume(evt2.segment);
+      }
+    }
+  },
+
+  getAvailableLinkedEvents: function() {
+    // point.events is always of length 2 or greater
+    var events = [];
+    for (var i = 0, iMax = this.point.events.length; i &lt; iMax; i++) {
+      var evt = this.point.events[i];
+      if (evt !== this &amp;&amp; !evt.segment.ringOut &amp;&amp; evt.segment.isInResult()) {
+        events.push(evt);
+      }
+    }
+    return events;
+  },
+
+  /**
+   * Returns a comparator function for sorting linked events that will
+   * favor the event that will give us the smallest left-side angle.
+   * All ring construction starts as low as possible heading to the right,
+   * so by always turning left as sharp as possible we'll get polygons
+   * without uncessary loops &amp; holes.
+   *
+   * The comparator function has a compute cache such that it avoids
+   * re-computing already-computed values.
+   */
+  getLeftmostComparator: function(baseEvent) {
+    var cache = {};
+	var currentPoint = this.point;
+
+    var fillCache = function(linkedEvent){
+      var nextEvent = linkedEvent.otherSE;
+      cache[linkedEvent.segment.id] = {
+        sine: sineOfAngle(currentPoint, baseEvent.point, nextEvent.point),
+        cosine: cosineOfAngle(currentPoint, baseEvent.point, nextEvent.point)
+      };
+    };
+
+    return function(a, b){
+      if (!cache[a.segment.id]) fillCache(a);
+      if (!cache[b.segment.id]) fillCache(b);
+      
+      var objA = cache[a.segment.id];
+      var asine = objA.sine;
+      var acosine = objA.cosine;
+		
+      var objB = cache[b.segment.id];
+      var bsine = objB.sine;
+      var bcosine = objB.cosine;
+
+      // both on or above x-axis
+      if (asine &gt;= 0 &amp;&amp; bsine &gt;= 0) {
+        if (acosine &lt; bcosine) return 1;
+        if (acosine &gt; bcosine) return -1;
+        return 0;
+      }
+
+      // both below x-axis
+      if (asine &lt; 0 &amp;&amp; bsine &lt; 0) {
+        if (acosine &lt; bcosine) return -1;
+        if (acosine &gt; bcosine) return 1;
+        return 0;
+      }
+
+      // one above x-axis, one below
+      if (bsine &lt; asine) return -1;
+      if (bsine &gt; asine) return 1;
+      return 0;
+    };
+  }
+};
+
+// for ordering sweep events in the sweep event queue
+SweepEvent.compare = function(a, b) {
+    // favor event with a point that the sweep line hits first
+    var ptCmp = SweepEvent.comparePoints(a.point, b.point);
+    if (ptCmp !== 0) return ptCmp;
+
+    // the points are the same, so link them if needed
+    if (a.point !== b.point) a.link(b);
+
+    // favor right events over left
+    if (a.isLeft !== b.isLeft) return a.isLeft ? 1 : -1;
+
+    // we have two matching left or right endpoints
+    // ordering of this case is the same as for their segments
+    return Segment.compare(a.segment, b.segment);
+};
+
+  // for ordering points in sweep line order
+SweepEvent.comparePoints = function(aPt, bPt) {
+	if (aPt.x &lt; bPt.x) return -1;
+	if (aPt.x &gt; bPt.x) return 1;
+
+	if (aPt.y &lt; bPt.y) return -1;
+	if (aPt.y &gt; bPt.y) return 1;
+
+	return 0;
+};
+
+/* Cross Product of two vectors with first point at origin */
+function crossProduct(a, b) { return a.x * b.y - a.y * b.x;}
+
+/* Dot Product of two vectors with first point at origin */
+function dotProduct(a, b){return a.x * b.x + a.y * b.y;}
+
+
+function length(v){ return Math.sqrt(dotProduct(v, v));}
+
+/* Get the sine of the angle from pShared -&gt; pAngle to pShaed -&gt; pBase */
+function sineOfAngle(pShared, pBase, pAngle){
+  var vBase = { x: pBase.x - pShared.x, y: pBase.y - pShared.y };
+  var vAngle = { x: pAngle.x - pShared.x, y: pAngle.y - pShared.y };
+  return crossProduct(vAngle, vBase) / length(vAngle) / length(vBase);
+}
+
+/* Get the cosine of the angle from pShared -&gt; pAngle to pShaed -&gt; pBase */
+function cosineOfAngle(pShared, pBase, pAngle){
+  var vBase = { x: pBase.x - pShared.x, y: pBase.y - pShared.y };
+  var vAngle = { x: pAngle.x - pShared.x, y: pAngle.y - pShared.y };
+  return dotProduct(vAngle, vBase) / length(vAngle) / length(vBase);
+}]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-01-23 09:08:27&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;22c08ff988e42110fa9bf275d1a0432a&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;3&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;SweepEvent&lt;/sys_name&gt;
+        &lt;sys_package display_value=""&gt;fa60558563b044509d2cba84af9c019c&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value=""&gt;fa60558563b044509d2cba84af9c019c&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_22c08ff988e42110fa9bf275d1a0432a&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-02-07 15:55:23&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:07</sys_created_on>
+        <sys_id>bbe0705983b01210c6695855eeaad380</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>SweepEvent</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_bbe0705983b01210c6695855eeaad380</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:07</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

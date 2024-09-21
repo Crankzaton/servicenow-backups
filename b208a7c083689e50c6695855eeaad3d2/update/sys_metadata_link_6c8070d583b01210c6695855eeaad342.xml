@@ -1,0 +1,484 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>10421b0bc0a80a6865d83dff7013ba76</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.FMUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Utilities for financial management applications&lt;/description&gt;
+        &lt;name&gt;FMUtils&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var FMUtils = Class.create();
+FMUtils.prototype = {
+
+    /*
+     * Start
+     */
+    initialize: function() {
+        this.LOGGER = new FMLogger(this.TYPE);
+        this.debug = false;
+    },
+
+    /*
+     * get previous month in format of yyyy-mm
+     */
+    getLastMonth: function() {
+        var lastMonth = new GlideDate();
+        lastMonth.addMonths(-1);
+        //correct for beginning of day issue
+        lastMonth.addDays(1);
+
+        var year = lastMonth.getYear().toString();
+        var month = lastMonth.getMonth().toString();
+        if (month.length == 1)
+            month = "0" + month;
+        return year + "-" + month;
+    },
+
+    getThisMonth: function() {
+        var thisMonth = new GlideDate();
+        //correct for beginning of day issue
+        thisMonth.addDays(1);
+
+        var year = thisMonth.getYear().toString();
+        var month = thisMonth.getMonth().toString();
+        if (month.length == 1)
+            month = "0" + month;
+        return year + "-" + month;
+    },
+
+    getMonthString: function( /*GlideDate*/ d) {
+        //correct for beginning of day issue
+        var temp = new GlideDateTime(d + " 12:00:00");
+        var year = temp.getYear().toString();
+        var month = temp.getMonth().toString();
+        if (month.length == 1)
+            month = "0" + month;
+        return year + "-" + month;
+    },
+
+    /*
+     * determine next process date from start date and interval
+     * where interval is monthly, quarterly, or yearly
+     * returns GlideDateTime
+     */
+    getNextProcessDate: function( /*String*/ interval, /*GlideDateTime*/ startDate) {
+        this._debug("_getNextProcess running with interval " + interval + " and start date of " + startDate);
+        if (!JSUtil.notNil(startDate) || startDate == " 12:00:00")
+            startDate = new GlideDateTime();
+
+        var nextRun = new GlideDateTime(startDate);
+        var period = interval.toString();
+
+        switch (period) {
+            case "daily":
+                nextRun.addDays(1);
+                break;
+            case "weekly":
+                nextRun.addWeeks(1);
+                break;
+            case "weekly2":
+                nextRun.addWeeks(2);
+                break;
+            case "monthly":
+                nextRun.addMonths(1);
+                break;
+            case "monthly2":
+                nextRun.addMonths(2);
+                break;
+            case "quarterly":
+                nextRun.addMonths(3);
+                break;
+            case "semiannual":
+                nextRun.addMonths(6);
+                break;
+            case "yearly":
+                nextRun.addYears(1);
+                break;
+            default:
+                break;
+        }
+        return nextRun; //returns GlideDateTime
+    },
+
+
+    /**
+     * Replace CI rate card items with the items matching rate card condition
+     * @param GlideRecord rateCard
+     */
+    replaceCIRateCardItems: function(rateCard) {
+        if (!rateCard.isValidRecord())
+            return;
+
+        if (!itemsRemoved)
+            var itemsRemoved = [];
+
+        if (!itemsAdded)
+            var itemsAdded = [];
+
+        var queryTable = rateCard.table;
+        var queryString = rateCard.condition;
+
+        var queryItems = this.getCIRateCardConditionRecords(queryTable, queryString);
+        var existingMtm = this.getCIRateCardItems(rateCard.getUniqueValue());
+        var queryItemSysIds = [];
+
+        while (queryItems.next()) {
+            queryItemSysIds.push(queryItems.getUniqueValue());
+        }
+
+
+        while (existingMtm.next()) {
+            //see if item is in condition result, if not remove it
+            if (queryItemSysIds.indexOf(existingMtm.cmdb_ci) &lt; 0) {
+                itemsRemoved.push(existingMtm.cmdb_ci.getDisplayValue());
+                this._debug("replaceCIRateCardItems deleting item: " + existingMtm.cmdb_ci.getDisplayValue() + " from " + rateCard.getDisplayValue());
+                existingMtm.deleteRecord();
+            }
+        }
+
+        //goto top record since find method may have moved the pointer
+        queryItems.setLocation(-1);
+
+        //add missing items from condition results
+        this.addCIRateCardItems(rateCard, queryItems);
+    },
+
+    /**
+     * Add CI Rate card items from rate card condition, do not remove any items
+     * @param GlideRecord rateCard
+     */
+    mergeCIRateCardItems: function(rateCard) {
+        if (!rateCard.isValidRecord())
+            return;
+
+        if (!itemsAdded)
+            var itemsAdded = [];
+
+        var queryTable = rateCard.table;
+        var queryString = rateCard.condition;
+
+        var queryItems = this.getCIRateCardConditionRecords(queryTable, queryString);
+
+        //add missing items from condition results
+        this.addCIRateCardItems(rateCard, queryItems);
+
+    },
+
+
+    /**
+     * get the list of existing items in a CI rate card
+     * @param String id - sysid of a ci rate card
+     * @return GlideRecord
+     */
+    getCIRateCardItems: function( /*String*/ id) {
+        if (!id || id == "")
+            return;
+
+        var rateCardItem = new GlideRecord("fm_ci_rate_card_cmdb_ci_m2m");
+        rateCardItem.addQuery("rate_card", id);
+        rateCardItem.query();
+        return rateCardItem;
+    },
+
+
+
+    /**
+     * Add CI Rate Card items from rate card condition
+     * @param GlideRecord rateCard
+     * @param GlideRecord items - items to be added if they don't already exist
+     */
+    addCIRateCardItems: function(rateCard, items) {
+
+        if (!rateCard || !rateCard.isValidRecord())
+            return;
+
+        var itemsAdded = [];
+
+        while (items.next()) {
+            var mtm = new GlideRecord("fm_ci_rate_card_cmdb_ci_m2m");
+            //check for existing
+            mtm.addQuery("rate_card", rateCard.getUniqueValue());
+            mtm.addQuery("cmdb_ci", items.getUniqueValue());
+            mtm.query();
+            if (mtm.hasNext())
+                continue;
+
+            //add a new rate card ci m2m
+            mtm.initialize();
+            mtm.setValue("rate_card", rateCard.getUniqueValue());
+            mtm.setValue("cmdb_ci", items.getUniqueValue());
+            var newMtm = mtm.insert();
+            if (newMtm != "")
+                itemsAdded.push(items.getDisplayValue());
+            this._debug("addCIRateCardItems adding item: " + mtm.cmdb_ci.getDisplayValue() + " from " + mtm.rate_card.getDisplayValue());
+        }
+    },
+
+
+    /**
+     * Get glide records matching the condition defined in rate card
+     * @param String table - table to query
+     * @param String query - encoded query
+     * @return GlideRecord
+     */
+    getCIRateCardConditionRecords: function(table, queryString) {
+        var condItems = new GlideRecord(table);
+        if (queryString != "")
+            condItems.addEncodedQuery(queryString);
+
+        condItems.query();
+        this._debug("getCIRateCardConditionRecords found " + condItems.getRowCount() + " from " + table + " with query:" + condItems.getEncodedQuery());
+        return condItems;
+    },
+
+
+
+    _debug: function(msg) {
+        if (this.debug == true)
+            this.LOGGER.logDebug(msg, this.TYPE);
+    },
+
+    /*
+     * processing for CI expenses, creates expense lines for parent CIs
+     * based on defined relationship paths
+     * called from expense line business rule when expense is not inherited and source is CI
+     */
+    processCIParents: function(expRecord) {
+
+        this._debug("processCIParents: starting handling expense " + expRecord.getDisplayValue());
+
+        //create global variable to track CIs already processed to prevent loops
+        if (expRecord.inherited != true)
+            itemsSeen = new Object();
+
+        //if (typeof itemsSeen == "undefined")
+        //itemsSeen = new Object();
+
+        var ci = expRecord.source_id.getRefRecord();
+        if (!ci || !ci.isValidRecord())
+            return;
+
+        var FMRels = new FMRelationships(ci);
+        var parentIds = FMRels.getParentIds();
+
+        if (!parentIds)
+            return;
+
+        var parentCount = parentIds.length;
+        var amount = expRecord.amount;
+        var parentExpAmount = amount / parentCount;
+
+
+
+        // get parent records
+        var parents = new GlideRecord("cmdb_ci");
+        parents.addQuery("sys_id", parentIds);
+        parents.query();
+        this._debug("_processParents parents query: " + parents.getEncodedQuery() + " returned " + parents.getRowCount());
+
+        while (parents.next()) {
+            this._debug("processParents processing " + ci.getDisplayValue() + " parent " + parents.getDisplayValue());
+
+            //make sure we don't have recursive relationships, stop if we already processed this CI
+            if (itemsSeen[parents.getUniqueValue() + '_' + expRecord.source_id]) {
+                this.LOGGER.logWarning("processCIParents - cannot process expense for (" + expRecord.source_id.getDisplayValue() + ") parent CI (" + parents.getDisplayValue() + ") since it was already processed once. Check for a relationship loop. Attempting to process other parents.");
+                this._debug("processParents duplicate " + parents.getUniqueValue() + '_' + expRecord.source_id);
+                continue;
+            }
+
+            itemsSeen[parents.getUniqueValue() + '_' + expRecord.source_id] = true;
+            this._debug("processParents visited " + parents.getUniqueValue() + '_' + expRecord.source_id);
+
+
+            //update expense line data
+            var out = "";
+            for (item in itemsSeen) {
+                out += "-----------------CI Seen: " + expRecord.source_id.getDisplayValue() + " --- " + item + "\n";
+            }
+            this._debug("********* Items Seen: " + out);
+
+            var exp;
+            var parentItem = new GlideRecord(parents.sys_class_name);
+            if (parentItem.get(parents.getUniqueValue())) {
+                exp = new ExpenseLine(parentItem, parentExpAmount, expRecord.short_description);
+            } else {
+                exp = new ExpenseLine(parents, parentExpAmount, expRecord.short_description);
+            }
+
+            if (expRecord.cost_id)
+                exp.setCostSource(expRecord.cost_id.getRefRecord());
+
+            exp.setParent(expRecord.getUniqueValue());
+            if (expRecord.type == "recurring")
+                exp.setRecurring(true);
+
+            var expDate = new GlideDate();
+            expDate.setDisplayValue(expRecord.date.getDisplayValue());
+            exp.setDate(expDate);
+            exp.setMonth(expRecord.month.toString());
+            exp.setSummaryType(expRecord.summary_type);
+            exp.setCategory(expRecord.category);
+            var parentExp = exp.createExpense();
+
+            //process next layer of parents
+            if (parentExp.isValidRecord())
+                this.processCIParents(parentExp);
+
+        }
+        this._debug("_processParents parents of " + ci.getDisplayValue() +
+            " completed");
+    },
+
+
+    /**
+     * For task source expense lines, process the task cost across affected CIs
+     * @param GlideRecord expRecord - expense line
+     */
+    processTaskCIs: function(expRecord) {
+        var task = expRecord.source_id.getRefRecord();
+        var items = [];
+        var cmdb_ci_item = null;
+
+        //get direct ci
+        if (task.cmdb_ci != "") {
+            cmdb_ci_item = task.cmdb_ci.sys_class_name + ":" + task.cmdb_ci
+            items.push(cmdb_ci_item);
+        }
+
+        //get affected ci related records
+        var taskCi = new GlideRecord("task_ci");
+        taskCi.addQuery("task", task.getUniqueValue());
+        taskCi.query();
+        this._debug("processTaskCIs parents query: " +
+            taskCi.getEncodedQuery() +
+            " returned " +
+            taskCi.getRowCount());
+
+        while (taskCi.next()) {
+            var candidateItem = taskCi.ci_item.sys_class_name + ":" + taskCi.ci_item;
+            if (candidateItem != cmdb_ci_item)
+                items.push(candidateItem);
+        }
+
+        var totalItems = items.length;
+        var itemAmount = 0;
+        if (totalItems &gt; 0)
+            itemAmount = expRecord.amount.getReferenceValue() / totalItems;
+
+        this._debug("processTaskCIs expense " + expRecord.getDisplayValue() + " splitting across " +
+            totalItems +
+            " related task CIs, " +
+            itemAmount.toString() +
+            " each.");
+
+        for (var i = items.length - 1; i &gt;= 0; i--) {
+            var table = items[i].split(":")[0];
+            var id = items[i].split(":")[1];
+            var item = new GlideRecord(table);
+            if (!item.get(id))
+                continue;
+
+            var description = task.getDisplayValue() + "-" + expRecord.short_description;
+            var exp = new ExpenseLine(item, itemAmount, description);
+            exp.setSummaryType(expRecord.summary_type);
+            expDate = new GlideDate();
+            expDate.setDisplayValue(expRecord.date.getDisplayValue());
+            exp.setDate(expDate);
+            exp.setCategory(expRecord.category);
+            if (!expRecord.cost_id.nil())
+                exp.setCostSource(expRecord.cost_id.getRefRecord());
+
+            exp.setMonth(expRecord.month.toString());
+            exp.createExpense();
+        }
+    },
+
+    /**
+     * For a planned task expense line, create duplicate expense for top task
+     * @param GlideRecord expRecord - expense line
+     */
+    processTopTask: function(expRecord) {
+        var task = expRecord.source_id.getRefRecord();
+        if (task.top_task == "")
+            return;
+
+        var topTask = task.top_task.getRefRecord();
+
+        var description = expRecord.short_description + " (" + expRecord.source_id.getDisplayValue() + ")";
+        var exp = new ExpenseLine(topTask, expRecord.amount.getCurrencyString(), description);
+        exp.setSummaryType(expRecord.summary_type);
+        var expDate = new GlideDate();
+        expDate.setDisplayValue(expRecord.date.getDisplayValue());
+        exp.setDate(expDate);
+        exp.setBaseExpense(expRecord.getUniqueValue());
+        exp.setMonth(expRecord.month.toString());
+        exp.setCategory(expRecord.category);
+        exp.setCostSource(expRecord.rate_card.getRefRecord());
+        if (expRecord.isValidField('cost_plan'))
+            exp.setCostPlan(expRecord.getValue('cost_plan'));
+        if (expRecord.isValidField('resource_type'))
+            exp.setResourceType(expRecord.getValue('resource_type'));
+        if (expRecord.isValidField('expense_type'))
+            exp.setExpenseType(expRecord.getValue('expense_type'));
+        if (expRecord.isValidField('rate_type'))
+            exp.setRateType(expRecord.getValue('rate_type'));
+        exp.createExpense();
+    },
+    glideDurationToMins: function(time) {
+
+        if (!time) {
+            return 0;
+        }
+        var tt = time.split(" ");
+        var sec = 0;
+        if (tt.length &gt; 1) {
+            sec = tt[0] * 86400;
+            var td = tt[1].split(":");
+            sec += td[0] * 3600 + td[1] * 60 + td[2] * 1;
+        } else {
+            var td = tt[0].split(":");;
+            sec += td[0] * 3600 + td[1] * 60 + td[2] * 1;
+        }
+
+        return sec;
+    },
+    getGlobalCurrencySymbol: function() {
+        return (new SNC.FinancialConfiguration().getCurrencySymbol());
+    },
+    TYPE: "FMUtils"
+
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;john.roberts&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2010-07-26 19:37:01&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;10421b0bc0a80a6865d83dff7013ba76&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;150&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;FMUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Cost Management" source="com.snc.cost_management"&gt;bfef86e747e64210cd4e1ce4316d4343&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_10421b0bc0a80a6865d83dff7013ba76&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-04-21 13:12:38&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:10:16</sys_created_on>
+        <sys_id>6c8070d583b01210c6695855eeaad342</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>FMUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_6c8070d583b01210c6695855eeaad342</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:10:16</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

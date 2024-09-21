@@ -1,0 +1,231 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0a5b5649433a31101ed803295bb8f202</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.GenAILargeInputHandler&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;GenAILargeInputHandler&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var GenAILargeInputHandler = Class.create();
+GenAILargeInputHandler.prototype = {
+    initialize: function() {
+		this.logger = new sn_log.GlideLogger("com.glide.one_extend.GenAILargeInputHandler");
+	},
+
+	_postProcess: function (attributes, capabilityId, definitionId) {
+		// Get extension instance for large input handler
+		var largeInputHandler = this._getLargeInputHandler(capabilityId, definitionId, "global.GenAILargeInputPostprocessor");
+		var combineRequestAttributes = largeInputHandler.process(attributes, capabilityId);
+		return combineRequestAttributes;
+	},
+
+	_mergeObjects: function (primary, secondary) {
+		for (var skey in secondary) {
+			primary[skey] = secondary[skey];
+		}
+		return primary;
+	},
+
+	_sortResultsBySequenceNumber: function (response) {
+		var results = Object.keys(response.result).map(function (key) {
+			return response.result[key];
+		});
+		results.sort(function (result1, result2) {
+			return result1.meta.sequenceNumber - result2.meta.sequenceNumber;
+		});
+
+		return results;
+	},
+
+	_groupByCapabilities: function (results, retainChunks) {
+		var capabilityGrouped = {};
+		var retainChunkAdded = {};
+		results.forEach(function (result) {
+			var capability = result.meta.originalPayload["_meta"].capability;
+			if (!capabilityGrouped[capability]) {
+				capabilityGrouped[capability] = [];
+			}
+			if (!retainChunkAdded[capability]) {
+				capabilityGrouped[capability] = capabilityGrouped[capability].concat(retainChunks[capability] || []);
+				retainChunkAdded[capability] = true;
+			}
+			capabilityGrouped[capability].push(result);
+		});
+
+		return capabilityGrouped;
+	},
+
+	_prepareExecutionRequest: function (capability, results, originalExecutionRequest) {
+		// Get essential parameters for combine request
+		var nonChunkedAttrPayload = null;
+		var chunkedAttributeResponses = {};
+		var parentFilter = null;
+		var definitionId = "";
+		for (var i = 0; i &lt; results.length; i++) {
+			var attrName = "";
+			if ((!results[i].result || !results[i].result.response) &amp;&amp; results[i].chunk) {
+				attrName = results[i].chunkedAttributeName;
+				if (chunkedAttributeResponses[attrName]) {
+					chunkedAttributeResponses[attrName].unshift(results[i].chunk);
+				} else {
+					chunkedAttributeResponses[attrName] = [results[i].chunk];
+				}
+				continue;
+			}
+			// Get the input attributes without large input
+			if (!nonChunkedAttrPayload) {
+				nonChunkedAttrPayload = results[i].meta.originalPayload;
+			}
+
+			// Get all the config filters for the combine request
+			var originalFilters = results[i].meta.originalPayload["_meta"].configFilters || {};
+			if (!parentFilter) {
+				parentFilter = this._mergeObjects(originalFilters, results[i].meta.parentFilter);
+			}
+			
+			// Get definition ID
+			if (!definitionId) {
+				definitionId = results[i].meta.originalPayload["_meta"].definition;
+			}
+
+			// Add chunk results to an array for further processing on the extension point
+			attrName = results[i].meta.chunkedAttributeName;
+			if (chunkedAttributeResponses[attrName]) {
+				chunkedAttributeResponses[attrName].push(results[i].result.response);
+			} else {
+				chunkedAttributeResponses[attrName] = [results[i].result.response];
+			}
+		}
+
+		// Invoke extension point for getting combine attributes
+		var payload = this._mergeObjects(nonChunkedAttrPayload, chunkedAttributeResponses);
+		payload = this._postProcess(payload, capability, definitionId);
+		delete payload["_meta"];
+
+		var executionRequest = {};
+		if (originalExecutionRequest) {
+			executionRequest = originalExecutionRequest;
+		}
+		if (!executionRequest.meta) {
+			executionRequest.meta = {};
+		}
+		executionRequest.payload = payload;
+		executionRequest.meta.configFilters = parentFilter;
+		executionRequest.meta.enableRecursiveExecution = false;
+
+		return executionRequest;
+	},
+
+	processCompleted: function(response) {
+		try {
+			// Get results sorted by sequence number
+			var results = this._sortResultsBySequenceNumber(response);
+			var retainChunks = response.meta.retainChunks || {};
+
+			var capabilitiesGrouped = this._groupByCapabilities(results, retainChunks);
+
+			var executionRequests = [];
+			Object.keys(capabilitiesGrouped).forEach(function (capability) {
+				var originalRequest = JSON.parse(response.meta.originalRequest);
+				var originalExecutionRequest = {};
+				originalRequest.executionRequests.forEach(function (execRequest) {
+					if (execRequest.capabilityId == capability) {
+						originalExecutionRequest = execRequest;
+					}
+				});
+				executionRequests.push(this._prepareExecutionRequest(capability, capabilitiesGrouped[capability], originalExecutionRequest));
+			}.bind(this));
+
+			var transactionId = response.transactionId;
+
+			var combineRequest = JSON.parse(response.meta.originalRequest);
+			if (combineRequest.callbackHandler) {
+				combineRequest.callbackHandler = this._getCallbackHandlerName(combineRequest.callbackHandler);
+			}
+			combineRequest.transactionId = transactionId;
+			combineRequest.executionRequests = executionRequests;
+
+			// Perform the combine request
+			var inputs = {};
+			inputs['request'] = combineRequest;
+			var result = sn_fd.FlowAPI.getRunner().action('global.recursive_execution_combine_action').inForeground().withInputs(inputs).run();
+			var outputs = result.getOutputs();
+			var combineResult = outputs['result'];
+			return combineResult;
+		} catch (e) {
+			this.logger.error("GenAILargeInputHandler: Error creating combine request for recursive execution: " + e);
+			return null;
+		}
+    },
+
+    processErrored: function(response) {
+        this.logger.error("GenAILargeInputHandler: Recursive execution error");
+    },
+
+    processCancelled: function(response) {
+        this.logger.error("GenAILargeInputHandler: Recursive execution cancelled");
+    },
+
+	_getCallbackHandlerName: function (callbackHandlerSysId) {
+		var scriptIncludeGr = new GlideRecord("sys_script_include");
+		if (scriptIncludeGr.get(callbackHandlerSysId)) {
+			return scriptIncludeGr.getValue("name");
+		}
+
+		return "";
+	},
+
+	_getLargeInputHandler: function (capabilityId, definitionId, extensionPoint) {
+		// Get extension point instances
+		var extensionInstances = new GlideScriptedExtensionPoint().getExtensions(extensionPoint);
+		try {
+			for (var i = 0; i &lt; extensionInstances.length; i++) {
+				if (extensionInstances[i].validateHandler(capabilityId, definitionId)) {
+					return extensionInstances[i];
+				}
+			}
+		} catch (e) {
+			this.logger.error("GenAILargeInputHandler: Unable to resolve combine extension point, falling back to default");
+        }
+
+		// Return the last instance which is default
+		return extensionInstances[extensionInstances.length - 1];
+	},
+
+    type: 'GenAILargeInputHandler'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-11-27 15:04:13&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0a5b5649433a31101ed803295bb8f202&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;58&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;GenAILargeInputHandler&lt;/sys_name&gt;
+        &lt;sys_package display_value="Glide OneExtend" source="com.glide.one_extend"&gt;dc98175b47220210cd4e1ce4316d4324&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0a5b5649433a31101ed803295bb8f202&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-12-22 09:24:23&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:42</sys_created_on>
+        <sys_id>d460f49583b01210c6695855eeaad389</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>GenAILargeInputHandler</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_d460f49583b01210c6695855eeaad389</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:42</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

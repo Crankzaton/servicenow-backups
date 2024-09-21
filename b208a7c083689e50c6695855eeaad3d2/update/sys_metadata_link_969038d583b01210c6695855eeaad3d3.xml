@@ -1,0 +1,247 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>14b2d32ec7403010202818b1c7c260d8</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_sow_inc.SOWServiceDeskAgentShiftSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;SOWServiceDeskAgentShiftSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var SOWServiceDeskAgentShiftSNC = Class.create();
+SOWServiceDeskAgentShiftSNC.prototype = {
+    initialize: function() {
+        this.PLUGINS = {
+            ON_CALL: "com.snc.on_call_rotation",
+            SHIFT_PLANNING: "com.sn_shift_planning"
+        };
+        this.DAYS_AHEAD = gs.getProperty('com.snc.on_call_rotation.upcoming_rota_days', 30);
+        this.DATE_FORMAT = gs.getDateFormat();
+        this.TIME_FORMAT = gs.getTimeFormat();
+        this.WFO_SCHEMA_IDENTIFIER = 'readInTimezone';
+        this.WFO_ONCALL_TYPE_IDENTIFIER = 'oncallAPIReadInTimezone';
+        this.WEEK_DAY_FORMAT = 'EEEE';
+        this.FORMAT = {
+            SERVICE_DESK_HEADER: 'SERVICE_DESK_HEADER'
+        };
+    },
+
+    getUpcomingShift: function(userId, outputFormat, wfoShift) {
+        var upcomingShifts, gd = new GlideDate();
+        var from = gd.getDisplayValueInternal();
+        gd.addDaysLocalTime(this.DAYS_AHEAD);
+        var to = gd.getDisplayValueInternal();
+        var mayBeWFOUser = userId == gs.getUserID() ? gs.hasRole("sn_shift_planning.agent") : true;
+        if (GlidePluginManager.isActive(this.PLUGINS.SHIFT_PLANNING) &amp;&amp; mayBeWFOUser &amp;&amp; wfoShift)
+            upcomingShifts = this.getWFOShifts(from, to, userId);
+        var isWFOResponseValid = Array.isArray(upcomingShifts) &amp;&amp; upcomingShifts.length &gt; 0;
+        if (!isWFOResponseValid &amp;&amp; GlidePluginManager.isActive(this.PLUGINS.ON_CALL))
+            upcomingShifts = this.getOnCallShifts(from, to, userId);
+        return this.getFormattedShift(upcomingShifts, outputFormat);
+    },
+
+    getWFOShifts: function(from, to, userId) {
+        var smUtil = new sn_shift_planning.ScheduleManagerUtil();
+        var defaultEventCategories = [
+            smUtil.WORK_CATEGORY_SYS_ID,
+            smUtil.ON_CALL_CATEGORY_SYS_ID
+        ];
+        var params = {
+            "assignmentGroups": "",
+            "individualAgents": userId,
+            "startDate": from,
+            "endDate": to,
+            "published": true,
+            "eventCategories": defaultEventCategories,
+            "filter": {
+                "sn_shift_planning_agent_schedule": {
+                    "event": ["8d03fd9b0f310010717cc562ff767e4a", "936319993bd02010e81a4ee1f3efc419"]
+                }
+            }
+        };
+        var upcomingShifts = [];
+        try {
+            var agentScheduleRESTAPIUtils = new sn_shift_planning.AgentScheduleRESTAPIUtils();
+            var spans = agentScheduleRESTAPIUtils.retrieveAgentSchedulesFromParams(params);
+            if (spans &amp;&amp; spans.shiftData &amp;&amp; spans.shiftData.user &amp;&amp; spans.shiftData.user.data &amp;&amp; spans.shiftData.user.data.length &gt; 0 &amp;&amp; spans.shiftData.user.data[0].schedules) {
+                var schedules = spans.shiftData.user.data[0].schedules,
+                    arrayUtil = new global.ArrayUtil();
+                for (var schedule in schedules)
+                    upcomingShifts = arrayUtil.union(upcomingShifts, schedules[schedule]);
+            }
+        } catch (e) {
+            gs.error("SOWServiceDeskAgentShiftSNC: Error fetching WFO shifts");
+        }
+
+        return upcomingShifts;
+    },
+
+    getOnCallShifts: function(from, to, userId) {
+        var onCallCommon = new global.OnCallCommon();
+        var onCallGroups = onCallCommon.getMyGroups();
+        var spans = new global.OCRotationV2(null, global.OCRotationV2.DEFAULT_FORMAT_OPTION).setStartDate(from).setEndDate(to).setUserIds(userId).setGroupIds(onCallGroups).getSpans();
+        var upcomingShifts = [];
+        for (var i = 0; i &lt; spans.length; i++)
+            if ((spans[i].type == "roster" || spans[i].type == "override") &amp;&amp; spans[i].user_id == userId)
+                upcomingShifts.push(spans[i]);
+        return upcomingShifts;
+    },
+
+    getFormattedShift: function(upcomingShifts, outputFormat) {
+        if (gs.nil(upcomingShifts))
+            return;
+        switch (outputFormat) {
+            case this.FORMAT.SERVICE_DESK_HEADER:
+                return this.getServiceDeskFormattedShift(upcomingShifts);
+            default:
+                return upcomingShifts;
+        }
+    },
+
+    getServiceDeskFormattedShift: function(upcomingShifts) {
+        var response = {
+            shiftText: "",
+            nearestShift: {}
+        };
+        var startAttr = "start",
+            endAttr = "end",
+            isOnCall = true;
+        var dateFormat = 'EEEE, MMM dd',
+            timeFormat = 'hh:mm a';
+        var isWFOSchema = Array.isArray(upcomingShifts) &amp;&amp; upcomingShifts.length &gt; 0 &amp;&amp; this.WFO_SCHEMA_IDENTIFIER in upcomingShifts[0];
+        if (isWFOSchema)
+            startAttr = "scheduledStartTime", endAttr = "scheduledEndTime";
+        response.nearestShift = this.getNearestShift(upcomingShifts, startAttr, endAttr);
+        if (response.nearestShift) {
+            if (isWFOSchema) {
+                if (response.nearestShift.schedule &amp;&amp; !(this.WFO_ONCALL_TYPE_IDENTIFIER in response.nearestShift.schedule))
+                    isOnCall = false;
+            }
+            if (isOnCall) {
+                if (response.nearestShift.isCurrent) {
+                    if (response.nearestShift.roster_name)
+                        response.shiftText = gs.getMessage("You are on-call until {0} as {1}", [this.getFormattedDateSpan(response.nearestShift[endAttr], dateFormat, timeFormat), response.nearestShift.roster_name]);
+                    else
+                        response.shiftText = gs.getMessage("You are on-call until {0}", [this.getFormattedDateSpan(response.nearestShift[endAttr], dateFormat, timeFormat)]);
+                } else {
+                    if (response.nearestShift.roster_name)
+                        response.shiftText = gs.getMessage("Your next on-call shift starts on {0} as {1}", [this.getFormattedDateSpan(response.nearestShift[startAttr], dateFormat, timeFormat), response.nearestShift.roster_name]);
+                    else
+                        response.shiftText = gs.getMessage("Your next on-call shift starts on {0}", [this.getFormattedDateSpan(response.nearestShift[startAttr], dateFormat, timeFormat)]);
+                }
+            } else {
+                if (response.nearestShift.isCurrent) {
+                    if (this.endsToday(response.nearestShift[endAttr]))
+                        response.shiftText = gs.getMessage("Your shift ends today at {0}", [this.getFormattedTime(response.nearestShift[endAttr], timeFormat)]);
+                    else if (this.endingTomorrow(response.nearestShift[endAttr]))
+                        response.shiftText = gs.getMessage("Your shift ends tomorrow at {0}", [this.getFormattedTime(response.nearestShift[endAttr], timeFormat)]);
+                    else
+                        response.shiftText = gs.getMessage("Your shift ends on {0} at {1}", [this.getFormattedDate(response.nearestShift[endAttr], this.WEEK_DAY_FORMAT), this.getFormattedTime(response.nearestShift[endAttr], timeFormat)]);
+                } else
+                    response.shiftText = gs.getMessage("Your next shift starts on {0}", [this.getFormattedDateSpan(response.nearestShift[startAttr], dateFormat, timeFormat)]);
+            }
+        }
+
+        return response;
+    },
+
+    getNearestShift: function(upcomingShifts, startAttr, endAttr) {
+        if (gs.nil(upcomingShifts) || gs.nil(startAttr) || gs.nil(endAttr))
+            return;
+        var nearestShift;
+        upcomingShifts.sort(function(shift_1, shift_2) {
+            var gdt1 = new GlideDateTime();
+            gdt1.setDisplayValueInternal(shift_1[startAttr]);
+            var gdt2 = new GlideDateTime();
+            gdt2.setDisplayValueInternal(shift_2[startAttr]);
+            return GlideDateTime.subtract(gdt2, gdt1).getNumericValue();
+        });
+        var currentDateTime = new GlideDateTime(),
+            startDateTime = new GlideDateTime(),
+            endDateTime = new GlideDateTime();
+        for (var i = 0; i &lt; upcomingShifts.length; i++) {
+            startDateTime.setDisplayValueInternal(upcomingShifts[i][startAttr] + "");
+            endDateTime.setDisplayValueInternal(upcomingShifts[i][endAttr] + "");
+            if (currentDateTime.onOrBefore(endDateTime)) {
+                nearestShift = upcomingShifts[i];
+                if (currentDateTime.onOrAfter(startDateTime))
+                    nearestShift.isCurrent = true;
+                else
+                    nearestShift.isCurrent = false;
+                break;
+            }
+        }
+        return nearestShift;
+    },
+
+    getFormattedDateSpan: function(date, dateFormat, timeFormat) {
+        var formattedDate = this.getFormattedDate(date, dateFormat);
+        var dateAmPmTime = this.getFormattedTime(date, timeFormat);
+        return formattedDate + " " + dateAmPmTime;
+    },
+
+    getFormattedDate: function(inputDate, format) {
+        var date = new GlideDateTime();
+        date.setDisplayValueInternal(inputDate);
+        format = !format ? this.DATE_FORMAT : format;
+        var gd = date.getLocalDate();
+        return gd.getByFormat(format);
+    },
+
+    getFormattedTime: function(inputDate, format) {
+        var date = new GlideDateTime();
+        date.setDisplayValueInternal(inputDate);
+        format = !format ? this.TIME_FORMAT : format;
+        var gt = date.getLocalTime();
+        return gt.getByFormat(format);
+    },
+
+    endsToday: function(inputDate) {
+        var inputGdt = new GlideDateTime();
+        inputGdt.setDisplayValueInternal(inputDate);
+        return new GlideDateTime().getLocalDate().getValue() == inputGdt.getLocalDate().getValue();
+    },
+
+    endingTomorrow: function(inputDate) {
+        var inputGdt = new GlideDateTime();
+        inputGdt.setDisplayValueInternal(inputDate);
+        var tomorrowDateTime = new GlideDateTime();
+        tomorrowDateTime.addDaysLocalTime(1);
+        return tomorrowDateTime.getLocalDate().getValue() == inputGdt.getLocalDate().getValue();
+    },
+
+    type: 'SOWServiceDeskAgentShiftSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-05-14 09:17:15&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;14b2d32ec7403010202818b1c7c260d8&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;175&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;SOWServiceDeskAgentShiftSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Incident Management for Service Operations Workspace" source="sn_sow_inc"&gt;49aff4bb733320103e366238edf6a70f&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Incident Management for Service Operations Workspace"&gt;49aff4bb733320103e366238edf6a70f&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_14b2d32ec7403010202818b1c7c260d8&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-05-04 08:05:42&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:10:39</sys_created_on>
+        <sys_id>969038d583b01210c6695855eeaad3d3</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>SOWServiceDeskAgentShiftSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_969038d583b01210c6695855eeaad3d3</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:10:39</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

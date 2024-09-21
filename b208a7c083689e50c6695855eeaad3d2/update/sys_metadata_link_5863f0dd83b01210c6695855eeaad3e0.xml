@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>9387160d073210105b6782730ad30036</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_fix"&gt;
+    &lt;sys_script_fix action="INSERT_OR_UPDATE"&gt;
+        &lt;before&gt;false&lt;/before&gt;
+        &lt;description&gt;This copies Spaces of type "Conference room" to the Room table, it sets the locations on existing reservations to the newly created rooms.
+If a reservation cannot be updated (to the new location) the existing space will not be deactivated.
+If all reservations are moved successfully the original room is deactivated.
+Warnings are logged if some spaces or reservations could not be updated correctly.&lt;/description&gt;
+        &lt;name&gt;Copy Conference Room Space To Room Fix&lt;/name&gt;
+        &lt;record_for_rollback&gt;true&lt;/record_for_rollback&gt;
+        &lt;script&gt;&lt;![CDATA[var CONF_ROOM_TYPE = 'conference_room';
+var ROOM_TYPE = 'room';
+var ROOM_LOC_TYPE_ID = '20713b83eb512010b89bfdfc9c522899';
+var SPACE_TABLE = 'sn_wsd_core_space';
+var ROOM_TABLE = 'sn_wsd_core_room';
+var CORE_RSV_TABLE = 'sn_wsd_core_reservation';
+var SCRIPT_NAME = 'Copy Conference Room Space To Room Fix - ';
+var TABLE_CHOICE = 'sys_choice';
+
+init();
+
+/**
+ * entry point for this fix script
+ */
+function init() {
+	// get spaces of type conference room
+	var spacesGr = new GlideRecord(SPACE_TABLE);
+	spacesGr.addQuery('space_type', CONF_ROOM_TYPE);
+	spacesGr.addQuery('active', true);
+	spacesGr.addQuery('sys_class_name', 'sn_wsd_core_space');
+	spacesGr.query();
+
+// get fields that should be copied to new table
+	var fieldsToCopy = getFields(spacesGr);
+
+	while (spacesGr.next()) {
+		// copy to new room
+		var newSpaceId = createRoomFromSpace(fieldsToCopy, spacesGr);
+		if (!newSpaceId) {
+			gs.warn(SCRIPT_NAME + 'Could not move sn_wsd_core_space ' + spacesGr.getValue('sys_id') + ' to new table');
+			continue;
+		}
+		// move reservations
+		var reservationGr = getReservationsForLocation(spacesGr.getValue('sys_id'));
+		var updateResult = updateReservationLocations(reservationGr, newSpaceId);
+
+		if (!updateResult.success) {
+			var msg = SCRIPT_NAME + 'Could not update all reservations from sn_wsd_core_space ';
+			msg += spacesGr.getValue('sys_id') + ' to sn_wsd_core_room ' + newSpaceId.getValue('sys_id');
+			msg += ' migrated rooms:\n';
+			msg += updateResult.failures.join(',');
+			gs.warn(msg);
+
+			if (!disableRoom(newSpaceId))
+				gs.warn(SCRIPT_NAME + 'Failed to deactivate newly created room, the sn_wsd_core_space ' + spacesGr.getValue('sys_id') +
+					' and sn_wsd_core_room ' + newSpaceId + ' refer to the same physicial space');
+
+			continue;
+		}
+		// deactivate old room
+		spacesGr.active = false;
+		spacesGr.setValue('name', spacesGr.getValue('name') + ' [deprecated]');
+
+		if (!spacesGr.update())
+			gs.warn(SCRIPT_NAME + 'Failed to deactivate sn_wsd_core_space ' + spacesGr.getValue('sys_id'));
+	}
+}
+
+
+/**
+ * returns a list of fields that should be copied
+ * @param {GlideRecord} gr
+ * @return {string[]}
+ */
+function getFields(gr) {
+	var fields = [];
+	var elements = gr.getElements();
+	for (var i = 0; i &lt; elements.length; i++) {
+		var element = elements[i];
+		var ed = element.getED();
+		var field = ed.getName();
+
+		if (field.indexOf('sys') !== 0 &amp;&amp; field !== 'number') // dont overwrite sys fields
+			fields.push(field);
+	}
+	return fields;
+}
+
+/**
+ *
+ * @param {string} id - sys_id of room to disable
+ * @return {string|null}
+ */
+function disableRoom(id) {
+	var spaceGr = new GlideRecord(ROOM_TABLE);
+	if (spaceGr.get(id)) {
+		spaceGr.active = false;
+		return spaceGr.update();
+	}
+	return null;
+}
+
+/**
+ * Copies a space to the room table
+ * @param {string[]} fields
+ * @param {GlideRecord} spaceGr
+ * @return {string}
+ */
+function createRoomFromSpace(fields, spaceGr) {
+	var roomGr = new GlideRecord(ROOM_TABLE);
+	for (var i = 0; i &lt; fields.length; i++) {
+		var field = fields[i];
+		roomGr.setValue(field, spaceGr.getValue(field));
+	}
+	roomGr.number = '';
+	roomGr.setValue('space_type', ROOM_TYPE);
+	roomGr.setValue('location_type', ROOM_LOC_TYPE_ID);
+
+	return roomGr.insert();
+}
+
+/**
+ * updates locations of a set of reservations to a new location
+ * returns sys_ids of reservations it fails to update
+ * @param {GlideRecord} reservationGr
+ * @param {string} locationId
+ * @return {{failures: string[], success: boolean}}
+ */
+function updateReservationLocations(reservationGr, locationId) {
+	var result = {success: true, failures: []};
+	while (reservationGr.next()) {
+		reservationGr.setValue('location', locationId);
+		reservationGr.setWorkflow(false);
+		var id = reservationGr.update();
+		if (!id) {
+			result.failures.push(reservationGr.getValue('sys_id'));
+			result.success = false;
+		}
+	}
+	return result;
+}
+
+/**
+ * gets reservations for specific location
+ * @param {string} id
+ * @return {GlideRecord}
+ */
+function getReservationsForLocation(id) {
+	var reservationGr = new GlideRecord(CORE_RSV_TABLE);
+	reservationGr.addQuery('location', id);
+	reservationGr.query();
+	return reservationGr;
+}
+]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_fix&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-08-21 13:41:14&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;9387160d073210105b6782730ad30036&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;12&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;Copy Conference Room Space To Room Fix&lt;/sys_name&gt;
+        &lt;sys_package display_value=""&gt;a208b07253201010b10bddeeff7b1281&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value=""&gt;a208b07253201010b10bddeeff7b1281&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_fix_9387160d073210105b6782730ad30036&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2021-02-05 13:56:32&lt;/sys_updated_on&gt;
+        &lt;unloadable&gt;false&lt;/unloadable&gt;
+    &lt;/sys_script_fix&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:22:48</sys_created_on>
+        <sys_id>5863f0dd83b01210c6695855eeaad3e0</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Copy Conference Room Space To Room Fix</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_5863f0dd83b01210c6695855eeaad3e0</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:22:48</sys_updated_on>
+        <tablename>sys_script_fix</tablename>
+    </sys_metadata_link>
+</record_update>

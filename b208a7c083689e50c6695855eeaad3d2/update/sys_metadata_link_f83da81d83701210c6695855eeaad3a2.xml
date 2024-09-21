@@ -1,0 +1,176 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>03789ece67302300a0bd35e643415a6b</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update sys_domain="global" table="sys_script"&gt;
+    &lt;sys_script action="INSERT_OR_UPDATE"&gt;
+        &lt;abort_action&gt;false&lt;/abort_action&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;action_delete&gt;false&lt;/action_delete&gt;
+        &lt;action_insert&gt;false&lt;/action_insert&gt;
+        &lt;action_query&gt;false&lt;/action_query&gt;
+        &lt;action_update&gt;true&lt;/action_update&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;add_message&gt;false&lt;/add_message&gt;
+        &lt;advanced&gt;true&lt;/advanced&gt;
+        &lt;change_fields&gt;false&lt;/change_fields&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;collection&gt;interaction&lt;/collection&gt;
+        &lt;condition/&gt;
+        &lt;description/&gt;
+        &lt;execute_function&gt;false&lt;/execute_function&gt;
+        &lt;filter_condition table="interaction"&gt;stateCHANGESTOclosed_complete^ORstateCHANGESTOwrap_up^agent_chat=true^stateCHANGESFROMwork_in_progress^ORstateCHANGESFROMnew^ORstateCHANGESFROMon_hold^channel_metadata_table=sys_cs_conversation^EQ&lt;item display_value="Closed Complete" endquery="false" field="state" goto="false" newquery="false" operator="CHANGESTO" or="false" value="closed_complete"/&gt;
+            &lt;item display_value="wrap_up" endquery="false" field="state" goto="false" newquery="false" operator="CHANGESTO" or="true" value="wrap_up"/&gt;
+            &lt;item endquery="false" field="agent_chat" goto="false" newquery="false" operator="=" or="false" value="true"/&gt;
+            &lt;item display_value="Work in Progress" endquery="false" field="state" goto="false" newquery="false" operator="CHANGESFROM" or="false" value="work_in_progress"/&gt;
+            &lt;item display_value="New" endquery="false" field="state" goto="false" newquery="false" operator="CHANGESFROM" or="true" value="new"/&gt;
+            &lt;item display_value="On Hold" endquery="false" field="state" goto="false" newquery="false" operator="CHANGESFROM" or="true" value="on_hold"/&gt;
+            &lt;item endquery="false" field="channel_metadata_table" goto="false" newquery="false" operator="=" or="false" value="sys_cs_conversation"/&gt;
+            &lt;item endquery="true" field="" goto="false" newquery="false" operator="=" or="false" value=""/&gt;
+        &lt;/filter_condition&gt;
+        &lt;is_rest&gt;false&lt;/is_rest&gt;
+        &lt;message/&gt;
+        &lt;name&gt;Interaction - On Closed&lt;/name&gt;
+        &lt;order&gt;100&lt;/order&gt;
+        &lt;priority&gt;100&lt;/priority&gt;
+        &lt;rest_method/&gt;
+        &lt;rest_method_text/&gt;
+        &lt;rest_service/&gt;
+        &lt;rest_service_text/&gt;
+        &lt;rest_variables/&gt;
+        &lt;role_conditions/&gt;
+        &lt;script&gt;&lt;![CDATA[(function executeRule(current, previous /*null when async*/ ) {
+    var chatLogger = new global.ChatLogger("", current.sys_id);
+    var canSendMessages = new InteractionTypeUtil().canSendMessages(current);
+
+    if (!current.channel_metadata_document) {
+        chatLogger.log("Interaction - On Closed: channel_metadata_document field is empty");
+        return;
+    }
+
+    if (!new global.UnifiedConversationUtil(current.channel_metadata_document).isInitialized()) {
+        chatLogger.log("Interaction - On Closed: UDM conversation is not initialized");
+        // In legacy mode, if there are no live agents available, the interaction could be closed directly
+        // and no handoff will be created. The rest of logic should be skipped in that case.
+        return;
+    }
+
+    var originalUser = gs.getSession().impersonate("system");
+    var chatInteractionUtil = new ChatInteractionUtil();
+    var requesterLanguage = chatInteractionUtil.getRequesterLanguage(current);
+    //Use agent's language if requester closes the session and dynamic translation is ON
+    var language = chatInteractionUtil.getDynamicTranslateLanguage(current);
+
+    var conversation = sn_connect.Conversation.get(
+        current.channel_metadata_document,
+        current.channel_metadata_table);
+    var loggingInfo = "";
+    if (current.type == 'chat' || current.type == 'phone' || current.type == 'video') {
+        if (originalUser == current.opened_for) {
+            sendConversationRequesterMessage();
+        } else if (originalUser == current.assigned_to) {
+            sendConversationAgentMessage();
+        } else {
+            sendConversationSystemMessage();
+        }
+    } else if (current.type == 'messaging') {
+        // only get the device type when its messaging since its an expensive db access
+        var deviceType = conversation.getDeviceType();
+
+        var isMweb = (deviceType.equalsIgnoreCase('mweb') || deviceType.equalsIgnoreCase('android') || deviceType.equalsIgnoreCase('ios'));
+        var isSMS = deviceType.equalsIgnoreCase('sms');
+        // if it is SMS, do not display any of these messages
+        if (!isSMS) {
+            if (originalUser == current.opened_for) {
+                sendConversationRequesterMessage();
+            } else if (originalUser == current.assigned_to) {
+                sendConversationAgentMessage();
+            } else {
+                // if it is mweb, do not display the following message
+                if (!isMweb) {
+                    sendConversationSystemMessage();
+                }
+            }
+        }
+        // if it is an agent initiated SMS then send a closing message
+        else if (current.direction == 'outbound') {
+            var closingMessage = sn_cs.VASystemObject.getClosingMessage(conversation.getSysID());
+            sendClosingConversationMessageSMS(closingMessage);
+        }
+    }
+    chatLogger.log("Interaction - On Closed - Success, " + loggingInfo);
+    gs.getSession().impersonate(originalUser);
+    new SNC.ConnectListeners().supportSessionClosed(current.channel_metadata_document);
+
+    function sendClosingConversationMessageSMS(msg) {
+        if (canSendMessages) {
+            conversation.sendMessage({
+                body: gs.getMessageLang(msg, requesterLanguage),
+                system: true
+            });
+        }
+    }
+
+    function sendConversationRequesterMessage() {
+        if (canSendMessages) {
+            conversation.sendMessage({
+                body: gs.getMessageLang('{0} has ended the conversation.', language, [current.opened_for.getDisplayValue()]),
+                visibilityType: 'agent_only',
+                system: true,
+                eventType: 'ChatEnded'
+            });
+        }
+        loggingInfo = "requester " + current.opened_for.getDisplayValue() + " has ended the conversation";
+    }
+
+    function sendConversationAgentMessage() {
+        if (canSendMessages) {
+            var agentName = sn_connect.Conversation.getAgentName(originalUser);
+            chatInteractionUtil.sendSystemMessage(conversation, '{0} has ended the conversation.', requesterLanguage, language, agentName, null, 'ChatEnded');
+        }
+        loggingInfo = "agent " + agentName + " has ended the conversation";
+    }
+
+    function sendConversationSystemMessage() {
+        if (canSendMessages) {
+            chatInteractionUtil.sendSystemMessage(conversation, 'The conversation has ended.', requesterLanguage, language, null, null, 'ChatEnded');
+        }
+        loggingInfo = "System has ended the conversation";
+    }
+})(current, previous);]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2018-09-28 17:41:43&lt;/sys_created_on&gt;
+        &lt;sys_domain&gt;global&lt;/sys_domain&gt;
+        &lt;sys_domain_path&gt;/&lt;/sys_domain_path&gt;
+        &lt;sys_id&gt;03789ece67302300a0bd35e643415a6b&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;95&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;Interaction - On Closed&lt;/sys_name&gt;
+        &lt;sys_overrides/&gt;
+        &lt;sys_package display_value="Agent Chat" source="com.glide.interaction.awa"&gt;1d3c46ab47664210cd4e1ce4316d4390&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_03789ece67302300a0bd35e643415a6b&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-08-10 16:20:51&lt;/sys_updated_on&gt;
+        &lt;template/&gt;
+        &lt;when&gt;after&lt;/when&gt;
+    &lt;/sys_script&gt;
+    &lt;sys_translated_text action="delete_multiple" query="documentkey=03789ece67302300a0bd35e643415a6b"/&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:55:48</sys_created_on>
+        <sys_id>f83da81d83701210c6695855eeaad3a2</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Interaction - On Closed</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_f83da81d83701210c6695855eeaad3a2</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:55:48</sys_updated_on>
+        <tablename>sys_script</tablename>
+    </sys_metadata_link>
+</record_update>

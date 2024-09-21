@@ -1,0 +1,643 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>02e123a553615110532cddeeff7b129e</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_sow_chg.SOWChangeUtilsSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;SOWChangeUtilsSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var SOWChangeUtilsSNC = Class.create();
+SOWChangeUtilsSNC.prototype = {
+
+	LOG_PROPERTY: 'com.snc.change_management.sow_chg_utils.log.level',
+
+	CHG_OVERVIEW_CFG_CACHE: 'change_overview_config',
+
+	PLUGIN_RISK: 'com.snc.bestpractice.change_risk',
+	PLUGIN_RISK_ASSESSMENT: 'com.snc.change_management.risk_assessment',
+
+	initialize: function() {
+		this._log = new global.GSLog(this.LOG_PROPERTY, this.type);
+		this._log.includeTimestamp();
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug('[initialize] type: ' + this.type);
+	},
+
+	deleteChangeRiskAsmts: function(changeSysId) {
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug('[deleteIncompleteRiskAssessments] changeSysId: ' + changeSysId);
+
+		if (!changeSysId)
+			return;
+
+		var changeGr = new GlideRecord('change_request');
+		if (!changeGr.get(changeSysId))
+			return;
+
+		var changeRiskAsmt = new global.ChangeRiskAsmt();
+		var asmtInstanceGr = new GlideRecord('asmt_assessment_instance');
+		asmtInstanceGr.addQuery('task_id', changeGr.getUniqueValue());
+		asmtInstanceGr.addQuery('metric_type.sys_class_name', 'change_risk_asmt');
+		asmtInstanceGr.addQuery('state', '!=', 'complete');
+		asmtInstanceGr.query();
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug('[deleteIncompleteRiskAssessments] asmt_assessment_instance encodedQuery: ' + asmtInstanceGr.getEncodedQuery());
+
+		// This is a cleanup operation which does not delete any records that customer would not wish deleted
+		while (asmtInstanceGr.next())
+			changeRiskAsmt.deleteAsmtInstance(asmtInstanceGr.getUniqueValue());
+	},
+
+	_getGr: function(sysId, table) {
+		if (!sysId)
+			return { errorMessage: gs.getMessage('Record sys_id not provided') };
+
+		table = table || 'change_request';
+
+		var gr = null;
+		if (sysId instanceof GlideRecord)
+			gr = sysId;
+		else {
+			gr = new GlideRecord(table);
+			if (!gr.get(sysId))
+				return { errorMessage: gs.getMessage('Record not found') };
+		}
+
+		if (!gr.canRead())
+			return { errorMessage: gs.getMessage('Not authorized') };
+
+		return gr;
+	},
+
+	getRiskActions: function(sysIdOrGr) {
+		var gr = this._getGr(sysIdOrGr);
+		if (!gr)
+			return { errorMessage: gs.getMessage('No record found') };
+
+		if (!GlidePluginManager.isActive(this.PLUGIN_RISK))
+			return { errorMessage: gs.getMessage('Risk plugin is not installed') };
+
+		if (gr &amp;&amp; gr.errorMessage)
+			return gr;
+
+		var result = {};
+		var riskCalculator = new global.RiskCalculator(gr);
+
+		var showChangeRiskDetails = false;
+		var changeRiskDetails = {};
+		var validChgSysId = gr.getUniqueValue();
+		if (validChgSysId) {
+			var chgRiskDetailsGr = new GlideRecord('change_risk_details');
+			chgRiskDetailsGr.addQuery('change_request', validChgSysId);
+			chgRiskDetailsGr.query();
+			if (chgRiskDetailsGr.next()) {
+				changeRiskDetails.sysId = chgRiskDetailsGr.getUniqueValue();
+				showChangeRiskDetails = !!changeRiskDetails.sysId;
+				changeRiskDetails.sys_updated_on = {
+					display_value: chgRiskDetailsGr.sys_updated_on.getDisplayValue(),
+					value: chgRiskDetailsGr.getValue('sys_updated_on')
+				};
+				changeRiskDetails.description = gs.getMessage('We calculate the risk score as a balance of factors such as scope, impact, and scheduling');
+			}
+		}
+
+		var showLegacyRiskAssessment = !!(typeof global.RiskAssessmentCalculator !== 'undefined' &amp;&amp; new global.RiskAssessmentCalculator(gr).checkForMatchingAssessment(gr.sys_class_name, gr) &amp;&amp; (GlidePluginManager.isActive(this.PLUGIN_RISK_ASSESSMENT) + '').toLowerCase() !== 'true');
+		var showCalculateRisk = !showLegacyRiskAssessment &amp;&amp; riskCalculator.showCalculateRisk();
+		var showRiskAssessment = riskCalculator.showRiskAssessment();
+		var showCompletedRiskAssessment = showRiskAssessment ? new global.ChangeRiskAsmt().hasCompletedAssessment(gr) : false;
+
+		return {
+			showLegacyRiskAssessment: { hide: !showLegacyRiskAssessment, label: gs.getMessage('Legacy Risk Assessment is not supported by SOW. Please evaluate risk using classic form.') },
+			showCalculateRisk: { hide: !showCalculateRisk, label: gs.getMessage('Recalculate risk') },
+			showRiskAssessment: { hide: !showRiskAssessment, label: gs.getMessage('Assess risk') },
+			showCompletedRiskAssessment: { hide: !showCompletedRiskAssessment, label: gs.getMessage('View risk assessment') },
+			showChangeRiskDetails: { hide: !showChangeRiskDetails, label: gs.getMessage('View risk details') },
+			changeRiskDetails: changeRiskDetails
+		};
+	},
+
+	calculateRisk: function(sysId, dryRun) {
+		if (!gs.hasRole('itil,sn_change_write'))
+			return { errorMessage: gs.getMessage('Not Authorized') };
+
+		var gr = this._getGr(sysId, 'change_request');
+		if (!gr)
+			return { errorMessage: gs.getMessage('No record found') };
+
+		if (gr &amp;&amp; gr.errorMessage)
+			return gr;
+
+		if (!GlidePluginManager.isActive(this.PLUGIN_RISK))
+			return { errorMessage: gs.getMessage('Risk plugin is not installed') };
+
+		// Explicit false must be passed to dryRun and must be a boolean
+		if (typeof dryRun === 'undefined')
+			dryRun = true;
+		else if (typeof dryRun === 'string')
+			dryRun = dryRun.toLowerCase() === 'true';
+
+		if (!dryRun) {
+			var riskCalculator = new global.RiskCalculator(gr);
+			if (riskCalculator.setHideNotification)
+				riskCalculator.setHideNotification(true);
+
+			var evaluatedRiskImpact = riskCalculator.evaluateRiskImpact();
+			if (!evaluatedRiskImpact)
+				return { errorMessage: gs.getMessage('Failed to evaluate Risk') };
+		}
+
+		var result = this.getRiskActions(gr);
+		if (evaluatedRiskImpact)
+			result = global.ChangeCommon.assign(result, evaluatedRiskImpact);
+
+		return result;
+	},
+
+	getCompletedChangeRiskAsmts: function(table, sysId) {
+		var gr = this._getGr(sysId);
+		if (!gr)
+			return { errorMessage: gs.getMessage('No record found') };
+
+		if (gr &amp;&amp; gr.errorMessage)
+			return gr;
+
+		if (!GlidePluginManager.isActive(this.PLUGIN_RISK))
+			return { errorMessage: gs.getMessage('Risk plugin is not installed') };
+
+		var riskCalculator = new global.RiskCalculator(gr);
+		if (riskCalculator.showRiskAssessment()) {
+			var changeRiskAsmt = new global.ChangeRiskAsmt();
+			if (changeRiskAsmt.hasCompletedAssessment(gr))
+				return changeRiskAsmt.viewAssessment({
+					'tableName': gr.getValue('sys_class_name'),
+					'sysId': gr.getUniqueValue(),
+					'userId': gs.getUserID()
+				});
+		}
+
+		return {
+			errorMessage: gs.getMessage('No completed Change Risk Assessment found')
+		};
+	},
+
+	getFormSectionsForLayout: function(table, sysId, view) {
+		if (!table || !sysId || !view)
+			return {};
+
+		var result = {
+			formLayout: {
+                isValidRecord: true,
+                table: table,
+                sysId: sysId,
+                sectionLayout: []
+			}
+		};
+
+		var sectionGr = new GlideRecord('sys_ui_section');
+		sectionGr.addQuery('name', table);
+		sectionGr.addQuery('view.name', view);
+		sectionGr.orderBy('sys_created_on');
+		sectionGr.query();
+		while (sectionGr.next()) {
+			var sectionSysId = sectionGr.getUniqueValue();
+			var section = {
+				sysId: sectionSysId,
+				caption: (sectionGr.getValue('caption') || '').toLowerCase(),
+				captionDisplay: sectionGr.caption.getDisplayValue() || sectionGr.name.getDisplayValue(),
+				rows: this._getSectionRows(sectionSysId)
+			};
+			result.formLayout.sectionLayout.push(section);
+		}
+		
+		return result;
+	},
+
+	_getSectionRows: function (sectionSysId) {
+		var rows = [];
+
+		if (!sectionSysId)
+			return rows;
+
+		var blocks = [];
+		var fields = [];
+
+		var elementGr = new GlideRecord('sys_ui_element');
+		elementGr.addQuery('sys_ui_section', sectionSysId);
+		elementGr.orderBy('position');
+		elementGr.query();
+		while (elementGr.next()) {
+			var field = elementGr.element + '';
+			var elementType = elementGr.type + '';
+			switch (elementType) {
+				case '.begin_split':
+					if (fields.length &gt; 0) {
+						blocks.push({ fields: fields });
+						rows.push(blocks);
+					}
+					fields = [];
+					blocks = [];
+					break;
+				case '.split':
+					if (fields.length &gt; 0)
+						blocks.push({ fields: fields });
+					fields = [];
+					break;
+				case '.end_split':
+					if (fields.length &gt; 0)
+						blocks.push({ fields: fields });
+					fields = [];
+					rows.push(blocks);
+					blocks = [];
+					break;
+				default:
+					fields.push(field);
+			}
+		}
+		
+		// No Splits
+		if (fields.length &gt; 0) {
+			blocks.push({ fields: fields });
+			rows.push(blocks);
+		}
+
+		return rows;
+	},
+
+	getSectionsForState: function(table, sysId, state, isNew) {
+		var sectionsForState = {};
+
+		if (!table || !sysId || !state)
+			return sectionsForState;
+
+		var changeRequestGr = new GlideRecord(table);
+		if (sysId === '-1' || isNew)
+			changeRequestGr.setValue('state', state);
+		else if (!changeRequestGr.get(sysId) || !changeRequestGr.canRead())
+			return sectionsForState;
+
+		var matched = false;
+		var orderMatched = '';
+		var chgOverviewContainers = this._getChgOverviewContainers(table);
+		for (var i = 0; i &lt; chgOverviewContainers.length &amp;&amp; !matched; i++) {
+			var chgOverviewContainer = chgOverviewContainers[i];
+			if (GlideFilter.checkRecord(changeRequestGr, chgOverviewContainer.condition)) {
+				matched = true;
+				orderMatched = chgOverviewContainer.order;
+				sectionsForState = chgOverviewContainer;
+			}
+		}
+
+		var scriptedSectionsForState = this._getScriptedChgOverviewContainers(orderMatched, table, changeRequestGr);
+		sectionsForState = scriptedSectionsForState ? scriptedSectionsForState : sectionsForState;
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug('[getSectionsForState] cards: ' + JSON.stringify(sectionsForState));
+
+		return sectionsForState;
+	},
+
+	getCacheKey: function(table, hasTranslatedContent) {
+		var key = table || '';
+		var domain = gs.getSession().getCurrentDomainID();
+		if (global.JSUtil.nil(domain))
+			domain = 'global';
+
+		key += '^' + domain;
+
+		if (hasTranslatedContent)
+			key += '^' + gs.getSession().getLanguage() || gs.getProperty('glide.sys.language', 'en');
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug('[getCacheKey] key: ' + key);
+
+		return key;
+	},
+
+	_getChgOverviewContainers: function(table) {
+		table = table || '';
+		var key = this.getCacheKey(table, true);
+		var chgOverviewContainersStr = sn_scoped_cache.ScopedCacheManager.get(this.CHG_OVERVIEW_CFG_CACHE, key);
+
+		if (chgOverviewContainersStr)
+			return JSON.parse(chgOverviewContainersStr);
+
+		chgOverviewContainers = [];
+
+		var chgOverviewCntGr = new GlideRecord('chg_overview_container');
+		chgOverviewCntGr.addActiveQuery();
+		chgOverviewCntGr.addQuery('table', table);
+		chgOverviewCntGr.addQuery('use_advanced_condition', false);
+		chgOverviewCntGr.orderBy('order');
+		chgOverviewCntGr.orderBy('sys_id');
+		chgOverviewCntGr.query();
+		while (chgOverviewCntGr.next()) {
+			var chgOverviewContainer = {};
+			chgOverviewContainer.name = chgOverviewCntGr.getDisplayValue();
+			chgOverviewContainer.order = chgOverviewCntGr.order + '';
+			chgOverviewContainer.condition = chgOverviewCntGr.condition + '';
+			chgOverviewContainer.displayActionBar = chgOverviewCntGr.getValue('display_action_bar') + '' === '1';
+			chgOverviewContainer.items = this._getChgOverviewCards(chgOverviewCntGr.getUniqueValue());
+			chgOverviewContainers.push(chgOverviewContainer);
+		}
+
+		chgOverviewContainersStr = JSON.stringify(chgOverviewContainers);
+		sn_scoped_cache.ScopedCacheManager.put(this.CHG_OVERVIEW_CFG_CACHE, key, chgOverviewContainersStr);
+
+		return JSON.parse(chgOverviewContainersStr);
+	},
+
+	_getScriptedChgOverviewContainers: function(order, table, changeRequestGr) {
+		var sectionsForState = null;
+
+		if (!changeRequestGr || !table)
+			return sectionsForState;
+
+		var evaluator;
+		var matched = false;
+		var chgOverviewCntGr = new GlideRecord('chg_overview_container');
+		chgOverviewCntGr.addActiveQuery();
+		chgOverviewCntGr.addQuery('table', table);
+		chgOverviewCntGr.addQuery('use_advanced_condition', true);
+		if (!global.JSUtil.nil(order))
+			chgOverviewCntGr.addQuery('order', '&lt;', order);
+
+		chgOverviewCntGr.orderBy('order');
+		chgOverviewCntGr.orderBy('sys_id');
+		chgOverviewCntGr.query();
+		while (chgOverviewCntGr.next() &amp;&amp; !matched) {
+			if (!evaluator) {
+				evaluator = new GlideScopedEvaluator();
+				evaluator.putVariable('current', changeRequestGr);
+				evaluator.putVariable('answer', false);
+			}
+			evaluator.evaluateScript(chgOverviewCntGr, 'advanced_condition');
+			matched = evaluator.getVariable('answer');
+
+			if (matched) {
+				sectionsForState = {};
+				sectionsForState.id = changeRequestGr.getValue('state');
+				sectionsForState.state = changeRequestGr.state.getDisplayValue();
+				sectionsForState.name = chgOverviewCntGr.getDisplayValue();
+				sectionsForState.displayActionBar = chgOverviewCntGr.getValue('display_action_bar') + '' === '1';
+				sectionsForState.items = this._getChgOverviewCards(chgOverviewCntGr.getUniqueValue());
+			}
+		}
+
+		return sectionsForState;
+	},
+
+	_getChgOverviewCards: function(chgOverviewContainerSysId) {
+		var cards = [];
+		if (!chgOverviewContainerSysId)
+			return cards;
+
+		var chgOverviewCardGr = new GlideRecord('chg_overview_card');
+		chgOverviewCardGr.addActiveQuery();
+		chgOverviewCardGr.addQuery('chg_overview_container', chgOverviewContainerSysId);
+		chgOverviewCardGr.orderBy('order');
+		chgOverviewCardGr.orderBy('sys_id');
+		chgOverviewCardGr.query();
+		while (chgOverviewCardGr.next()) {
+			var card = {};
+			card.name = chgOverviewCardGr.getValue('name');
+			card.expanded = chgOverviewCardGr.getValue('expanded') + '' === '1';
+			card.showNewRecord = chgOverviewCardGr.getValue('show_new_record') + '' === '1';
+			card.heading = chgOverviewCardGr.heading.getDisplayValue();
+			var fields = this._getChgOverviewFields(chgOverviewCardGr.getUniqueValue());
+			if (fields &amp;&amp; fields.length &gt; 0)
+				card.fields = fields;
+
+			cards.push(card);
+		}
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug('[_getChgOverviewCards] cards: ' + JSON.stringify(cards));
+
+		return cards;
+	},
+
+	_getChgOverviewFields: function(chgOverviewCardSysId) {
+		var fields = [];
+		if (!chgOverviewCardSysId)
+			return fields;
+
+		var chgOverviewCardGr = new GlideRecord('chg_overview_field');
+		chgOverviewCardGr.addActiveQuery();
+		chgOverviewCardGr.addQuery('chg_overview_card', chgOverviewCardSysId);
+		chgOverviewCardGr.query();
+		while (chgOverviewCardGr.next())
+			fields.push(chgOverviewCardGr.getValue('name'));
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug('[_getChgOverviewFields] fields: ' + JSON.stringify(fields));
+
+		return fields;
+	},
+
+	_getChangeQueryParams: function(srcSysId) {
+		var changeUtils = new global.ChangeUtils();
+		var attributesList = changeUtils._getCsvPropertyValue(changeUtils.PROP_CHANGE_ATTRS, changeUtils.CHANGE_REQUEST_DEFAULT_ATTR_VALUE);
+		var gr = new GlideRecord(changeUtils.CHANGE_REQUEST);
+		if (gr.get(srcSysId))
+			return changeUtils._getRecordValuesAsEncodedQuery(gr, attributesList);
+		else
+			this._log.logErr('Invalid src change_request sysid provided = ' + srcSysId);
+		return '';
+	},
+
+	copyChangeURL: function(srcSysId) {
+		var changeUtils = new global.ChangeUtils();
+		var queryParams = this._getChangeQueryParams(srcSysId);
+		if (changeUtils.hasReadWriteAccess()) {
+			var newSysID = '-1';
+
+			// Copy Change attachments if enabled
+			changeUtils.copyChangeAttachments(srcSysId, newSysID);
+
+			// If API status is true all was ok. If no, still redirect to the URL on stack. All warning messages will be put in the util.
+			if (!changeUtils.copyChangeRelatedLists(srcSysId, newSysID))
+				gs.log('sn_sow_chg.SOWChangeUtilsSNC - copyChangeURL - Warnings present in ChangeUtils.copyChangeRelatedLists');
+
+			return queryParams;
+		}
+	},
+
+	getApprovals: function(taskId) {
+		var cabApproval = new sn_change_cab.CABApproval(taskId);
+		var delegators = cabApproval._getDelegators();
+		var approvals = cabApproval.toJS();
+		var groupsArray = approvals.groups;
+		var groupsObject = {};
+		groupsArray.forEach(function(group) {
+			groupsObject[group.sys_id] = group.delegated;
+		});
+		approvals.groups = groupsObject;
+		approvals.allowedApprovers = delegators;
+		approvals.allowedApprovers.push(gs.getUserID());
+
+		var result = {
+			'taskId': taskId,
+			'approvals': {}
+		};
+		var approvalsGr = new GlideRecord('sysapproval_approver');
+		approvalsGr.addQuery('sysapproval', taskId);
+		approvalsGr.addQuery('approver', 'IN', approvals.allowedApprovers);
+		approvalsGr.query();
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug('[getApprovals] sysapproval_approver.encodedQuery: ' + approvalsGr.getEncodedQuery());
+
+		while (approvalsGr.next()) {
+			var groupED = approvalsGr.group.assignment_group.getRefRecord();
+			var group = {
+				'value': groupED.getUniqueValue() + '',
+				'displayValue': groupED.getDisplayValue()
+			};
+			var isDelegated = false;
+
+			if ((approvals.groups &amp;&amp; approvals.groups[approvalsGr.group]) || (approvalsGr.getValue('approver') !== gs.getUserID()))
+				isDelegated = true;
+
+			var approvalSysId = approvalsGr.getUniqueValue();
+
+			var groupDisplayValue = isDelegated ? gs.getMessage('{0} (delegated)', group.displayValue) : group.displayValue;
+			var approverDisplayValue = isDelegated ? gs.getMessage('{0} (delegated)', approvalsGr.getDisplayValue('approver')) : approvalsGr.getDisplayValue('approver');
+
+			result.approvals[approvalSysId] = {
+				'sys_id': approvalSysId,
+				'group': approvalsGr.getValue('group'),
+				'assignment_group': {
+					'value': group.value,
+					'displayValue': groupDisplayValue
+				},
+				'approver': {
+					'value': approvalsGr.getValue('approver'),
+					'displayValue': approverDisplayValue
+				},
+				'delegated': isDelegated,
+				'state': {
+					'value': approvalsGr.getValue('state'),
+					'displayValue': approvalsGr.getDisplayValue('state')
+				},
+				'last_updated': {
+					'value': approvalsGr.getValue('sys_updated_on'),
+					'displayValue': approvalsGr.getDisplayValue('sys_updated_on')
+				}
+			};
+		}
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug('[getApprovals] result: ' + JSON.stringify(result));
+
+		return result;
+	},
+
+	updateApproval: function(taskSysId, state, comments) {
+		var approvalUser = this._processApproval(taskSysId, state, comments);
+		var result = this.getApprovals(taskSysId);
+		result.approvalUser = approvalUser;
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug('[updateApproval] result: ' + JSON.stringify(result));
+
+		return result;
+	},
+
+	_processApproval: function(taskSysId, state, comments) {
+		var approvalUser = {};
+		state = (state + '').toLowerCase();
+
+		if (state !== 'approved' &amp;&amp; state !== 'rejected')
+			return approvalUser;
+
+		// comments are mandatory on rejection
+		if (state === 'rejected' &amp;&amp; !comments)
+			return approvalUser;
+
+		// only process my approvals
+		var userSysIds = this._getMyApprovals();
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug('[_processApproval] userSysIds: ' + userSysIds);
+
+		var gr = new GlideRecord('sysapproval_approver');
+		gr.addQuery('approver', 'IN', userSysIds);
+		gr.addQuery('document_id', taskSysId);
+		gr.addQuery('state', 'requested');
+		gr.query();
+
+		while (gr.next()) {
+			gr.state = state;
+			if (comments)
+				gr.comments = comments;
+
+			if (gr.canWrite()) {
+				var approvalSysId = gr.update();
+				if (approvalSysId)
+					approvalUser[approvalSysId] = {
+						userSysId: gr.getValue('approver'),
+						state: gr.getValue('state')
+					};
+			}
+		}
+
+		return approvalUser;
+	},
+
+	_getMyApprovals: function() {
+		var u = gs.getUserID();
+		var answer = new Array();
+		var i = 0;
+		answer[i++] = new String(u);
+		var g = new GlideRecord('sys_user_delegate');
+		g.addQuery('delegate', u);
+		g.addQuery('approvals', 'true');
+		g.addQuery('starts', '&lt;=', gs.daysAgo(0));
+		g.addQuery('ends', '&gt;=', gs.daysAgo(0));
+		g.query();
+		while (g.next()) {
+			answer[i++] = new String(g.user);
+		}
+		return answer;
+	},
+
+	type: 'SOWChangeUtilsSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-08-26 13:47:04&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;02e123a553615110532cddeeff7b129e&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;154&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;SOWChangeUtilsSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Change Management for Service Operations Workspace" source="sn_sow_chg"&gt;bccbdbb023213010785ddc1756bf6579&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Change Management for Service Operations Workspace"&gt;bccbdbb023213010785ddc1756bf6579&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_02e123a553615110532cddeeff7b129e&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-07-28 14:17:15&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:02</sys_created_on>
+        <sys_id>d6303c5583b01210c6695855eeaad338</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>SOWChangeUtilsSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_d6303c5583b01210c6695855eeaad338</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:02</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

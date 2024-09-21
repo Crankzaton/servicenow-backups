@@ -1,0 +1,895 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>03ee950514189300964fa81e247aa80b</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.ISCEventsUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;ISCEventsUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ISCEventsUtil = Class.create();
+ISCEventsUtil.prototype = {
+    constants: new ISCConstants(),
+    initialize: function () {},
+	/**
+	 * This function will be used to migrate notification pref in Paris to N + 2 versions
+	 */
+	migrateNotifPref: function() {
+		// Mapping
+		var notifToEmail = {
+			"HP Role Added": "0766c2580f470010b25fea12ff767ec0",
+			"Failed Login": "1aa3a7a20f124010b25fea12ff767e5b",
+			"Weekly Digest": "9ba08edd0f220010b25fea12ff767e68",
+			"Security Elevation": "aa046ba20f124010b25fea12ff767ecd",
+			"Admin Login": "cba46ba20f124010b25fea12ff767e95",
+			"Impersonation": "dd0523e20f124010b25fea12ff767ee7"
+		};
+
+		// Get all notification preferences
+		var customGr = new GlideRecord("appsec_security_notifications");
+		if (customGr.isValid()) {
+			customGr.query();
+
+			// Loop through each one and create a new record in cmn_notif_message for Primary email
+			while(customGr.next()) {
+				// Get the device for this user
+				var notifDeviceGr = new GlideRecord("cmn_notif_device");
+				notifDeviceGr.addEncodedQuery("user=" + customGr.user.sys_id.toString() + "^nameLIKEemail");
+				notifDeviceGr.query();
+				if (notifDeviceGr.next()) {
+					// Build the new notification record
+					var notifMsgGr = new GlideRecord("cmn_notif_message");
+					notifMsgGr.initialize();
+					notifMsgGr.notification = notifToEmail[customGr.notification.name.toString()];
+					notifMsgGr.user = customGr.user;
+					notifMsgGr.notification_filter = customGr.enable ? "" : "c1bfa4040a0a0b8b001eeb0f3f5ee961";
+					notifMsgGr.device = notifDeviceGr.sys_id;
+					notifMsgGr.insert();
+				}
+			}
+		}
+
+		// Drop custom table
+		gs.dropTable("appsec_security_notifications");
+    },
+    /**
+     * This function will be used to migrate dashboard events in Rome to new table. Migration will occur
+     * after updates through a scheduled job.
+     * Rome: Do not drop appsec_security_dashboard_event_logs. Will phase this out over 2 releases
+     */
+    migrateDashEventLog: function() {
+        // Get all dashboard event logs
+        var legacyEventGr = new GlideRecord("appsec_security_dashboard_event_logs");
+        if (legacyEventGr.isValid()) {
+            legacyEventGr.query();
+
+            // Loop through each event and insert into the new events table
+            while(legacyEventGr.next()) {
+                // Parse out old record for information
+                var eventName = legacyEventGr.sec_dash_event.toString();
+                var userName = legacyEventGr.sec_dash_event_reference.parm1.toString();
+
+                // Get user gr if there exists one, okay if null
+                var userGr = new GlideRecord(this.constants.tables.SYS_USER);
+                userGr.addQuery('user_name', userName);
+                userGr.query();
+                userGr.next();
+
+                // Create new ISC event
+                var eventTable = this.constants.dashEventToTable[eventName];
+                var iscEventGr = new GlideRecord(eventTable);
+                iscEventGr.initialize();
+                
+                // Common information
+                iscEventGr.user = userGr.sys_id ? userGr.sys_id : null;
+                iscEventGr.event = legacyEventGr.sec_dash_event_reference.sys_id;
+                iscEventGr.user_name = userName;
+        
+                // Insert event specific data
+                if (eventTable === this.constants.tables.ISC_LOGIN) {
+                    iscEventGr.login_type = eventName;
+                    iscEventGr.ip_address = legacyEventGr.sec_dash_ip_addr.toString();
+                } else if (eventTable === this.constants.tables.ISC_IMPERSONATION) {
+                    iscEventGr.impersonated = legacyEventGr.sec_dash_event_reference.parm2.toString();
+                }
+                iscEventGr.insert();
+
+                // Update created on time
+                iscEventGr.sys_created_on = legacyEventGr.sec_dash_event_created;
+                iscEventGr.update();
+            }
+        }
+    },
+    /**
+     * This function will be called by script action AppSec Event - Logins to handle
+     * ISC related login events.
+     */
+    loginEvent: function () {
+
+        var that = this;
+        var userGr = new GlideRecord(this.constants.tables.SYS_USER);
+        var userName = event.parm1;
+        var currentIpAddress = event.parm2;
+        var eventCreatedOn = event.sys_created_on;
+
+        // Get current user
+        userGr.addQuery('user_name', userName);
+        userGr.query();
+
+        // Check if user exists
+        if (userGr.next()) {
+
+            // Check if current user has roles we desire
+            var query = 'role=' + this.constants.ADMIN_ROLE_SYS_ID + '^ORrole=' + this.constants.EXTERNAL_USER_ROLE_SYS_ID + '^user=' + userGr.sys_id.toString();
+            var sysUserRoleGr = new GlideRecord(this.constants.tables.USER_HAS_ROLE);
+            sysUserRoleGr.addEncodedQuery(query);
+            sysUserRoleGr.query();
+            if (sysUserRoleGr.hasNext()) {
+                // Get the login event from sysevent
+                var loginEventGr = this._findSysEvent(this.constants.LOGIN, userName, currentIpAddress, eventCreatedOn);
+                if (loginEventGr != null) {
+                    var loginEventGrSysId = loginEventGr.sys_id.toString();
+        
+                    // Log dashboard event and check for security notifications
+                    if (userGr) {
+                        while (sysUserRoleGr.next()) {
+                            if (sysUserRoleGr.role.sys_id.toString() === this.constants.ADMIN_ROLE_SYS_ID) {
+                                _checkAdminEvent(userGr, currentIpAddress, loginEventGrSysId);
+                            } else {
+                                _checkExternalLoginEvent(userGr, currentIpAddress, loginEventGrSysId);
+                            }
+                        }
+        
+                        // Check for notifications
+                        _notifyNewAdminLogin(userGr, userName, currentIpAddress);
+                    }
+                }
+            }
+        } else {
+            // No record, must be maint login
+            var loginEventGr = this._findSysEvent(this.constants.LOGIN, userName, currentIpAddress, eventCreatedOn);
+
+            if (loginEventGr != null) {
+                var loginEventGrSysId = loginEventGr.sys_id.toString();
+                
+                // Check SNC Login Event
+                _checkSncLoginEvent(currentIpAddress, userName, loginEventGrSysId);
+            }
+        }
+
+        /**
+         * This function will log an admin login event to the security dashboard events table
+         * if the user logged in has the role admin.
+         * @param {GlideRecord} gr - glide record of logged in user
+         * @param {string} ipAddress - ip address of logged in user
+         * @param {string} eventSysId - sys_id of event reference
+         */
+        function _checkAdminEvent(gr, ipAddress, eventSysId) {
+            if (that._checkRole(gr, that.constants.ADMIN_ROLE_SYS_ID)) {
+                // Grab event reference
+                that._insertSecDashEventRecord({
+                    eventName: that.constants.dashEvents.LOGIN_ADMIN,
+                    ipAddress: ipAddress,
+                    reference: eventSysId,
+                    userGr: gr
+                });
+            }
+        }
+
+        /**
+         * This function will log an external login event to the security dashboard events table
+         * if the user logged in has the role "snc_external".
+         * @param {GlideRecord} gr - glide record of logged in user
+         * @param {string} ipAddress - ip address of logged in user
+         * @param {string} eventSysId - sys_id of event reference
+         */
+        function _checkExternalLoginEvent(gr, ipAddress, eventSysId) {
+            if (that._checkRole(gr, '940ba702933002009c8579b4f47ffbe2')) {
+                // Grab event reference
+                that._insertSecDashEventRecord({
+                    eventName: that.constants.dashEvents.LOGIN_EXTERNAL,
+                    ipAddress: ipAddress,
+                    reference: eventSysId,
+                    userGr: gr
+                });
+            }
+        }
+
+        /**
+         * This function will log a snc login event to the security dashboard events table
+         * if the user logged in has snc prefixed to their name.
+         * @param {string} name - username of logged in user
+         * @param {string} ipAddress - ip address of logged in user
+         * @param {string} userId - sys_id of logged in user
+         * @param {string} eventSysId - sys_id of event reference
+         */
+        function _checkSncLoginEvent(ipAddress, userName, eventSysId) {
+            if (userName.endsWith("@snc")) {
+                // Grab event reference
+                that._insertSecDashEventRecord({
+                    eventName: that.constants.dashEvents.LOGIN_SNC,
+                    ipAddress: ipAddress,
+                    reference: eventSysId,
+                    userName: userName
+                });
+            }
+        }
+
+        /**
+         * This function will send an email notification to the logged in user if they have
+         * a high privilege role and the login event is occuring a new ip address.
+         * @param {GlideRecord} gr - glide record of logged in user
+         * @param {string} name - username of logged in user
+         * @param {string} ipAddress - ip address of logged in user
+         */
+        function _notifyNewAdminLogin(gr, name, ipAddress) {
+            var foundNewLogin = false;
+
+            // Verify notificaiton enabled
+            if(that._canReceiveNotification(gr)) {
+                // Check to see if this is the first occurence of this ip address
+                var firstLocation = false;
+                var loginEventGa = new GlideAggregate(that.constants.tables.ISC_LOGIN);
+                loginEventGa.addQuery('login_type', that.constants.dashEvents.LOGIN_ADMIN);
+                loginEventGa.addQuery('user_name', name);
+                loginEventGa.addQuery('ip_address', ipAddress);
+                loginEventGa.addAggregate('COUNT');
+                loginEventGa.query();
+                if (loginEventGa.next()) {
+                    firstLocation = loginEventGa.getAggregate('COUNT') === '1';
+                }
+
+                // If this is the first location, next check for distinct ip addresses.
+                // Only log a new event if there is more than one distinct ip address
+                if (firstLocation) {
+                    loginEventGa = new GlideAggregate(that.constants.tables.ISC_LOGIN);
+                    loginEventGa.addQuery('login_type', that.constants.dashEvents.LOGIN_ADMIN);
+                    loginEventGa.addQuery('user_name', name);
+                    loginEventGa.addAggregate('COUNT(DISTINCT', 'ip_address');
+                    loginEventGa.setGroup(false);
+                    loginEventGa.query();
+
+                    if (loginEventGa.next()) {
+                        foundNewLogin = parseInt(loginEventGa.getAggregate('COUNT(DISTINCT', 'ip_address'), 10) &gt; 1;
+                    }
+                }
+            }
+
+            // If there's a new login, log the event
+            if (foundNewLogin) {
+                // Add security notification to platform
+                var notificationListGr = that.addToNotifications(that.constants.events.NEW_ADMIN_LOGIN_NOTIFICATION, gr.sys_id, ipAddress);
+
+                // Send email if user has it enabled
+                if (that._checkNotificationEnabled(that.constants.notificationNames.NEW_ADMIN_LOGIN, gr)) {
+                    gs.eventQueue(that.constants.events.NEW_ADMIN_LOGIN_NOTIFICATION, notificationListGr, gr.sys_id, ipAddress);
+                }
+            }
+        }
+    },
+    /**
+     * This function will be called by the script action AppSec Event - Failed Login
+     * to handle ISC related failed login events. This will be used to record the
+     * security dashboard events.
+     */
+    loginFailed: function () {
+        var that = this;
+        var userGr = new GlideRecord(this.constants.tables.SYS_USER);
+        var user_name = event.parm1;
+        var ip_address = event.parm2;
+        var eventCreatedOn = event.sys_created_on;
+        userGr.addQuery('user_name', user_name);
+        userGr.query();
+
+        // Log dashboard event and check for security notifications
+        if (userGr.next()) {
+            var eventRecordGr = this._findSysEvent(this.constants.LOGIN, user_name, ip_address, eventCreatedOn);
+            if (eventRecordGr != null) {
+                that._insertSecDashEventRecord({
+                    eventName: this.constants.dashEvents.LOGIN_FAILED,
+                    ipAddress: ip_address,
+                    reference: eventRecordGr.sys_id.toString(),
+                    userGr: userGr
+                });
+            }
+        }
+    },
+    /**
+     * This function will be executed by a BR when the user gets locked out from
+     * failing logins too many times. It will send a notification in the platform
+     * that there have been failed login attempts made to notified user's account.
+     * @param {GlideRecord} userGr - The sys_user GlideRecord
+     */
+    loginFailedNotification: function(userGr) {
+        var that = this;
+
+        // Send notification based on lockout
+        var maxUnlockAttempts = gs.getProperty(this.constants.property.USER_MAX_UNLOCK_ATTEMPTS, this.constants.DEFAULT_UNLOCK_ATTEMPTS);
+        if (userGr.failed_attempts &gt; maxUnlockAttempts &amp;&amp; this._canReceiveNotification(userGr) &amp;&amp;
+            _checkConsecutiveEmails(userGr) &lt; this.constants.MAX_EMAILS_SENT) {
+
+            // Add security notification to platform
+            var notificationListGr = this.addToNotifications(this.constants.events.LOGIN_FAILED_NOTIFICATION, userGr.sys_id, userGr.failed_attempts);
+
+            // Send notification if we haven't sent 3 in a row already
+            if (this._checkNotificationEnabled(this.constants.notificationNames.LOGIN_FAILED, userGr)) {
+                gs.eventQueue(this.constants.events.LOGIN_FAILED_NOTIFICATION, notificationListGr, userGr.sys_id, userGr.failed_attempts);
+            }
+        }
+
+        /**
+         * This function will check the number of emails we have sent since the last lockout
+         */
+        function _checkConsecutiveEmails(gr) {
+            // Only send up to 3 emails if there have been 3 consecutive lockouts
+            // There are 5 login failed attempts before a lockout, so 3 consecutive notifications
+            // would have occured after 15 consecutive failed logins.
+            var consecutiveFailed = 0;
+            var eventHistoryGr = new GlideRecord(that.constants.tables.SYS_EVENT);
+            var q1 = eventHistoryGr.addQuery('name', that.constants.LOGIN);
+            q1.addOrCondition('name', that.constants.LOGIN_FAILED);
+            eventHistoryGr.addQuery('parm1', gr.user_name);
+            eventHistoryGr.orderByDesc('sys_created_on');
+            eventHistoryGr.query();
+
+            while (eventHistoryGr.next() &amp;&amp; consecutiveFailed &lt; 18) {
+                if (eventHistoryGr.name.toString() === that.constants.LOGIN_FAILED) {
+                    consecutiveFailed += 1;
+                } else {
+                    break;
+                }
+            }
+
+            return Math.floor(consecutiveFailed / 6);
+        }
+    },
+    /**
+     * This function will be called by the script action AppSec Event - Security Elevations
+     * to handle ISC related security elevation events
+     */
+    securityElevation: function () {
+        var that = this;
+        var elevatedUser = event.parm1;
+        var elevatedTo = event.parm2;
+        var eventCreatedOn = event.sys_created_on;
+
+        // Grab user reference
+        var userGr = new GlideRecord(this.constants.tables.SYS_USER);
+        userGr.addQuery('user_name', elevatedUser);
+        userGr.query();
+        userGr.next();
+
+        // Grab event reference
+        var eventRecordGr = this._findSysEvent(this.constants.events.SECURITY_ELEVATED_ROLE, elevatedUser, elevatedTo, eventCreatedOn);
+        
+        if (eventRecordGr != null) {
+            // Log the security dashboard event and notify enabled users
+            this._insertSecDashEventRecord({
+                eventName: this.constants.dashEvents.SECURITY_ELEVATION,
+                reference: eventRecordGr.sys_id.toString(),
+                userGr: userGr
+            });
+            _notifySubscribedUsers(elevatedUser);
+        }
+
+        /**
+         * This function will send an email notification to all high privilege users
+         * when a user has their roles elevated to a high privilege role
+         * @param {string} user - username of the elevated user
+         */
+        function _notifySubscribedUsers(user) {
+            // Get all admin/security admin users
+            var allAdminGr = new GlideAggregate(that.constants.tables.USER_HAS_ROLE);
+            var allAdminQc = allAdminGr.addQuery('role', that.hpRoles[0]);
+            allAdminQc.addOrCondition('role', that.hpRoles[1]);
+            allAdminGr.groupBy('user');
+            allAdminGr.query();
+            while (allAdminGr.next()) {
+                // Add security notification to platform
+                var notificationListGr = that.addToNotifications(that.constants.events.SECURITY_ELEVATION_NOTIFICATION, allAdminGr.user.sys_id, user);
+
+                // Send email if user has it enabled
+                if (that._checkNotificationEnabled(that.constants.notificationNames.SECURITY_ELEVATION, allAdminGr.user)) {
+                    gs.eventQueue(that.constants.events.SECURITY_ELEVATION_NOTIFICATION, notificationListGr, allAdminGr.user.sys_id, user);
+                }
+            }
+        }
+    },
+    /**
+     * This function will be called by the script action AppSec Event - Impersonation Start
+     * to handle ISC related impersonation events
+     */
+    impersonation: function () {
+        var that = this;
+        var eventCreatedOn = event.sys_created_on;
+        var userImpersonating = event.parm1.toString();
+        var userImpersonated = event.parm2.toString();
+
+        // Grab user reference
+        var userGr = new GlideRecord(this.constants.tables.SYS_USER);
+        userGr.addQuery('user_name', userImpersonating);
+        userGr.query();
+        userGr.next();
+
+        // Grab event reference
+        var eventRecordGr = this._findSysEvent(this.constants.events.IMPERSONATION, userImpersonating, userImpersonated, eventCreatedOn);
+        
+        if (eventRecordGr != null) {
+            // Log the security dashboard event and notify impersonated user if HP
+            this._insertSecDashEventRecord({
+                eventName: this.constants.dashEvents.IMPERSONATION,
+                reference: eventRecordGr.sys_id.toString(),
+                userGr: userGr,
+                impersonated: userImpersonated
+            });
+    
+            // Notify the impersonated user on platform
+            _notifyImpersonatedUser(userImpersonated, userImpersonating);
+        }
+
+        /**
+         * This function will sned an email notification a high privlege user
+         * if they are being impersonated
+         * @param {string} user - the username of the impersonated user
+         * @param {string} userImpersonating - the username of the impersonating user
+         */
+        function _notifyImpersonatedUser(user, userImpersonating) {
+            var userGr = new GlideRecord(that.constants.tables.SYS_USER);
+            userGr.addQuery('user_name', user);
+            userGr.query();
+
+            // Check impersonated user roles and the notification is enabled
+            if (userGr.next() &amp;&amp; that._canReceiveNotification(userGr)) {
+                // Add security notification to platform
+                var notificationListGr = that.addToNotifications(that.constants.events.IMPERSONATION_NOTIFICATION, userGr.sys_id, userImpersonating);
+
+                // Send email if user has it enabled
+                if (that._checkNotificationEnabled(that.constants.notificationNames.IMPERSONATION, userGr)) {
+                    gs.eventQueue(that.constants.events.IMPERSONATION_NOTIFICATION, notificationListGr, userGr.sys_id, userImpersonating);
+                }
+            }
+        }
+
+    },
+    /**
+     * This function will be called by the script action AppSec Event - Weekly Digest
+     * to generate the weekly digest
+     */
+    weeklyDigest: function () {
+        // Get all admin/security admin users
+        var weeklyDigest = JSON.stringify(new ISCNotificationTemplateUtility().weeklyDigest());
+        var allAdminGr = new GlideAggregate(this.constants.tables.USER_HAS_ROLE);
+        var allAdminQc = allAdminGr.addQuery('role', this.hpRoles[0]);
+        allAdminQc.addOrCondition('role', this.hpRoles[1]);
+        allAdminGr.groupBy('user');
+        allAdminGr.query();
+        while (allAdminGr.next()) {
+            // Add security notification to platform
+            var notificationListGr = this.addToNotifications(this.constants.events.WEEKLY_DIGEST_NOTIFICATION, allAdminGr.user.sys_id, weeklyDigest);
+
+            // Send email if user has it enabled
+            if (this._checkNotificationEnabled(this.constants.notificationNames.WEEKLY_DIGEST, allAdminGr.user)) {
+                gs.eventQueue(this.constants.events.WEEKLY_DIGEST_NOTIFICATION, notificationListGr, allAdminGr.user.sys_id, weeklyDigest);
+            }
+        }
+
+    },
+    /**
+     * This function will be called by the buisness rule AppSec Notification - HP Role Added
+     * to generate the hp role added notification
+     * @param {GlideRecord} currentGr - The GlideRecord for the sys_user_has_role
+     */
+    hpRoleAdded: function (currentGr) {
+        // Get all admin/security admin users
+        var allAdminGr = new GlideAggregate(this.constants.tables.USER_HAS_ROLE);
+        var allAdminQc = allAdminGr.addQuery('role', this.hpRoles[0]);
+        allAdminQc.addOrCondition('role', this.hpRoles[1]);
+        allAdminGr.groupBy('user');
+        allAdminGr.query();
+        while (allAdminGr.next()) {
+            // Data to send
+            var parm2 = JSON.stringify({
+                role: currentGr.role.name.toString(),
+                userSysId: currentGr.user.sys_id.toString(),
+            });
+
+            // Add security notification to platform
+            var notificationListGr = this.addToNotifications(this.constants.events.HP_ROLE_ADDED_NOTIFICATION, allAdminGr.user.sys_id, parm2);
+
+            // Send email if user has it enabled
+            if (this._checkNotificationEnabled(this.constants.notificationNames.HP_ROLE_ADDED, allAdminGr.user)) {
+                gs.eventQueue(this.constants.events.HP_ROLE_ADDED_NOTIFICATION, notificationListGr, allAdminGr.user.sys_id, parm2);
+            }
+        }
+    },
+    /**
+     * This function will be called by the business rule AppSec Notification - Admin Unlock
+     * to generate an admin unlock notification. This notification will be sent to security/admin users
+     * when an unlock of a high privilege user account has been performed by a non system user.
+     * @param {GlideRecord} previousGr - The glide record of sys_user before the update
+     * @param {GlideRecord} currentGr - The glide record of sys_user in it's current state
+     */
+    hpUserUnlock: function(previousGr, currentGr) {
+        // Check if the user is moved from a locked state to an unlock state and it has been updated by someone that's not system
+        var pLockoutState = previousGr.locked_out.toString();
+        var cLockoutState = currentGr.locked_out.toString();
+        var updatedBy = currentGr.sys_updated_by.toString();
+
+        if (pLockoutState === 'true' &amp;&amp; cLockoutState === 'false' &amp;&amp; updatedBy !== 'system') {
+            // Validate user is a high privilege user
+            var sysUserRoleGr = new GlideRecord(this.constants.tables.USER_HAS_ROLE);
+            var isHpUserQuery = 'role=' + this.hpRoles.join('^ORrole=') + '^user=' + currentGr.sys_id;
+            sysUserRoleGr.addEncodedQuery(isHpUserQuery);
+            sysUserRoleGr.query();
+            if (sysUserRoleGr.next()) {
+                // Send notification to all high privilege users
+                var allAdminGa = new GlideAggregate(this.constants.tables.USER_HAS_ROLE);
+                var allHpUserQuery = 'role=' + this.constants.ADMIN_ROLE_SYS_ID + '^ORrole=' + this.constants.SEC_ADMIN_ROLE_SYS_ID;
+                allAdminGa.addEncodedQuery(allHpUserQuery);
+                allAdminGa.groupBy('user');
+                allAdminGa.query();
+                while (allAdminGa.next()) {
+                    // Data to send
+                    var parm2 = JSON.stringify({
+                        unlocked: currentGr.sys_id.toString(),
+                        unlocker: updatedBy,
+                    });
+
+                    // Add security notification to platform
+                    var notificationListGr = this.addToNotifications(this.constants.events.ADMIN_UNLOCK_NOTIFICATION, allAdminGa.user.sys_id, parm2);
+        
+                    // Send email if user has it enabled
+                    if (this._checkNotificationEnabled(this.constants.notificationNames.ADMIN_UNLOCK, allAdminGa.user)) {
+                        gs.eventQueue(this.constants.events.ADMIN_UNLOCK_NOTIFICATION, notificationListGr, allAdminGa.user.sys_id, parm2);
+                    }
+                }
+            }
+        }
+    },
+    /**
+     * This function will be called by the business rule ISC - Store Export Data
+     * to generate an export event.
+     * @param {GlideRecord} current - The glide record of sys_user in it's current state
+     */
+    createExportEvent: function(current) {
+        var jobGr = new GlideRecord(this.constants.tables.SYS_POLL);
+        jobGr.get(current.table_sys_id);
+        if (jobGr.isValid()) {
+            var exportedTableName = current.file_name.toString().split('.')[0];
+            var exportByteSize = current.size_bytes.toString();
+            var exportRecordCount = jobGr.max.toString();
+            var exportData = {
+                exportByteSize: exportByteSize,
+                exportRecordCount: exportRecordCount
+            };
+            gs.eventQueue(this.constants.events.EXPORT, jobGr, exportedTableName, JSON.stringify(exportData));
+        }
+    },
+    /**
+     * This function will be called by AppSec Event - Export to generate the dashboard event record
+     * for export events.
+     */
+    createTableExportEvent: function() {
+        var that = this;
+        var exportedTableName = event.parm1;
+        var exportData = JSON.parse(event.parm2);
+        var userName = event.user_name;
+
+        // User ref
+        var userGr = new GlideRecord(this.constants.tables.SYS_USER);
+        userGr.addQuery("user_name", userName);
+        userGr.query();
+        userGr.next();
+
+        // Check for classifications
+        var classification = this.checkClassification(exportedTableName);
+
+        // Log the security dashboard event
+        this._insertSecDashEventRecord({
+            eventName: this.constants.dashEvents.EXPORT,
+            reference: event.sys_id,
+            userGr: userGr,
+            size: exportData['exportByteSize'],
+            records: exportData['exportRecordCount'],
+            table: exportedTableName,
+            classification: classification
+        });
+
+        // Create export notification
+        var exportNotifData = {
+            exporter: userName.toString(),
+            size: exportData['exportByteSize'].toString(),
+            records: exportData['exportRecordCount'].toString(),
+            table: exportedTableName.toString(),
+            classification: classification
+        };
+        _notifySubscribedUsers(exportNotifData);
+
+        /**
+         * This function will send a notification to the platform and subscribed users
+         * on their subscribed channels if the export has classified information that lines
+         * up with the user's settings
+         * @param {object} exportNotifData - The data object containing export information
+         */
+        function _notifySubscribedUsers(exportNotifData) {
+            // Get all admin/security admin users
+            var allAdminGr = new GlideAggregate(that.constants.tables.USER_HAS_ROLE);
+            var allAdminQc = allAdminGr.addQuery('role', that.hpRoles[0]);
+            allAdminQc.addOrCondition('role', that.hpRoles[1]);
+            allAdminGr.groupBy('user');
+            allAdminGr.query();
+            while (allAdminGr.next()) {
+
+                // Next, check if admin user has a classification setting
+                var exportClassSettingGr = new GlideRecord(that.constants.tables.ISC_EXP_SETTING);
+                exportClassSettingGr.addQuery('user', allAdminGr.user.sys_id);
+                exportClassSettingGr.query();
+                if (exportClassSettingGr.next()) {
+                    // Grab the classifications set by the user and find the intersection between the exported data and user setting
+                    var userClassSettings = exportClassSettingGr.classification_alert.toString().split(',');
+                    var exportedTableClass = exportNotifData.classification.toString().split(',');
+                    var classIntersect = new ArrayUtil().intersect(userClassSettings, exportedTableClass);
+
+                    // Get the record count and compare to user setting
+                    var recordCount = parseInt(exportNotifData.records, 10);
+                    var userRecordThreshold = parseInt(exportClassSettingGr.threshold, 10);
+
+                    // Export contains classified data that matches what user wants to alert on
+                    if (classIntersect.length &gt; 0 &amp;&amp; recordCount &gt;= userRecordThreshold) {
+                        // Add security notification to platform
+                        var notificationListGr = that.addToNotifications(that.constants.events.EXPORT_NOTIFICATION, allAdminGr.user.sys_id, JSON.stringify(exportNotifData));
+        
+                        // Send email if user has it enabled
+                        if (that._checkNotificationEnabled(that.constants.notificationNames.EXPORT, allAdminGr.user)) {
+                            gs.eventQueue(that.constants.events.EXPORT_NOTIFICATION, notificationListGr, allAdminGr.user.sys_id, JSON.stringify(exportNotifData));
+                        }
+                    }
+                }
+
+            }
+        }
+    },
+    /**
+     * This function will check if the current exported table contains classified columns.
+     * It will return the classified columns on this table.
+     * @param {string} tableName - The exported table name
+     */
+    checkClassification: function(tableName) {
+        // Find all parent tables and possible classifications and build an encoded query
+        var classifications = {};
+        var tableUtil = new TableUtils(tableName);
+        var extendedTables = j2js(tableUtil.getTables());
+        for (var i = 0; i &lt; extendedTables.length; i++) {
+            extendedTables[i] = 'sys_dictionary.name=' + extendedTables[i];
+        }
+        
+        // Find all classifications on columns from parent and child tables
+        var dictClassGr = new GlideRecord(this.constants.tables.DICT_CLASS);
+        dictClassGr.addEncodedQuery(extendedTables.join('^OR'));
+        dictClassGr.query();
+        while (dictClassGr.next()) {
+            classifications[dictClassGr.data_class.sys_id.toString()] = 1;
+        }
+
+        return Object.keys(classifications).toString();
+    },
+    // Helpers
+    /**
+     * This function will check if the user has a role
+     * @param {GlideRecord} userGr - The glide record for sys_user
+     * @param {string} roleId - The sys_id of the role being checked
+     */
+    _checkRole: function (userGr, roleId) {
+        var userRoleGr = new GlideRecord(this.constants.tables.USER_HAS_ROLE);
+        userRoleGr.addQuery('user', userGr.sys_id);
+        userRoleGr.addQuery('role', roleId);
+        userRoleGr.query();
+        return userRoleGr.next();
+    },
+    /**
+     * This function will insert a record to the isc events log.
+     * @param {any} obj - This object will contain only the necessary parameters
+     *                    for the type of security event being logged
+     */
+    _insertSecDashEventRecord: function (obj) {
+        // Insert into the mapped event table
+        var eventTable = this.constants.dashEventToTable[obj.eventName];
+        var iscEventGr = new GlideRecord(eventTable);
+        iscEventGr.initialize();
+        iscEventGr.user = obj.userGr ? obj.userGr.sys_id : null;
+        iscEventGr.event = obj.reference;
+        iscEventGr.user_name = obj.userGr ? obj.userGr.user_name : obj.userName;
+
+        // Insert event specific data
+        if (eventTable === this.constants.tables.ISC_LOGIN) {
+            iscEventGr.login_type = obj.eventName;
+            iscEventGr.ip_address = obj.ipAddress;
+        } else if (eventTable === this.constants.tables.ISC_IMPERSONATION) {
+            iscEventGr.impersonated = obj.impersonated;
+        } else if (eventTable === this.constants.tables.ISC_EXPORT) {
+            iscEventGr.size = obj.size;
+            iscEventGr.records = obj.records;
+            iscEventGr.classification = obj.classification;
+            iscEventGr.table = obj.table;
+        }
+
+        // Insert
+        iscEventGr.insert();
+    },
+    /**
+     * This function will check if the user has the specific notification enabled
+     * @param {string} notificationName - the notification being checked for 
+     * @param {GlideRecord} userGr - the glide record of the user
+     */
+    _checkNotificationEnabled: function (notificationName, userGr) {
+        // Check if the specific notification is enabled
+        var userPrefsQuery = "user=" + userGr.sys_id + "^notification.nameLIKE" + notificationName;
+        var userNotificationSettingsGr = new GlideRecord(this.constants.tables.USER_NOTIF_PREFS);
+        userNotificationSettingsGr.addEncodedQuery(userPrefsQuery);
+        userNotificationSettingsGr.query();
+
+        return userNotificationSettingsGr.next();
+
+    },
+    /**
+     * This function validates that a user has the correct role to receive a notification
+     * @param {GlideRecord} userGr - The glide record of the user
+     */
+    _canReceiveNotification: function (userGr) {
+        var canReceive = false;
+        var receivableRoles = [this.hpRoles[0], this.hpRoles[1]];
+        for (var i = 0; i &lt; receivableRoles.length; i++) {
+            var receivableRole = receivableRoles[i];
+            if (this._checkRole(userGr, receivableRole)) {
+                canReceive = true;
+            }
+        }
+
+        return canReceive;
+    },
+    /**
+     * This function will find the desired system event
+     * @param {string} eventName - The name of the event to generate
+     * @param {string} parm1 - The first parameter data
+     * @param {string} parm2 - The second parameter data
+     * @param {string} createdOn - The date the event was created on
+     */
+    _findSysEvent: function(eventName, parm1, parm2, createdOn) {
+        var gr = new GlideRecord(this.constants.tables.SYS_EVENT);
+        gr.addQuery('name', "CONTAINS", eventName);
+        gr.addQuery('parm1', parm1);
+        gr.addQuery('parm2', parm2);
+        gr.addQuery('sys_created_on', createdOn);
+        gr.query();
+        gr.next();
+
+        return gr;
+    },
+    /**
+     * This function will generate an item in our security notification list table
+     * @param {string} event - The name of the event
+     * @param {string} recipient - The sys_id of the user receiving the notification
+     * @param {string} email - The data of the notification
+     */
+    addToNotifications: function (event, recipient, data) {
+        var that = this;
+
+        // Fire event queue to trigger email
+        var notificationListGr = new GlideRecord(this.constants.tables.SEC_NOTIFICATION_LIST);
+        notificationListGr.initialize();
+        notificationListGr.event = event;
+        notificationListGr.label = this.eventNameToLabel[event];
+        notificationListGr.user = recipient;
+        notificationListGr.data = data;
+        notificationListGr.description = _generateDescription(event, recipient, data);
+        notificationListGr.read = false;
+        notificationListGr.insert();
+
+        return notificationListGr;
+
+        function _generateDescription(event, recipient, data) {
+            var description = 'Error fetching user information';
+            var userGr = new GlideRecord(that.constants.tables.SYS_USER);
+            var foundUser = userGr.get(recipient);
+            var templateUtility = new ISCNotificationTemplateUtility();
+
+            // Generate description based on event
+            if (foundUser) {
+                var name = userGr.name;
+                if (event === that.constants.events.LOGIN_FAILED_NOTIFICATION) {
+                    description = 'There have been multiple failed login attempts for ' + name;
+                } else if (event === that.constants.events.IMPERSONATION_NOTIFICATION) {
+                    description = data + ' has impersonated ' + name;
+                } else if (event === that.constants.events.NEW_ADMIN_LOGIN_NOTIFICATION) {
+                    description = name + ' has logged in from a new ip address ' + data;
+                } else if (event === that.constants.events.SECURITY_ELEVATION_NOTIFICATION) {
+                    description = 'Security admin status has been granted to ' + data;
+                } else if (event === that.constants.events.HP_ROLE_ADDED_NOTIFICATION) {
+                    var info = JSON.parse(data);
+                    var gr = new GlideRecord(that.constants.tables.SYS_USER);
+                    gr.get(info.userSysId);
+                    description = info.role + ' role was added to ' + gr.name;
+                } else if (event === that.constants.events.WEEKLY_DIGEST_NOTIFICATION) {
+                    description = templateUtility.convertToLexicalTime(new GlideDateTime()) + ' - Weekly Digest';
+                } else if (event === that.constants.events.ADMIN_UNLOCK_NOTIFICATION) {
+                    var info = JSON.parse(data);
+
+                    // Get unlocked user
+                    gr = new GlideRecord(that.constants.tables.SYS_USER);
+                    gr.get(info.unlocked);
+                    var unlocked = gr.name;
+
+                    // Create description
+                    description = info.unlocker + ' has unlocked ' + unlocked;
+                } else if (event === that.constants.events.EXPORT_NOTIFICATION) {
+                    var info = JSON.parse(data);
+
+                    // Get exporting user
+                    gr = new GlideRecord(that.constants.tables.SYS_USER);
+                    gr.addQuery('user_name', info.exporter);
+                    gr.query();
+                    var fullUserName = gr.next() ? gr.name.toString() : info.exporter;
+
+                    // Create description
+                    description = fullUserName + ' has exported ' + info.records + ' records from ' + info.table;
+                }
+            }
+
+            return description;
+        }
+    },
+    type: 'ISCEventsUtil'
+};
+
+// Constants
+ISCEventsUtil.prototype.eventNameToLabel = {
+    'appsec.notification.login.failed': 'Failed Login',
+    'appsec.notification.impersonation': 'Impersonation',
+    'appsec.notification.login.new_ip': 'Admin Login',
+    'appsec.notification.security.elevation': 'Security Elevation',
+    'appsec.notification.hp_role_added': 'High Privilege Role Added',
+    'appsec.notification.weekly_digest': 'Weekly Digest',
+    'appsec.notification.admin_unlock': 'High Privilege User Unlocked',
+    'appsec.notification.export': 'Export',
+};
+
+ISCEventsUtil.prototype.hpRoles = [
+    '2831a114c611228501d4ea6c309d626d', // Admin
+    'b2d8f7130a0a0baa5bf52498ecaadeb4', // Security Admin
+    'bca873d30a000704013944bd9a5e03a4', // Impersonator
+    '88a98433d7112100f20bc8170e61033e', // OAuth Admin
+];]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;sachin.banavi&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2018-02-13 18:10:25&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;03ee950514189300964fa81e247aa80b&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;337&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ISCEventsUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Instance Security Center" source="com.glide.instance_sec_center"&gt;387a706c3cf1311068bcf327dfe37f96&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_03ee950514189300964fa81e247aa80b&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2021-05-12 23:09:25&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:07</sys_created_on>
+        <sys_id>a3307c5583b01210c6695855eeaad3cc</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ISCEventsUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_a3307c5583b01210c6695855eeaad3cc</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:07</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

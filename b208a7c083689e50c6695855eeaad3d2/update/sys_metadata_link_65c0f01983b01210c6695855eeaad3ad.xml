@@ -1,0 +1,255 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1c97ad00eb600200c8690e815206fe44</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.EmailAccountRequester&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Functionality related to the initialization of ServiceNow configured Email Accounts. &lt;/description&gt;
+        &lt;name&gt;EmailAccountRequester&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var EmailAccountRequester = Class.create();
+EmailAccountRequester.prototype = {
+
+	initialize: function() {
+		this.jobName = 'Request ServiceNow Email Accounts';
+	},
+
+	/**
+	 * This function is intended to be called in a script action.
+	 * @param eventParm1 - parm1 value from the system.upgraded event.
+	 * @returns sys_id of sys_trigger record.
+	 */
+	createJob: function(eventParm1) {
+		if (!this._isValidEventParm(eventParm1)) {
+			gs.log('Skipping ServiceNow Email Account Request: system.upgraded event was not triggered by a zboot or upgrade.', 'EmailAccountRequester');
+			return null;
+		}
+
+		if (this._shouldSkip())
+			return null;
+
+		var runDateTime = new GlideDateTime();
+
+		if (this._isZboot(eventParm1)) {
+			var durationSecs = Number(gs.getProperty('glide.email.zboot_to_provision_duration', 3600));
+			runDateTime.addSeconds(durationSecs);
+		}
+
+		this._removeStaleTriggers();
+		return this._createTrigger(runDateTime, 1);
+	},
+
+	requestInitialization: function() {
+		try {
+			if (this._shouldSkip()) {
+				this._deleteJob();
+				return;
+			}
+			var statusCode = SNC.EmailAccountRequester.provisionEmailAccounts();
+			if (statusCode == '200') {
+				gs.log('Request made to provision ServiceNow email accounts successful.', 'EmailAccountRequester');
+				this._deleteJob();
+			} else if (statusCode == '401') {
+				gs.log('Request made to provision ServiceNow email accounts failed: Authentication.', 'EmailAccountRequester');
+				this._deleteJob();
+			} else {
+				if (this._isExecFromJob()) {
+					this._retryRequest(statusCode);
+				} else {
+					gs.log('Request made to provision ServiceNow email accounts failed with status code ' + statusCode + '.', 'EmailAccountRequester');
+				}
+			}
+		} catch (e) {
+			gs.log('An error occured requesting initialization of ServiceNow email accounts: ' + e + '.', 'EmailAccountRequester');
+			if (this._isExecFromJob()) {
+				this._deleteJob();
+			}
+		}
+	},
+
+	_removeStaleTriggers: function() {
+		var trigger = new GlideRecord('sys_trigger');
+		trigger.addQuery('name', this.jobName);
+		trigger.query();
+		trigger.deleteMultiple();
+	}, 
+	
+	_createTrigger: function(time, runCount) {
+		var durationMilliSecs = Number(gs.getProperty('glide.email.provision_retry_duration', 1800)) * 1000;
+		var retryDuration = new GlideDuration(durationMilliSecs);
+
+		var job = new GlideRecord('sys_job');
+		job.addQuery('handler_class', 'RunScriptJob');
+		job.query();
+		if (!job.next()) {
+			gs.log('Unable to find a sys_job of type RunScriptJob', 'EmailAccountRequester');
+			return;
+		}
+		if (job.getRowCount() != 1) {
+			gs.log('Found multiple sys_jobs of type RunScriptJob', 'EmailAccountRequester');
+			return;
+		}
+
+		var trigger = new GlideRecord('sys_trigger');
+		trigger.name = this.jobName;
+		trigger.next_action = time;
+		trigger.job_id = job.sys_id.toString();
+		trigger.trigger_type = 1; //repeat
+		trigger.script = "var requester = new EmailAccountRequester(); requester.requestInitialization();";
+		trigger.state = 0; //ready
+		trigger.run_count = runCount;
+		trigger.repeat = retryDuration;
+		return trigger.insert();
+	},
+
+	_shouldSkip: function() {
+
+		if (this._isExecFromJob()) {
+			var runCount = g_schedule_record.run_count;
+			var maxRunCount = Number(gs.getProperty('glide.email.max_provision_attempts', 12));
+
+			if (runCount &gt; maxRunCount) {
+				gs.log('Skipping ServiceNow Email Account Request: Run count of ' + runCount + ' exceeded the maximum number of ' + maxRunCount + ' provision attempts.', 'EmailAccountRequester');
+				return true;
+			}
+		}
+
+		var isProd = GlideUtil.isProductionInstance();
+		var isDev = GlideProperties.getBoolean('glide.emailaccounts.plugin.indevelopment');
+		if (!isProd &amp;&amp; !isDev) {
+			gs.log('Skipping ServiceNow Email Account Request: Non-production instance.', 'EmailAccountRequester');
+			return true;
+		}
+
+		//Do the accounts already exist?
+		var pop3Account = new GlideRecord('sys_email_account');
+		pop3Account.addQuery('type', 'pop3');
+		pop3Account.addQuery('servicenow_configured', true);
+		pop3Account.query();
+
+		var hasSncPop3 = pop3Account.hasNext();
+
+		var smtpAccount = new GlideRecord('sys_email_account');
+		smtpAccount.addQuery('type', 'smtp');
+		smtpAccount.addQuery('servicenow_configured', true);
+		smtpAccount.query();
+
+		var hasSncSmtp = smtpAccount.hasNext();
+
+		if (hasSncPop3 &amp;&amp; hasSncSmtp) {
+			gs.log('Skipping ServiceNow Email Account Request: ServiceNow configured email accounts have already been initialized.', 'EmailAccountRequester');
+			return true;
+		}
+
+		var maxTime = new GlideDateTime();
+		var requestAfterZBoot = Number(gs.getProperty('glide.email.zboot_to_provision_duration', 3600));
+		maxTime.addSeconds(requestAfterZBoot);
+
+		var trigger = new GlideRecord('sys_trigger');
+		trigger.addQuery('name', this.jobName);
+		trigger.addQuery('next_action', '&lt;=', maxTime);
+		trigger.addQuery('next_action', '&gt;=', new GlideDateTime());
+
+		if (this._isExecFromJob()) {
+			trigger.addQuery('sys_id', '!=', g_schedule_record.sys_id);
+		}
+		trigger.query();
+
+		if (trigger.next()) {
+			//If job already exists, give it the priority.
+			gs.log('Skipping ServiceNow Email Account Request: Scheduled request already exists.', 'EmailAccountRequester');
+			return true;
+		}
+		return false;
+	},
+
+	_retryRequest: function(statusCode) {
+		var maxRunCount = Number(gs.getProperty('glide.email.max_provision_attempts', 12));
+
+		var runCount = 1;
+		if (this._isExecFromJob()) {
+			runCount = g_schedule_record.run_count;
+		}
+
+		var retryDuration = Number(gs.getProperty('glide.email.provision_retry_duration', 1800));
+		var retryDateTime = new GlideDateTime();
+		retryDateTime.addSeconds(retryDuration);
+
+		var failureMsg = 'Request ' + runCount + ' made to provision ServiceNow email accounts failed with status code "' + statusCode + '".';
+		failureMsg += ' This was attempt ' + runCount + ' out of a maximum of ' + maxRunCount + ' attempts.';
+
+		if (runCount &gt;= maxRunCount) {
+			gs.log(failureMsg, 'EmailAccountRequester');
+			this._deleteJob();
+			return;
+		}
+
+		failureMsg += ' Next attempt is scheduled to be executed at ' + retryDateTime + '.';
+		gs.log(failureMsg, 'EmailAccountRequester');
+	},
+
+	_isValidEventParm: function(eventParm1) {
+		if (!eventParm1)
+			return false;
+
+		eventParm1 = eventParm1.toLowerCase();
+		var isZboot = this._isZboot(eventParm1);
+		var isUpgrade = this._isUpgrade(eventParm1);
+
+		return (isZboot || isUpgrade);
+	},
+
+	_isZboot: function(eventParm1) {
+		return eventParm1.indexOf('zboot') &gt; -1;
+	},
+
+	_isUpgrade: function(eventParm1) {
+		return eventParm1.indexOf('upgrade') &gt; -1;
+	},
+
+	_deleteJob: function() {
+		if (this._isExecFromJob()) {
+			g_schedule_record.deleteRecord();
+		}
+	},
+
+	_isExecFromJob: function() {
+		return (typeof g_schedule_record != 'undefined') &amp;&amp; g_schedule_record.name == this.jobName;
+	},
+
+	type: "EmailAccountRequester"
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2015-06-04 21:34:35&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1c97ad00eb600200c8690e815206fe44&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;1&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;EmailAccountRequester&lt;/sys_name&gt;
+        &lt;sys_package display_value="Email Accounts" source="com.glide.email_accounts"&gt;c0e674e43cb1311068bcf327dfe37f64&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1c97ad00eb600200c8690e815206fe44&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2015-06-25 15:47:33&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:25</sys_created_on>
+        <sys_id>65c0f01983b01210c6695855eeaad3ad</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>EmailAccountRequester</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_65c0f01983b01210c6695855eeaad3ad</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:25</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

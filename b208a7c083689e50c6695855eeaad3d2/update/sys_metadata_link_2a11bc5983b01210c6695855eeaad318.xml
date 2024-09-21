@@ -1,0 +1,303 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>29ded71b073e51102fe9f1e08c1ed044</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_vsc.SCEventUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;SCEventUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var SCEventUtil = Class.create();
+SCEventUtil.prototype = {
+    constants: new sn_vsc.SecurityCenterConstants(),
+    initialize: function() {},
+    /**
+     * This function will be called by script action Security center Event - Logins to handle
+     * SC related login events.
+     */
+    loginEvent: function() {
+        var that = this;
+        var userGr = new GlideRecord(this.constants.SYS_USER);
+        var userName = event.parm1;
+        var currentIpAddress = event.parm2;
+        var eventCreatedOn = event.sys_created_on;
+
+        // Get current user
+        userGr.addQuery('user_name', userName);
+        userGr.query();
+
+        // Check if user exists
+        if (userGr.next()) {
+            // Check if current user has roles we desire
+            var query = 'role=' + this.constants.ADMIN_ROLE_SYS_ID + '^user=' + userGr.sys_id.toString();
+            var sysUserRoleGr = new GlideRecord(this.constants.USER_HAS_ROLE);
+            sysUserRoleGr.addEncodedQuery(query);
+            sysUserRoleGr.query();
+            if (sysUserRoleGr.hasNext()) {
+               _checkAdminEvent(userGr, currentIpAddress);
+            }
+        } else {
+            // No record, must be maint login
+            // Check SNC Login Event
+            _checkSncLoginEvent(currentIpAddress, userName);
+        }
+
+        /**
+         * This function will log an admin login event to the sc events table
+         * if the user logged in has the role admin.
+         * @param {GlideRecord} gr - glide record of logged in user
+         * @param {string} ipAddress - ip address of logged in user
+         */
+        function _checkAdminEvent(gr, ipAddress) {
+            if (that._checkRole(gr, that.constants.ADMIN_ROLE_SYS_ID)) {
+                // Grab event reference
+                that._insertSecCenterEventRecord({
+                    eventName: that.constants.scEvents.LOGIN_ADMIN,
+                    ipAddress: ipAddress,
+                    userGr: gr
+                });
+            }
+        }
+
+        /**
+         * This function will log a snc login event to the sc events table
+         * if the user logged in has snc prefixed to their name.
+         * @param {string} name - username of logged in user
+         * @param {string} ipAddress - ip address of logged in user
+         */
+        function _checkSncLoginEvent(ipAddress, userName) {
+            if (userName.endsWith("@snc")) {
+                // Grab event reference
+                that._insertSecCenterEventRecord({
+                    eventName: that.constants.scEvents.LOGIN_SNC,
+                    ipAddress: ipAddress,
+                    userName: userName
+                });
+            }
+        }
+    },
+
+    /**
+     * This function will be called by the script action Security center Event - Security Elevations
+     * to handle SC related security elevation events
+     */
+    securityElevation: function() {
+        var that = this;
+        var elevatedUser = event.parm1;
+        var elevatedTo = event.parm2;
+        var eventCreatedOn = event.sys_created_on;
+
+        // Grab user reference
+        var userGr = this._userReference(elevatedUser);
+        if (userGr) {
+            // Log the security dashboard event and notify enabled users
+            this._insertSecCenterEventRecord({
+                eventName: this.constants.scEvents.SECURITY_ELEVATION,
+                userGr: userGr
+            });
+        }
+    },
+
+    /**
+     * This function will be called by the script action Security center Event - Impersonation Start
+     * to handle SC related impersonation events
+     */
+    impersonation: function() {
+        var that = this;
+        var eventCreatedOn = event.sys_created_on;
+        var userImpersonating = event.parm1;
+        var userImpersonated = event.parm2;
+
+        // Grab user reference
+        var userGr = this._userReference(userImpersonating);
+        if (userGr) {
+            // Log the security dashboard event and notify impersonated user if HP
+            this._insertSecCenterEventRecord({
+                eventName: "impersonation",
+                userGr: userGr,
+                impersonated: userImpersonated
+            });
+        }
+    },
+
+    /**
+     * This function will be called by the business rule SC - Store Export Data
+     * to generate an export event.
+     * @param {GlideRecord} current - The glide record of sys_user in it's current state
+     */
+    createExportEvent: function(current) {
+        var jobGr = new GlideRecord(this.constants.SYS_POLL);
+        jobGr.get(current.table_sys_id);
+        if (jobGr.isValid()) {
+            var exportedTableName = current.file_name.toString().split('.')[0];
+            var exportByteSize = current.size_bytes.toString();
+            var exportRecordCount = jobGr.max.toString();
+            var exportData = {
+                exportByteSize: exportByteSize,
+                exportRecordCount: exportRecordCount
+            };
+            gs.eventQueue(this.constants.scEvents.EXPORT, jobGr, exportedTableName, JSON.stringify(exportData));
+        }
+    },
+    /**
+     * This function will be called by Security center Event - Export to generate the dashboard event record
+     * for export events.
+     */
+    createTableExportEvent: function() {
+        var that = this;
+        var exportedTableName = event.parm1;
+        var exportData = JSON.parse(event.parm2);
+        var userName = event.user_name;
+
+        /// User ref
+        var userGr = new GlideRecord(this.constants.SYS_USER);
+        userGr.addQuery("user_name", userName);
+        userGr.query();
+        userGr.next();
+
+        // Check for classifications
+        var classification = this.checkClassification(exportedTableName);
+
+        var grTable = new GlideRecord('sys_db_object');
+        grTable.addQuery('name', exportedTableName);
+        grTable.query();
+        grTable.next();
+        var tableId = grTable.sys_id;
+
+        // Log the security dashboard event
+        this._insertSecCenterEventRecord({
+            eventName: this.constants.scEvents.EXPORT,
+            userGr: userGr,
+            size: exportData['exportByteSize'],
+            records: exportData['exportRecordCount'],
+            table: tableId,
+            classification: classification
+        });
+    },
+    /**
+     * This function will check if the current exported table contains classified columns.
+     * It will return the classified columns on this table.
+     * @param {string} tableName - The exported table name
+     */
+    checkClassification: function(tableName) {
+        // Find all parent tables and possible classifications and build an encoded query
+        var classifications = {};
+        var extendedTables = this._getTables(tableName);
+        for (var i = 0; i &lt; extendedTables.length; i++) {
+            extendedTables[i] = 'sys_dictionary.name=' + extendedTables[i];
+        }
+
+        // Find all classifications on columns from parent and child tables
+        var dictClassGr = new GlideRecord(this.constants.DICT_CLASS);
+        dictClassGr.addEncodedQuery(extendedTables.join('^OR'));
+        dictClassGr.query();
+        while (dictClassGr.next()) {
+            classifications[dictClassGr.data_class.sys_id.toString()] = 1;
+        }
+
+        return Object.keys(classifications).toString();
+    },
+
+    /**
+     * This function will insert a record to the sc events log.
+     * @param {any} obj - This object will contain only the necessary parameters
+     * for the type of security event being logged
+     */
+    _insertSecCenterEventRecord: function(obj) {
+        // Insert into the mapped event table
+        var eventTable = this.constants.scEventToTable[obj.eventName];
+        var scEventGr = new GlideRecord(eventTable);
+        scEventGr.initialize();
+        scEventGr.user = obj.userGr ? obj.userGr.sys_id : null;
+        scEventGr.user_name = obj.userGr ? obj.userGr.user_name : obj.userName;
+
+        // Insert event specific data
+        if (eventTable === "sn_vsc_login_event") {
+            scEventGr.login_type = obj.eventName;
+            scEventGr.ip_address = obj.ipAddress;
+        } else if (eventTable === "sn_vsc_impersonation_event") {
+            scEventGr.impersonated = obj.impersonated;
+        } else if (eventTable === "sn_vsc_export_event") {
+            scEventGr.size = obj.size;
+            scEventGr.records = obj.records;
+            scEventGr.classification = obj.classification;
+            scEventGr.table = obj.table;
+        }
+
+        // Insert
+        scEventGr.insert();
+    },
+
+    /*
+     * Return an array of table names in the table parent hierarchy
+     * @return ArrayList
+     */
+    _getTables: function(tableName) {
+        var table = new GlideTableHierarchy(tableName);
+        return table.getTables();
+    },
+
+    /**
+     * // Grab user reference
+     * @param {string} userName
+     */
+    _userReference: function(userName) {
+        var userGr = new GlideRecord(this.constants.SYS_USER);
+        userGr.addQuery('user_name', userName);
+        userGr.query();
+        if (userGr.next()) {
+            return userGr;
+        }
+    },
+	
+     /**
+     * This function will check if the user has a role
+     * @param {GlideRecord} userGr - The glide record for sys_user
+     * @param {string} roleId - The sys_id of the role being checked
+     */
+    _checkRole: function (userGr, roleId) {
+        var userRoleGr = new GlideRecord(this.constants.USER_HAS_ROLE);
+        userRoleGr.addQuery('user', userGr.sys_id);
+        userRoleGr.addQuery('role', roleId);
+        userRoleGr.query();
+        if (userRoleGr.next()) {
+            return userRoleGr;
+        }
+    },
+
+    type: 'SCEventUtil'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;maint&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-11-02 03:21:15&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;29ded71b073e51102fe9f1e08c1ed044&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;SCEventUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Security Center" source="sn_vsc"&gt;a51d46e3f2014110366b10017c5ba675&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Security Center"&gt;a51d46e3f2014110366b10017c5ba675&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_29ded71b073e51102fe9f1e08c1ed044&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;maint&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-12-06 23:31:26&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:51</sys_created_on>
+        <sys_id>2a11bc5983b01210c6695855eeaad318</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>SCEventUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_2a11bc5983b01210c6695855eeaad318</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:51</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

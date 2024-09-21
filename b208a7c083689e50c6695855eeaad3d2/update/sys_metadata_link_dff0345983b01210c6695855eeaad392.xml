@@ -1,0 +1,329 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>24c782869f202200d9011977677fcf89</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_hr_core.hr_CaseUtils&lt;/api_name&gt;
+        &lt;caller_access&gt;2&lt;/caller_access&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;hr_CaseUtils&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var hr_CaseUtils = Class.create();
+hr_CaseUtils.prototype = {
+	initialize : function(_case, _gs) {
+		if (!_case)
+			return;
+
+		this._case = _case;
+		this._gs = _gs || gs;
+
+		// Other object scripts have a reference here as they are used throughout
+		this.hrProfile = new hr_Profile(this._case.hr_profile, this._gs);
+		this.hrUtils = new hr_Utils();
+
+		this._ignoreFields = {
+			'opened_for' : '',
+			'priority' : '',
+			'short_description' : '',
+			'description' : ''
+		};
+		this._requiresUserOrProfileCreation = {
+			'request_onboarding':'',
+			'new_hire_journey':''
+		};
+	},
+
+	populateCase : function(service, questions, source) {
+		var hrServiceGr = new GlideRecord(hr.TABLE_SERVICE);
+		if (hrServiceGr.get(service) &amp;&amp; hrServiceGr.getValue('active')) {
+			var serviceName = hrServiceGr.getValue('name');
+			var serviceValue = hrServiceGr.getValue('value');
+
+			this._logDebug("Creating new HR Case record for service name: " + serviceName);
+
+			this._setServiceFields(hrServiceGr);
+			this._setGeneralFields(serviceValue, questions);
+			this._setCommonFields(hrServiceGr, questions, source);
+			
+			var extPoints = new GlideScriptedExtensionPoint().getExtensions('sn_hr_core.HRPopulateCaseFields');
+			for(var i = 0; i &lt; extPoints.length; i++) {
+				if (extPoints[i].handles(hrServiceGr)) 
+					extPoints[i].setFields(hrServiceGr,  this._case);
+			}
+		}
+	},
+
+	/*
+    * Updates the service and service offering fields into the Case.
+    */
+	setServiceOfferingFields: function() {
+        if (!gs.nil(this._case.getValue("hr_service"))) {
+
+            var serviceMapGr = new GlideRecord("csdm_service_mapping");
+            serviceMapGr.addActiveQuery();
+            serviceMapGr.addQuery("service_table", hr.TABLE_SERVICE);
+            serviceMapGr.addQuery("service", this._case.getValue("hr_service"));
+            serviceMapGr.query();
+
+            if (serviceMapGr.next()) {
+                if (!gs.nil(serviceMapGr.csdm_service)) {
+                    this._case.business_service = serviceMapGr.csdm_service;
+                } else if (!gs.nil(serviceMapGr.csdm_service_offering)) {
+                    this._case.service_offering = serviceMapGr.csdm_service_offering;
+                    this._case.business_service = serviceMapGr.csdm_service_offering.getRefRecord().parent;
+                }
+            }
+        }
+    },
+
+	/*
+    * Updates the HR Service related fields into the Case.
+	* Note: template kicked off when case updated (after this script runs)
+	*
+    * @param hrServiceGr The service glide record
+    */
+	_setServiceFields : function(hrServiceGr) {
+		this._case.hr_service = hrServiceGr.getUniqueValue();
+		this._case.topic_detail = hrServiceGr.topic_detail;
+		this._case.topic_category = hrServiceGr.topic_detail.topic_category;
+		this._case.template = hrServiceGr.template;
+	},
+
+	/*
+    * Updates the general HR Case related objects like the InfoMessage
+    *
+    * @param producer Holds questions/answers (Is not a record producer glide record)
+    * @param category The category of the case, also drives the template used in case
+    */
+	_setGeneralFields : function(serviceValue, questions) {
+		var parameters = this._getParametersFromQuestions(questions);
+
+		// Create user and profile for the subject person
+		if (this._requiresUserOrProfileCreation.hasOwnProperty(serviceValue)){
+			parameters['onboarding'] = true;
+			var subject_person_profile = this.hrProfile.createOrGetProfileFromParameters(parameters); // create subject person user and profile
+			this._case.subject_person = subject_person_profile.user.sys_id;
+		}
+
+		// Retrieve the profile of the 'opened_for' user
+		// a question might have been mapped to opened_for, in which case we grab from case
+		if (!parameters['opened_for']) {
+			if (this._case.opened_for)
+				parameters['opened_for'] = this._case.opened_for;
+			else
+				parameters['opened_for'] = gs.getUserID();
+		}
+
+		//Set opened for profile
+		this._grProfile = this.hrProfile.getProfileFromParameters(parameters);
+
+		// Retrieve the job information from parameters
+		// In some cases, a question might have been mapped to subject_person_job field, in which case we grab from case
+		if (parameters['job'])
+			this._job = parameters['job'];
+		else
+			if (this._case.subject_person_job)
+				this._job = this._case.subject_person_job;
+		else if(parameters['concurrent_job'] &amp;&amp; parameters['concurrent_job'] == 'true')
+			this._job = this.hrUtils.createJobFromParameters(this._grProfile, parameters, false);
+	},
+
+	/*
+    * Set the common Case fields across all categories.
+    * Note: this._case is the new Case
+    */
+	_setCommonFields : function(hrServiceGr, questions, source) {
+		var logged_in = gs.getUserDisplayName();
+		var serviceName = hrServiceGr.getDisplayValue('name');
+		var serviceValue = hrServiceGr.getValue('value');
+		this._case.contact_type = source;
+
+		// a question might have been mapped to opened_for and we do not want to override
+		if (!this._case.opened_for)
+			this._case.opened_for = this._grProfile.user.sys_id;
+
+		this._case.hr_profile = this._grProfile.sys_id;
+		var spUser = this._case.subject_person || this._case.opened_for;
+		this._case.subject_person_job = this._job? this._job : this.hrUtils.getPrimaryJob(spUser);
+
+		var openedForPriority = this._getPriority(this._grProfile.user,  this._case.template);
+		var subjectPersonPriority = this._getPriority(this._case.subject_person,  this._case.template);
+		var highestPriority =  openedForPriority &lt; subjectPersonPriority ? openedForPriority : subjectPersonPriority;
+		this._case.priority = highestPriority;
+		this._case.payload = new global.JSON().encode(this._getParametersFromQuestions(questions));
+		this._case.comments = gs.getMessage('User {0} has initiated a {1} request', [ logged_in, serviceName ]);
+
+		// Include subject person's name in short description of Performance (PIP) related cases
+		if ([hr.INITIATE_PIP_SERVICE, hr.PIP_ASSESSMENT_SERVICE].indexOf(hrServiceGr.sys_id.toString()) != -1)
+			this._setShortDescription(serviceName, this._case.subject_person.name);
+		else
+			this._setShortDescription(serviceName, this._grProfile.user.name); 
+		var description = this._getDescriptionFromAnswers(questions, serviceValue);
+		this._case.description = description;
+		this._case.rich_description = description;
+	},
+
+	_setShortDescription: function(serviceName, username) {
+		this._case.short_description = gs.getMessage("{0} case for {1}", [ serviceName, username ]);
+	},
+
+	/*
+    * Builds a description field with changed or new variables.  Has to determine the original value and
+    * display value for each of the fields coming in.
+    */
+	_getDescriptionFromAnswers : function(questions, hrServiceValue) {
+		var filledValues = '';
+		for (var i = 0; i &lt; questions.length; i++) {
+			var question = questions[i];
+
+			// Ignore the 'Opened for', 'priority' fields
+			if (!this._ignoreFields.hasOwnProperty(question.name) &amp;&amp; question.question.trim() != "") {
+				// Checking that the answer does not match the fields original value
+				var originalDisplayValue = this.hrProfile.getDisplayValue(this._grProfile, question.name, true);
+				var originalValue = this.hrProfile.getDisplayValue(this._grProfile, question.name, false);
+
+				if ((question.answer != originalValue &amp;&amp; question.answer != originalDisplayValue) || this._requiresUserOrProfileCreation.hasOwnProperty(hrServiceValue)) {
+
+					// Produces a string giving 'Field: newValue (original value: oldValue)'
+					var answerDisplayValue = question.answerDisplayValue;
+					// Replacing new lines(\n) with &lt;br&gt; tag for multi-line ("2") variable type
+					if(!gs.nil(question.variableType) &amp;&amp; question.variableType === "2")
+						answerDisplayValue = answerDisplayValue.replace(/\n/g,"&lt;br&gt;");
+					filledValues += question.question + ': ' + answerDisplayValue;
+
+					if ((originalValue || originalDisplayValue) &amp;&amp; !this._requiresUserOrProfileCreation.hasOwnProperty(hrServiceValue)) {
+						var txt = gs.getMessage(' (original value: {0})', originalDisplayValue);
+						filledValues += txt;
+					}
+
+					filledValues += '&lt;br/&gt;&lt;br/&gt;';
+				}
+			}
+		}
+
+		var additionalDescription = '';
+		if (filledValues) {
+			var spacer = (gs.nil(this._case.description)) ? '': '\n\n' ;
+			var msg = gs.getMessage('The following fields have been provided:');
+			additionalDescription = spacer +  msg + '&lt;br/&gt;' + filledValues;
+		}
+
+		return this._case.description + additionalDescription;
+	},
+
+	/*
+    * This function is used in Sign Document UI action
+    * Moved the condition here due to condition field length limit
+    */
+	showSignUIAction : function(current) {
+		return current.state==18 &amp;&amp; current.pdf_template &amp;&amp; (gs.nil(current.pdf_template.template_type) || current.pdf_template.template_type=='hr_pdf_templates') &amp;&amp; new global.HRSecurityUtils().hasSignatureOnForm(current);
+	},
+
+	getQuestion : function(question, variableName, answer, fieldRaw, variableOrder, displayValue, variableType) {
+		return {
+			question : question+"",
+			name : variableName+"",
+			answer : answer+"",
+			raw : fieldRaw+"",
+			order : variableOrder+"",
+			answerDisplayValue : displayValue+"",
+			variableType: variableType+""
+		};
+	},
+
+	/*
+    * Simplify the complex question object into a simpler object
+    */
+	_getParametersFromQuestions : function(questions) {
+		var parameters = {};
+
+		for (var i = 0; i &lt; questions.length; i++) {
+			parameters[questions[i].name] = questions[i].raw;
+		}
+
+		return parameters;
+	},
+
+
+	_getPriority : function(user, templateId) {
+		if (user.vip == true) {
+			var defaultPriority = new hr_CaseAjax().getDefaultVIPPriority();
+			if (defaultPriority)
+				return defaultPriority;
+			else
+				return '2'; // high
+		} else {
+			var result = this._getTemplateProperty(templateId, 'priority');
+			if (!gs.nil(result))
+				return result;
+			else
+				return '4'; // low
+		}
+	},
+
+	_getTemplateProperty : function(templateSysId, field) {
+		return new sn_hr_core.hr_TemplateUtils()._getTemplateProperty(templateSysId, field);
+	},
+
+	/*
+    * Convenience method to prevent the code becoming unreadable from the useful debug statements
+    */
+	_logDebug : function(str) {
+		if (gs.isDebugging())
+			gs.debug(str);
+	},
+
+    caseLink: function(caseGr) {
+        if (!caseGr || !caseGr.getUniqueValue())
+            return;
+        var sysId = caseGr.getUniqueValue();
+        var tableName = caseGr.sys_class_name;
+        var number = caseGr.number;
+        var caseUrl = '&lt;a href="/nav_to.do?uri=/' + tableName + '.do' + '?sys_id=' + sysId + '" target="_blank"&gt;' + number + '&lt;/a&gt;';
+
+        return caseUrl;
+    },
+
+    _getActivitySetContextCases: function(caseId) {
+        var grContext = new GlideRecord('sn_hr_le_activity_set_context');
+        grContext.addQuery('hr_case', caseId);
+        grContext.addQuery('state', 'awaiting_trigger');
+        grContext.query();
+        return grContext.hasNext();
+    },
+
+    type: 'hr_CaseUtils'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2016-07-12 21:24:05&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;24c782869f202200d9011977677fcf89&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;118&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;hr_CaseUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Human Resources: Core" source="sn_hr_core"&gt;d4ac3fff5b311200a4656ede91f91af2&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Human Resources: Core"&gt;d4ac3fff5b311200a4656ede91f91af2&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_24c782869f202200d9011977677fcf89&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-03-21 15:38:57&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:22</sys_created_on>
+        <sys_id>dff0345983b01210c6695855eeaad392</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>hr_CaseUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_dff0345983b01210c6695855eeaad392</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:22</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

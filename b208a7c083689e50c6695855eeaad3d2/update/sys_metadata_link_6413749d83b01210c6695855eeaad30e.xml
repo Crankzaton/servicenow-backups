@@ -1,0 +1,269 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>6014cd61776511109560df454b5a99cb</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_fix"&gt;
+    &lt;sys_script_fix action="INSERT_OR_UPDATE"&gt;
+        &lt;before&gt;false&lt;/before&gt;
+        &lt;description&gt;This fix script migrates the legacy theme from sys_sg_client_theme table to sys_ux_theme and sys_ux_style tables if the legacy theme is used by any native client and has color customization.&lt;/description&gt;
+        &lt;name&gt;Migrate legacy mobile themes&lt;/name&gt;
+        &lt;record_for_rollback&gt;false&lt;/record_for_rollback&gt;
+        &lt;script&gt;&lt;![CDATA[function migrateLegacyThemes() {
+	gs.info('Migration of legacy mobile themes has started');
+	var nativeClientGr = new GlideRecord("sys_sg_native_client");
+	nativeClientGr.query();
+	var uxThemeSysId;
+	var createdThemeRecords = {};
+	
+	while (nativeClientGr.next()) {
+		// Check if migration needed for `client_theme` and `navigation`
+		if (gs.nil(nativeClientGr.mobile_theme) &amp;&amp; shouldMigrate(nativeClientGr.client_theme, nativeClientGr.navigation)) {
+			var key = nativeClientGr.client_theme.sys_id + nativeClientGr.navigation.sys_id;
+			if (key in createdThemeRecords) {
+				uxThemeSysId = createdThemeRecords[key];
+			} else {
+				uxThemeSysId = createThemeRecords(nativeClientGr.client_theme, nativeClientGr.navigation);
+				createdThemeRecords[key] = uxThemeSysId;
+			}
+			linkThemeRecordToNativeClient(uxThemeSysId, nativeClientGr);
+		}
+	}
+	gs.info("Migration of legacy mobile themes has ended");
+}
+
+function getOOTBRecords() {
+	var ootbRecords = {
+		"Brand": "#293e40",
+		"Primary": "#1f8476",
+		"Secondary": "#165c53",
+		"Destructive": "#c83c36"
+	};
+	return ootbRecords;
+}
+
+function shouldMigrate(client_theme, navigation) {
+	return shouldMigrateLegacyTheme(client_theme) || shouldMigrateNavigationTheme(navigation);
+}
+
+function linkThemeRecordToNativeClient(uxThemeSysId, nativeClientGr) {
+	// Associating this theme record to the native client
+	if (!gs.nil(uxThemeSysId)) {
+		nativeClientGr.setValue('mobile_theme', uxThemeSysId);	
+		nativeClientGr.update();
+	}
+}
+
+function shouldMigrateLegacyTheme(client_theme) {
+	
+	if (gs.nil(client_theme))
+		return false;
+	
+	var legacyThemeColors = client_theme.palette;
+	var ootbRecords = getOOTBRecords();
+	
+	// compare for any change in colors
+	for (colorNameKey in legacyThemeColors) {
+		var clientCustomColor = legacyThemeColors[colorNameKey];
+		var nativeColor = ootbRecords[colorNameKey];
+		if (isValidHexColor(clientCustomColor) &amp;&amp; isValidColorName(colorNameKey) &amp;&amp; clientCustomColor !== nativeColor) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function shouldMigrateNavigationTheme(navigation) {
+	if (gs.nil(navigation))
+		return false;
+	
+	var legacyColor = navigation.color;
+	var legacyQuickActionsMenuColor = navigation.quick_actions_menu_color;
+	return (!gs.nil(legacyColor) &amp;&amp; isValidHexColor(legacyColor)) || (!gs.nil(legacyQuickActionsMenuColor) &amp;&amp; isValidHexColor(legacyQuickActionsMenuColor));
+}
+
+function isValidColorName(colorName) {
+	var ootbColorNames = ["Brand", "Secondary", "Primary", "Tertiary", "Positive", "Destructive"];
+	return ootbColorNames.indexOf(colorName) !== -1;
+}
+
+function createThemeRecords(client_theme, navigation) {
+	
+	var styleThemePrefix = "Upgraded Mobile";
+	var styleSuffix = "Colors";
+	var themeSuffix = "Theme";
+	var legacyThemeName;
+	var legacyStyleName;
+	var colorMap;
+	
+	if (shouldMigrateLegacyTheme(client_theme)) {
+		legacyThemeName = styleThemePrefix + " " + client_theme.name + " " + themeSuffix;
+		legacyStyleName = styleThemePrefix + " " + client_theme.name + " " + styleSuffix;
+		
+		colorMap = transformClientCustomTheme(client_theme.palette);
+		
+		// sets the new swipe action mobile variable colors on migration
+		setSwipeActionVarColors(colorMap);
+	}
+	if (shouldMigrateNavigationTheme(navigation)) {
+		
+		var navColors = transformNavigationTheme(navigation);
+		if (gs.nil(legacyThemeName)) {
+			legacyThemeName = styleThemePrefix + " " + themeSuffix;
+			legacyStyleName = styleThemePrefix + " " + styleSuffix;
+			colorMap = navColors;
+		} else {
+			// merging the objects `colorMap` and `navColors` into `colorMap`
+			for (navColorKey in navColors) {
+				colorMap[navColorKey] = navColors[navColorKey];
+			}
+		}
+	}
+	
+	convertHexToRGB(colorMap);
+	var transformedColorMap = {
+		"nativeMobile": colorMap
+	};
+	return createRecords(legacyThemeName, legacyStyleName, transformedColorMap);
+}
+
+function transformClientCustomTheme(palette) {
+	var ootbRecords = getOOTBRecords();
+	var colorMap = {};
+	for (colorKey in palette) {
+		if (isValidColorName(colorKey)) {
+			if (!gs.nil(palette[colorKey]) &amp;&amp; isValidHexColor(palette[colorKey]))
+				colorMap[colorKey] = palette[colorKey];
+			else if (!gs.nil(ootbRecords[colorKey]))
+				colorMap[colorKey] = ootbRecords[colorKey];
+		}
+	}
+	return colorMap;
+}
+
+function transformNavigationTheme(navigation) {
+	var navColors = {};
+	var legacyColor = navigation.color;
+	var legacyQuickActionsMenuColor = navigation.quick_actions_menu_color;
+	
+	if (!gs.nil(legacyColor) &amp;&amp; isValidHexColor(legacyColor))
+		navColors['Navigation Bar Selected'] = navigation.color;
+	
+	if (!gs.nil(legacyQuickActionsMenuColor) &amp;&amp; isValidHexColor(legacyQuickActionsMenuColor))
+		navColors['Quick Action Background'] = navigation.quick_actions_menu_color;
+	return navColors;
+}
+
+function setSwipeActionVarColors(colorMap) {
+	var swipeActionSuffix = "Swipe Action";
+	var swipeActionColorKey;
+	for (colorMapKey in colorMap) {
+		if (isValidSwipeActionColorName(colorMapKey)) {
+			swipeActionColorKey = colorMapKey + " " + swipeActionSuffix;
+			colorMap[swipeActionColorKey] = colorMap[colorMapKey];
+		}
+	}
+}
+
+function isValidSwipeActionColorName(colorName) {
+	var swipeActionColorNames = ["Primary", "Secondary", "Tertiary", "Positive", "Destructive"];
+	return swipeActionColorNames.indexOf(colorName) !== -1;
+}
+
+function createRecords(customThemeName, customStyleName, transformedLegacyThemeColors) {
+	var uxStyleGr = createUXStyleRecord(customStyleName, transformedLegacyThemeColors);
+	var uxThemeGr = createUXThemeRecord(customThemeName);
+	createM2MRecords(uxStyleGr, uxThemeGr);
+	return uxThemeGr.getValue('sys_id');
+}
+
+function createUXStyleRecord(customStyleName, transformedLegacyThemeColors) {
+	var uxStyleGr = new GlideRecord("sys_ux_style");
+	uxStyleGr.initialize();
+	uxStyleGr.setValue('name', customStyleName);
+	uxStyleGr.setValue('style', JSON.stringify(transformedLegacyThemeColors));
+	uxStyleGr.setValue('type', 'core');
+	uxStyleGr.insert();
+	return uxStyleGr;
+}
+
+function createUXThemeRecord(customThemeName) {
+	var uxThemeGr = new GlideRecord("sys_ux_theme");
+	uxThemeGr.initialize();
+	uxThemeGr.setValue('name', customThemeName);
+	uxThemeGr.setValue('active', 'true');
+	uxThemeGr.insert();
+	return uxThemeGr;
+}
+
+function createM2MRecords(uxStyleGr, uxThemeGr) {
+	var m2mThemeGr = new GlideRecord('m2m_theme_style');
+	m2mThemeGr.initialize();
+	m2mThemeGr.setValue('style', uxStyleGr.getValue('sys_id'));
+	m2mThemeGr.setValue('order', 100);
+	m2mThemeGr.setValue('theme', uxThemeGr.getValue('sys_id'));
+	m2mThemeGr.insert();
+	
+	// Associating the Legacy Mobile Style to the Upgraded Mobile Legacy theme record
+	// Using `sys_id` of `Mobile Colors Legacy` style record
+	m2mThemeGr = new GlideRecord('m2m_theme_style');
+	m2mThemeGr.initialize();
+	m2mThemeGr.setValue('style', '4ed92c375b411110848b28582d81c7d2');
+	m2mThemeGr.setValue('order', 0);
+	m2mThemeGr.setValue('theme', uxThemeGr.getValue('sys_id'));
+	m2mThemeGr.insert();
+}
+
+function convertHexToRGB(legacyThemeColors) {
+	for (colorName in legacyThemeColors) {
+		var rgbColor = hexToRGB(legacyThemeColors[colorName]);
+		legacyThemeColors[colorName] = rgbColor;
+	}
+}
+
+function hexToRGB(hexColor) {
+	var regExp = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i;
+	var rgbArray = regExp.exec(hexColor);
+	var rgb = "";
+	if (!gs.nil(rgbArray)) {
+		rgb = [parseInt(rgbArray[1], 16), parseInt(rgbArray[2], 16), parseInt(rgbArray[3], 16)].join(',');
+	}
+	return rgb ? rgb : null;
+}
+
+function isValidHexColor(hexColor) {
+	var regExp = /^#[0-9A-F]{6}$/i;
+	return regExp.test(hexColor);
+}
+
+migrateLegacyThemes();]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_fix&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-08-26 02:46:09&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;6014cd61776511109560df454b5a99cb&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;214&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;Migrate legacy mobile themes&lt;/sys_name&gt;
+        &lt;sys_package display_value="Mobile Theming" source="com.glide.sg.theme"&gt;15a81f5b47220210cd4e1ce4316d437d&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_fix_6014cd61776511109560df454b5a99cb&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-03-28 16:09:33&lt;/sys_updated_on&gt;
+        &lt;unloadable&gt;false&lt;/unloadable&gt;
+    &lt;/sys_script_fix&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:21:27</sys_created_on>
+        <sys_id>6413749d83b01210c6695855eeaad30e</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Migrate legacy mobile themes</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_6413749d83b01210c6695855eeaad30e</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:21:27</sys_updated_on>
+        <tablename>sys_script_fix</tablename>
+    </sys_metadata_link>
+</record_update>

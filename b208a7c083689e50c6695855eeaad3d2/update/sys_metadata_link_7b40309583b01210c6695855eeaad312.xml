@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>06c571b75bd2030036c32c1cf0f91a03</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.BacklogMetaDataService&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;BacklogMetaDataService&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var BacklogMetaDataService = Class.create();
+
+BacklogMetaDataService.getPreferredBacklogFilterId = function(userId) {
+
+	if (JSUtil.nil(userId))
+		userId = gs.getUserID();
+	var user = GlideUser.getUserByID(userId);
+	var filterId = user.getPreference("com.snc.agile_board.lastSelectedBacklog") || '' ;
+	var gr = new GlideRecord('backlog_definition');
+	if (JSUtil.notNil(filterId)) {
+		gr.addQuery('shared_with_groups', 'DYNAMIC', 'd6435e965f510100a9ad2572f2b47744').addOrCondition('owner', userId).addOrCondition('shared_with', 'CONTAINS', userId);			
+        gr.addQuery('sys_id', filterId);
+        gr.query();
+        if (!gr.next())
+			filterId = '';
+	}
+	
+	if (JSUtil.nil(filterId)) {
+		gr = new GlideRecord('backlog_definition');
+		gr.addQuery('shared_with_groups', 'DYNAMIC', 'd6435e965f510100a9ad2572f2b47744').addOrCondition('owner', userId).addOrCondition('shared_with', 'CONTAINS', userId);
+		gr.addQuery('table', 'rm_story');
+		gr.orderByDesc('sys_updated_on');
+		gr.setLimit(1);
+		gr.query();
+		if (gr.next())
+			filterId = gr.getValue('sys_id');
+	}
+	user.setPreference("com.snc.agile_board.lastSelectedBacklog", filterId);
+
+	if (gr.isValidRecord())
+		return gr.getValue('sys_id');
+
+	return null;
+};
+
+BacklogMetaDataService.query = {
+	nonStoryFilter: 'original_task.sys_class_name!=rm_story^active=true^sprintISEMPTY^original_task.active=true^backlog_definition=',
+	storyFilter: AgileBoardMetaDataCommonUtil.isMultiTaskActive() ? 'original_task.sys_class_name=rm_story' : 'sys_class_name=rm_story'
+};
+
+BacklogMetaDataService.buildQuery = function(filterId, backlogQuery) {
+	var metricQuery = '';
+
+	return BacklogMetaDataService.buildMetricQuery(filterId, backlogQuery, metricQuery);
+};
+
+BacklogMetaDataService.buildMetricQuery = function(backlogId, backlogQuery, metricQuery) {
+	var nonStoryPart = '', storyPart = '';
+	var filters = backlogQuery.split('^NQ');
+	var query = this.query;
+
+	if (AgileBoardMetaDataCommonUtil.isMultiTaskActive())
+		nonStoryPart = query.nonStoryFilter + backlogId + metricQuery + '^NQ';
+
+	storyPart += filters.map(function(filter) {
+		return query.storyFilter + metricQuery + '^' + filter;
+	}).join('^NQ');
+
+	var combinedQuery = nonStoryPart + storyPart;
+
+	return combinedQuery;
+};
+
+BacklogMetaDataService.getMetricCount = function(query) {
+    var count = 0;
+    var gr = new GlideAggregate('rm_story');
+    gr.addEncodedQuery(query);
+    gr.addAggregate('COUNT');
+    gr.query();
+    if (gr.next())
+        count = gr.getAggregate('COUNT');
+    return count;
+};
+
+BacklogMetaDataService.getMetrics = function(backlogId){
+	var  backlogQuery = '';
+	var isMultiTaskActive = AgileBoardMetaDataCommonUtil.isMultiTaskActive();
+	if (JSUtil.notNil(backlogId) &amp;&amp; backlogId !== 'null') {
+		var gr = new GlideRecord('backlog_definition');
+		if (gr.get(backlogId))
+			backlogQuery = gr.getValue('filter');
+	}
+	if (JSUtil.nil(backlogQuery))
+		backlogQuery = '';
+
+	var allStoriesQuery = '';
+	var unsizedStoriesQuery = 'story_pointsISEMPTY^ORstory_points=0';
+    var noACStroiesQery = 'acceptance_criteriaISEMPTY';
+	var metrics = [{
+        name: isMultiTaskActive ? gs.getMessage('Records in total') : gs.getMessage('Stories in total'),
+        query: allStoriesQuery,
+        count: this.getMetricCount(this.buildMetricQuery(backlogId, backlogQuery, allStoriesQuery))
+    }, {
+        name: gs.getMessage('No story points'),
+        query: unsizedStoriesQuery,
+        count: this.getMetricCount(this.buildMetricQuery(backlogId, backlogQuery, '^' + unsizedStoriesQuery))
+    }, {
+        name: gs.getMessage('No acceptance criteria'),
+        query: noACStroiesQery,
+        count: this.getMetricCount(this.buildMetricQuery(backlogId, backlogQuery, '^' + noACStroiesQery))
+    }];
+	return metrics;
+};
+
+BacklogMetaDataService.getBacklogMetaData = function() {
+	var epicGr = new GlideRecord('rm_epic');
+	var themeGr = new GlideRecord('scrum_theme');
+	var storyGr = new GlideRecord('rm_story');
+	var isMultiTaskActive = AgileBoardMetaDataCommonUtil.isMultiTaskActive();
+	var searchFilterFields = ['short_description', 'number'];
+	if(isMultiTaskActive)
+		searchFilterFields.push('original_task.number');
+    var metadata = {
+        backlogPageSize: parseInt(gs.getUser().getPreference('rowcount')),
+        canWrite: storyGr.canWrite(),
+		canCreateStory: storyGr.canCreate(),
+		canCreateEpic: epicGr.canCreate(),
+		canCreateTheme: themeGr.canCreate(),
+		showStoryContextMenu: storyGr.canWrite(),
+		showEpicFilter: true,
+		epicsLimit: 10,
+		triageLimit: 20,
+		filterType: "checkbox",
+		config: {
+			epic_filter: AgileBoardMetaDataCommonUtil.getBooleanPreference('backlog.config.epic_filter', true)
+		},
+		listConfig: AgileBoardMetaDataCommonUtil.getBacklogListConfig(),
+		transformField: isMultiTaskActive ? 'original_task.number' : 'number',
+		isMultiTaskActive: isMultiTaskActive,
+		defaultQuery: this.query,
+		view: 'scrum',
+		listView: isMultiTaskActive ? 'unified_agile_board' : 'agile_board',
+		backlogTable: 'rm_story',
+		searchFilter: searchFilterFields,
+		searchPlaceHolder: gs.getMessage('Search')
+    };
+
+	return metadata;
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2017-11-14 22:47:52&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;06c571b75bd2030036c32c1cf0f91a03&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;96&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;BacklogMetaDataService&lt;/sys_name&gt;
+        &lt;sys_package display_value="Agile Development 2.0" source="com.snc.sdlc.agile.2.0"&gt;7205e388477e0610cd4e1ce4316d43ce&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_06c571b75bd2030036c32c1cf0f91a03&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-04-12 10:41:45&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:24</sys_created_on>
+        <sys_id>7b40309583b01210c6695855eeaad312</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>BacklogMetaDataService</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_7b40309583b01210c6695855eeaad312</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:24</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

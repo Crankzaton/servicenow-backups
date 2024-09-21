@@ -1,0 +1,321 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0e8a029787b71300b18a046787cb0bc4</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.NotifyWorkflow&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;NotifyWorkflow&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var NotifyWorkflow = Class.create();
+NotifyWorkflow.prototype = {
+
+	NOTIFY_STATUS_TO_EVENT_NAME_MAP: {
+		'ringing': 'ringing',
+		'in_progress': 'InProgress',
+		'completed': 'completed',
+		'no_answer': 'NoAnswer',
+		'busy': 'busy',
+		'failed': 'failed',
+		'invalid': 'invalid',
+		'initiated': 'initiated',
+		'input': '-noevent-'
+	},
+
+	ACTIVITY_WAIT_TIME: gs.getProperty('com.snc.notify.wf_activity_resp_wait_time', 1000),
+	NUM_TRIES: gs.getProperty('com.snc.notify.wf_activity_max_tries', 20),
+
+    initialize: function() {
+		this.workflowScriptAPI = new SNC.WorkflowScriptAPI();
+		this.db = new NotifyDatabase();
+    },
+
+	runIncomingCallWorkflow: function (/*String*/ notifyPhoneNumber, /*GlideRecord*/ callRecord) {
+		var notifyAction = this._runWorkflow(notifyPhoneNumber, "incoming_call_workflow", callRecord);
+		notifyAction.setCallRecord(callRecord);
+		return notifyAction;
+	},
+
+	runIncomingCallWorkflowJ: function (/*String*/ notifyPhoneNumber, /*GlideRecord*/ callRecord) {
+		return this._getNotifyActionJson(this.runIncomingCallWorkflow(notifyPhoneNumber, callRecord));
+	},
+
+	runOutgoingCallWorkflow: function (/*String*/ notifyPhoneNumber, /*GlideRecord*/ callRecord, /*GlideRecord*/ conferenceCallRecord) {
+		this.startWorkflow(notifyPhoneNumber, "outgoing_call_workflow", callRecord, conferenceCallRecord);
+	},
+
+	runIncomingSMSWorkflow: function (/*String*/ notifyPhoneNumber, /*GlideRecord*/ messageRecord) {
+		var notifyNumberGr = new GlideRecord("notify_number");
+		notifyNumberGr.addQuery("number",notifyPhoneNumber);
+		notifyNumberGr.addActiveQuery();
+		notifyNumberGr.query();
+		var isOptMessage = false;
+		if(notifyNumberGr.next()){
+			var owner = notifyNumberGr.getValue('owner');
+			var numberType = notifyNumberGr.getValue('short_code') === null ? 'long': 'short';
+			var handler = new sn_sms_pref.SMSPreferenceHandler(owner);
+			isOptMessage = handler.isOptMessage(messageRecord.getValue('body'), numberType);
+		}
+
+		if(!isOptMessage)
+			this._runWorkflow(notifyPhoneNumber, "incoming_sms_workflow", messageRecord);
+	},
+	
+
+	runOutgoingSMSWorkflow: function (/*String*/ notifyPhoneNumber, /*GlideRecord*/ messageRecord) {
+		this._runWorkflow(notifyPhoneNumber, "outgoing_sms_workflow", messageRecord, true);
+	},
+
+	workflowIsRunning: function (/*GlideRecord*/ someRecord) {
+		var context = this.workflowScriptAPI.getContexts(someRecord);
+		return (context &amp;&amp; context.next());
+	},
+
+	_runWorkflow: function (/*String*/ notifyPhoneNumber, /*String*/ workflowColumn, /*GlideRecord*/ callOrMessageRecord, suppressErrorLog) {
+		var groupRecord = this.db.getNotifyPhoneNumberGroupRecord(notifyPhoneNumber);
+		var workflow = groupRecord.getElement(workflowColumn);
+
+		// check if workflow is defined and that a context does not already exist for this call
+		if (!workflow.nil()) {
+			if (!this.workflowIsRunning(callOrMessageRecord)) {
+
+				// start workflow
+				this.workflowScriptAPI.startFlow(workflow.getValue(), callOrMessageRecord, null, null);
+
+				// process activities
+				return this._processExecutingWorkflowActivities(callOrMessageRecord);
+			}
+		} else if (!suppressErrorLog) {
+			// add error log
+			gs.error("There is no workflow associated in workflow column " + workflowColumn + " of Notify Group " + groupRecord.getValue("name"));
+		}
+
+		return new SNC.NotifyAction();
+	},
+
+	_processExecutingWorkflowActivities: function (/*GlideRecord*/ callOrMessageRecord) {
+		var callSysID = callOrMessageRecord.getUniqueValue();
+		var executingActivity = this._getExecutingActivity(callSysID);
+		if (!executingActivity.hasNext())
+			gs.info("No activities found to execute for call " + callSysID);
+
+		var notifyAction = new SNC.NotifyAction();
+		// find the executing activities
+		while (executingActivity.next()) {
+			var action = new SNC.NotifyAction();
+			var json = executingActivity.getValue("notify_action");
+
+			if (json) {
+				action.fromJson(json, true);
+				notifyAction.append(action);
+
+				executingActivity.setValue("state", "processed");
+				executingActivity.setValue("processed", new GlideDateTime());
+				executingActivity.update();
+			} else {
+				// no NotifyActions found
+				gs.info("No notify_action found for call " + callSysID + " and activity " + executingActivity.getValue("activity.name"));
+			}
+		}
+
+		// set call record
+		notifyAction.setCallRecord(callOrMessageRecord);
+
+		return notifyAction;
+	},
+
+	startWorkflow: function (/*String*/ notifyPhoneNumber, /*String*/ workflowColumn, /*GlideRecord*/ callOrMessageRecord, /*GlideRecord*/ conferenceCallRecord) {
+		var groupRecord = this.db.getNotifyPhoneNumberGroupRecord(notifyPhoneNumber);
+		var workflow = groupRecord.getElement(workflowColumn);
+
+		// check if workflow is defined and that a context does not already exist for this call
+		if (!workflow.nil()) {
+			// start workflow if its not already running
+			if (!this.workflowIsRunning(callOrMessageRecord)) {
+				var scratchMap = null;
+
+				// add conference call to the scratchpad if needed
+				if (conferenceCallRecord != null) {
+					scratchMap = {
+						conference_call: conferenceCallRecord
+					};
+				}
+
+				this.workflowScriptAPI.startFlow(workflow.getValue(), callOrMessageRecord, null, scratchMap);
+			}
+		} else {
+			// add error log
+			gs.error("There is no workflow associated in workflow column " + workflowColumn + " of Notify Group " + groupRecord.getValue("name"));
+		}
+	},
+
+	finishWaitingActivities: function (/*String*/ notifyNumber, /*GlideRecord*/ callOrMessageRecord, /*Object - Optional*/ jsonArgs, /*boolean - Optional*/ getNext,
+												   /*String - Optional*/ actionSysId) {
+		// get all the records from notify_wf_activity for this call that are state = processed
+		var notifyWFActivity = new GlideRecord("notify_wf_activity");
+		notifyWFActivity.addQuery("notify_call", callOrMessageRecord.getUniqueValue());
+		notifyWFActivity.addQuery("state", "processed");
+		notifyWFActivity.orderByDesc("sys_created_on");
+		notifyWFActivity.query();
+
+		var json = {};
+		var fromNumber = callOrMessageRecord.getValue("phone_number");
+
+		json.notify_number = notifyNumber;
+		json.from_number = fromNumber;
+
+		// add extra arguments?
+		if (jsonArgs) {
+			for (var k in jsonArgs) {
+				json[k] = jsonArgs[k];
+			}
+		}
+
+		// set state to complete
+		while (notifyWFActivity.next()) {
+			notifyWFActivity.setValue("state", "complete");
+			notifyWFActivity.setValue("response_args", JSON.stringify(json));
+			notifyWFActivity.update();
+
+			// update the call record with the last completed action
+			callOrMessageRecord.setValue("last_action", notifyWFActivity.getValue("notify_action"));
+			callOrMessageRecord.setForceUpdate(true);
+			callOrMessageRecord.update();
+		}
+
+		// get the next batch of activities that are ready to be executed
+		if (getNext) {
+			var notifyAction = new SNC.NotifyAction();
+			if (actionSysId) {
+				var action = this.db.popActionJson(actionSysId);
+				if (action)
+					notifyAction.fromJson(action);
+			}
+			notifyAction.append(this._processExecutingWorkflowActivities(callOrMessageRecord));
+			// set call record
+			notifyAction.setCallRecord(callOrMessageRecord);
+
+			return notifyAction;
+		}
+	},
+
+	finishWaitingActivitiesJ: function (/*String*/ notifyNumber, /*GlideRecord*/ callOrMessageRecord, /*Object - Optional*/ jsonArgs, /*boolean - Optional*/ getNext,
+													/*String - Optional*/ actionSysId) {
+		return this._getNotifyActionJson(this.finishWaitingActivities(notifyNumber, callOrMessageRecord, jsonArgs, getNext, actionSysId));
+	},
+
+	broadcastEvent: function (/*String*/ callId, /*String*/ notifyStatus) {
+		var call = new GlideRecord("notify_call");
+
+		if (call.get("call_id", callId)) {
+			var eventName = this._notifyStatusToEventName(notifyStatus);
+			if (eventName)
+				this._broadcastEvent(call, eventName);
+		}
+	},
+
+	_notifyStatusToEventName: function (notifyStatus) {
+		if (notifyStatus &amp;&amp; this.db.VALID_CALL_STATUS.indexOf(notifyStatus) &gt; -1) {
+			
+			var eventName = this.NOTIFY_STATUS_TO_EVENT_NAME_MAP[notifyStatus];
+			if(eventName &amp;&amp; eventName === '-noevent-')
+				return;
+			if (eventName)
+				return eventName;
+			else
+				gs.error('The given notify status - ' + notifyStatus + ', cannot raise an event.');
+		} else
+			gs.error('Bad notify status "' + notifyStatus + '" provided.');
+	},
+
+	_broadcastEvent: function (/*GlideRecord*/ call, /*String*/ eventName) {
+		var context = this._getWorkflowContext(call);
+		while (context.next())
+			this.workflowScriptAPI.broadcastEvent(context.getUniqueValue(), eventName, null);
+	},
+
+	_getWorkflowContext: function (/*GlideRecord*/ callRecord) {
+		var workflowContext = new GlideRecord("wf_context");
+		workflowContext.addQuery("id", callRecord.getUniqueValue());
+		workflowContext.addQuery("table", "notify_call");
+		workflowContext.query();
+
+		if (workflowContext.hasNext() &amp;&amp; workflowContext.isValid())
+			return workflowContext;
+	},
+
+	processExecutingActivity: function (/*GlideRecord*/ callOrMessageRecord) {
+		return this._processExecutingWorkflowActivities(callOrMessageRecord);
+	},
+
+	processExecutingActivityJ: function (/*GlideRecord*/ callOrMessageRecord) {
+		return this._getNotifyActionJson(this.processExecutingActivity(callOrMessageRecord));
+	},
+
+	processAndWaitActivityJ: function(callOrMessageRecord) {
+		var action;
+		var callSysID = callOrMessageRecord.getUniqueValue();
+		var executingAct = this._getExecutingActivity(callSysID);
+		var numTries = 0;
+		while (!executingAct.hasNext() &amp;&amp; numTries &lt; this.NUM_TRIES) {
+			gs.sleep(this.ACTIVITY_WAIT_TIME);
+			executingAct = this._getExecutingActivity(callSysID);
+			numTries++;
+		}
+		action = this.processExecutingActivity(callOrMessageRecord);
+		return this._getNotifyActionJson(action);
+	},
+
+	_getExecutingActivity: function(callSysID) {
+		var gr = new GlideRecord("notify_wf_activity");
+		gr.addQuery("notify_call", callSysID);
+		gr.addQuery("state", "execute");
+		gr.orderByDesc("sys_created_on");
+		gr.query();
+		return gr;
+	},
+
+	_getNotifyActionJson: function (/*SNC.NotifyAction*/ action) {
+		if (action) {
+			var j = action.toJson();
+			gs.debug("NotifyAction JSON: " + j);
+			return JSON.parse(j);
+		}
+	},
+
+    type: 'NotifyWorkflow'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2018-08-13 20:50:16&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0e8a029787b71300b18a046787cb0bc4&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;48&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;NotifyWorkflow&lt;/sys_name&gt;
+        &lt;sys_package display_value="Notify" source="com.snc.notify"&gt;f0dfd45447320210cd4e1ce4316d4394&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0e8a029787b71300b18a046787cb0bc4&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-08-08 12:46:27&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:10:04</sys_created_on>
+        <sys_id>ad703c9583b01210c6695855eeaad370</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>NotifyWorkflow</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_ad703c9583b01210c6695855eeaad370</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:10:04</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,181 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules">
+    <x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection/>
+        <condition/>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>Process before create or update action</name>
+        <order>100</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[function publisherAndProdNameExist(coreCompany, prodName) {
+ var prod = new GlideRecord('samp_sw_product');
+ prod.addQuery('prod_name', prodName);
+ var condition = prod.addQuery('publisher.manufacturer', coreCompany);
+ prod.appendOrQuery(condition, 'publisher.name', '=', coreCompany.name);
+ prod.setLimit(1);
+ prod.query();
+
+ return prod.hasNext();
+}
+
+// Return publisher sys ID
+function createSwPublisherIfNotExist(coreCompany) {
+ var coreCompanyDomain = gs.nil(coreCompany.sys_domain) ? 'global' : coreCompany.sys_domain;
+ var swPublisher = new GlideRecord('samp_sw_publisher');
+ swPublisher.addQuery('manufacturer', coreCompany);
+ swPublisher.addQuery('sys_domain', coreCompanyDomain);
+ swPublisher.query();
+
+ // If publisher with same core company reference exists
+ if (swPublisher.next()) {
+  return swPublisher.getUniqueValue();
+ }
+
+ swPublisher.initialize();
+ swPublisher.addQuery('name', coreCompany.name);
+ swPublisher.addQuery('sys_domain', coreCompanyDomain);
+ swPublisher.query();
+
+ // If publisher with same core company name exits
+ if (swPublisher.next()) {
+  // If publisher does not have core company reference
+  if (gs.nil(swPublisher.manufacturer)) {
+   swPublisher.setValue('manufacturer', coreCompany);
+   return swPublisher.update();
+  }
+  var errMsg = 'There is already a software publisher with same company name: ' + swPublisher.manufacturer.name;
+  throw new Error(errMsg);
+ }
+
+ var customPublisher = new GlideRecord('samp_custom_sw_publisher');
+ customPublisher.setValue('name', coreCompany.name);
+ customPublisher.setValue('manufacturer', coreCompany);
+ customPublisher.setValue('sys_domain', coreCompanyDomain);
+ var custPubSysId = customPublisher.insert();
+
+ // If the session domain is different from core company domain, we need to force set the domain
+ if (!gs.nil(custPubSysId)) {
+  customPublisher.get(custPubSysId);
+  var custPubDomain = gs.nil(customPublisher.getValue('sys_domain')) ? 'global' : customPublisher.getValue('sys_domain');
+  if (custPubDomain !== coreCompanyDomain) {
+   customPublisher.setValue('sys_domain', coreCompanyDomain);
+   customPublisher.update();
+  }
+ }
+ return custPubSysId;
+}
+
+function createProductHash(currProd) {
+ var hashCalculator = new SAMHashAPI();
+ var prodHash = hashCalculator.generateProductHash(currProd.manufacturer.name, currProd.prod_name);
+
+ var prodMap = new GlideRecord('samp_custom_product_map');
+ prodMap.addQuery('product', current.getValue('sys_id'));
+ prodMap.addQuery('product_hash', prodHash);
+ prodMap.query();
+
+ if (!prodMap.next()) {
+  prodMap.initialize();
+  prodMap.setValue('product', currProd.getValue('sys_id'));
+  prodMap.setValue('product_hash', prodHash);
+  prodMap.insert();
+ }
+}
+
+function processInsert(currProd) {
+ if (publisherAndProdNameExist(currProd.manufacturer, currProd.prod_name)) {
+  gs.addErrorMessage(gs.getMessage('There is already a product with the same publisher and product name'));
+  currProd.setAbortAction(true);
+ } else if (gs.nil(currProd.manufacturer.name)) {
+  gs.addErrorMessage(gs.getMessage('The publisher name is missing'));
+  currProd.setAbortAction(true);
+ } else {
+  try {
+   // Create sw publisher if it doesn't exist in samp_custom_sw_publisher
+   currProd.publisher = createSwPublisherIfNotExist(currProd.manufacturer);
+
+   if (GlidePluginManager.isActive('com.snc.samp')) {
+    // Create product hash
+    createProductHash(currProd);
+   }
+  } catch (error) {
+   gs.addErrorMessage(gs.getMessage(error.message));
+   currProd.setAbortAction(true);
+  }
+ }
+}
+
+function processUpdate(currProd) {
+ var coreCompanyChanged = currProd.manufacturer.changes();
+ var prodNameChanged = currProd.prod_name.changes();
+
+ if (coreCompanyChanged || prodNameChanged) {
+  if (publisherAndProdNameExist(currProd.manufacturer, currProd.prod_name)) {
+   gs.addErrorMessage(gs.getMessage('There is already a product with the same publisher and product name'));
+   currProd.setAbortAction(true);
+  } else if (gs.nil(currProd.manufacturer.name)) {
+   gs.addErrorMessage(gs.getMessage('The publisher name is missing'));
+   currProd.setAbortAction(true);
+  } else {
+   // Create sw publisher if it doesn't exist in samp_custom_sw_publisher
+   currProd.publisher = createSwPublisherIfNotExist(currProd.manufacturer);
+
+   if (GlidePluginManager.isActive('com.snc.samp')) {
+    // Delete unused product map
+    var prodMap = new GlideRecord('samp_custom_product_map');
+    prodMap.addQuery('product', currProd.getValue('sys_id'));
+    prodMap.deleteMultiple();
+
+    createProductHash(currProd);
+   }
+  }
+ }
+}
+
+(function executeRule(current, previous /* null when async */) {
+ if (current.operation() === 'insert') {
+  processInsert(current);
+ } else if (current.operation() === 'update') {
+  processUpdate(current);
+ }
+}(current, previous));]]></script>
+        <sys_class_name>x_938076_now_utils_now_utils_business_rules</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:51:39</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>f73cacd583701210c6695855eeaad363</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Process before create or update action</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>x_938076_now_utils_now_utils_business_rules_f73cacd583701210c6695855eeaad363</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:51:39</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </x_938076_now_utils_now_utils_business_rules>
+    <sys_translated_text action="delete_multiple" query="documentkey=f73cacd583701210c6695855eeaad363"/>
+</record_update>

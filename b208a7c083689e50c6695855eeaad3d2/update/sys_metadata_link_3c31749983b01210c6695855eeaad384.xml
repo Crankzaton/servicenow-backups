@@ -1,0 +1,215 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>2d996213bf31010007fdbeba3f073953</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access/&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.ResourceManagerCalculator&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Calculate the resource events for a group, storing the results in the resource_events table.&lt;/description&gt;
+        &lt;name&gt;ResourceManagerCalculator&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[// Build the Resource Management report for a group and date range
+
+
+gs.include("PrototypeServer");
+var RESOURCE_REPORT_MONTHLY  = "resource_report_monthly";
+var monthNames = ['NUL', 'Jan', 'Feb', 'Mar', 'Apr', 
+	'May', 'Jun', 'Jul', 'Aug', 
+	'Sep', 'Oct', 'Nov', 'Dec'];
+
+
+var ResourceManagerCalculator = Class.create();
+ResourceManagerCalculator.prototype = {
+   
+   initialize: function() {
+	  this.loglevel = gs.getProperty("com.snc.resourcemanagement.loglevel");
+      this.includeTimeOff = false;   // never include user's time_off entries in their own on-call reminders and notifications
+      this.includeCoverage = true;
+      this.debug = true;
+	  this.util = new SNC.ResourceManagementUtility(); 
+      // this.resourceId;   // limit to this specific resource
+      // this.groupId; // limit to this specific group
+	  this.debugPrint("ResourceManagerCalculator being initialized");
+   },
+   
+   /**
+    * The ajaxSchedulePage provides the methods used to create the AJAXScheduleItem
+    * items that contain the rotation information we are computing.  Use getItems()
+    * to get the List of items that were created after run() was called
+    */
+   setPage: function(/* AJAXSchedulePage */ ajaxSchedulePage) {
+      this.page = ajaxSchedulePage;
+   },
+   
+   limitResourceId: function(resourceId) {
+      this.resourceId = resourceId;
+   },
+
+   limitGroupId: function(groupId) {
+      this.groupId = groupId;
+   },
+   
+   cleanReportRecords: function(tableName) {
+      var gr = new GlideRecord(tableName);
+      gr.initialize();
+      gr.addQuery('current_user_id', gs.userID());
+      gr.deleteMultiple();
+   },
+   
+   createSchedule: function(scheduleId) {
+      return new GlideSchedule(scheduleId + '');
+   },
+   
+
+	handleReportGeneration : function (groups, start_date, end_date) {
+		this.debugPrint("RMC::handleReportGeneration  start_date=" + start_date + " end_date=" + end_date);
+		this.cleanReportRecords('resource_report');
+		var glist = groups.split(',');
+		for (var i = 0; i &lt; glist.length; i++) {
+			this.util.saveGroupEventsDetail(glist[i], start_date, end_date, "resource_report", "");
+		}	
+	},
+	
+	saveEvents : function(groupId, start, end) {
+	    //groupId = "ea178abceba1010060bbafcef106fead";
+		this.debugPrint("RMC::saveEvents groupId=" + groupId + " start=" + start + " end=" + end);
+		var gr = new GlideRecord('sys_user_grmember');
+		gr.addQuery('group', groupId);
+		gr.query();
+		while (gr.next()) {
+			this.debugPrint("RMC::grmember=" + gr.user + " groupId=" + groupId + " start=" + start + " end=" + end);
+			this.util.explodeAllEvents(gr.user, start, end, "resource_report", "");
+		}
+	},
+   
+	saveMonthlyEvents : function (groups, start_date, end_date) {
+		this.debugPrint("RMC::saveMonthlyEvents  start_date=" + start_date + " end_date=" + end_date);
+		this.cleanReportRecords('resource_report_monthly');
+		this.cleanReportRecords('resource_report_daily');
+		this.changeMonthsLabels(start_date);
+		var glist = groups.split(',');
+		for (var i = 0; i &lt; glist.length; i++) {
+			this.util.saveGroupMonthlyEvents(glist[i], start_date, end_date, "resource_report", "");
+		}	
+		var resoureReportDaily = new GlideRecord("resource_report_daily");
+		resoureReportDaily.addQuery("parent", null);
+		resoureReportDaily.query();
+		var sysIds = new Array();
+		var i =0;
+		while(resoureReportDaily.next()){
+			sysIds[i] =  resoureReportDaily.getValue("sys_id");
+			i++;
+		}
+		resoureReportDaily = new GlideAggregate("resource_report_daily");
+		resoureReportDaily.addQuery("parent","IN", sysIds.join(","));
+		resoureReportDaily.addQuery("type","!=", "Percent Allocation");
+		resoureReportDaily.groupBy("parent");
+		resoureReportDaily.addAggregate("SUM", "total");
+		resoureReportDaily.query();
+		var resourceReportUpdate = new GlideRecord("resource_report_daily");
+		while(resoureReportDaily.next()){
+			resourceReportUpdate.get(resoureReportDaily.getValue("parent"));
+			resourceReportUpdate.setValue("total", resoureReportDaily.getAggregate("SUM", "total"));
+			resourceReportUpdate.update();
+		}
+		
+		resoureReportDaily = new GlideAggregate("resource_report_daily");
+		resoureReportDaily.addQuery("parent","IN", sysIds.join(","));
+		resoureReportDaily.addQuery("type","=", "Percent Allocation");
+		resoureReportDaily.groupBy("parent");
+		resoureReportDaily.addAggregate("AVG", "total");
+		resoureReportDaily.query();
+		var resourceReportUpdate = new GlideRecord("resource_report_daily");
+		while(resoureReportDaily.next()){
+			resourceReportUpdate.get(resoureReportDaily.getValue("parent"));
+			resourceReportUpdate.setValue("total", resoureReportDaily.getAggregate("AVG", "total"));
+			resourceReportUpdate.update();
+		}
+		
+	},
+	
+	changeMonthsLabels : function(start_date) {
+		var startMonth = this.getMonth(start_date);
+		var currentIdx = startMonth;
+		for (var i=1; i &lt;= 12; i++) {
+			var grResourceReportAggregateDictionary = new GlideRecord("sys_dictionary");
+			grResourceReportAggregateDictionary.addQuery("name", RESOURCE_REPORT_MONTHLY);
+			grResourceReportAggregateDictionary.addQuery("element", "hours_month" + i);
+		
+			grResourceReportAggregateDictionary.query();
+			if (grResourceReportAggregateDictionary.next()) {
+				grResourceReportAggregateDictionary.column_label=monthNames[currentIdx];
+				grResourceReportAggregateDictionary.update();
+				//this.debugPrint("changeMonthsLabels hours_month" + i + " changed to " + grResourceReportAggregateDictionary.column_label + " for startMonth=" + startMonth);
+				currentIdx++;
+				if (currentIdx == 13) {
+					currentIdx = 1;
+				} 
+			}
+		}
+	},
+	
+	getMonth : function(start_date) {
+		return this.util.getMonth(start_date);
+	},
+	
+	getDuration : function (start_date, end_date) {
+		var startGDT = new GlideDateTime();
+		startGDT.setDisplayValue(start_date);
+		var endGDT = new GlideDateTime();
+		endGDT.setDisplayValue(end_date);
+		var durationMilliseconds = endGDT.getNumericValue() - startGDT.getNumericValue();
+		var millisecondsPerYear = 365.242 * 24 * 3600000;
+		var years = durationMilliseconds/millisecondsPerYear;
+		return years;
+	},
+	
+	infoPrint : function(msg) {
+
+		if (this.loglevel &gt;= 1)
+    	    gs.log(msg, this.type);
+    },
+    
+	debugPrint : function(msg) {
+		if (this.loglevel &gt;= 2)
+	        gs.log(msg, this.type);
+    },
+	
+   type: function() {
+      return 'ResourceManagerCalculator';
+   }
+}
+]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2013-06-11 23:17:28&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;2d996213bf31010007fdbeba3f073953&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;87&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ResourceManagerCalculator&lt;/sys_name&gt;
+        &lt;sys_package display_value="Resource Management" source="com.snc.resource_management"&gt;7200da2b47e64210cd4e1ce4316d438e&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_2d996213bf31010007fdbeba3f073953&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2014-02-23 02:13:06&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:13:17</sys_created_on>
+        <sys_id>3c31749983b01210c6695855eeaad384</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ResourceManagerCalculator</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_3c31749983b01210c6695855eeaad384</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:13:17</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

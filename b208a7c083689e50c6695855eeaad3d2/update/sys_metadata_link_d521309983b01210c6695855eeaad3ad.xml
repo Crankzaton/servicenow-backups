@@ -1,0 +1,169 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>2ba766d7678020109743b1bb27415a86</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.MatchingDimensionPrioritizePreferredTechnicians&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;MatchingDimensionPrioritizePreferredTechnicians&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var MatchingDimensionPrioritizePreferredTechnicians = Class.create();
+MatchingDimensionPrioritizePreferredTechnicians.prototype = {
+    initialize: function() {
+    },
+
+	_getTechnician: function (users, wotGR, agentType) {
+		var woGR = wotGR.parent;
+		var result = {};
+		result.checkResult = false;
+		result.agents = [];
+
+		if (JSUtil.nil(woGR)  || JSUtil.nil(woGR.account)) {
+			return result;	
+		}
+		
+		var qualifiedAgentsGR = new GlideRecord('wm_agent_assignment_preferences');
+		qualifiedAgentsGR.addQuery('account', woGR.account);
+		qualifiedAgentsGR.addQuery('assignment_preference', agentType);
+		qualifiedAgentsGR.addQuery('agent', 'IN', users.join());
+		qualifiedAgentsGR.addNotNullQuery('agent');
+		qualifiedAgentsGR.query();
+		while (qualifiedAgentsGR.next()) {
+			result.agents.push(String(qualifiedAgentsGR.agent));
+		} 
+		
+		var checkAvail = this._checkAgentAvail(wotGR, result.agents);
+
+		if (checkAvail) {
+			result.checkResult = true;
+		} 
+		
+		return result;
+	},
+	
+	_checkAgentAvail: function (wotGR, agents) {
+		try {
+			var checkAvail = false;
+			var suggestedResourceData = null;
+			var smConfigAPI = new sn_sm.SMConfiguration();
+			var taskSysId = wotGR.sys_id;
+				
+			var dynamicSchedulingConfigObj = {};
+			dynamicSchedulingConfigObj.unAssign = false;
+			dynamicSchedulingConfigObj.bulkTaskUpdates = {};
+			dynamicSchedulingConfigObj.exclusionTimeSpans = {};
+
+			var configGR = new GlideRecord("dynamic_scheduling_config");
+			configGR.addQuery("task_table", "wm_task");
+			configGR.setLimit(1);
+			configGR.query();
+			if (configGR.next()){	
+				var useLocation = smConfigAPI.isEnabled(configGR.getValue("task_table"), "use_location", true);
+				var propertyPrefix = smConfigAPI.getPropertyPrefix(new GlideRecord(configGR.getValue("task_table")));
+				var processor = new DynamicSchedulingProcessor();
+				var dynamic_scheduling_config_id = configGR.getValue('sys_id');
+				var mapProvider = processor._getStringProperty(propertyPrefix,"travel.calculation.dynamic_scheduling", SMConstants.USE_STRAIGHT_LINE_ESTIMATE) ;
+
+				dynamicSchedulingConfigObj.exclusionTimeSpans.tasks = processor.getConfigExclusionTimeSpans(taskSysId, configGR);
+				dynamicSchedulingConfigObj.task_filter_query =  "dynamic_scheduling_config="+dynamic_scheduling_config_id;
+				var taskSpacing = processor._getIntProperty(propertyPrefix, "work.spacing", 0, 0, -1) * 60;
+				var useGeoLoc = processor._getBooleanProperty(propertyPrefix, "autodispatch.geolocation", false) &amp;&amp; processor.geoLocationActive &amp;&amp; useLocation;
+				var taskSysIdArray = [];
+				taskSysIdArray.push(taskSysId);
+					
+				var tasksWindowTimes = {};
+				tasksWindowTimes = new DynamicSchedulingAgentRecommendationUtil().getWindowTimesForTasks(configGR.getValue("task_table"), taskSysIdArray);
+				
+				//Input paramters for DynamicSchedulingOptimization(In order): agents, rangeStart, rangeEnd, tasks, task_table, propertyPrefix, taskSpacing, mapProvider, default_work_schedule, useGeoLoc, appointmentBooking, taskRecord, skipInitialCalculation, resourceParams
+				var optimization = new DynamicSchedulingOptimization(agents, tasksWindowTimes.windowStart, tasksWindowTimes.windowEnd, taskSysIdArray, configGR.getValue("task_table"), propertyPrefix, taskSpacing, mapProvider, configGR.getValue("default_work_schedule"), useGeoLoc, false, null, true);
+
+				//TODO: check the args from matching rule for the config properties
+				var recommendationHelper = new DynamicSchedulingAgentRecommendationNew(wotGR, dynamicSchedulingConfigObj, optimization);
+				checkAvail = recommendationHelper.checkAgentAvailability(wotGR, agents);
+			}					
+			return checkAvail;
+		}catch (err) {
+			gs.info('MatchingDimensionPrioritizePreferredTechnicians: ' + err);
+		}
+	},
+	
+	_generateReturnedAgents: function (users, selectedAgents){
+		var returnedUsers = {};
+		for( var i = 0; i &lt; users.length; i++){ 
+			if (selectedAgents.indexOf(users[i]) &gt;= 0) {
+				var detailObj = {};
+				detailObj.rating = FSMConstants.DEFAULT_TECHNICIAN_RATE;
+				detailObj.value = FSMConstants.DEFAULT_TECHNICIAN_RATE;
+				var displayMessage = FSMConstants.DEDICATED_TECHNICIAN_MSG;
+				detailObj.displayValue = displayMessage;
+				detailObj.detailedDisplayValue = displayMessage;
+				returnedUsers[users[i]] = detailObj;
+			}
+		}
+
+		return returnedUsers;
+	},
+	
+    processTechnician: function(task, users, taskFieldValues, args) {
+		var preferredUsersResult = this._getTechnician(users, task, FSMConstants.PREFERRED_TECHNICIAN_OPTION);
+		//check to see if dedicated agents are available
+		if (preferredUsersResult.checkResult &amp;&amp; preferredUsersResult.agents.length &gt; 0) {
+			return this._generateReturnedAgents(users, preferredUsersResult.agents);
+		}
+		
+		var secondaryUsersResult = this._getTechnician(users,task, FSMConstants.SECONDARY_TECHNICIAN_OPTION);
+		if (secondaryUsersResult.checkResult &amp;&amp; secondaryUsersResult.agents.length &gt; 0) {
+			return this._generateReturnedAgents(users, secondaryUsersResult.agents);
+		}
+		
+		// Neither dedicated nor prefered agents available
+		if (preferredUsersResult.agents.length &gt; 0 || secondaryUsersResult.agents.length &gt; 0) {
+			var remainingUsers = [];
+			for(var i = 0; i &lt; users.length; i++){ 
+				if (preferredUsersResult.agents.indexOf(users[i]) &lt; 0 &amp;&amp; secondaryUsersResult.agents.indexOf(users[i]) &lt; 0) {
+					remainingUsers.push(users[i]);
+				}
+			}
+			return this._generateReturnedAgents(users, remainingUsers);
+		} else {
+			return this._generateReturnedAgents(users, users);
+		}
+    },
+	
+	
+    type: 'MatchingDimensionPrioritizePreferredTechnicians'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-10-29 17:54:15&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;2ba766d7678020109743b1bb27415a86&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;10&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;MatchingDimensionPrioritizePreferredTechnicians&lt;/sys_name&gt;
+        &lt;sys_package display_value="Customer Service with Field Service Management" source="com.snc.csm_fsm_integration"&gt;00cb5ebf4722c210cd4e1ce4316d43f3&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_2ba766d7678020109743b1bb27415a86&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-18 16:37:48&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:13:03</sys_created_on>
+        <sys_id>d521309983b01210c6695855eeaad3ad</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>MatchingDimensionPrioritizePreferredTechnicians</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_d521309983b01210c6695855eeaad3ad</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:13:03</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

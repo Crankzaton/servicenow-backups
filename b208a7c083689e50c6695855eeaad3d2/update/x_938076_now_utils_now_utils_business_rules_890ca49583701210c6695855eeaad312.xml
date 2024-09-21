@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules">
+    <x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>true</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection/>
+        <condition/>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>Reset Used flag on Auth Policy Criteria</name>
+        <order>200</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function executeRule(current, previous /*null when async*/ ) {
+
+    var operation = current.operation();
+    var currentFields = fetchFields(current.condition);
+    var arrayUtil = new global.ArrayUtil();
+
+
+    if (operation == 'insert')
+        doInsert();
+    else if (operation == 'update')
+        doUpdate();
+    else if (operation == 'delete')
+        doDelete();
+
+    //Verify if policy condition is using Identity Provider filter, if yes then validate if multisso is enabled & the selected IDP is active.
+    if (arrayUtil.contains(currentFields, 'global_04b1f9d2c7312010df1417b703c26032')) {
+
+        var res = GlideProperties.getBoolean('glide.authenticate.multisso.enabled');
+        if (!res)
+            gs.addErrorMessage(gs.getMessage("MultiSSO is not enabled on the instance. kindly update the property 'glide.authenticate.multisso.enabled' to true, for it to get executed as expected."));
+
+        var finalTerms = [];
+        var glideQS = new GlideQueryString(current.condition);
+        glideQS.deserialize();
+        var queryTerms = glideQS.getTerms();
+        for (var i = 0; i < queryTerms.size(); i++) {
+            var field = queryTerms.get(i).getField();
+            if (field != 'null' && field == 'global_04b1f9d2c7312010df1417b703c26032') {
+                var value = queryTerms.get(i).getValue();
+                gr = new GlideRecord('sso_properties');
+                gr.get(value);
+                if (!gr.active)
+                    gs.addErrorMessage(gs.getMessage("Identity provider - '{0}' used in the policy condition is Inactive, kindly activate it to be evaluated during execution.", gr.name));
+            }
+        }
+    }
+
+    /*
+       Find the fields which are used in condition that is being added. Simply mark those criteria used
+    */
+    function doInsert() {
+        resetUsedFlag(currentFields, true);
+    }
+
+    /*
+       Find the fields which are using in condition being updated.
+       Find the fields which are unused in this condition but are used in old condition. Mark them unused if they are not used in any other condition
+       Find the fields which are newly used in this condition. Mark them used.
+    */
+    function doUpdate() {
+        var previousFields = fetchFields(previous.condition);
+
+        //fields that are used in previous condition, but not in current condition. 
+        //in other words unused ones in the current condition, but used in old condition
+        var unusableFields = arrayUtil.diff(previousFields, currentFields);
+        unsetUsedFlag(unusableFields);
+
+        resetUsedFlag(currentFields, true);
+    }
+
+    /*
+       Find the fields which are used in condition being deleted. If these fields are not already used in any other condition, mark them unused
+    */
+    function doDelete() {
+        unsetUsedFlag(currentFields);
+    }
+
+    function unsetUsedFlag(fields) {
+        var usedFields = fetchFieldsUsedByOthers(true);
+        var unusedFields = [];
+        for (var i = 0; i < fields.length; i++) {
+            //if current field is not already used field, in other words this field is not used in any other condition, 
+            //then add it to unused fileds list to mark them unused
+            if (!arrayUtil.contains(usedFields, fields[i]))
+                unusedFields.push(fields[i]);
+        }
+        resetUsedFlag(unusedFields, false);
+    }
+
+    function fetchFieldsUsedByOthers() {
+        var fields = [];
+        var gr = new GlideRecord('sys_auth_policy_condition');
+        gr.addQuery('decision_table', current.decision_table);
+        gr.addQuery('input_table', current.input_table);
+        //do not include current sys_id
+        gr.addQuery('sys_id', '!=', current.sys_id);
+        gr.queryNoDomain();
+        while (gr.next()) {
+            fields = arrayUtil.concat(fields, fetchFields(gr.condition));
+        }
+        return arrayUtil.unique(fields);
+    }
+
+    function fetchFields(condition) {
+        var finalTerms = [];
+
+        if (!condition)
+            return finalTerms;
+
+        var glideQS = new GlideQueryString(current.input_table, condition);
+        glideQS.deserialize();
+        var queryTerms = glideQS.getTerms();
+        for (var i = 0; i < queryTerms.size(); i++) {
+            var field = queryTerms.get(i).getField();
+            //sometimes field value is null
+            if (field != 'null' && field) {
+                //fields can be of simple format like 'first_name', 'email' or of dotwalked type like 'user.company.location'
+                //if they are not dot walked fields, use them directly, otherwise get the parent field which is being dotwalked
+                var dotIndex = field.indexOf('.');
+                if (dotIndex < 0)
+                    finalTerms.push(String(field));
+                else
+                    finalTerms.push(field.substring(0, dotIndex));
+            }
+        }
+        return finalTerms;
+    }
+
+    function resetUsedFlag(element_names, flag) {
+        if (!element_names || element_names.length <= 0)
+            return;
+        var gr = new GlideRecord('sys_authentication_policy_criteria_m2m');
+        gr.addQuery('sys_auth_filter_criteria.element_name', 'IN', element_names.join(','));
+        //if flag is already what we want, we don't need to update them
+        gr.addQuery('used', '!=', flag);
+        gr.addQuery('policy', getPolicySysID());
+        gr.setValue('used', flag);
+        gr.updateMultiple();
+    }
+
+    function getPolicySysID() {
+        var gr = new GlideRecord('sys_authentication_policy');
+        gr.query('decision_table', current.decision_table);
+        if (gr.next())
+            return gr.getUniqueValue();
+    }
+
+})(current, previous);]]></script>
+        <sys_class_name>x_938076_now_utils_now_utils_business_rules</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:50:39</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>890ca49583701210c6695855eeaad312</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Reset Used flag on Auth Policy Criteria</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>x_938076_now_utils_now_utils_business_rules_890ca49583701210c6695855eeaad312</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:50:39</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </x_938076_now_utils_now_utils_business_rules>
+    <sys_translated_text action="delete_multiple" query="documentkey=890ca49583701210c6695855eeaad312"/>
+</record_update>

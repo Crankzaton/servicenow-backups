@@ -1,0 +1,517 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>26bca9150a4794a83841c453271114c5</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.TaskRateProcessor&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Called by 'Process Task Rate Cards' and 'Create expense from approved time card' business rules.
+			
+ Uses task rate cards to calculate a value of the task and generates expense line(s).
+		&lt;/description&gt;
+        &lt;name&gt;TaskRateProcessor&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var TaskRateProcessor = Class.create();
+TaskRateProcessor.prototype = {
+
+    /*
+     * Constants
+     */
+    TASK_RATE_CARD: "fm_task_rate_card",
+    LABOR_RATE_CARD: "fm_labor_rate_card",
+    TASK_TIME_WORKED: "task_time_worked",
+    TASK_EXPENSE_LINE: "fm_expense_line",
+
+    /*
+     * Start
+     */
+    initialize: function() {
+        this.LOGGER = new FMLogger(this.TYPE);
+        this.FMUtils = new FMUtils();
+    },
+
+
+    processTask: function( /*GlideRecord*/ task) {
+        var ratecard = new GlideRecord(this.TASK_RATE_CARD);
+        ratecard.addQuery('table', task.getTableName());
+        ratecard.addActiveQuery();
+        ratecard.orderBy('order');
+        ratecard.query();
+        while (ratecard.next()) {
+            var filter = GlideFilter;
+            var currentMatch = filter.checkRecord(task, ratecard.condition);
+
+            if (currentMatch) {
+
+                // use task time worked
+                if (ratecard.use_time_worked == true) {
+                    this._debug("processTask using task time worked for " + task.getDisplayValue() + " with rate card " + ratecard.getDisplayValue());
+                    this._processTimeWorked(task, ratecard);
+                    return;
+                }
+
+                this._debug("processTask using per task rate for " + task.getDisplayValue() + " with rate card " + ratecard.getDisplayValue());
+                // use fixed task rate in system currency
+                var taskRate = ratecard.task_rate.getCurrencyCode() + ';' + ratecard.task_rate.getCurrencyValue();
+
+                // create expense line
+                var exp = new ExpenseLine(task, taskRate, ratecard.name);
+                exp.setCostSource(ratecard);
+                exp.setCategory("labor");
+
+                var taskDate = new GlideDate();
+                taskDate.setValue(task.sys_updated_on);
+                exp.setDate(taskDate);
+
+                if (ratecard.summary_type)
+                    exp.setSummaryType(ratecard.summary_type);
+                exp.createExpense();
+
+                return;
+            }
+        }
+    },
+
+    processTaskTimecard: function( /*GlideRecord*/ timecard) {
+        this._debug("processTaskTimecard - processing " + timecard.user.getDisplayValue() + " - " + timecard.week_starts_on.toString());
+        if (!timecard.isValidRecord())
+            return;
+
+        var task = timecard.task.getRefRecord();
+
+        var totalHours = parseFloat(timecard.total);
+        var user = timecard.user.getRefRecord();
+        var week = timecard.week_starts_on;
+
+        //check labor rate cards for this user
+        var userRate;
+        var rateCard;
+        if (!gs.nil(timecard.rate_type))
+            rateCard = this.getRateCardWithRateType(user, timecard.rate_type);
+        else
+            rateCard = this.getRateCard(user);
+
+        userRate = this._getLaborRateFromRateCard(rateCard);
+
+        if (!userRate) {
+            userRate = gs.getProperty("com.snc.time_card.default_rate", 0); //get default rate from property
+            this._debug("Using default user rate from property: " + userRate.toString());
+        }
+        if (userRate == 0 || totalHours == 0) {
+            this._debug("processTaskTimecard - user rate (" + userRate.toString() + ") or hours (" + totalHours.toString() + ") are zero, not creating expense for nothing");
+            return;
+        }
+
+        if (isNaN(userRate) || isNaN(totalHours)) {
+            this._debug("processTaskTimecard - user rate or hours are NaN, not creating expense for nothing");
+            return;
+        }
+        if (!rateCard) {
+            rateCard = new GlideRecord(this.LABOR_RATE_CARD);
+            rateCard.initialize();
+        }
+        var amount = rateCard.hourly_rate.getReferenceCurrencyCode() + ";" + (totalHours * userRate);
+        var description = task.getDisplayValue() + " Time Card (" + user.getDisplayValue() + " " + week + ")";
+
+        this._debug("processTaskTimecard creating expense for task: " + task.getDisplayValue());
+        var exp = new ExpenseLine(task, amount, description);
+        var taskDate = new GlideDate();
+        taskDate.setValue(timecard.sys_updated_on);
+        exp.setDate(taskDate);
+        exp.setCategory("labor");
+        exp.setCostSource(rateCard);
+        exp.setTimeCard(timecard.sys_id);
+        if (new GlidePluginManager().isActive('com.snc.financial_planning_pmo') &amp;&amp; !timecard.resource_plan.nil()) {
+            var costPlan = new GlideRecord('cost_plan');
+            costPlan.addQuery('resource_plan', timecard.getValue('resource_plan'));
+            costPlan.query();
+            if (costPlan.next())
+                exp.setCostPlan(costPlan.getUniqueValue());
+        }
+
+        if (JSUtil.notNil(rateCard) &amp;&amp; rateCard.isValidRecord() &amp;&amp; JSUtil.notNil(rateCard.rate_type))
+            exp.setRateType(rateCard.rate_type);
+
+        exp.createExpense();
+
+        return exp;
+    },
+
+    processTaskTimeCardWithDailyRate: function( /*GlideRecord*/ timecard, /*DailyRateInstance*/ dailyRates) {
+        this._debug("processTaskTimecard - processing " + timecard.user.getDisplayValue() + " - " + timecard.week_starts_on.toString());
+        if (!timecard.isValidRecord())
+            return;
+
+
+        var task = timecard.task.getRefRecord();
+
+        if (new GlidePluginManager().isActive("com.snc.financial_planning_pmo") &amp;&amp; new GlidePluginManager().isActive("sn_audit") &amp;&amp; (PPMAuditTaskHelper.isRelatedToAudit(task) || PPMAuditTaskHelper.isRelatedToAuditEngagementProject(task))) {
+            var taskHelper = new PPMAuditTaskHelper();
+            task = taskHelper.getParentProject(task);
+        }
+
+        var totalHours = parseFloat(timecard.total);
+
+        if (totalHours == 0) {
+            this._debug("processTaskTimecard - hours (" + totalHours.toString() + ") is zero, not creating expense for nothing");
+            return;
+        }
+
+        if (isNaN(totalHours)) {
+            this._debug("processTaskTimecard - hours are NaN, not creating expense for nothing");
+            return;
+        }
+        this._debug("processTaskTimecard creating expense for task: " + task.getDisplayValue());
+
+        //Set date for comparison in UTC as expense roll ups to Cost Plan and Task happen in UTC
+        var startDate = new GlideDate();
+        startDate.setValue(timecard.week_starts_on);
+
+        var endDate = new GlideDate();
+        endDate.setValue(timecard.week_starts_on);
+        endDate.addDaysUTC(6);
+
+        var fp = this._getFiscalPeriods(startDate, endDate);
+
+        if (!fp || (fp &amp;&amp; !fp.hasNext())) {
+            this._createExpenseLine(task, timecard, startDate, endDate, dailyRates);
+        } else {
+            /* Fiscal Periods are sorted in ascending order */
+            fp.next();
+            var fpChanged = true;
+            var expEndDate, expStartDate, fpStartDate, fpEndDate;
+            var currentDate = startDate;
+            fpStartDate = fp.start_date_time.getGlideObject().getGlideDateTime().getDate();
+            fpEndDate = fp.end_date_time.getGlideObject().getGlideDateTime().getDate();
+
+
+            while (currentDate.onOrBefore(endDate)) {
+
+                /*Time card date doesnt fall in between fiscal periods*/
+                if (currentDate.after(fpEndDate)) {
+                    fpChanged = true;
+                    fp.next();
+                }
+                if (fpChanged) {
+
+                    fpStartDate = fp.start_date_time.getGlideObject().getGlideDateTime().getDate();
+                    fpEndDate = fp.end_date_time.getGlideObject().getGlideDateTime().getDate();
+
+                    if (fpStartDate.onOrBefore(startDate)) {
+                        expStartDate = startDate;
+                    } else {
+                        expStartDate = fpStartDate;
+                    }
+                    if (fpEndDate.onOrBefore(endDate)) {
+                        expEndDate = fpEndDate;
+                    } else {
+                        expEndDate = endDate;
+                    }
+
+                    fpChanged = false;
+
+                    this._createExpenseLine(task, timecard, expStartDate, expEndDate, dailyRates);
+
+                }
+
+                currentDate.addDaysUTC(1);
+            }
+
+        }
+
+    },
+
+    recallTaskTimeCard: function( /*GlideRecord*/ timeCard) {
+        this._debug("processedTaskTimecard - recalling " + timeCard.user.getDisplayValue() + " - " + timeCard.week_starts_on.toString());
+        if (!timeCard.isValid())
+            return;
+
+        var task = timeCard.task.getRefRecord();
+        var exp_count = this._recallExpenseLine(task, timeCard);
+        return exp_count;
+    },
+
+    _recallExpenseLine: function(task, timeCard) {
+        var expGr = new GlideRecord(this.TASK_EXPENSE_LINE);
+        var isRelatedToAudit = false;
+        expGr.addQuery('time_card', timeCard.getUniqueValue());
+        if (task.isValidRecord()) {
+            if (new GlidePluginManager().isActive("com.snc.financial_planning_pmo") &amp;&amp; new GlidePluginManager().isActive("sn_audit") &amp;&amp; (PPMAuditTaskHelper.isRelatedToAudit(task) || PPMAuditTaskHelper.isRelatedToAuditEngagementProject(task))) {
+                var taskHelper = new PPMAuditTaskHelper();
+                var parentProjectId = taskHelper.getProjectId(task);
+                if (JSUtil.notNil(parentProjectId)) {
+                    expGr.addQuery('task', parentProjectId);
+                    isRelatedToAudit = true;
+                }
+            } else {
+                expGr.addQuery('task', task.getUniqueValue());
+            }
+        } else {
+            expGr.addQuery('source_id', timeCard.getValue('sys_id'));
+            expGr.addQuery('source_table', 'time_card');
+        }
+
+        var recalledCondition = expGr.addNullQuery('recalled');
+        recalledCondition.addOrCondition('recalled', false);
+        expGr.query();
+        var expense_count = 0;
+
+        while (expGr.next()) {
+            var description = expGr.getDisplayValue() + ' Recalled for Time Card: ' + timeCard.getDisplayValue() + ' Recall';
+            var negativeAmount = expGr.amount.getCurrencyValue() * -1;
+            // here the task needs to be checked if null, then pass time card 
+            var exp;
+            if (task.isValidRecord()) {
+                if (isRelatedToAudit) {
+                    var auditRelatedTask = new GlideRecord("pm_project");
+                    auditRelatedTask.get(parentProjectId);
+                    exp = new ExpenseLine(auditRelatedTask, negativeAmount, description);
+                } else {
+                    exp = new ExpenseLine(task, negativeAmount, description);
+                }
+            } else {
+                exp = new ExpenseLine(timeCard, negativeAmount, description);
+            }
+
+            exp.setTimeCard(timeCard.getUniqueValue());
+            exp.setDate(expGr.getValue('date'));
+            if (new GlidePluginManager().isActive('com.snc.financial_planning_pmo') &amp;&amp; !timeCard.resource_plan.nil()) {
+                var costPlan = new GlideRecord('cost_plan');
+                costPlan.addQuery('resource_plan', timeCard.getValue('resource_plan'));
+                costPlan.query();
+                if (costPlan.next())
+                    exp.setCostPlan(costPlan.getUniqueValue());
+            }
+            var recalledExpGr = exp.createExpense();
+            recalledExpGr.setValue('rate_card', expGr.getValue('rate_card'));
+            recalledExpGr.setValue('rate_type', expGr.getValue('rate_type'));
+            recalledExpGr.setValue('expense_type', expGr.getValue('expense_type'));
+            recalledExpGr.setValue('resource_type', expGr.getValue('resource_type'));
+            recalledExpGr.setValue('recalled', true);
+            recalledExpGr.setValue('amount', expGr.amount.getReferenceCurrencyCode() + ";" + negativeAmount);
+            recalledExpGr.update();
+            expGr.setValue('recalled', true);
+            expGr.update();
+            var expDailies = new ExpenseLineBreakdown(task, timeCard, expGr.getUniqueValue());
+            var res = expDailies.recallExpenseDetailForTimeCard(recalledExpGr.getUniqueValue());
+            expense_count += 1;
+        }
+        return expense_count;
+    },
+
+    _createExpenseLine: function(task, timecard, startDate, endDate, dailyRates) {
+        var description = task.getDisplayValue() + " Time Card (" + timecard.user.getDisplayValue() + " " + timecard.week_starts_on + ")";
+        var exp;
+        if (task.isValidRecord())
+            exp = new ExpenseLine(task, 0, description);
+        else
+            exp = new ExpenseLine(timecard, 0, description);
+
+        exp.setDate(startDate.getDate());
+        exp.setCategory("labor");
+        exp.setTimeCard(timecard.sys_id);
+        if (new GlidePluginManager().isActive('com.snc.financial_planning_pmo') &amp;&amp; !timecard.resource_plan.nil()) {
+            var costPlan = new GlideRecord('cost_plan');
+            costPlan.addQuery('resource_plan', timecard.getValue('resource_plan'));
+            costPlan.query();
+            if (costPlan.next())
+                exp.setCostPlan(costPlan.getUniqueValue());
+        }
+        var expGr = exp.createExpense();
+
+        var expDailies = new ExpenseLineBreakdown(task, timecard, expGr.getUniqueValue());
+        var res = expDailies.createExpenseDetailsForTimeCard(startDate, endDate, dailyRates);
+        expGr.setValue('amount', expGr.amount.getReferenceCurrencyCode() + ";" + res.expense);
+        if (res.rateCard)
+            expGr.setValue('rate_card', res.rateCard);
+        if (res.rateType)
+            expGr.setValue('rate_type', res.rateType);
+        expGr.update();
+        return exp;
+    },
+
+    _getFiscalPeriods: function(startDate, endDate) {
+        var fp = new GlideRecord('fiscal_period');
+        if (!fp.isValid())
+            return null;
+        else {
+            return PPMFiscalPeriod.getLeafFiscalPeriodsForGlideDates(startDate, endDate);
+        }
+
+    },
+    _processTimeWorked: function( /* GlideRecord */ task, /*GlideRecord*/ rateCard) {
+        // get time worked records by user for this task
+        var ttw = new GlideAggregate(this.TASK_TIME_WORKED);
+        ttw.addQuery("task", task.getUniqueValue());
+        ttw.addAggregate("SUM", "time_in_seconds");
+        ttw.groupBy("user");
+        ttw.query();
+        this._debug("_processTimeWorked aggregate query " + ttw.getEncodedQuery() + " returned " + ttw.getRowCount());
+        while (ttw.next()) {
+            this._debug(" _processTimeWorked " + ttw.user.getDisplayValue() + " worked " + ttw.getAggregate("SUM", "time_in_seconds"));
+            var timeWorkedSecs = parseInt(ttw.getAggregate("SUM", "time_in_seconds"));
+            if (isNaN(timeWorkedSecs))
+                continue;
+
+            var user = new GlideRecord("sys_user");
+            user.get(ttw.user);
+
+            // get user rate, if missing use rate card default
+            this._debug(" _processTimeWorked getting user labor rate for " + user.getDisplayValue());
+            var laborRate = this.getLaborRate(user);
+            this._debug(" _processTimeWorked got labor rate for " + user.getDisplayValue() + " = " + laborRate);
+            if (!laborRate) {
+                laborRate = rateCard.default_labor_rate.getReferenceValue();
+                this._debug(" _processTimeWorked found no labor rate for " + user.getDisplayValue() + " using default from task rate card " + laborRate);
+            }
+
+            var amount = timeWorkedSecs / 3600 * laborRate;
+            this._debug(" _processTimeWorked calculated amount for user = " + amount);
+
+            //create expense line
+            var exp = new ExpenseLine(task, amount, rateCard.name);
+            exp.setCostSource(rateCard);
+
+            var taskDate = new GlideDate();
+            taskDate.setValue(task.sys_updated_on);
+            exp.setDate(taskDate);
+            exp.setCategory("labor");
+            if (rateCard.summary_type)
+                exp.setSummaryType(rateCard.summary_type);
+            exp.createExpense();
+
+        }
+    },
+
+
+    /*
+     * get rate from labor rate cards based on matching a user to rate card
+     * condition
+     */
+    getLaborRate: function( /* GlideRecord */ user) {
+        return this.getLaborRateWithRateType(user, '');
+    },
+
+    getLaborRateWithRateType: function(user, rateType) {
+        var rateCard = this.getRateCardWithRateType(user, rateType);
+        return this._getLaborRateFromRateCard(rateCard);
+    },
+
+    getPlannedLaborRate: function( /* GlideRecord */ user, startDate) {
+        return this.getPlannedLaborRateWithRateType(user, '', startDate);
+    },
+
+    getPlannedLaborRateWithRateType: function(user, rateType, startDate) {
+        var rateCard = this.getRateCardWithRateType(user, rateType);
+        return this._getPlannedLaborRateFromRateCard(rateCard, startDate);
+    },
+
+    _getLaborRateFromRateCard: function(rateCard) {
+        if (!rateCard)
+            return null;
+        else {
+            this._debug("getRate rule " + rateCard.name + " for " +
+                user.getDisplayValue());
+
+            var hourlyRate = rateCard.hourly_rate.getReferenceValue();
+            this._debug("getRate return rate for " + user.getDisplayValue() +
+                " = " +
+                hourlyRate);
+            return hourlyRate;
+        }
+    },
+
+    _getPlannedLaborRateFromRateCard: function(rateCard, startDate) {
+        if (!rateCard)
+            return null;
+        else {
+            this._debug("_getPlannedLaborRateFromRateCard: getRate rule " + rateCard.name + " for " +
+                user.getDisplayValue());
+            var currencyService = new SNC.FMCurrency();
+            var globalCurrencyCode = currencyService.getGlobalCurrencyCode();
+            if (globalCurrencyCode != rateCard.hourly_rate.getCurrencyCode())
+                return currencyService.convertAmountWithFp(rateCard.hourly_rate.getCurrencyValue(), rateCard.hourly_rate.getCurrencyCode(), globalCurrencyCode, startDate);
+            //this._debug("_getPlannedLaborRateFromRateCard: getRate return rate for " + user.getDisplayValue() + " = " +	hourlyRate);
+            return rateCard.hourly_rate.getCurrencyValue();
+        }
+    },
+
+    /*
+     * get rate cards based on matching a user
+     */
+    getRateCard: function( /* GlideRecord */ user) {
+        return this.getRateCardWithRateType(user, '');
+    },
+
+    getRateCardWithRateType: function(user, rateType) {
+        if ((typeof user == 'undefined') || !user || !user.isValidRecord())
+            return;
+
+        var filter = GlideFilter;
+
+        var rateCard = new GlideRecord(this.LABOR_RATE_CARD);
+        rateCard.addActiveQuery();
+
+        if (!gs.nil(rateType)) {
+            rateCard.addQuery('rate_type', rateType);
+            rateCard.addQuery('rate_type.active', 'true');
+        } else
+            rateCard.addEncodedQuery('rate_typeISEMPTY');
+
+        rateCard.orderBy("order");
+        rateCard.query();
+        this._debug("getLaborRate query " + rateCard.getEncodedQuery() + " returned " + rateCard.getRowCount());
+        if (!rateCard.hasNext())
+            return null;
+        while (rateCard.next()) {
+            var conditionMatch = filter.checkRecord(user, rateCard.condition);
+
+            if (!conditionMatch) {
+                this._debug("getRate - condition " + rateCard.condition +
+                    " is not met");
+                continue;
+            }
+
+            return rateCard;
+        }
+    },
+
+    _debug: function(msg) {
+        this.LOGGER.logDebug(msg, this.TYPE);
+    },
+
+    TYPE: "TaskRateProcessor"
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;john.roberts&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2010-09-18 21:25:33&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;26bca9150a4794a83841c453271114c5&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;261&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;TaskRateProcessor&lt;/sys_name&gt;
+        &lt;sys_package display_value="Cost Management" source="com.snc.cost_management"&gt;bfef86e747e64210cd4e1ce4316d4343&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_26bca9150a4794a83841c453271114c5&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2020-12-15 17:18:43&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:34</sys_created_on>
+        <sys_id>5601f45983b01210c6695855eeaad3c6</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>TaskRateProcessor</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_5601f45983b01210c6695855eeaad3c6</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:34</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

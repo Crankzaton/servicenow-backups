@@ -1,0 +1,257 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>050b18a80b401300283eed3ab4673a00</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.ResourceGridBaseAllocator&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;ResourceGridBaseAllocator&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ResourceGridBaseAllocator = Class.create();
+ResourceGridBaseAllocator.prototype = {
+    initialize: function(totalHours, startDate, endDate, userIds, type, capacityHelper) {
+		var resourceProperties = new ResourceManagementProperties();
+		this.allowMoreThan24Hours = resourceProperties.getPropertyToAllocateMoreThan24Hours() === 'true';
+        this.minTimeUnit = resourceProperties.getAllocationIntervalMinutes();
+		this.isEvenSpread = type == "even";
+        this.userIds = userIds;
+        this.startDate = new GlideDate();
+        this.startDate.setValue(startDate);
+        this.endDate = new GlideDate();
+        this.endDate.setValue(endDate);
+        this.users = {};
+        this.totalCapacityAcrossUsers = 0;
+        this.totalAvailabilityAcrossUsers = 0;
+        this.capacityHelper = capacityHelper;
+        this.rmAggregator = new RMHoursAggregator();
+        this._setUserDetails();
+        this.noOfDays = GlideDateTime.subtract(this.startDate, this.endDate).getDayPart() + 1;
+        this.totalHours = totalHours;
+    },
+
+    _setUserDetails: function() {
+		var total = this.isEvenSpread ? 'totalUnits' : 'totalHours';
+        for (var i = 0; i &lt; this.userIds.length; i++) {
+            var userId = this.userIds[i];
+            this.users[userId] = {};
+            this.users[userId]['capacity'] = this._getCapacity(userId);
+            this.users[userId]['availability'] = this._getAvailability(userId);
+            this.totalCapacityAcrossUsers += Number(this.users[userId]['capacity'][total]);
+            this.totalAvailabilityAcrossUsers += Number(this.users[userId]['availability'][total]);
+        }
+    },
+
+    _getCapacity: function(userId) {
+        if (JSUtil.notNil(this.capacityHelper)) {
+			var capacityDetails = {};
+            var hoursPerDay = this.capacityHelper.getCapacityPerDay(userId, this.startDate, this.endDate);
+			if(this.isEvenSpread)
+				capacityDetails = this._convertHoursToUnits(hoursPerDay, false);
+			else{
+				capacityDetails.hoursPerDay = hoursPerDay;
+				capacityDetails.totalHours = this.rmAggregator.arraySum(hoursPerDay);
+			}
+            return capacityDetails;
+        } else
+            return this._getUserCategoryDetails(userId, 'capacity');
+    },
+
+    _getAvailability: function(userId) {
+        if (JSUtil.notNil(this.capacityHelper)) {
+			var availabilityDetails = {};
+            var hoursPerDay = this.capacityHelper.getAvailabilityPerDay(userId, this.startDate, this.endDate);
+			if(this.isEvenSpread)
+				availabilityDetails = this._convertHoursToUnits(hoursPerDay, true);
+			else{
+				availabilityDetails.hoursPerDay = hoursPerDay;
+				availabilityDetails.totalHours = this.rmAggregator.arraySum(hoursPerDay);
+			}
+            return availabilityDetails;
+        } else
+            return this._getUserCategoryDetails(userId, 'availability');
+    },
+
+    _convertHoursToUnits: function(hoursPerDay, doFloor) {
+        var unitsPerDay = [];
+        var totalUnits = 0;
+        for (var i = 0; i &lt; hoursPerDay.length; i++) {
+            var units = 0;
+            if (hoursPerDay[i] &gt; 0) {
+                if (doFloor)
+                    units = Math.floor((hoursPerDay[i] * 60) / this.minTimeUnit);
+                else
+                    units = (hoursPerDay[i] * 60) / this.minTimeUnit;
+            }
+            unitsPerDay.push(units);
+            totalUnits += units;
+        }
+        return {
+            'unitsPerDay': unitsPerDay,
+            'totalUnits': totalUnits
+        };
+    },
+
+    _getUserCategoryDetails: function(userId, category) {
+		var hoursPerDay;
+		var userCategoryDetails = {};
+
+		var rmCapacityApi = new RMCapacityAPI(this.startDate, this.endDate);
+		if (category == 'availability')
+			hoursPerDay = rmCapacityApi.getAvailabilityForUser(userId);
+		else if (category == 'capacity')
+			hoursPerDay = rmCapacityApi.getCapacityForUser(userId);
+		else
+			return userCategoryDetails;
+
+        if (this.isEvenSpread) {
+            var doFloor = category == "availability";
+            userCategoryDetails = this._convertHoursToUnits(hoursPerDay, doFloor);
+        } else {
+            var totalHours = 0;
+            for (var i = 0; i &lt; hoursPerDay.length; i++) {
+                totalHours += hoursPerDay[i];
+            }
+            userCategoryDetails.hoursPerDay = hoursPerDay;
+            userCategoryDetails.totalHours = totalHours;
+        }
+        return userCategoryDetails;
+    },
+
+    _decrementAvailability: function(userId, day, units) {
+        if (day in this.users[userId]['availability']['unitsPerDay']) {
+            this.users[userId]['availability']['unitsPerDay'][day] -= units;
+            this.users[userId]['availability']['totalUnits'] -= units;
+            this.totalAvailabilityAcrossUsers -= units;
+        }
+    },
+	
+	_getBlockedHours: function(userId, rpId, hoursToAllocate) {
+        if (!('blockedHours' in this.users[userId])) {
+            var resourceAllocationDailyAgg = new ResourceAllocationDailyAggregate(userId, this.startDate.getValue(), this.endDate.getValue());
+			var blockedFilter = 'allocationISEMPTY^NQallocationISNOTEMPTY^allocation.resource_plan!='+rpId;
+			this.users[userId]['blockedHours'] = resourceAllocationDailyAgg.hoursByDay(blockedFilter);
+        }
+		if (hoursToAllocate) { //updated blocked hours with hoursToAllocate
+			var date = new GlideDate();
+			date.setValue(this.startDate.getValue());
+			for (var i = 0; i &lt; this.noOfDays; i++) {
+				if (this.users[userId]['capacity']['unitsPerDay'][i] &gt; 0 &amp;&amp; (date.getValue() in hoursToAllocate))
+					this.users[userId]['blockedHours'][i] += Number(hoursToAllocate[date.getValue()]);
+				date.addDaysUTC(1);
+			}
+		}
+        return this.users[userId]['blockedHours'];
+    },
+
+    _setAvailability: function(userId, day, units) {
+        if (day in this.users[userId]['availability']['unitsPerDay']) {
+            this.users[userId]['availability']['totalUnits'] += units - this.users[userId]['availability']['unitsPerDay'][day];
+            this.totalAvailabilityAcrossUsers += units - this.users[userId]['availability']['unitsPerDay'][day];
+            this.users[userId]['availability']['unitsPerDay'][day] = units;
+        }
+    },
+
+    _adjustAvailableHoursTo24Hours: function(userId, day) {
+        if (day in this.users[userId]['capacity']['unitsPerDay'] &amp;&amp; this.users[userId]['capacity']['unitsPerDay'][day] &gt; 0) {
+            var availableUnits = 0;
+            if (day in this.users[userId]['blockedHours']) {
+                var availableHours = 24 - this.users[userId]['blockedHours'][day];
+                availableUnits = Math.floor((availableHours * 60) / this.minTimeUnit);
+            } else
+                availableUnits = Math.floor((24 * 60) / this.minTimeUnit) - this.users[userId]['capacity']['unitsPerDay'][day];
+            this._setAvailability(userId, day, availableUnits);
+        }
+    },
+
+    _adjustAvailableHoursTo24HoursForAllDays: function(userId) {
+        var date = new GlideDate();
+        date.setValue(this.startDate.getValue());
+        for (var day = 0; day &lt; this.noOfDays; day++) {
+            this._adjustAvailableHoursTo24Hours(userId, day);
+            date.addDaysUTC(1);
+        }
+    },
+	
+	_setHoursAllocatedPerUserPerDate: function(hoursToAllocPerUserPerDate){
+		this.hoursToAllocPerUserPerDate = hoursToAllocPerUserPerDate;
+	},
+	
+	getHoursAllocatedPerUser: function(){
+		var hoursAllocatedPerUser = {};
+		hoursAllocatedPerUser.users = {};
+		var totalHours = 0;
+		for(var userId in this.hoursToAllocPerUserPerDate){
+			var hours = 0;
+			for(var date in this.hoursToAllocPerUserPerDate[userId]){
+				hours += Number(this.hoursToAllocPerUserPerDate[userId][date]);
+			}
+			totalHours += hours;
+			hoursAllocatedPerUser.users[userId] = hours;
+		}
+		hoursAllocatedPerUser['total'] = totalHours;
+		return hoursAllocatedPerUser;
+	},
+	
+    type: 'ResourceGridBaseAllocator'
+};
+
+ResourceGridBaseAllocator.canAllocate = function(hoursPerDate, totalHours, start, end, userId, rpId) {
+    var resourceAllocationDailyAgg = new ResourceAllocationDailyAggregate(userId, start, end);
+    var filter = 'allocationISEMPTY^NQallocationISNOTEMPTY^allocation.resource_plan!=' + rpId;
+    var blockedHours = resourceAllocationDailyAgg.hoursByDay(filter);
+    var startDate = new GlideDate();
+    startDate.setValue(start);
+    var endDate = new GlideDate();
+    endDate.setValue(end);
+    var date = new GlideDate();
+    date.setValue(start);
+    var day = 0;
+    var hoursToAlloc = 0;
+    while (date &lt;= endDate) {
+        var allocatedHrs = hoursPerDate[date.getValue()];
+        if (JSUtil.notNil(allocatedHrs)) {
+            var blockedHrs = blockedHours[day];
+            if (Number(blockedHrs) + Number(allocatedHrs) &gt; 24) {
+                return false;
+            }
+            hoursToAlloc = hoursToAlloc + Number(allocatedHrs);
+        }
+        day++;
+        date.addDaysUTC(1);
+    }
+    return totalHours &lt;= hoursToAlloc;
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2018-01-30 13:40:09&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;050b18a80b401300283eed3ab4673a00&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;55&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ResourceGridBaseAllocator&lt;/sys_name&gt;
+        &lt;sys_package display_value="Resource Grid Interface" source="com.snc.resource_grid"&gt;7e00da2b47e64210cd4e1ce4316d438f&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_050b18a80b401300283eed3ab4673a00&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-08-20 07:07:58&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:13</sys_created_on>
+        <sys_id>9d40bc5583b01210c6695855eeaad3b0</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ResourceGridBaseAllocator</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_9d40bc5583b01210c6695855eeaad3b0</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:13</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

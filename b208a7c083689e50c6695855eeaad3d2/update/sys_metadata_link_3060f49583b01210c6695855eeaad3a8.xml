@@ -1,0 +1,835 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0a977c3a0b000010bc67ed3ab4673a7c</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.ResourcePlanLogHelperSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Customers should not change this script include directly&amp;#13;
+This is never called directly.&lt;/description&gt;
+        &lt;name&gt;ResourcePlanLogHelperSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ResourcePlanLogHelperSNC = Class.create();
+ResourcePlanLogHelperSNC.prototype = {
+
+    initialize: function(rpGr, isAtResPlanLevel, isAllocationWorkbench) { //rpGr is resource plan GlideRecord 
+        this.rpGR = rpGr;
+        this.isAtResPlanLevel = gs.nil(isAtResPlanLevel) ? false : isAtResPlanLevel;
+        this.isAllocationWorkbench = gs.nil(isAllocationWorkbench) ? false : isAllocationWorkbench;
+        this.totalHoursNotAllocated = 0;
+        this.hoursNotAllocated = {};
+        this.totalHoursAllocated = 0;
+        this.hardBookedHours = 0;
+        this.hoursAllocated = {};
+        this.infoMsg = '';
+        this.errorMsg = '';
+        this.rpState = '';
+    },
+
+    _setDefaultFields: function() {
+        this.defaultFields = {};
+        this.defaultFields.action_by = gs.getUserID();
+        this.defaultFields.resource_plan = this.rpGR.getValue("sys_id");
+        this.defaultFields.sys_domain = this.rpGR.getValue("sys_domain");
+        this.logs = {};
+        this.logs.parent = {};
+        this.logs.parent.action_status = ResourcePlanLogConstants.SUCCESSFUL;
+        this.logs.parent.exception_count = 0;
+        this.logs.parent.allocated_hours = this.totalHoursAllocated;
+        this.logs.parent.unallocated_hours = this.totalHoursNotAllocated;
+        this.logs.children = [];
+    },
+
+    setRPState: function(state) {
+        this.rpState = state;
+    },
+
+    _getRPState: function() {
+        if (gs.nil(this.rpState))
+            this.rpState = this.rpGR.getValue("state");
+        return this.rpState;
+    },
+
+    _refreshResPlan: function() {
+        var gr = new GlideRecord("resource_plan");
+        gr.get(this.rpGR.getValue("sys_id"));
+        this.rpGR = gr;
+    },
+
+    updateHoursInfo: function(hoursAllocated, hoursLeft, startDate, endDate) {
+        this.updateHoursAllocated(hoursAllocated, startDate, endDate);
+        this.updateHoursNotAllocated(hoursLeft, startDate, endDate);
+    },
+
+    updateHoursAllocated: function(hoursAllocated, startDate, endDate) {
+        var dates = startDate + ':' + endDate;
+        if (!(dates in this.hoursAllocated)) {
+            this.hoursAllocated[dates] = {};
+            this.hoursAllocated[dates]['total'] = hoursAllocated.total;
+        }
+        for (var userId in hoursAllocated.users) {
+            if (!(userId in this.hoursAllocated[dates]))
+                this.hoursAllocated[dates][userId] = 0;
+            this.hoursAllocated[dates][userId] += hoursAllocated.users[userId];
+            this.totalHoursAllocated += hoursAllocated.users[userId];
+        }
+    },
+
+    updateHoursNotAllocated: function(hoursLeft, startDate, endDate) {
+        var dates = startDate + ':' + endDate;
+        if (!(dates in this.hoursNotAllocated)) {
+            this.hoursNotAllocated[dates] = {};
+            this.hoursNotAllocated[dates]['total'] = hoursLeft.total;
+        }
+        for (var userId in hoursLeft.users) {
+            if (!(userId in this.hoursNotAllocated[dates]))
+                this.hoursNotAllocated[dates][userId] = 0;
+            this.hoursNotAllocated[dates][userId] += hoursLeft.users[userId];
+            this.totalHoursNotAllocated += hoursLeft.users[userId];
+        }
+    },
+
+    getHoursNotAllocated: function(userId, startDate, endDate) {
+        var hours = 0;
+        var dates = startDate + ':' + endDate;
+        if (this.rpGR.getValue("distribution_type") == 'front_load')
+            hours = this.hoursNotAllocated[dates]['total'];
+        else {
+            if (this.hoursNotAllocated &amp;&amp; (dates in this.hoursNotAllocated) &amp;&amp; (userId in this.hoursNotAllocated[dates]))
+                hours = this.hoursNotAllocated[dates][userId];
+        }
+
+        return hours;
+    },
+
+    _deleteResAllocs: function() {
+        var allocs = new GlideRecord("resource_allocation");
+        allocs.addQuery("resource_plan", this.rpGR.getValue("sys_id"));
+        allocs.setWorkflow(false);
+        allocs.deleteMultiple();
+    },
+
+    _setRPToPrevState: function(prevState) {
+        if (this.rpGR.getValue("state") != prevState) {
+            this.rpGR.setValue("state", prevState);
+            this.rpGR.setWorkflow(false);
+            this.rpGR.update();
+        }
+    },
+
+    populateLogs: function(params) {
+        var prevState = params.prevState;
+        this._setDefaultFields();
+        if (params.action_by) //send action_by to log, when resource plan changes are done through events
+            this.defaultFields.action_by = params.action_by;
+        var type = params.type;
+        var hoursReleased = params.hoursReleased;
+        this.hardBookedHours = JSUtil.notNil(params.hardBookedHours) ? params.hardBookedHours : 0;
+        var fromDate = params.fromDate;
+        var toDate = params.toDate;
+        this.logs.parent.action_status = ResourcePlanLogConstants.SUCCESSFUL;
+        this.logs.parent.exception_count = 0;
+        if (fromDate)
+            this.logs.parent.start_date = fromDate;
+        if (toDate)
+            this.logs.parent.end_date = toDate;
+		
+        switch (type) {
+            case 'stateChanged':
+                this._populateLogsForRPStateChange(prevState, hoursReleased);
+                break;
+            case 'rpExtensionRequested':
+                this._populateLogsForRPExtension('rpExtensionRequested', params.fromDate, params.toDate, params.requestValue, params.requestType, params.result);
+                break;
+            case 'rpExtensionAllocated':
+                this._populateLogsForRPExtension('rpExtensionAllocated', params.fromDate, params.toDate, params.requestValue, params.requestType, params.result);
+                break;
+            case 'rpExtended':
+                this._populateLogsForRPExtension('rpExtended', params.fromDate, params.toDate, params.requestValue, params.requestType, params.result);
+                break;
+			case 'rpReduced': 
+				this._populateLogsForRPReduction(params.prevEndDate, hoursReleased);
+				break;
+            case 'bookingTypeUpdated':
+                this.logs.parent.allocated_hours = this.hardBookedHours;
+                this.logs.parent.booking_type = ResourceConstants.HARD_BOOKING;
+                this.logs.parent.action = ResourcePlanLogAction.BOOKING_TYPE_UPDATED;
+                params.userName = this._getUserName(params.userId);
+                this.logs.parent.message = ResourcePlanLogMessage.ALLOC_BOOKING_TYPE_UPDATED(params);
+                break;
+			case 'rpHoursUpdated':
+				this.logs.parent.action = ResourcePlanLogAction.RESOURCE_PLAN_PLANNED_HOURS_UPDATED;
+				this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_PLANNED_HOURS_UPDATED({
+					'hours': params.hours
+				});
+				break;
+			case 'requestedHoursUpdated':
+				this.logs.parent.action = ResourcePlanLogAction.REQUESTED_HOURS_UPDATED;
+				this.logs.parent.message = ResourcePlanLogMessage.REQ_PLAN_HOURS_UPDATED({
+					'start_date': params.fromDate,
+					'end_date': params.toDate,
+					'requested_hours': params.requested_hours
+				});
+				break;
+            case 'allocationHoursUpdated':
+                this.logs.parent.booking_type = this._getRPState() == ResourcePlanState.CONFIRMED ? ResourceConstants.SOFT_BOOKING : ResourceConstants.HARD_BOOKING;
+                this.logs.parent.action = ResourcePlanLogAction.HOURS_UPDATED;
+                this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_HOURS_UPDATE_SUCCESSFUL({
+                    'userName': this._getUserName(params.userId),
+                    'allocated_hours': this.totalHoursAllocated
+                });
+                if (this.totalHoursNotAllocated &gt; 0) {
+                    this.warning = ResourcePlanLogMessage.RES_PLAN_HOURS_UPDATE_WARNING;
+                    this.failed = ResourcePlanLogMessage.RES_PLAN_HOURS_UPDATE_FAILED;
+                    this.allocWarning = ResourcePlanLogMessage.RES_ALLOC_HOURS_UPDATE_WARNING;
+                    this.allocFailed = ResourcePlanLogMessage.RES_ALLOC_HOURS_UPDATE_FAILED;
+                    this._setLogsForAllocations('', {
+                        'userName': this._getUserName(params.userId)
+                    });
+                }
+                break;
+            case 'taskMoved':
+                this.logs.parent.action = ResourcePlanLogAction.TASK_MOVED;
+                if (this.rpGR.getValue('actual_hours') &gt; "0") {
+                    this.logs.parent.action_status = ResourcePlanLogConstants.WARNING;
+                    this.logs.parent.message = ResourcePlanLogMessage.TASK_MOVE_WARNING({
+                        'actual_hours': this.rpGR.getValue('actual_hours')
+                    });
+                } else {
+                    var state = this._getRPState();
+                    if (state == ResourcePlanState.CONFIRMED || state == ResourcePlanState.CONFIRMATION_IN_PROGRESS)
+                        this.logs.parent.booking_type = ResourceConstants.SOFT_BOOKING;
+                    else if (state == ResourcePlanState.ALLOCATED || state == ResourcePlanState.ALLOCATION_IN_PROGRESS)
+                        this.logs.parent.booking_type = ResourceConstants.HARD_BOOKING;
+                    if (this.totalHoursNotAllocated == 0)
+                        this.logs.parent.message = ResourcePlanLogMessage.TASK_MOVE_SUCCESSFUL({
+                            'start_date': params.fromDate,
+                            'end_date': params.toDate,
+                            'task': this.rpGR.task.getDisplayValue()
+                        });
+                    else {
+                        this.warning = ResourcePlanLogMessage.TASK_MOVE_WARNING;
+                        this.failed = ResourcePlanLogMessage.TASK_MOVE_FAILED;
+                        this.allocWarning = ResourcePlanLogMessage.TASK_MOVE_ALLOC_WARNING;
+                        this.allocFailed = ResourcePlanLogMessage.TASK_MOVE_ALLOC_FAILED;
+                        this._setLogsForAllocations(state, {
+                            'task': this.rpGR.task.getDisplayValue()
+                        });
+                    }
+                }
+                break;
+            case 'resourceShift':
+            case 'resourceReplace':
+            case 'resourcePlanReplace':
+            case 'partialConfOrAlloc':
+            case 'resourcePlanMoved':
+            case 'allocationDelete':
+                this._populateLogsForGridActions(params);
+                break;
+
+        }
+        this._populateLogs();
+        var detailsMsg = gs.getMessage("Check resource plan logs for more details.");
+        var detailsMsgWithLink = ' &lt;a target="_blank" href=/resource_plan_logs.do?sys_id=' + this.parentId + '&gt;' + detailsMsg + '&lt;/a&gt;';
+
+		var state = Number(this._getRPState());
+        if (this.logs.parent.action_status == ResourcePlanLogConstants.FAILED) {
+            this.errorMsg = this.logs.parent.message + detailsMsgWithLink;
+			this.errorMsg = this._append24HoursPropertyMessage(state, this.errorMsg, type);
+		} else if (this.logs.parent.action_status == ResourcePlanLogConstants.WARNING) {
+            this.infoMsg = this.logs.parent.message + detailsMsgWithLink;
+			this.infoMsg = this._append24HoursPropertyMessage(state, this.infoMsg, type);
+		}
+    },
+
+	_append24HoursPropertyMessage: function(state, message, type) {
+		var resourcePropertySI = new ResourceManagementProperties();
+		var appendMessage = (type === 'stateChanged' &amp;&amp; (state === ResourcePlanState.CONFIRMED || state === ResourcePlanState.ALLOCATED) &amp;&amp; resourcePropertySI.getPropertyToAllocateMoreThan24Hours() == 'false');
+		if(appendMessage)
+			message +=  gs.getMessage(' Enable the \'com.snc.resource_management.allocate_more_than_24hours_per_day property\' to allocate more than 24 hours per a day.');
+		return message;
+	},
+
+    _populateLogsForRPExtension: function(type, prevEndDate, newEndDate, requestValue, requestType, result) {
+        var logInfo = {};
+        logInfo.start_date = prevEndDate;
+        logInfo.end_date = newEndDate;
+		
+        var extensionHoursProvided = false;
+        if (JSUtil.notNil(requestValue) &amp;&amp; JSUtil.notNil(requestType)) {
+            logInfo.requestValue = requestValue;
+            logInfo.requestType = this._getRequestTypeDisplayValue(requestType);
+            extensionHoursProvided = true;
+        }
+		if(result === ResourcePlanLogConstants.FAILED){
+			this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_EXTENDED_FAILED();
+			this.logs.parent.action_status = ResourcePlanLogConstants.FAILED;
+		}			
+        if (type === "rpExtensionRequested") {
+            this.logs.parent.action = ResourcePlanLogAction.EXTENSION_REQUESTED;
+			if(result !== ResourcePlanLogConstants.FAILED)
+			this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_EXTENSION_REQUESTED_SUCCESSFUL(logInfo);
+        } else {
+            this.logs.parent.booking_type = ResourceConstants.HARD_BOOKING;
+            if (type === "rpExtended") {
+                this.logs.parent.action = ResourcePlanLogAction.EXTENDED;
+				if(result !== ResourcePlanLogConstants.FAILED)
+				this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_EXTENDED_SUCCESSFUL(logInfo);
+                this.warning = ResourcePlanLogMessage.RES_PLAN_EXTENDED_WARNING;
+                this.failed = ResourcePlanLogMessage.RES_PLAN_EXTENDED_FAILED;
+                this.allocWarning = ResourcePlanLogMessage.RES_ALLOC_EXTENDED_WARNING;
+                this.allocFailed = ResourcePlanLogMessage.RES_ALLOC_EXTENDED_FAILED;
+            } else { // type === "rpExtensionAllocated"
+                this.logs.parent.action = ResourcePlanLogAction.EXTENSION_ALLOCATED;
+                this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_EXTENSION_ALLOCATED_SUCCESSFUL(logInfo);
+                this.warning = ResourcePlanLogMessage.RES_PLAN_EXTENSION_ALLOCATED_WARNING;
+                this.failed = ResourcePlanLogMessage.RES_PLAN_EXTENSION_ALLOCATED_FAILED;
+                this.allocWarning = ResourcePlanLogMessage.RES_ALLOC_EXTENSION_ALLOCATED_WARNING;
+                this.allocFailed = ResourcePlanLogMessage.RES_ALLOC_EXTENSION_ALLOCATED_FAILED;
+            }
+            if (extensionHoursProvided &amp;&amp; this.totalHoursNotAllocated &gt; 0)
+                this._setLogsForAllocations(this._getRPState(), logInfo);
+        }
+    },
+
+    _getRequestTypeDisplayValue: function(requestType) {
+        var requestTypes = {
+            'hours': "Hours",
+            'man_days': "Person days",
+            'fte': "FTE",
+			'percent_capacity': "% Capacity"
+        };
+        return requestTypes[requestType];
+    },
+
+    _populateLogsForRPStateChange: function(prevState, hoursReleased) {
+        var state = Number(this._getRPState());
+        this.logs.parent.start_date = this.rpGR.getValue("start_date");
+        this.logs.parent.end_date = this.rpGR.getValue("end_date");
+        switch (state) {
+            case ResourcePlanState.REQUESTED:
+                this.logs.parent.action = ResourcePlanLogAction.REQUESTED;
+                var logInfo = {};
+                logInfo.start_date = this.rpGR.start_date.getGlideObject();
+                logInfo.end_date = this.rpGR.end_date.getGlideObject();
+                logInfo.hours = this.rpGR.getValue("planned_hours");
+                this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_REQUESTED_SUCCESSFUL(logInfo);
+                break;
+            case ResourcePlanState.CONFIRMED:
+            case ResourcePlanState.CONFIRMATION_IN_PROGRESS:
+                this.logs.parent.booking_type = ResourceConstants.SOFT_BOOKING;
+                this.logs.parent.action = this.isAllocationWorkbench ? ResourcePlanLogAction.CONFIRMED_FROM_FINDER : ResourcePlanLogAction.CONFIRMED;
+                if (this.totalHoursNotAllocated == 0)
+                    this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_CONFIRMATION_SUCCESSFUL({
+                        'allocated_hours': this.totalHoursAllocated
+                    });
+                else {
+                    this.warning = ResourcePlanLogMessage.RES_PLAN_CONFIRMATION_WARNING;
+                    this.failed = ResourcePlanLogMessage.RES_PLAN_CONFIRMATION_FAILED;
+                    this.allocWarning = ResourcePlanLogMessage.RES_ALLOC_CONFIRMATION_WARNING;
+                    this.allocFailed = ResourcePlanLogMessage.RES_ALLOC_CONFIRMATION_FAILED;
+                    this._setLogsForAllocations(ResourcePlanState.CONFIRMED);
+                }
+                break;
+            case ResourcePlanState.ALLOCATED:
+            case ResourcePlanState.ALLOCATION_IN_PROGRESS:
+                this.logs.parent.booking_type = ResourceConstants.HARD_BOOKING;
+                this.logs.parent.action = this.isAllocationWorkbench ? ResourcePlanLogAction.ALLOCATED_FROM_FINDER : ResourcePlanLogAction.ALLOCATED;
+                if (this.totalHoursNotAllocated == 0) {
+                    if (prevState == ResourcePlanState.CONFIRMED) {
+                        this.logs.parent.allocated_hours = this.hardBookedHours; //hours which is converted from soft to hard
+                        this.logs.parent.message = ResourcePlanLogMessage.BOOKING_TYPE_UPDATED({
+                            'hard_booked_hours': this.hardBookedHours
+                        });
+                    } else {
+                        // totalHoursAllocated (hours from allocations which are newly created) + hardBookedHours (hours from allocations which are converted from soft to hard)
+                        this.logs.parent.allocated_hours = this.totalHoursAllocated + this.hardBookedHours;
+                        this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_ALLOCATION_SUCCESSFUL({
+                            'allocated_hours': this.totalHoursAllocated + this.hardBookedHours
+                        });
+                    }
+                } else {
+                    this.warning = ResourcePlanLogMessage.RES_PLAN_ALLOCATION_WARNING;
+                    this.failed = ResourcePlanLogMessage.RES_PLAN_ALLOCATION_FAILED;
+                    this.allocWarning = ResourcePlanLogMessage.RES_ALLOC_ALLOCATION_WARNING;
+                    this.allocFailed = ResourcePlanLogMessage.RES_ALLOC_ALLOCATION_FAILED;
+                    this._setLogsForAllocations(ResourcePlanState.ALLOCATED);
+                }
+                break;
+            case ResourcePlanState.COMPLETED:
+            case ResourcePlanState.COMPLETION_IN_PROGRESS:
+                this.logs.parent.action = ResourcePlanLogAction.COMPLETED;
+                this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_COMPLETED_SUCCESSFUL({
+                    'hours_released': hoursReleased
+                });
+                break;
+            case ResourcePlanState.CANCELLED:
+            case ResourcePlanState.CANCEL_IN_PROGRESS:
+                this.logs.parent.action = ResourcePlanLogAction.CANCELLED;
+                this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_CANCELLED_SUCCESSFUL({
+                    'hours_released': hoursReleased
+                });
+                break;
+            case ResourcePlanState.REJECTED:
+                this.logs.parent.action = ResourcePlanLogAction.REJECTED;
+                var logInfo = {};
+                logInfo.start_date = this.rpGR.start_date.getGlideObject();
+                logInfo.end_date = this.rpGR.end_date.getGlideObject();
+                logInfo.hours = this.rpGR.getValue("planned_hours");
+                this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_REJECTED_SUCCESSFUL(logInfo);
+                break;
+        }
+    },
+	
+	_populateLogsForRPReduction: function(prevEndDate, hoursReleased) {
+		var _self = this;
+		this._refreshResPlan();
+		this.logs.parent.start_date = this.rpGR.getValue("start_date");
+        this.logs.parent.end_date = this.rpGR.getValue("end_date");
+		this.logs.parent.action = ResourcePlanLogAction.RESOURCE_PLAN_REDUCED;
+		this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_REDUCED_SUCCESSFUL({
+			'prev_end_date': prevEndDate.getDisplayValue(),
+			'new_end_date': _self.rpGR.getDisplayValue('end_date'),
+			'hours_released': hoursReleased
+		});
+	},
+
+    _populateLogsForGridActions: function(params) {
+        var state = Number(this._getRPState());
+        var type = params.type;
+        if (state == ResourcePlanState.CONFIRMED || state == ResourcePlanState.CONFIRMATION_IN_PROGRESS)
+            this.logs.parent.booking_type = ResourceConstants.SOFT_BOOKING;
+        else if (state == ResourcePlanState.ALLOCATED || state == ResourcePlanState.ALLOCATION_IN_PROGRESS)
+            this.logs.parent.booking_type = ResourceConstants.HARD_BOOKING;
+        var extraLogInfo = {};
+        extraLogInfo.fromDate = params.fromDate.getDisplayValue();
+        extraLogInfo.toDate = params.toDate.getDisplayValue();
+        switch (type) {
+            case 'resourceShift':
+                this.logs.parent.action = ResourcePlanLogAction.ALLOCATION_SHIFTED;
+                if (this.totalHoursNotAllocated == 0)
+                    this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_ALLOC_SHIFT_SUCCESSFUL({
+                        'state': state,
+                        'fromDate': extraLogInfo.fromDate,
+                        'toDate': extraLogInfo.toDate
+                    });
+                else {
+                    extraLogInfo.userName = this._getUserName(params.userId);
+                    extraLogInfo.type = type;
+                    this.warning = ResourcePlanLogMessage.RES_PLAN_ALLOC_SHIFT_WARNING;
+                    this.failed = ResourcePlanLogMessage.RES_PLAN_ALLOC_SHIFT_FAILED;
+                    this.allocWarning = ResourcePlanLogMessage.RES_ALLOC_SHIFT_WARNING;
+                    this.allocFailed = ResourcePlanLogMessage.RES_ALLOC_SHIFT_FAILED;
+                    this._setLogsForAllocations(state, extraLogInfo, true);
+                }
+                break;
+            case 'resourceReplace':
+                this.logs.parent.action = ResourcePlanLogAction.ALLOCATION_REPLACED;
+                extraLogInfo.targetUserName = this._getUserName(params.targetUserId);
+                extraLogInfo.sourceUserId = params.sourceUserId;
+                extraLogInfo.sourceUserName = this._getUserName(params.sourceUserId);
+                extraLogInfo.hoursTransfered = params.hoursTransfered;
+                extraLogInfo.type = type;
+                this.logs.parent.allocated_hours = params.hoursTransfered;
+                if (this.totalHoursNotAllocated == 0 &amp;&amp; params.hoursTransfered &gt; 0)
+                    this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_ALLOC_REPLACE_SUCCESSFUL({
+                        'sourceUserName': extraLogInfo.sourceUserName,
+                        'targetUserName': extraLogInfo.targetUserName,
+                        'fromDate': extraLogInfo.fromDate,
+                        'toDate': extraLogInfo.toDate,
+                        'hoursTransfered': params.hoursTransfered
+                    });
+                else if (params.hoursTransfered == 0 &amp;&amp; JSUtil.notNil(params.userCompletelyNotAvailable) &amp;&amp; params.userCompletelyNotAvailable) {
+                    this.logs.parent.unallocated_hours = params.hoursUnallocated;
+                    this.logs.parent.action_status = ResourcePlanLogConstants.FAILED;
+                    this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_ALLOC_REPLACE_FAILED({
+                        'sourceUserName': extraLogInfo.sourceUserName,
+                        'targetUserName': extraLogInfo.targetUserName,
+                        'fromDate': extraLogInfo.fromDate,
+                        'toDate': extraLogInfo.toDate
+                    });
+                } else {
+                    this.warning = ResourcePlanLogMessage.RES_PLAN_ALLOC_REPLACE_WARNING;
+                    this.failed = ResourcePlanLogMessage.RES_PLAN_ALLOC_REPLACE_FAILED;
+                    this.allocWarning = ResourcePlanLogMessage.RES_ALLOC_REPLACE_WARNING;
+                    this.allocFailed = ResourcePlanLogMessage.RES_ALLOC_REPLACE_FAILED;
+                    this._setLogsForAllocations(state, extraLogInfo, true);
+                }
+                break;
+            case 'partialConfOrAlloc':
+                this.logs.parent.action = (ResourcePlanState.CONFIRMED == state) ? ResourcePlanLogAction.CONFIRMED_FOR_SPECIFIC_PERIOD : ResourcePlanLogAction.ALLOCATED_FOR_SPECIFIC_PERIOD;
+                extraLogInfo.allocHours = this.totalHoursAllocated + this.hardBookedHours;
+                if (this.totalHoursNotAllocated == 0)
+                    this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_CONF_FOR_SPECIFIC_PERIOD_SUCCESSFUL({
+                        'state': state,
+                        'fromDate': extraLogInfo.fromDate,
+                        'toDate': extraLogInfo.toDate,
+                        'allocHours': extraLogInfo.allocHours
+                    });
+                else {
+                    this.warning = ResourcePlanLogMessage.RES_PLAN_CONF_FOR_SPECIFIC_PERIOD_WARNING;
+                    this.failed = ResourcePlanLogMessage.RES_PLAN_CONF_FOR_SPECIFIC_PERIOD_FAILED;
+                    this.allocWarning = ResourcePlanLogMessage.RES_PLAN_ALLOC_CONF_FOR_SPECIFIC_PERIOD_WARNING;
+                    this.allocFailed = ResourcePlanLogMessage.RES_PLAN_ALLOC_CONF_FOR_SPECIFIC_PERIOD_FAILED;
+                    this._setLogsForAllocations(state, extraLogInfo, true);
+                }
+                break;
+            case 'resourcePlanReplace':
+                this.logs.parent.action = ResourcePlanLogAction.RESOURCE_PLAN_REPLACED;
+                extraLogInfo.resPlanNumber = params.resPlanNumber;
+                extraLogInfo.targetUserName = this._getUserName(params.targetUserId);
+                extraLogInfo.sourceUserId = params.sourceUserId;
+                extraLogInfo.sourceUserName = this._getUserName(params.sourceUserId);
+                extraLogInfo.hoursTransfered = params.hoursTransfered;
+                extraLogInfo.type = type;
+                this.logs.parent.allocated_hours = params.hoursTransfered;
+                if (this.totalHoursNotAllocated == 0 &amp;&amp; params.hoursTransfered &gt; 0)
+                    this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_REPLACE_SUCCESSFUL({
+                        'resPlanNumber': extraLogInfo.resPlanNumber,
+                        'sourceUserName': extraLogInfo.sourceUserName,
+                        'targetUserName': extraLogInfo.targetUserName,
+                        'fromDate': extraLogInfo.fromDate,
+                        'toDate': extraLogInfo.toDate,
+                        'hoursTransfered': params.hoursTransfered
+                    });
+                else if (params.hoursTransfered == 0 &amp;&amp; JSUtil.notNil(params.userCompletelyNotAvailable) &amp;&amp; params.userCompletelyNotAvailable) {
+                    this.logs.parent.unallocated_hours = params.hoursUnallocated;
+                    this.logs.parent.action_status = ResourcePlanLogConstants.FAILED;
+                    this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_REPLACE_FAILED({
+                        'sourceUserName': extraLogInfo.sourceUserName,
+                        'targetUserName': extraLogInfo.targetUserName,
+                        'fromDate': extraLogInfo.fromDate,
+                        'toDate': extraLogInfo.toDate
+                    });
+                } else {
+                    this.warning = ResourcePlanLogMessage.RES_PLAN_REPLACE_WARNING;
+                    this.failed = ResourcePlanLogMessage.RES_PLAN_REPLACE_FAILED;
+                    this.allocWarning = ResourcePlanLogMessage.RES_PLAN_REPLACE_ALLOC_WARNING;
+                    this.allocFailed = ResourcePlanLogMessage.RES_PLAN_REPLACE_ALLOC_FAILED;
+                    this._setLogsForAllocations(state, extraLogInfo, true);
+                }
+                break;
+            case 'resourcePlanMoved':
+                this.logs.parent.action = ResourcePlanLogAction.RESOURCE_PLAN_MOVED;
+                if (this.totalHoursNotAllocated == 0)
+                    this.logs.parent.message = ResourcePlanLogMessage.RES_PLAN_MOVE_SUCCESSFUL({
+                        'fromDate': extraLogInfo.fromDate,
+                        'toDate': extraLogInfo.toDate
+                    });
+                else {
+                    this.warning = ResourcePlanLogMessage.RES_PLAN_MOVE_WARNING;
+                    this.failed = ResourcePlanLogMessage.RES_PLAN_MOVE_FAILED;
+                    this.allocWarning = ResourcePlanLogMessage.RES_PLAN_MOVE_ALLOC_WARNING;
+                    this.allocFailed = ResourcePlanLogMessage.RES_PLAN_MOVE_ALLOC_FAILED;
+                    this._setLogsForAllocations(state, extraLogInfo, true);
+                }
+                break;
+            case 'allocationDelete':
+                this.logs.parent.action = ResourcePlanLogAction.ALLOCATION_DELETED;
+                extraLogInfo.userName = this._getUserName(params.userId);
+                extraLogInfo.allocHours = params.hardBookedHours;
+                this.logs.parent.message = ResourcePlanLogMessage.ALLOCATION_DELETE_SUCCESSFUL({
+                    'userName': extraLogInfo.userName,
+                    'fromDate': extraLogInfo.fromDate,
+                    'toDate': extraLogInfo.toDate,
+                    'allocHours': extraLogInfo.allocHours
+                });
+                break;
+        }
+    },
+
+    //For Resource Plan Confirm / Allocate (with 'state' parameter) and Resource Allocation Hours update (without 'state' parameter)
+    _setLogsForAllocations: function(state, extraLogInfo, isGridAction) {
+        var isConfirm = state == ResourcePlanState.CONFIRMED || state == ResourcePlanState.CONFIRMATION_IN_PROGRESS;
+        var isAllocate = state == ResourcePlanState.ALLOCATED || state == ResourcePlanState.ALLOCATION_IN_PROGRESS;
+		
+        var exceptions = 0;
+        for (var dates in this.hoursNotAllocated) {
+            var logDates = dates.split(':');
+            for (var userId in this.hoursNotAllocated[dates]) {
+                if (userId !== "total" &amp;&amp; this.hoursNotAllocated[dates][userId] &gt; 0) {
+                    if (JSUtil.notNil(isGridAction) &amp;&amp; isGridAction &amp;&amp; extraLogInfo.sourceUserId &amp;&amp; userId == extraLogInfo.sourceUserId)
+                        continue;
+                    exceptions++;
+                    var childLog = {};
+                    childLog.start_date = logDates[0];
+                    childLog.end_date = logDates[1];
+                    childLog.user = userId;
+                    childLog.allocated_hours = this.hoursAllocated[dates][userId];
+                    childLog.unallocated_hours = this.hoursNotAllocated[dates][userId];
+                    childLog.action = this.logs.parent.action;
+                    childLog.action_status = childLog.allocated_hours == 0 ? ResourcePlanLogConstants.FAILED : ResourcePlanLogConstants.WARNING;
+                    if (state)
+                        childLog.booking_type = isConfirm ? ResourceConstants.SOFT_BOOKING : ResourceConstants.HARD_BOOKING;
+                    var logInfo = {};
+                    for (var prop in childLog)
+                        logInfo[prop] = childLog[prop];
+                    for (var key in extraLogInfo)
+                        logInfo[key] = extraLogInfo[key];
+                    logInfo.state = this._getRPState();
+                    logInfo.childLogUserName = this._getUserName(userId);
+                    childLog.message = childLog.allocated_hours == 0 ? this.allocFailed(logInfo) : this.allocWarning(logInfo);
+                    this.logs.children.push(childLog);
+                }
+            }
+        }
+        this.logs.parent.action_status = this.totalHoursAllocated == 0 ? ResourcePlanLogConstants.FAILED : ResourcePlanLogConstants.WARNING;
+        this.logs.parent.exception_count = exceptions;
+        if (extraLogInfo.type != 'resourceReplace')
+            this.logs.parent.allocated_hours = this.totalHoursAllocated + this.hardBookedHours;
+        this.logs.parent.unallocated_hours = this.totalHoursNotAllocated;
+        if (state)
+            this.logs.parent.booking_type = isConfirm ? ResourceConstants.SOFT_BOOKING : ResourceConstants.HARD_BOOKING;
+        var parentLogInfo = {};
+        for (var property in this.logs.parent)
+            parentLogInfo[property] = this.logs.parent[property];
+        for (var key in extraLogInfo)
+            parentLogInfo[key] = extraLogInfo[key];
+        parentLogInfo.state = this._getRPState();
+        if (extraLogInfo.type &amp;&amp; (extraLogInfo.type == 'resourceReplace' || extraLogInfo.type == 'resourcePlanReplace'))
+            this.logs.parent.message = extraLogInfo.hoursTransfered == 0 ? this.failed(parentLogInfo) : this.warning(parentLogInfo);
+        else
+            this.logs.parent.message = this.totalHoursAllocated == 0 ? this.failed(parentLogInfo) : this.warning(parentLogInfo);
+    },
+
+    _getUserName: function(userId) {
+        if (JSUtil.nil(this.userNamesObj))
+            this.userNamesObj = {};
+        if (!(userId in this.userNamesObj)) {
+            var user = new GlideRecord('sys_user');
+            user.get(userId);
+            this.userNamesObj[userId] = user.getDisplayValue('name');
+        }
+        return this.userNamesObj[userId];
+    },
+
+    _populateLogs: function() {
+        var log = new GlideRecord("resource_plan_logs");
+        for (var prop in this.logs.parent)
+            log.setValue(prop, this.logs.parent[prop]);
+        for (var defaultProp in this.defaultFields)
+            log.setValue(defaultProp, this.defaultFields[defaultProp]);
+        this.parentId = log.insert();
+        this.logs.children.forEach(function(child) {
+            log = new GlideRecord("resource_plan_logs");
+            log.setValue("parent", this.parentId);
+            for (var prop in child)
+                log.setValue(prop, child[prop]);
+            for (var defaultProp in this.defaultFields)
+                log.setValue(defaultProp, this.defaultFields[defaultProp]);
+            log.insert();
+        }, this);
+    },
+
+    insertLogs: function() {
+        var hoursNotAllocated = 0;
+        if (this.totalHoursNotAllocated &lt;= 0) {
+            if (!this.isAtResPlanLevel) {
+                hoursNotAllocated = this._getTotalUnallocatedHours();
+                if (hoursNotAllocated &gt; 0)
+                    this._insertLog(hoursNotAllocated);
+            }
+            return;
+        }
+
+        this.deleteLogs(this.rpGR.getValue("start_date"), this.rpGR.getValue("end_date"));
+        var prevState = this.rpGR.getValue("state");
+        this._refreshResPlan();
+        var logMsg;
+        if (Number(this.rpGR.getValue("allocated_hours")) == 0) {
+            this._setMsg('resPlanTotallyNotAllocated');
+            this._insertLog(this.rpGR.getValue("planned_hours"));
+            if (!this.isAllocationWorkbench) {
+                this._deleteResAllocs();
+                this._setRPToPrevState(prevState);
+            }
+            return;
+        }
+
+        for (var dates in this.hoursNotAllocated) {
+            var logDates = dates.split(':');
+            for (var userId in this.hoursNotAllocated[dates]) {
+                if (userId !== "total") {
+                    hoursNotAllocated = this.hoursNotAllocated[dates][userId];
+                    this._insertLog(hoursNotAllocated, logDates[0], logDates[1], userId);
+                }
+            }
+        }
+
+        hoursNotAllocated = this.totalHoursNotAllocated;
+        if (hoursNotAllocated &gt; 0) {
+            if (this.isAtResPlanLevel)
+                this._setMsg('resPlanPartiallyAllocated', hoursNotAllocated);
+            else
+                this._setMsg('userPartiallyAllocated', hoursNotAllocated);
+            hoursNotAllocated = this._getTotalUnallocatedHours();
+            this._insertLog(hoursNotAllocated);
+        }
+        return;
+    },
+
+    _setMsg: function(useCase, hoursNotAllocated) {
+        var state = this._getRPState() == ResourcePlanState.CONFIRMED ? "confirmed" : "allocated";
+        switch (useCase) {
+            case 'resPlanTotallyNotAllocated':
+                this.errorMsg = gs.getMessage("The resource plan cannot be {0} as user(s) not available. Check the resource plan logs for details.", state);
+                break;
+            case 'resPlanPartiallyAllocated':
+                this.infoMsg = gs.getMessage("The resource plan cannot be {0} for {1} hour(s) based on user(s) availabililty. Check the resource plan logs for details.", [state, hoursNotAllocated]);
+                break;
+            case 'userPartiallyAllocated':
+                this.infoMsg = gs.getMessage("User is not {0} for {1} hour(s) based on availability. Check the resource plan logs for details.", [state, hoursNotAllocated]);
+                break;
+        }
+    },
+
+    getInfoMsg: function() {
+        return this.infoMsg;
+    },
+
+    getErrorMsg: function() {
+        return this.errorMsg;
+    },
+
+    showMsg: function() {
+        if (!gs.nil(this.errorMsg))
+            gs.addErrorMessage(this.errorMsg);
+        else if (!gs.nil(this.infoMsg))
+            gs.addInfoMessage(this.infoMsg);
+    },
+
+    _getTotalUnallocatedHours: function() {
+        var totalUnallocatedHours = 0;
+        var logs = new GlideAggregate('resource_plan_logs');
+        logs.addQuery("resource_plan", this.rpGR.getValue("sys_id"));
+        logs.addNotNullQuery("user");
+        logs.groupBy('resource_plan');
+        logs.addAggregate('SUM', 'unallocated_hours');
+        logs.query();
+        while (logs.next())
+            totalUnallocatedHours = logs.getAggregate('SUM', 'unallocated_hours');
+        return totalUnallocatedHours;
+    },
+
+    _insertLog: function(hoursNotAllocated, startDate, endDate, userId) {
+        if (gs.nil(hoursNotAllocated) || hoursNotAllocated &lt;= 0)
+            return;
+        if (gs.nil(startDate))
+            startDate = this.rpGR.getValue("start_date");
+        if (gs.nil(endDate))
+            endDate = this.rpGR.getValue("end_date");
+        var log = new GlideRecord("resource_plan_logs");
+        log.setValue("resource_plan", this.rpGR.getValue("sys_id"));
+        log.setValue("sys_domain", this.rpGR.getValue("sys_domain"));
+        log.setValue("unallocated_hours", hoursNotAllocated);
+        log.setValue("start_date", startDate);
+        log.setValue("end_date", endDate);
+        if (!gs.nil(userId)) {
+            log.setValue("user", userId);
+        }
+        log.insert();
+    },
+
+    deleteLogs: function(startDate, endDate, userId) {
+        var logs = new GlideRecord("resource_plan_logs");
+        logs.addQuery("resource_plan", this.rpGR.getValue("sys_id"));
+        logs.addQuery("start_date", "&lt;=", endDate);
+        logs.addQuery("end_date", "&gt;=", startDate);
+        logs.addNullQuery("user").addOrCondition("user", userId);
+        logs.deleteMultiple();
+    },
+
+    deleteAllLogs: function() {
+        var logs = new GlideRecord("resource_plan_logs");
+        logs.addQuery("resource_plan", this.rpGR.getValue("sys_id"));
+        logs.deleteMultiple();
+    },
+	
+    _updateResourcePlanCompletionLog: function(resourcePlanSysId, source, completionDate, initialResourcePlanEndDate) {
+        var completionLog = new GlideRecord("resource_plan_logs");
+        completionLog.addQuery('resource_plan',resourcePlanSysId);
+        completionLog.addQuery('action', ResourcePlanLogAction.COMPLETED);
+		completionLog.orderByDesc('sys_created_on');
+		completionLog.setLimit(1);
+        completionLog.query();
+        // For one resource plan, one completion log would exist. Update message in that complete log
+		if (completionLog.next()) {
+            completionLog.message = completionLog.getValue('message') + ' ' + this._getCompletionLogMessageBySource(source, initialResourcePlanEndDate, completionDate);
+            completionLog.update();
+        }
+    },
+	
+    _getCompletionLogMessageBySource: function(source, initialResourcePlanEndDate, completionDate) {
+        return gs.getMessage('The operation is done via {0}.\nPlanned end date: {1}.\nActual end date: {2}.', [source, initialResourcePlanEndDate, completionDate]);
+    },
+	
+	_populateLogsForTimeCard: function (timeCard) {
+		var resourcePlanSysId = timeCard.getValue('resource_plan');
+		var timeCardState = timeCard.getValue('state');
+		var approvedBy = gs.getUserName();
+		var approvedOn = timeCard.getValue('approved_on');
+		var weekStartsOn = timeCard.getValue('week_starts_on');
+		var totalHours = timeCard.getValue('total') ? timeCard.getValue('total'): 0;
+		var message;
+		switch(timeCardState) {
+			case 'Approved':
+				message = gs.getMessage('Your Time card for {0} is approved by {2} on {1}', [weekStartsOn, approvedOn, approvedBy]);
+				break;
+			case 'Recalled':
+				message = gs.getMessage('Your Time card for the {0} is recalled', weekStartsOn); // Approved by symbolises the user that performed the action
+				break;
+			default:
+				message = null;
+		}
+		if(message) {
+			this._pushTimeCardLogsForResourcePlan(timeCardState, message, resourcePlanSysId, weekStartsOn, totalHours);
+		}
+	},
+	
+	_pushTimeCardLogsForResourcePlan: function (timeCardState, message, resourcePlanSysId, weekStartsOn, totalHours) {
+		if(!timeCardState) return;
+		var timeCardLog = new GlideRecord("resource_plan_logs");
+		timeCardLog.initialize();
+		timeCardLog.setValue('action', 'time_card_' + timeCardState);
+		timeCardLog.setValue('message', message);
+		timeCardLog.setValue('resource_plan', resourcePlanSysId);
+		timeCardLog.setValue('booking_type', ResourceConstants.HARD_BOOKING);
+		timeCardLog.setValue('action_status', ResourcePlanLogConstants.SUCCESSFUL);
+		timeCardLog.setValue('action_by', gs.getUserID());
+		timeCardLog.insert();
+	},
+    type: 'ResourcePlanLogHelperSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2019-09-26 04:05:08&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0a977c3a0b000010bc67ed3ab4673a7c&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;249&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ResourcePlanLogHelperSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Resource Management" source="com.snc.resource_management"&gt;7200da2b47e64210cd4e1ce4316d438e&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0a977c3a0b000010bc67ed3ab4673a7c&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-08-07 12:50:10&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:44</sys_created_on>
+        <sys_id>3060f49583b01210c6695855eeaad3a8</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ResourcePlanLogHelperSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_3060f49583b01210c6695855eeaad3a8</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:44</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

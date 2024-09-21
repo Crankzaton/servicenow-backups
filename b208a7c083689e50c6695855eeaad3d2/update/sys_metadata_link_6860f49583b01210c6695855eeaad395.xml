@@ -1,0 +1,1824 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0a90d4700b50201099b8ea7885673aa4</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.CMDBDynamicIREProcessor&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;CMDBDynamicIREProcessor&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var CMDBDynamicIREProcessor = Class.create();
+CMDBDynamicIREProcessor.prototype = {
+
+    // The size of batches to be processed before maximum_records is reached.
+    batchSize: 1000,
+
+    // Add this property to sys_properties type=string value=info/debug/warn/error.
+    // Then filter logs where source contains CMDBDynamicIREProcessor.
+    _LOG_PROPERTY: "glide.identification_engine.ire_dynamic.log.level",
+
+    // Tables
+    _CMDB_DYNAMIC_IRE_MATCH: 'cmdb_dynamic_ire_match',
+    _CMDB_DYNAMIC_IRE_FILTER_CONDITION: 'cmdb_dynamic_ire_filter_condition',
+    _CMDB_DYNAMIC_IRE_FEATURE: 'cmdb_dynamic_ire_feature',
+    _CMDB_DYNAMIC_IRE_FEATURE_SET: 'cmdb_dynamic_ire_feature_set',
+    _CMDB_DYNAMIC_IRE_MODEL: 'cmdb_dynamic_ire_model',
+    _CMDB_CI: "cmdb_ci",
+
+    // Tables filter for reference to cmdb tables.
+    filteredTables: ['ecc_event', 'discovery_log', 'cmdb_metric', 'u_eal_submission'],
+
+    // Columns filtered as not relevant for viewing.
+    filteredColumns: ['sys_domain_path', 'sys_class_path'],
+
+    initialize: function(logProperty) {
+        // The count of inserts into this._CMDB_DYNAMIC_IRE_MATCH
+        this.matchCount = 0;
+
+        // Feature set update records
+        this.featureSetUpdateCount = 0;
+
+        if (JSUtil.nil(logProperty))
+            logProperty = this._LOG_PROPERTY;
+
+        this.log = new GSLog(logProperty, this.type);
+        // this.log.disableDatabaseLogs();
+
+		this._mlInterface = new global.CMDBDynamicIREMLInterface();
+    },
+
+    /*
+     * Calculate the feature score. 1=equals, 0=not equal, -1 null or empty string. For the
+     * selected cmdb_dynamic_match records.
+     *
+     * @param modelId the model. cmdb_dymanic_model.sys_id
+     * @param matchFilterJSON a filter to pick the match records. {
+    "expected_match": [0, 1], // 0 = NoMatch, 1 = Match, 2 = Not Processed, 3 = Analyze
+    "reviewed": true,
+    "processed_time_from": "2020-04-19 20:35:41",
+    "processed_time_to": "2020-04-19 20:35:41"
+}
+	 *
+     * @return feature {message: "", processed_records: "", updated_records: "", processed_time: "", feature_count: ""}
+     */
+
+    applyFeatures: function(modelId, matchFilterJSON) {
+
+        try {
+
+            var filterMatchObj = {
+                'expected_match': [0, 1],
+                'reviewed': true,
+                'processed_time_from': '',
+                'processed_time_to': ''
+            };
+
+            if (!gs.nil(matchFilterJSON))
+                filterMatchObj = JSON.parse(matchFilterJSON);
+
+            var expectedMatch = [];
+            if (filterMatchObj.hasOwnProperty('expected_match'))
+                expectedMatch = filterMatchObj.expected_match;
+
+            var swComplete = new GlideStopWatch();
+            var lastProccessId = '';
+            var complete = false;
+            var processedRecCount = 0;
+            this.featureSetUpdateCount = 0;
+
+            var featuresJSON = this.getFeatures(modelId);
+
+            var feature = {};
+            feature.message = '';
+            feature.processed_records = processedRecCount;
+            feature.updated_records = this.featureSetUpdateCount;
+            feature.processed_time = 0;
+            feature.feature_count = 0;
+
+            if (gs.nil(featuresJSON)) {
+
+                var message = this.formatMessage("Completed job CMDBDynamicIREProcessor::applyFeatures no active features defined for model Id: {0}", [modelId]);
+                this.log.logInfo(message);
+                feature.message = message;
+                return feature;
+            }
+
+            feature.feature_count = Object.keys(featuresJSON).length;
+            var matchGr = new GlideRecord(this._CMDB_DYNAMIC_IRE_MATCH);
+
+            // Only process matched record based on the filters.
+
+            if (expectedMatch.length &gt; 0)
+                matchGr.addQuery('expected_match', 'IN', expectedMatch.toString());
+
+
+            if (filterMatchObj.hasOwnProperty('reviewed'))
+                matchGr.addQuery('reviewed', filterMatchObj.reviewed);
+
+            if (filterMatchObj.hasOwnProperty('processed_time_from') &amp;&amp; filterMatchObj.hasOwnProperty('processed_time_to')) {
+                if (!gs.nil(filterMatchObj.processed_time_from))
+                    matchGr.addQuery('processed_time', '&gt;=', new GlideDateTime(filterMatchObj.processed_time_from));
+                if (!gs.nil(filterMatchObj.processed_time_to))
+                    matchGr.addQuery('processed_time', '&lt;=', new GlideDateTime(filterMatchObj.processed_time_to));
+            }
+
+
+            matchGr.query();
+            totalCount = matchGr.getRowCount();
+            while (!complete) {
+                var sw = new GlideStopWatch();
+                complete = true;
+                if (!gs.nil(lastProccessId))
+                    matchGr.addQuery('sys_id', '&gt;', lastProccessId);
+
+                // NOTE limit must be set BEFORE order by
+                matchGr.setLimit(this.batchSize);
+                matchGr.orderBy('sys_id');
+                matchGr.query();
+
+                while (matchGr.next()) {
+
+                    var ci1Gr = new GlideRecord(matchGr.getValue('class_ci_1'));
+                    if (!ci1Gr.get(matchGr.getValue('ci_1'))) {
+                        this.log.logErr(this.formatMessage("CMDBDynamicIREProcessor::applyFeatures CI1 not found: {0}", [matchGr.getValue('ci_1')]));
+                        continue;
+                    }
+
+                    var ci2Gr = new GlideRecord(matchGr.getValue('class_ci_2'));
+                    if (!ci2Gr.get(matchGr.getValue('ci_2'))) {
+                        this.log.logErr(this.formatMessage("CMDBDynamicIREProcessor::applyFeatures CI2 not found: {0}", [matchGr.getValue('ci_2')]));
+                        continue;
+                    }
+
+                    var featuresScores = [];
+                    var featureRef = null;
+
+                    for (var key in featuresJSON) {
+
+                        var featureObj = featuresJSON[key];
+
+                        var columns = featureObj.attributes.split(',');
+
+                        // Get the feature columns and values for each CI.
+
+                        var columnValuesJSON = {};
+
+                        if (gs.nil(featureObj.reference_field)) {
+                            columnValuesJSON.ci1 = this._getFieldColumnsAndValues(columns, ci1Gr);
+                            columnValuesJSON.ci2 = this._getFieldColumnsAndValues(columns, ci2Gr);
+                        } else {
+                            columnValuesJSON.ci1 = this._getReferenceFeatureColumnsAndValues(featureObj, columns, ci1Gr);
+                            columnValuesJSON.ci2 = this._getReferenceFeatureColumnsAndValues(featureObj, columns, ci2Gr);
+                        }
+
+                        this.log.logDebug(this.formatMessage("Processing job CMDBDynamicIREProcessor::applyFeatures \nMatch Id: {0}\nFeature: {1}\nFeature Scores: {2}\nCI Data: {3}", [matchGr.getUniqueValue(), JSON.stringify(featureObj), JSON.stringify(featuresScores), JSON.stringify(columnValuesJSON)]));
+
+                        // Just calculate plain equals for each value.
+                        var score = this.calculateFeatureScore(featureObj, featuresScores, columnValuesJSON);
+
+                        var featureScore = {};
+                        featureScore.feature = key;
+                        featureScore.score = score;
+                        featuresScores.push(featureScore);
+                    }
+
+                    if (featuresScores.length &gt; 0) {
+                        featureRef = this.createFeatureSetRecord(matchGr.getValue('expected_match'), featuresScores);
+                    }
+                    //update the reference back on to the cmdb_dynamic_match table.
+                    if (!gs.nil(featureRef)) {
+                        matchGr.setValue('feature_record', featureRef);
+                        updated = matchGr.update();
+                        if (gs.nil(updated)) {
+                            this.log.logErr(this.formatMessage("CMDBDynamicIREProcessor::applyFeatures  updating the reference back on {0}", [this._CMDB_DYNAMIC_IRE_MATCH]));
+                        }
+                    }
+
+                    lastProccessId = matchGr.getUniqueValue();
+                    processedRecCount++;
+
+                    if (processedRecCount === totalCount) {
+                        complete = true;
+                        break;
+                    }
+
+                    complete = false;
+                }
+
+
+                sw.stop();
+                this.log.logDebug(this.formatMessage("Processing job CMDBDynamicIREProcessor::applyFeatures Processed {0} match records out of {1}. Duration: {2} (sec).", [processedRecCount.toString(), totalCount, sw.getTime() / 1000]));
+
+            }
+
+            swComplete.stop();
+
+            var completeMessage = this.formatMessage("Completed job CMDBDynamicIREProcessor::applyFeatures Processed {0} CI's where expected match is {1}. Duration: {2} (sec).", [processedRecCount.toString(), expectedMatch.toString(), swComplete.getTime() / 1000]);
+            this.log.logInfo(completeMessage);
+
+            feature.message = completeMessage;
+            feature.processed_records = processedRecCount;
+            feature.updated_records = this.featureSetUpdateCount;
+            feature.processed_time = swComplete.getTime() / 1000;
+
+            return JSON.stringify(feature);
+
+        } catch (ex) {
+            this.log.logErr(this.formatMessage("CMDBDynamicIREProcessor::applyFeatures msg: {0}", [ex]));
+        }
+    },
+
+    /*
+     * Find CI's that have a common filter pattern i.e. name or serial_nuber or mac_address match.
+     *
+     * @param modelId the model. cmdb_dymanic_model.sys_id
+     * @return feature {message: "", maximum_records: "", processed_records: "", match_records: "", reference_filter: "", processed_time: ""}
+     */
+
+    applyFilterConditions: function(modelId) {
+
+        try {
+            var result = [];
+            var filter = {};
+
+            var modelGr = new GlideRecord(this._CMDB_DYNAMIC_IRE_MODEL);
+            if (!modelGr.get(modelId)) {
+                filter.message = this.formatMessage("Completed job CMDBDynamicIREProcessor::applyFilterConditions Model not found Id {0}", [modelId]);
+                this.log.logInfo(filter.message);
+                result.push(filter);
+                return result;
+            }
+
+            var baseClass = modelGr.getValue('cmdb_class');
+            var baseClassTableTree = j2js(new TableUtils(baseClass).getTables());
+            baseClassTableTree = baseClassTableTree.concat(j2js(new TableUtils(baseClass).getTableExtensions()));
+
+            var maxRecords = 0;
+            var maxMatchRecords = 0;
+
+            if (!gs.nil(modelGr.getValue("maximum_records")))
+                maxRecords = parseInt(modelGr.getValue('maximum_records'));
+
+            if (!gs.nil(modelGr.getValue("maximum_match_records")))
+                maxMatchRecords = parseInt(modelGr.getValue("maximum_match_records"));
+
+            if (0 != maxRecords &amp;&amp; this.batchSize &gt; maxRecords)
+                this.batchSize = maxRecords;
+
+            // get the filters for this table.
+            var filterCondGr = new GlideRecord(this._CMDB_DYNAMIC_IRE_FILTER_CONDITION);
+            filterCondGr.addQuery('model_id', modelId);
+            filterCondGr.addActiveQuery();
+            filterCondGr.orderBy("order");
+            filterCondGr.query();
+
+            if (0 == filterCondGr.getRowCount()) {
+                filter.message = this.formatMessage("Completed job CMDBDynamicIREProcessor::applyFilterConditions no filters defined in table: {0} for model Id: {1}", [this._CMDB_DYNAMIC_IRE_FILTER_CONDITION, modelId]);
+                this.log.logInfo(filter.message);
+                result.push(filter);
+                return result;
+            }
+
+            while (filterCondGr.next()) {
+
+                this.log.logInfo(this.formatMessage("Started job CMDBDynamicIREProcessor::applyFilterConditions for filter: {0}.", [filterCondGr.getValue('name')]));
+
+                this.matchCount = 0;
+
+                var maxFilteredRecords = 0;
+                if (!gs.nil(filterCondGr.getValue("maximum_filtered_records")))
+                    maxFilteredRecords = parseInt(filterCondGr.getValue('maximum_filtered_records'));
+
+                var filterName = filterCondGr.getValue('name');
+                var referenceField = filterCondGr.getValue('reference_field');
+                var filterClass = filterCondGr.getValue('cmdb_class');
+
+                var filterClasses = j2js(new TableUtils(filterClass).getTableExtensions());
+                filterClasses.push(filterClass);
+
+                var staticCondition = filterCondGr.getValue("static_condition");
+                var dynamicCondition = filterCondGr.getValue("dynamic_condition");
+                var condition = staticCondition;
+
+                if (!gs.nil(dynamicCondition))
+                    condition = dynamicCondition.replace('EQ', staticCondition);
+
+                var dynamicConditionColumns = this._getColumnFromQuery(dynamicCondition);
+
+                if (gs.nil(referenceField)) {
+                    filter = this._processFilterCMDBItems(filterName, maxFilteredRecords, maxRecords, maxMatchRecords, filterClasses, staticCondition, condition, dynamicConditionColumns, modelId);
+                } else {
+                    filter = this._processFilterReferenceItems(filterName, maxFilteredRecords, maxRecords, maxMatchRecords, baseClassTableTree, staticCondition, condition, dynamicConditionColumns, filterClass, referenceField, modelId);
+                }
+
+                result.push(filter);
+            }
+
+            return JSON.stringify(result);
+
+        } catch (ex) {
+            this.log.logErr(this.formatMessage("CMDBDynamicIREProcessor::applyFilterConditions msg: {0}", [ex]));
+        }
+    },
+
+    getFeatures: function(modelId) {
+
+        var featuresJSON = {};
+
+        // Get all the active features/filters
+        var featureGr = new GlideRecord(this._CMDB_DYNAMIC_IRE_FEATURE);
+        var filterJoinCondition = featureGr.addJoinQuery(this._CMDB_DYNAMIC_IRE_FILTER_CONDITION, 'filter_condition_id', 'sys_id');
+        filterJoinCondition.addCondition('model_id', modelId);
+        featureGr.addNotNullQuery('attributes');
+        featureGr.addActiveQuery();
+        featureGr.orderBy("order");
+        featureGr.query();
+
+        if (0 == featureGr.getRowCount()) {
+            return null;
+        }
+
+        while (featureGr.next()) {
+
+            var feature = {};
+
+            feature.name = featureGr.getValue('name');
+            feature.attributes = featureGr.getValue('attributes');
+            feature.cmdb_class = featureGr.getValue('cmdb_class');
+            feature.matching_algorithm = parseInt(featureGr.getValue('matching_algorithm'));
+            feature.weight = featureGr.getValue('weight');
+            feature.featureColumnName = featureGr.getValue('feature');
+
+            var filterGr = featureGr.filter_condition_id.getRefRecord();
+            feature.model_id = filterGr.getValue('model_id');
+            feature.reference_field = gs.nil(filterGr.getValue('reference_field')) ? '' : filterGr.getValue('reference_field');
+            feature.static_condition = filterGr.getValue('static_condition');
+            feature.dynamic_condition = filterGr.getValue('dynamic_condition');
+
+            featuresJSON[featureGr.getValue('feature')] = feature;
+        }
+
+        return featuresJSON;
+    },
+
+    createMatchRecord: function(ci_1, class_ci_1, ci_2, class_ci_2, referenceFilter) {
+
+        if (gs.nil(ci_1) || gs.nil(ci_2) || ci_1 == ci_2)
+            return false;
+
+        var dynamicMatchGr = new GlideRecord(this._CMDB_DYNAMIC_IRE_MATCH);
+        var q = dynamicMatchGr.addQuery('cmdb_ci_1', ci_1);
+        q.addOrCondition('cmdb_ci_2', ci_1);
+        var q1 = dynamicMatchGr.addQuery('cmdb_ci_1', ci_2);
+        q1.addOrCondition('cmdb_ci_2', ci_2);
+        dynamicMatchGr.query();
+
+        if (dynamicMatchGr.next()) {
+
+            // getDisplayValue returns string true/false
+            var refFilter = dynamicMatchGr.getDisplayValue('reference_filter');
+
+            // Dont reset if this was already found with a reference filter
+            if ('true' !== refFilter) {
+                dynamicMatchGr.setValue('reference_filter', referenceFilter);
+
+                if (!dynamicMatchGr.update()) {
+                    this.log.logErr(this.formatMessage("CMDBDynamicIREProcessor::createMatchRecord updating {0} ID: {1}", [this._CMDB_DYNAMIC_IRE_MATCH, dynamicMatchGr.getUniqueValue()]));
+                }
+            }
+
+            return false;
+        }
+
+        dynamicMatchGr = new GlideRecord(this._CMDB_DYNAMIC_IRE_MATCH);
+        dynamicMatchGr.initialize();
+        dynamicMatchGr.setValue('cmdb_ci_1', ci_1);
+        dynamicMatchGr.setValue('ci_1', ci_1);
+        dynamicMatchGr.setValue('class_ci_1', class_ci_1);
+        dynamicMatchGr.setValue('cmdb_ci_2', ci_2);
+        dynamicMatchGr.setValue('ci_2', ci_2);
+        dynamicMatchGr.setValue('class_ci_2', class_ci_2);
+        dynamicMatchGr.setValue('reference_filter', referenceFilter);
+        dynamicMatchGr.setValue('model_id', modelId);
+        dynamicMatchGr.setValue('expected_match', 2);
+
+        var dynamicMatchId = dynamicMatchGr.insert();
+        if (gs.nil(dynamicMatchId)) {
+            this.log.logErr(this.formatMessage("CMDBDynamicIREProcessor::createMatchRecord inserting {0}", [this._CMDB_DYNAMIC_IRE_MATCH]));
+        }
+        this.matchCount++;
+        return true;
+    },
+
+    createFeatureSetRecord: function(expectedMatch, features) {
+
+        if (features.length == 0)
+            return null;
+
+        var newDynamicFeatureSetGr = new GlideRecord(this._CMDB_DYNAMIC_IRE_FEATURE_SET);
+        newDynamicFeatureSetGr.initialize();
+        newDynamicFeatureSetGr.setValue('label', expectedMatch);
+
+        for (var j = 0; j &lt; features.length; j++) {
+            newDynamicFeatureSetGr.setValue(features[j].feature, features[j].score);
+        }
+
+        var dynamicFeatureSetId = newDynamicFeatureSetGr.insert();
+        if (gs.nil(dynamicFeatureSetId)) {
+            this.log.logErr(this.formatMessage("CMDBDynamicIREProcessor::createFeatureSetRecord  inserting {0}", [this._CMDB_DYNAMIC_IRE_FEATURE_SET]));
+        }
+
+        return dynamicFeatureSetId;
+    },
+
+    /*
+     * Calculate the feature score. 1=equals, 0=not equal, -1 null or empty string.
+     * @param featureObj the feature.
+     * @param featuresScores {feature_1: &lt;score&gt;, feature_2: &lt;score&gt;, ...}
+     * @param columnValuesJSON {ci1:  {column1: [value1, value2],column2: [value3, value4], ...},ci2: ...
+     * @return int score.
+     */
+
+    calculateFeatureScore: function(featureObj, featuresScores, columnValuesJSON) {
+
+        // Alorgrithm to calculate match Equals (0), Non Existing (1), Distance (2).
+        var matchAlgorithm = parseInt(featureObj.matching_algorithm);
+        var ci1ColValues = columnValuesJSON.ci1;
+        var ci2ColValues = columnValuesJSON.ci2;
+
+        // Score to be returned
+        var score = 0;
+
+        // The number of set pairs
+        var keyCount = 0;
+
+        var nonExisting = true;
+
+        for (var key in ci1ColValues) {
+
+            var ci1Values = ci1ColValues[key];
+            var ci2Values = ci2ColValues[key];
+
+            // If no values.
+            if (ci1Values.length == 0 &amp;&amp; ci2Values.length == 0) {
+                continue;
+            }
+            nonExisting = false;
+
+            // Calculate the Interset of 2 sets
+            // i.e set1= [1,2,3,4] set2=[3,4,5,6,7] intersect = [1,2[3,4,3,4]5,6,7]
+            // score = 4/set1.length + set2.length = 0.4444
+
+            var matchedCount = 0;
+            for (var i = 0; i &lt; ci1Values.length; i++) {
+                if (ci2Values.indexOf(ci1Values[i]) !== -1) {
+                    // If it exists in both
+                    matchedCount++;
+                }
+            }
+            for (var j = 0; j &lt; ci2Values.length; j++) {
+                if (ci1Values.indexOf(ci2Values[j]) !== -1) {
+                    // If it exists in both
+                    matchedCount++;
+                }
+            }
+
+            // matchAlgorithm === 0 i.e. Equals i.e. all values must be equal
+            if (matchAlgorithm === 0 &amp;&amp; (matchedCount !== (ci1Values.length + ci2Values.length))) {
+                return 0;
+            }
+
+            keyCount++;
+
+            score = score + (matchedCount / (ci1Values.length + ci2Values.length));
+        }
+
+        if (0 !== keyCount) {
+            score = score / keyCount;
+        }
+        // Non Existing
+        if (matchAlgorithm === 1) {
+            if (nonExisting) {
+                score = 1;
+            } else {
+                score = 0;
+            }
+        } else {
+            if (nonExisting)
+                score = -1;
+        }
+
+        // Score should always be less than equal to 1
+        if (score &gt; 1) {
+            this.log.logErr(this.formatMessage("Processing job CMDBDynamicIREProcessor::calculateFeatureScore score greater than 1 \nScore: {0}\nFeature: {1}\n Previous Feature Scores: {2}\nCI Data: {3}", [score, JSON.stringify(featureObj), JSON.stringify(featuresScores), JSON.stringify(columnValuesJSON)]));
+        }
+
+        return score;
+    },
+
+    /*
+     * The Levenshtein distance between two strings stringA, stringB (of length  |stringA| and |stringB| respectively)
+     * is given by levenshteinDistance{stringA,stringB}(|stringA|,|stringB|)
+     * Use to get a percent value
+     * var levenshteinDistance = this.levenshteinDistance(stringA, stringB);
+     * var bigger = Math.max(stringA.length, stringB.length);
+     * var percent =  (bigger - levenshteinDistance) / bigger;
+     *
+     */
+
+    levenshteinDistance: function(stringA, stringB) {
+        if (gs.nil(stringA))
+            stringA = '';
+
+        if (gs.nil(stringB))
+            stringB = '';
+
+        if (stringA.length == 0) return stringB.length;
+        if (stringB.length == 0) return stringA.length;
+
+        var matrix = [];
+
+        // increment along the first column of each row
+        var i;
+        for (i = 0; i &lt;= stringB.length; i++) {
+            matrix[i] = [i];
+        }
+
+        // increment each column in the first row
+        var j;
+        for (j = 0; j &lt;= stringA.length; j++) {
+            matrix[0][j] = j;
+        }
+
+        // Fill in the rest of the matrix
+        for (i = 1; i &lt;= stringB.length; i++) {
+            for (j = 1; j &lt;= stringA.length; j++) {
+                if (stringB.charAt(i - 1) == stringA.charAt(j - 1)) {
+                    matrix[i][j] = matrix[i - 1][j - 1];
+                } else {
+                    matrix[i][j] = Math.min(matrix[i - 1][j - 1] + 1, // substitution
+                        Math.min(matrix[i][j - 1] + 1, // insertion
+                            matrix[i - 1][j] + 1)); // deletion
+                }
+            }
+        }
+        return matrix[stringB.length][stringA.length];
+    },
+
+    /*
+     *
+     * @param  matchJSON {"cmdb_dynamic_ire_match": [{"sys_id": "&lt;value&gt;","expected_match": "Match"},
+     * {"sys_id": "&lt;value&gt;","expected_match": "value"}]}
+     * @return matchJSON {"cmdb_dynamic_ire_match": [{"sys_id": "&lt;value&gt;","expected_match": "value", "updated": "true"},
+     * {"sys_id": "&lt;value&gt;","expected_match": "value", "updated": "true"}]}.
+     */
+
+    updateMatchRecords: function(matchJSON) {
+
+        try {
+
+            matchJSON = JSON.parse(matchJSON);
+            var matchRecs = matchJSON.cmdb_dynamic_ire_match;
+
+            for (var i = 0; i &lt; matchRecs.length; i++) {
+                var matchGr = new GlideRecord(this._CMDB_DYNAMIC_IRE_MATCH);
+                if (matchGr.get(matchRecs[i].sys_id)) {
+                    matchGr.setValue('expected_match', matchRecs[i].expected_match);
+                    if (matchGr.update()) {
+                        matchRecs[i].updated = true;
+                    } else {
+                        matchRecs[i].updated = false;
+                        this.log.logErr(this.formatMessage("CMDBDynamicIREProcessor::updateMatchRecords updating {0} ID: {1}", [this._CMDB_DYNAMIC_IRE_MATCH, matchGr.getUniqueValue()]));
+                    }
+                } else {
+                    this.log.logErr(this.formatMessage("CMDBDynamicIREProcessor::updateMatchRecords updating {0} ID: {1}", [this._CMDB_DYNAMIC_IRE_MATCH, matchRecs[i].sys_id]));
+                }
+            }
+            return JSON.stringify(matchJSON);
+
+        } catch (ex) {
+            this.log.logErr(this.formatMessage("CMDBDynamicIREProcessor::updateMatchRecords Parsing json msg: {0}", [ex]));
+        }
+    },
+
+    /*
+     *
+     * @param  matchJSON {"cmdb_dynamic_ire_match": [{"sys_id": "&lt;value&gt;","expected_match": "value"},
+     * {"sys_id": "&lt;value&gt;","expected_match": "value"}]}
+     *
+     * @return matchJSON {"columns": ["DynamicIREIT_89_9191","DynamicIREIT_89_9191"],"cmdb_ci_win_server": {"rows": [{"asset": ["YAH-0F4C-9191 - Unknown",""],"asset_tag": ["YAH-0F4C-9191","YAH-0F4C-9292"]} ]},"cmdb_serial_number": {"rows": [{"serial_number": ["4f-fc-cd-db-b1-919853","4f-fc-cd-db-b1-919855"],"serial_number_type": ["chassis","chassis"]},{"serial_number": ["4f-fc-cd-db-b1-919854","4f-fc-cd-db-b1-919854"],"serial_number_type": ["chassis","chassis"]},{"serial_number": ["","4f-fc-cd-db-b1-919853"],"serial_number_type": ["","chassis"]}]}}
+     *
+     */
+
+    getMatchRecords: function(matchJSON, excludeNull) {
+        try {
+
+            matchJSON = JSON.parse(matchJSON);
+
+            var matchRecs = matchJSON.cmdb_dynamic_ire_match;
+            var items = {};
+            var index = 0;
+
+            for (var i = 0; i &lt; matchRecs.length; i++) {
+
+                var matchGr = new GlideRecord(this._CMDB_DYNAMIC_IRE_MATCH);
+
+                if (matchGr.get(matchRecs[i].sys_id)) {
+
+                    items = this._getCIItemColumnsAndValues((matchRecs.length * 2), index, items, matchGr.getValue('ci_1'), matchGr.getValue('class_ci_1'), excludeNull);
+                    index++;
+                    items = this._getCIItemColumnsAndValues((matchRecs.length * 2), index, items, matchGr.getValue('ci_2'), matchGr.getValue('class_ci_2'), excludeNull);
+                    index++;
+
+                } else {
+                    this.log.logErr(this.formatMessage("CMDBDynamicIREProcessor::getMatchRecords Match record not found: {0}", [matchRecs[i].sys_id]));
+
+                }
+            }
+            return JSON.stringify(items);
+
+        } catch (ex) {
+            this.log.logErr(this.formatMessage("CMDBDynamicIREProcessor::getMatchRecords Parsing json msg: {0}", [ex]));
+        }
+    },
+
+    _getCIItemColumnsAndValues: function(ciCount, index, items, ciId, ciClass, excludeNull) {
+
+
+        var ciGr = new GlideRecord(ciClass);
+        if (!ciGr.get(ciId)) {
+            this.log.logErr(this.formatMessage("CMDBDynamicIREProcessor::_getCIItemColumnsAndValues CI not found: {0}", [ciId]));
+            return items;
+        }
+
+        var tableName = ciGr.getTableName();
+
+        if (!items.hasOwnProperty('columns')) {
+            items['columns'] = [ciGr.getValue('name')];
+        } else {
+            items['columns'].push(ciGr.getValue('name'));
+        }
+        var rownumber = 0;
+
+        this._populateFieldsAndValues(excludeNull, ciCount, index, rownumber, tableName, items, ciGr);
+
+        // Get hte reference tables for the features.
+        var featureGr = new GlideRecord(this._CMDB_DYNAMIC_IRE_FEATURE);
+        var filterJoinCondition = featureGr.addJoinQuery(this._CMDB_DYNAMIC_IRE_FILTER_CONDITION, 'filter_condition_id', 'sys_id');
+        featureGr.addActiveQuery();
+        featureGr.orderBy("order");
+        featureGr.query();
+
+        var referenceObjs = {};
+
+        while (featureGr.next()) {
+
+            // Get the reference tables and fields.
+
+            // {"cmdb_ci_network_adapter": {"referenceField": "cmdb_ci","referenceFields": ["mac_address"]},
+            //  "cmdb_serial_number": {"referenceField": "cmdb_ci","referenceFields": ["serial_number_type","serial_number"]}}
+
+            if (!gs.nil(featureGr.filter_condition_id.reference_field)) {
+
+                var className = featureGr.getValue('cmdb_class');
+                var referenceObj = null;
+                var referenceFields = [];
+
+                for (var key in referenceObjs) {
+                    if (className === key) {
+                        referenceObj = referenceObjs[key];
+                        referenceFields = referenceObj.referenceFields;
+                        break;
+                    }
+                }
+
+                if (gs.nil(referenceObj)) {
+                    referenceObj = {};
+                    referenceObj.referenceField = featureGr.filter_condition_id.reference_field;
+                    referenceObj.referenceFields = referenceFields;
+                    referenceObjs[featureGr.getValue('cmdb_class')] = referenceObj;
+                }
+
+                var attributes = featureGr.getValue('attributes');
+
+                if (!gs.nil(attributes)) {
+                    attributes = attributes.split(',');
+                    for (var i = 0; i &lt; attributes.length; i++) {
+                        if (referenceFields.indexOf(attributes[i]) === -1) {
+                            referenceFields.push(attributes[i]);
+                        }
+                    }
+                }
+            }
+        }
+
+        for (var table in referenceObjs) {
+
+            var referenceItemObj = referenceObjs[table];
+
+            var refGr = new GlideRecord(table);
+            refGr.addQuery(referenceItemObj.referenceField, ciGr.getUniqueValue());
+            refGr.query();
+            rownumber = 0;
+
+            while (refGr.next()) {
+                this._populateFieldsAndValues(excludeNull, ciCount, index, rownumber, table, items, refGr);
+                rownumber++;
+            }
+        }
+
+        return items;
+    },
+
+
+    _populateFieldsAndValues: function(excludeNull, ciCount, index, rowNumber, tableName, items, gr) {
+
+        var columns = new GlideRecordUtil().getFields(gr);
+        columns = this._filterColumns(columns);
+        columns.sort();
+
+        var tableLabel = this._getClassLabel(tableName);
+
+        if (!items.hasOwnProperty(tableLabel)) {
+            items[tableLabel] = {
+                rows: [{}]
+            };
+        }
+        var row;
+        var rows = items[tableLabel].rows;
+
+        // Add a new row
+        if (rowNumber &gt;= rows.length) {
+            row = {};
+            rows.push(row);
+        } else {
+            row = rows[rowNumber];
+        }
+
+        // Add the column values for this row object.
+        for (var i = 0; i &lt; columns.length; i++) {
+
+            var columnLabel = this._getColumnForTable(tableName, columns[i], true);
+            if (!row.hasOwnProperty(columnLabel))
+                row[columnLabel] = this._getEmptyRow(ciCount);
+
+            row[columnLabel][index] = gr.getDisplayValue(columns[i]);
+
+            // If the row is empty and its the last value to be added remove the element.
+            if ((ciCount - 1) == index &amp;&amp; this._isEmptyRow(row[columnLabel]) &amp;&amp; excludeNull)
+                delete row[columnLabel];
+
+        }
+    },
+
+    _isEmptyRow: function(rowValues) {
+
+        for (var i = 0; i &lt; rowValues.length; i++) {
+            if (!gs.nil(rowValues[i]))
+                return false;
+        }
+        return true;
+    },
+
+    _getEmptyRow: function(ciCount) {
+        var row = [];
+        for (var i = 0; i &lt; ciCount; i++) {
+            row.push('');
+        }
+        return row;
+    },
+
+    _getFieldColumnsAndValues: function(columns, ciGr) {
+
+        var columnObj = {};
+
+        if (gs.nil(columns))
+            return columnObj;
+
+        columns.sort();
+
+        for (var i = 0; i &lt; columns.length; i++) {
+
+            var value = this._getValueForColumn(columns[i], ciGr);
+
+            if (gs.nil(value)) {
+                columnObj[columns[i]] = [];
+            } else {
+                columnObj[columns[i]] = value;
+            }
+        }
+
+        return columnObj;
+    },
+
+    _getValueForColumn: function(column, gr) {
+        var fields = column.split('.');
+        var ciObj;
+        var value;
+
+        for (var j = 0; j &lt; fields.length; j++) {
+
+            var field = '' + fields[j];
+
+            if (j == 0)
+                ciObj = gr.getElement(field);
+            else
+                ciObj = ciObj.getElement(field);
+
+            if (gs.nil(ciObj)) {
+                value = '';
+            } else {
+                if (j &lt; fields.length - 1) {
+                    ciObj = ciObj.getRefRecord();
+                } else {
+                    value = [ciObj.getValue(field)];
+                }
+            }
+        }
+
+        return value;
+    },
+    /*
+     *
+     * @parm featureObj
+     * @parm columns
+     * @parm ciGr
+     * @return {"serial_number_type":["chassis","chassis"],"serial_number":["4f-fc-cd-db-b1-919843","4f-fc-cd-db-b1-919844"]}
+     */
+
+    _getReferenceFeatureColumnsAndValues: function(featureObj, columns, ciGr) {
+
+
+        var cmdbFeatureGr = new GlideRecord(featureObj.cmdb_class);
+
+        cmdbFeatureGr.addQuery(featureObj.reference_field, ciGr.getUniqueValue());
+
+        if (!gs.nil(featureObj.static_condition))
+            cmdbFeatureGr.addEncodedQuery(featureObj.static_condition);
+
+        cmdbFeatureGr.query();
+
+        // Nothing found return empty column/values.
+        var referencedObj;
+        if (cmdbFeatureGr.getRowCount() &gt; 0) {
+
+            while (cmdbFeatureGr.next()) {
+
+                var ciColValues = this._getFieldColumnsAndValues(columns, cmdbFeatureGr);
+                if (gs.nil(referencedObj)) {
+                    referencedObj = ciColValues;
+                } else {
+                    for (var key in referencedObj) {
+                        var values = referencedObj[key];
+                        values = values.concat(ciColValues[key]);
+                        referencedObj[key] = values;
+                    }
+                }
+            }
+        } else {
+            referencedObj = {};
+            for (var i = 0; i &lt; columns.length; i++) {
+                referencedObj[columns[i]] = [];
+            }
+
+        }
+        return referencedObj;
+
+    },
+
+    _getEncodedQueryCondition: function(columns, conditionQuery, itemGr) {
+
+        var encodedQuery = '';
+
+        if (gs.nil(conditionQuery))
+            return encodedQuery;
+
+        var conditionColumn = conditionQuery.split('^');
+
+        var encodedQueryWildCard = '';
+        for (var i = 0; i &lt; conditionColumn.length; i++) {
+
+            var conditionColumnWildCard = conditionColumn[i].split('?');
+
+            encodedQueryWildCard = '';
+            if (conditionColumnWildCard.length &gt; 1) {
+                for (var j = 0; j &lt; conditionColumnWildCard.length; j++) {
+                    var condition = conditionColumnWildCard[j];
+
+                    if (gs.nil(condition))
+                        continue;
+
+                    for (var k = 0; k &lt; columns.length; k++) {
+                        if (condition.indexOf(columns[k]) !== -1 &amp;&amp; (condition.split('.').length === columns[k].split('.').length)) {
+                            var value = this._getValueForColumn(columns[k], itemGr);
+                            if (!gs.nil(value)) {
+                                encodedQueryWildCard = condition + value;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (gs.nil(encodedQueryWildCard)) {
+                if (gs.nil(encodedQuery))
+                    encodedQuery = encodedQuery + conditionColumn[i];
+                else
+                    encodedQuery = encodedQuery + '^' + conditionColumn[i];
+            } else {
+                if (gs.nil(encodedQuery))
+                    encodedQuery = encodedQuery + encodedQueryWildCard;
+                else
+                    encodedQuery = encodedQuery + '^' + encodedQueryWildCard;
+            }
+        }
+        return encodedQuery;
+    },
+
+
+    /**
+     * Only gets tables which have data for that column.
+     * Gets clazz and all tables that extend clazz +
+     * reference tables of clazz and its extended from classes.
+     */
+
+    _getColumnsForLookupTable: function(clazz, column, referenceOnly) {
+        var results = [];
+
+        if (gs.nil(clazz) || gs.nil(column))
+            return results;
+
+        var tables = [];
+        // Get all extended tables from clazz
+        if (!referenceOnly) {
+            tables = j2js(new TableUtils(clazz).getTableExtensions());
+            tables.push(clazz);
+        }
+
+        // Get parent tables and ref tables for clazz
+        var parentTables = j2js(new TableUtils(clazz).getTables());
+        for (var k = 0; k &lt; parentTables.length; k++) {
+            // Add reference tables.
+            var refTables = this._getReferencingTables(parentTables[k]);
+            for (var l = 0; l &lt; refTables.length; l++)
+                tables.push(refTables[l]);
+        }
+
+        tables = this._filterTables(tables);
+
+        for (var i = 0; i &lt; tables.length; i++) {
+
+            var columns = this._getTableColumns(tables[i]);
+            for (var j = 0; j &lt; columns.length; j++) {
+
+                if (column == columns[j]) {
+                    var entry = {};
+                    entry.table = tables[i];
+                    entry.column = columns[j];
+                    results.push(entry);
+                }
+            }
+        }
+        return results;
+    },
+
+    train: function(tableName, featuresColumns, outputColumn, modelName, modelId) {
+        var result = {};
+
+        try {
+            var modelGr = new GlideRecord(this._CMDB_DYNAMIC_IRE_MODEL);
+            if (!modelGr.get(modelId)) {
+                var message = this.formatMessage("Completed job CMDBDynamicIREProcessor::train Model not found Id {0}", [modelId]);
+                this.log.logErr(message);
+                result.status = "FAILURE";
+                return result;
+            }
+
+            //deep copy
+            var fieldNames = JSON.parse(JSON.stringify(featuresColumns));
+
+            fieldNames.push(outputColumn);
+
+            var fieldDetails = [];
+            for (var j = 0; j &lt; featuresColumns.length; j++) {
+                fieldDetails.push({
+                    'name': featuresColumns[j],
+                    type: 'numeric'
+                });
+            }
+
+            var myData = new sn_ml.DatasetDefinition({
+
+                'tableName': tableName,
+                'fieldNames': fieldNames,
+                'fieldDetails': fieldDetails
+
+            });
+
+            var mySolution = new sn_ml.ClassificationSolution({
+                'label': modelName,
+                'dataset': myData,
+                'predictedFieldName': outputColumn,
+                'inputFieldNames': featuresColumns
+            });
+
+
+            var solutionName = sn_ml.ClassificationSolutionStore.add(mySolution);
+
+            // submit training job
+            var solutionVersion = mySolution.submitTrainingJob();
+            result.solutionName = mySolution.getName();
+
+            var trainingStatus = JSON.parse(solutionVersion.getStatus());
+            result.solutionVersion = trainingStatus;
+            result.status = "SUCCESS";
+
+            modelGr.setValue('ml_model_name', solutionName);
+            modelGr.setValue('version', solutionVersion.getVersionNumber());
+            if (gs.nil(modelGr.update())) {
+                result.status = "FAILURE";
+                this.log.logErr(this.formatMessage("CMDBDynamicIREProcessor::train msg: Unable to update {0} with the solutionName and solutionVersion", [this._CMDB_DYNAMIC_IRE_MODEL]));
+            }
+        } catch (ex) {
+            this.log.logErr(this.formatMessage("CMDBDynamicIREProcessor::train  msg: {0}", [ex]));
+            result.status = "FAILURE";
+        }
+
+        return JSON.stringify(result);
+    },
+
+    monitorStatus: function(solutionName) {
+
+        var result = {};
+
+        try {
+            var mlSolution = sn_ml.ClassificationSolutionStore.get(solutionName);
+            var trainingStatus = JSON.parse(mlSolution.getLatestVersion().getStatus());
+            result.state = trainingStatus['state'];
+            result.precentComplete = trainingStatus['percentComplete'];
+            result.hasJobEnded = trainingStatus['hasJobEnded'];
+            result.status = "SUCCESS";
+        } catch (ex) {
+            result.status = "FAILURE";
+            this.log.logErr(this.formatMessage("CMDBDynamicIREProcessor::monitorStatus msg: {0}", [ex]));
+        }
+        return JSON.stringify(result);
+    },
+
+    predict: function(tableName, solutionName, modelId, isComputeLocalPrediction) {
+
+        try {
+
+            var result = {};
+            var options = {};
+            var message = '';
+            options.apply_threshold = false;
+
+            var mlSolution = sn_ml.ClassificationSolutionStore.get(solutionName);
+            var activeMlSolutionVersion = mlSolution.getActiveVersion();
+
+            var complete = false;
+            var swComplete = new GlideStopWatch();
+
+            var inputGr = new GlideRecord(tableName);
+            inputGr.query();
+            var rowCount = inputGr.getRowCount();
+            var lo = 0;
+            var hi = 50;
+            var batchSize = 50;
+
+            if (isComputeLocalPrediction) {
+
+                var featuresJSON = this.getFeatures(modelId);
+
+                if (gs.nil(featuresJSON)) {
+                    message = this.formatMessage("Completed job CMDBDynamicIREProcessor::predict no active features defined for model Id: {0}", [modelId]);
+                    this.log.logErr(message);
+                    result.status = 'FAILURE';
+                    result.statusCode = 'no_active_features_present_make_sure_to_run_configure_model';
+                    return JSON.stringify(result);
+                }
+
+                var modelConfigInfo = this.getModelConfigInfo(modelId);
+
+                modelConfigInfoObject = JSON.parse(modelConfigInfo);
+
+                if (modelConfigInfoObject.status == 'SUCCESS') {
+                    if (gs.nil(modelConfigInfoObject.biasValue) || modelConfigInfoObject.biasValue == '') {
+                        message = this.formatMessage("Completed job CMDBDynamicIREProcessor::predict model configuration not done yet, run configureModel for model Id: {0}", [modelId]);
+                        result.status = 'FAILURE';
+                        result.statusCode = 'no_bias_value_present_make_sure_to_run_configure_model';
+                        return JSON.stringify(result);
+                    }
+                } else {
+                    message = this.formatMessage("Completed job CMDBDynamicIREProcessor::predict error while fetching bias weight and reverse flag for model Id: {0}", [modelId]);
+                    result.status = 'FAILURE';
+                    result.statusCode = 'error_while_fetching_bias_weight_and_reverse_flag_make_sure_to_run_configure_model';
+                    return JSON.stringify(result);
+                }
+            }
+
+            while (!complete) {
+
+                var sw = new GlideStopWatch();
+
+                inputGr.orderByDesc('sys_id');
+                inputGr.chooseWindow(lo, hi);
+                inputGr.query();
+
+                var tempSysIds = [];
+                while (inputGr.next()) {
+                    tempSysIds.push('' + inputGr.sys_id);
+
+                }
+
+                var gr = new GlideRecord(tableName);
+                gr.addQuery('sys_id', 'IN', tempSysIds);
+                gr.query();
+
+
+                var results = {};
+                if (isComputeLocalPrediction)
+                    results = this._computeLocalPrediction(gr, featuresJSON, modelConfigInfoObject);
+                else
+                    results = activeMlSolutionVersion.predict(gr, options);
+
+                this._updatePredictionAndProbability(results);
+                lo = hi;
+                hi = lo + batchSize;
+                if (lo &gt;= rowCount) {
+                    complete = true;
+                }
+                sw.stop();
+                this.log.logInfo(this.formatMessage("Completed job CMDBDynamicIREProcessor::predict. Processed {0} records of {1}. Duration: {2} (sec).", [lo, rowCount, sw.getTime() / 1000]));
+
+            }
+
+            swComplete.stop();
+            this.log.logInfo(this.formatMessage("Completed job CMDBDynamicIREProcessor::predict. Processed {0} records of {1}. Duration: {2} (sec).", [hi, 50, rowCount, swComplete.getTime() / 1000]));
+
+            result.status = "SUCCESS";
+        } catch (ex) {
+            this.log.logErr(this.formatMessage("CMDBDynamicIREProcessor::predict Msg: {0}", [ex]));
+            result.status = "FAILURE";
+        }
+        return JSON.stringify(result);
+    },
+
+    /*
+     * Fetch the weights of the trained model from ML platform tables and
+     * update the cmdb_dynamic_ire_feature table with it for each of the features.
+     * @param modelId The modelId for the specific class of the the CMDB class
+     * @param mlSolutionName the soutionName for the final Solution to be used by IRE
+     * @param options {'mlSolutionVersion':1} JSON string which contains the solutionVersion for the final Solution to be used by IRE
+     * @return {status: "SUCCESS"}"}
+     */
+    configureModel: function(modelId, mlSolutionName, options) {
+        try {
+            var result = {};
+            result.status = "SUCCESS";
+
+            var mlSolutionVersion = options.hasOwnProperty('mlSolutionVersion')?
+              options.mlSolutionVersion : 1;
+
+            //verify that there is a model configured in the cmdb_dynamic_ire_model table
+            var modelGr = new GlideRecord(this._CMDB_DYNAMIC_IRE_MODEL);
+            if (!modelGr.get(modelId)) {
+                this.log.logErr(this.formatMessage("Completed job CMDBDynamicIREProcessor::configureModel Model not found Id {0}", [modelId]));
+                result.status = "FAILURE";
+                result.statusCode = "model_not_found";
+                return JSON.stringify(result);
+            }
+
+            //update the ml_model_name and ml_solution_version in the cmdb_dynamic_ire_model
+            modelGr.setValue('ml_model_name', mlSolutionName);
+            modelGr.setValue('version', mlSolutionVersion);
+            if (gs.nil(modelGr.update())) {
+                this.log.logErr(this.formatMessage("Completed job CMDBDynamicIREProcessor::configureModel Unable to update the model solutionName {0} modelSolutionVersion {1}", [mlSolutionName, mlSolutionVersion]));
+                result.status = "FAILURE";
+                result.statusCode = "unable_to_update_model_solution_name";
+                return JSON.stringify(result);
+            }
+
+            var modelMetaData = this._mlInterface.getModelMetaData(mlSolutionName, mlSolutionVersion);
+
+            if (gs.nil(modelMetaData)) {
+
+                this.log.logErr(this.formatMessage("Comleted Job CMDBDynamicIREProcessor::configureModel Unable to configure the model, there was an exception while fetching the model metadata from the ml platfrom tables {0}", [modelMetaData]));
+                result.status = "FAILURE";
+                result.statusCode = "ml_meta_data_undefined_or_failure";
+                return JSON.stringify(result);
+
+            }
+
+            var modelMetaDataObject = JSON.parse(modelMetaData);
+
+            if (modelMetaDataObject.status === 'FAILURE') {
+
+                this.log.logErr(this.formatMessage("Comleted Job CMDBDynamicIREProcessor::configureModel Unable to configure the model, there was an exception while fetching the model metadata from the ml platfrom tables {0}", [modelMetaData]));
+                result.status = "FAILURE";
+                result.statusCode = "ml_meta_data_undefined_or_failure";
+                return JSON.stringify(result);
+
+            }
+
+            var modelObject = modelMetaDataObject.weights;
+
+            if (gs.nil(modelObject)) {
+                this.log.logErr(this.formatMessage("Completed Job CMDBDynamicIREProcessor::configureModel Unable to parse the response from the ML API for the model MetaData"));
+                result.status = "FAILURE";
+                result.statusCode = "unable_to_parse_ml_meta_data";
+                return JSON.stringify(result);
+            }
+
+            var feature_count = modelObject.feature_count;
+
+            if (feature_count === 0) {
+                this.log.logErr(this.formatMessage("Completed Job CMDBDynamicIREProcessor::configureModel There are no features which made it to the model. Ensure that the training was successful and the ML model for solution name {0} and solution version {1} is valid", [mlSolutionName, mlSolutionVersion]));
+                result.status = "FAILURE";
+                result.statusCode = "no_features_found_in_model";
+                return JSON.stringify(result);
+            }
+
+            var featureGr = new GlideRecord(this._CMDB_DYNAMIC_IRE_FEATURE);
+            var filterJoinCondition = featureGr.addJoinQuery(this._CMDB_DYNAMIC_IRE_FILTER_CONDITION, 'filter_condition_id', 'sys_id');
+            filterJoinCondition.addCondition('model_id', modelId);
+            featureGr.addNotNullQuery('attributes');
+            featureGr.orderBy("order");
+            featureGr.query();
+            while (featureGr.next()) {
+
+                if (gs.nil(modelObject[featureGr.getValue('feature')])) {
+                    //feature did not make it into the model can set this feature in table to inactive
+                    featureGr.setValue('active', 'false');
+                    featureGr.setValue('weight', '');
+                } else {
+                    featureGr.setValue('active', 'true');
+                    featureGr.setValue('weight', modelObject[featureGr.getValue('feature')]);
+                }
+
+                if (gs.nil(featureGr.update())) {
+                    this.log.logErrr(this.formatMessage('CMDBDynamicIREProcessor::configureModel Issue with updating the weight values for feature Id {0}', [featureGr.getUniqueValue()]));
+                    result.statusCode = "unable_to_update_feature_weight";
+                    result.status = "FAILURE";
+                }
+            }
+
+            var updateModelGr = new GlideRecord(this._CMDB_DYNAMIC_IRE_MODEL);
+            updateModelGr.addQuery('sys_id', modelId);
+            updateModelGr.query();
+            if (updateModelGr.next()) {
+                updateModelGr.setValue('ml_model_bias', modelObject['bias']);
+                updateModelGr.setValue('ml_model_class_label', modelObject['rev']);
+                if (gs.nil(updateModelGr.update())) {
+                    this.log.logErrr(this.formatMessage('CMDBDynamicIREProcessor::configureModel Issue with updating the bias weight for model Id {0}', [updateModelGr.getUniqueValue()]));
+                    result.statusCode = "unable_to_update_bias_weight";
+                    result.status = "FAILURE";
+                }
+            }
+        } catch (ex) {
+            this.log.logErr(this.formatMessage("CMDBDynamicIREProcessor::configureModel exception while configuring model {0}", [ex]));
+            result.statusCode = "unhandled_exception";
+            result.status = "FAILURE";
+        }
+
+        return JSON.stringify(result);
+    },
+
+    getModelConfigInfo: function(modelId) {
+        var modelConfigInfo = {};
+        modelConfigInfo.status = 'SUCCESS';
+        var modelGr = new GlideRecord(this._CMDB_DYNAMIC_IRE_MODEL);
+        modelGr.addQuery('sys_id', modelId);
+        modelGr.query();
+        if (modelGr.next()) {
+            modelConfigInfo.isReverse = modelGr.getValue('ml_model_class_label');
+            modelConfigInfo.biasValue = modelGr.getValue('ml_model_bias');
+        } else {
+            var message = this.formatMessage("Completed job CMDBDynamicIREProcessor::getModelConfigInfo Model not found Id {0}", [modelId]);
+            this.log.logErr(message);
+            modelConfigInfo.status = 'FAILURE';
+        }
+        return JSON.stringify(modelConfigInfo);
+    },
+
+    _computeLocalPrediction: function(gr, featuresJSON, modelConfigInfoObject) {
+
+        var results = {};
+        var message = '';
+        if (gs.nil(featuresJSON)) {
+            message = this.formatMessage("Completed job CMDBDynamicIREProcessor::_computeLocalPrediction no active features provided");
+            this.log.logErr(message);
+            return JSON.stringify(result);
+        }
+
+        if (gs.nil(modelConfigInfoObject)) {
+            message = this.formatMessage("Completed job CMDBDynamicIREProcessor::_computeLocalPrediction no modelConfigInfoObject provided", [modelConfigInfoObject]);
+            this.log.logErr(message);
+            return JSON.stringify(result);
+        }
+
+        if (gs.nil(modelConfigInfoObject.biasValue)) {
+            message = this.formatMessage("Completed job CMDBDynamicIREProcessor::_computeLocalPrediction no_bias_value_present_make_sure_to_run_configure_model", [modelConfigInfoObject.biasValue]);
+            this.log.logErr(message);
+            return JSON.stringify(result);
+        }
+
+        if (gs.nil(modelConfigInfoObject.isReverse)) {
+            message = this.formatMessage("Completed job CMDBDynamicIREProcessor::_computeLocalPrediction no_isReverse_present_make_sure_to_run_configure_model", [modelConfigInfoObject.isReverse]);
+            this.log.logErr(message);
+            return JSON.stringify(result);
+        }
+
+        while (gr.next()) {
+            //for each featureset row get each featureValue as defined in the model from the table
+            var product = parseFloat(modelConfigInfoObject.biasValue);
+            for (var key in featuresJSON) {
+
+                var featureObj = featuresJSON[key];
+                product += (featureObj.weight * gr.getValue(featureObj.featureColumnName));
+            }
+            var probability = this._applyLogistic(product);
+            var confidence = probability &gt; 0.5 ? probability * 100 : (1 - probability) * 100;
+            var predictedValue = (modelConfigInfoObject.isReverse == "1") ? (probability &gt; 0.5) ? "0" : "1" : (probability &gt; 0.5) ? "1" : "0";
+            results[gr.getUniqueValue()] = [{
+                "confidence": confidence,
+                "predictedValue": predictedValue
+            }];
+        }
+        return JSON.stringify(results);
+    },
+
+    /**
+     * compute the logistic function
+     */
+    _applyLogistic: function(num) {
+        return 1 / (1 + Math.exp(-num));
+    },
+
+    /**
+     * Get table column where the table has data.
+     */
+
+    _getTableColumns: function(clazz) {
+
+        var columns = [];
+        try {
+
+            // If the table has no data it will not be added.
+            var grCheck = new GlideRecord(clazz);
+            grCheck.setLimit(1);
+            grCheck.query();
+            if (grCheck.next()) {
+                var fields = new GlideRecordUtil().getFields(grCheck);
+                var gr = new GlideRecord('sys_db_object');
+                // CMDB tables
+                var column = '';
+                for (var j = 0; j &lt; fields.length; j++) {
+                    if (!gs.nil(grCheck.sys_class_name) &amp;&amp; gr.get('name', grCheck.sys_class_name)) {
+                        // Extended tables
+                        column = this._getColumnForTable(gr.super_class.name, fields[j], false);
+                        if (!gs.nil(column))
+                            columns.push(column);
+                        else {
+                            column = this._getColumnForTable(grCheck.sys_class_name, fields[j], false);
+                            if (!gs.nil(column))
+                                columns.push(column);
+                        }
+
+                    } else {
+                        //None CMDB tables
+                        if (gr.get('name', clazz)) {
+                            column = this._getColumnForTable(gr.name, fields[j], false);
+                            if (!gs.nil(column))
+                                columns.push(column);
+                        }
+                    }
+                }
+            }
+
+        } catch (ex) {
+            this.log.logInfo(this.formatMessage("Info: _getTableColumns for class: {0}. Msg: {1}", [clazz, ex]));
+        }
+        return columns;
+    },
+
+    _updatePredictionAndProbability: function(results) {
+
+        var resultsJson = JSON.parse(results);
+        for (var key in resultsJson) {
+
+            var arrayObject = resultsJson[key];
+
+            var matchGr = new GlideRecord(this._CMDB_DYNAMIC_IRE_MATCH);
+            matchGr.addQuery('feature_record', key);
+            matchGr.query();
+            if (0 == matchGr.getRowCount()) {
+                this.log.logErr(this.formatMessage("_updatePredictionAndProbability - unable to find match record for sys_id: {0}.", [key]));
+            }
+            if (matchGr.next()) {
+                matchGr.setValue('prediction', parseInt(arrayObject[0].predictedValue));
+                matchGr.setValue('probability', arrayObject[0].confidence);
+                if (!matchGr.update())
+                    this.log.logErr(this.formatMessage("Error: _updatePredictionAndProbability - unable to update the match record for sys_id: {0}.", [key]));
+            }
+
+        }
+    },
+
+    _getColumnForTable: function(className, field, columnLabel) {
+        var dict = new GlideRecord('sys_dictionary');
+        dict.addQuery('name', className);
+        dict.addQuery('element', field);
+        dict.addActiveQuery();
+        dict.query();
+        if (dict.next()) {
+            if (columnLabel)
+                return dict.column_label;
+            else
+                return dict.element;
+        }
+        return null;
+    },
+
+    _getReferenceTableForColumn: function(referenceTable, field) {
+
+        var gr = new GlideAggregate('sys_dictionary');
+        gr.addQuery('name', referenceTable);
+        // exclude entries for duplicate_of field
+        gr.addQuery('element', field);
+        gr.addAggregate('count');
+        gr.orderByAggregate('count');
+        gr.groupBy('reference');
+        gr.query();
+        if (gr.next())
+            return '' + gr.reference;
+
+        return null;
+    },
+
+    _getLookupTables: function(className) {
+        var map = {};
+        var tables = j2js(new TableUtils(className).getTables());
+        for (var i = 0; i &lt; tables.length; i++) {
+            var refTables = this._getReferencingTables(tables[i]);
+            for (var j = 0; j &lt; refTables.length; j++)
+                map[refTables[j]] = '';
+        }
+
+        var result = [];
+        result.push(className);
+        for (var tab in map)
+            if (tab != className)
+                result.push(tab);
+
+        result = this._filterTables(result);
+        return result;
+    },
+
+    _getLookupTablesForClassManager: function(className) {
+        var result = [];
+        var lookupTables = this._getLookupTables(className);
+        for (var i = 0; i &lt; lookupTables.length; i++) {
+            if (className == lookupTables[i])
+                continue;
+            var entry = {};
+            entry.value = lookupTables[i];
+            entry.name = this._getClassLabel(lookupTables[i]);
+            result.push(entry);
+        }
+        return result;
+    },
+
+    _filterColumns: function(columns) {
+
+        var filtered = [];
+        for (var i = 0; i &lt; columns.length; i++) {
+            var tbl = columns[i];
+            var j = 0;
+            while (j &lt; this.filteredColumns.length) {
+                if (tbl.indexOf(this.filteredColumns[j]) !== -1)
+                    break;
+                j++;
+            }
+            // filter out tables meant for workflow
+            if (tbl.startsWith('var__'))
+                continue;
+
+            if (j == this.filteredColumns.length)
+                filtered.push(tbl);
+        }
+        return filtered;
+    },
+
+    _filterTables: function(tables) {
+
+        var filtered = [];
+        for (var i = 0; i &lt; tables.length; i++) {
+            var tbl = tables[i];
+            var j = 0;
+            while (j &lt; this.filteredTables.length) {
+                if (tbl.indexOf(this.filteredTables[j]) !== -1)
+                    break;
+                j++;
+            }
+            // filter out tables meant for workflow
+            if (tbl.startsWith('var__'))
+                continue;
+
+            if (j == this.filteredTables.length)
+                filtered.push(tbl);
+        }
+        return filtered;
+    },
+
+    _getReferencingTables: function(table) {
+        var referencingTables = [];
+        var gr = new GlideAggregate('sys_dictionary');
+        gr.addQuery('reference', table);
+        // exclude entries for duplicate_of field
+        gr.addQuery('element', '!=', 'duplicate_of');
+        gr.addAggregate('count');
+        gr.orderByAggregate('count');
+        gr.groupBy('name');
+        gr.query();
+        while (gr.next())
+            referencingTables.push('' + gr.name);
+
+        return referencingTables;
+    },
+
+    _getClassLabel: function(className) {
+        var descriptor = GlideTableDescriptor.get(className);
+        return descriptor.getLabel();
+    },
+
+    _processFilterCMDBItems: function(filterName, maxFilteredRecords, maxRecords, maxMatchRecords, filterClasses, staticCondition, condition, dynamicConditionColumns, modelId) {
+
+        var swComplete = new GlideStopWatch();
+        var complete = false;
+        var processedRecCount = 0;
+        var lastProccessId = '';
+        var filter = {
+            "name": filterName
+        };
+
+        while (!complete) {
+
+            var sw = new GlideStopWatch();
+            complete = true;
+
+            var tableGr = new GlideRecord(this._CMDB_CI);
+            tableGr.addQuery('sys_class_name', 'IN', filterClasses.toString());
+
+            if (!gs.nil(lastProccessId))
+                tableGr.addQuery('sys_id', '&gt;', lastProccessId);
+
+            if (!gs.nil(staticCondition)) {
+                tableGr.addEncodedQuery(staticCondition);
+            }
+            // NOTE limit must be set BEFORE order by
+            tableGr.setLimit(this.batchSize);
+            tableGr.orderBy('sys_id');
+            tableGr.query();
+
+            while (tableGr.next()) {
+
+                // Apply the filter condition
+                if (!gs.nil(condition)) {
+
+                    var filterCIsGr = new GlideRecord(tableGr.getValue('sys_class_name'));
+
+                    // Get the encodedQuery with the wildcards substituted for actaul values.
+                    var encodedQuery = this._getEncodedQueryCondition(dynamicConditionColumns, condition, tableGr);
+                    if (!gs.nil(encodedQuery))
+                        filterCIsGr.addEncodedQuery(encodedQuery);
+
+                    filterCIsGr.addQuery('sys_id', '!=', tableGr.getUniqueValue());
+
+                    if (0 != maxFilteredRecords)
+                        filterCIsGr.setLimit(maxFilteredRecords);
+
+                    filterCIsGr.query();
+
+                    var cmdbCI = [];
+
+                    while (filterCIsGr.next()) {
+
+                        if (cmdbCI.indexOf(filterCIsGr.getUniqueValue()) === -1) {
+                            cmdbCI.push(filterCIsGr.getUniqueValue());
+
+                            // createMatchRecord(ci_1, class_ci_1, ci_2, class_ci_2)
+                            this.createMatchRecord(tableGr.getUniqueValue(), tableGr.getValue('sys_class_name'), filterCIsGr.getUniqueValue(), filterCIsGr.getTableName(), false, modelId);
+                        }
+                    }
+
+                    lastProccessId = tableGr.getUniqueValue();
+                    processedRecCount++;
+
+                    if (maxRecords != 0 &amp;&amp; processedRecCount &gt;= maxRecords) {
+                        complete = true;
+                        break;
+                    }
+
+                    // Check if we have reached the limit of maxMatchRecords
+                    if (0 != maxMatchRecords &amp;&amp; this.matchCount &gt;= maxMatchRecords) {
+                        complete = true;
+                        break;
+                    }
+
+                    complete = false;
+                }
+            }
+            if (0 != tableGr.getRowCount()) {
+                sw.stop();
+                this.log.logDebug(this.formatMessage("Processing job CMDBDynamicIREProcessor::applyFilterConditions for filter: {0}. Processed {1} CI's of {2}. Found {3} duplicates. Duration: {4} (sec).", [filterName, processedRecCount.toString(), maxRecords.toString(), this.matchCount.toString(), sw.getTime() / 1000]));
+            }
+        }
+
+        swComplete.stop();
+
+        var message = this.formatMessage("Completed job CMDBDynamicIREProcessor::applyFilterConditions for filter: {0}. Processed {1} CI's of {2}. Found {3} duplicates. Duration: {4} (sec).", [filterName, processedRecCount.toString(), maxRecords.toString(), this.matchCount.toString(), swComplete.getTime() / 1000]);
+
+        filter.message = message;
+        filter.maximum_records = maxRecords;
+        filter.processed_records = processedRecCount;
+        filter.match_records = this.matchCount;
+        filter.reference_filter = false;
+        filter.processed_time = swComplete.getTime() / 1000;
+        this.log.logInfo(message);
+        return filter;
+    },
+
+    _processFilterReferenceItems: function(filterName, maxFilteredRecords, maxRecords, maxMatchRecords, baseClassCITree, staticCondition, condition, dynamicConditionColumns, filterClass, referenceField, modelId) {
+
+        var swComplete = new GlideStopWatch();
+        var complete = false;
+        var processedRecCount = 0;
+        var lastProccessId = '';
+        var filter = {
+            "name": filterName
+        };
+
+        while (!complete) {
+
+            var sw = new GlideStopWatch();
+            complete = true;
+
+            var tableGr = new GlideRecord(filterClass);
+            var cmdbClass = this._getReferenceTableForColumn(filterClass, referenceField);
+            var joinCondition = tableGr.addJoinQuery(cmdbClass, referenceField, 'sys_id');
+            joinCondition.addCondition('sys_class_name', 'IN', baseClassCITree.toString());
+
+            if (!gs.nil(lastProccessId))
+                tableGr.addQuery('sys_id', '&gt;', lastProccessId);
+
+            if (!gs.nil(staticCondition)) {
+                tableGr.addEncodedQuery(staticCondition);
+            }
+
+            // NOTE limit must be set BEFORE order by
+            tableGr.setLimit(this.batchSize);
+            tableGr.orderBy('sys_id');
+            tableGr.query();
+
+            while (tableGr.next()) {
+
+                // Apply the filter condition
+                if (!gs.nil(condition)) {
+
+                    var filterCIsGr = new GlideRecord(filterClass);
+                    var filterJoinCondition = filterCIsGr.addJoinQuery(cmdbClass, referenceField, 'sys_id');
+                    filterJoinCondition.addCondition('sys_class_name', 'IN', baseClassCITree.toString());
+
+                    // Get the encodedQuery with the wildcards substituted for actaul values.
+                    var encodedQuery = this._getEncodedQueryCondition(dynamicConditionColumns, condition, tableGr);
+                    if (!gs.nil(encodedQuery))
+                        filterCIsGr.addEncodedQuery(encodedQuery);
+
+                    filterCIsGr.addQuery('sys_id', '!=', tableGr.getUniqueValue());
+
+                    if (0 != maxFilteredRecords)
+                        filterCIsGr.setLimit(maxFilteredRecords);
+
+                    filterCIsGr.query();
+
+                    var cmdbCI = [];
+
+                    while (filterCIsGr.next()) {
+
+                        if (cmdbCI.indexOf(filterCIsGr[referenceField]) === -1) {
+                            cmdbCI.push(filterCIsGr[referenceField]);
+
+                            // createMatchRecord(ci_1, class_ci_1, ci_2, class_ci_2)
+                            this.createMatchRecord(tableGr[referenceField], tableGr[referenceField].sys_class_name, filterCIsGr[referenceField], filterCIsGr[referenceField].sys_class_name, true, modelId);
+                        }
+                    }
+
+                    lastProccessId = tableGr.getUniqueValue();
+                    processedRecCount++;
+
+                    if (maxRecords != 0 &amp;&amp; processedRecCount &gt;= maxRecords) {
+                        complete = true;
+                        break;
+                    }
+
+                    // Check if we have reached the limit of maxMatchRecords
+                    if (0 != maxMatchRecords &amp;&amp; this.matchCount &gt;= maxMatchRecords) {
+                        complete = true;
+                        break;
+                    }
+
+                    complete = false;
+                }
+            }
+            if (0 != tableGr.getRowCount()) {
+                sw.stop();
+                this.log.logDebug(this.formatMessage("Processing job CMDBDynamicIREProcessor::applyFilterConditions for filter: {0}. Processed {1} CI's of {2}. Found {3} matches. Duration: {4} (sec).", [filterName, processedRecCount.toString(), maxRecords.toString(), this.matchCount.toString(), sw.getTime() / 1000]));
+            }
+        }
+
+        swComplete.stop();
+
+        var message = this.formatMessage("Completed job CMDBDynamicIREProcessor::applyFilterConditions for filter: {0}. Processed {1} CI's of {2}. Found {3} matches. Duration: {4} (sec).", [filterName, processedRecCount.toString(), maxRecords.toString(), this.matchCount.toString(), swComplete.getTime() / 1000]);
+
+        filter.message = message;
+        filter.maximum_records = maxRecords;
+        filter.processed_records = processedRecCount;
+        filter.match_records = this.matchCount;
+        filter.reference_filter = true;
+        filter.processed_time = swComplete.getTime() / 1000;
+        this.log.logInfo(message);
+        return filter;
+    },
+
+    _getColumnFromQuery: function(conditionQuery) {
+
+        var columns = [];
+        var conditionColumn = conditionQuery.split('^');
+
+        for (var i = 0; i &lt; conditionColumn.length; i++) {
+
+            if (gs.nil(conditionColumn[i]))
+                continue;
+
+            var column = '';
+
+            conditionColumn[i].replace(/[a-z_.]/g, function(m) {
+                column = column + m;
+            });
+            if (!gs.nil(column))
+                columns.push(column);
+
+        }
+        return columns;
+    },
+
+    formatMessage: function(str, args) {
+        this._replaceExpr = this._replaceExpr || [];
+        
+        for (var i = 0; i &lt; args.length; i++) {
+            if(i &gt;= this._replaceExpr.length)
+                this._replaceExpr[i] = new RegExp('\\{' + i + '\\}', 'gi');
+            
+            str = str.replace(this._replaceExpr[i], args[i]);
+        }
+
+        return str;
+    },
+
+    type: 'CMDBDynamicIREProcessor'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-11-02 22:46:13&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0a90d4700b50201099b8ea7885673aa4&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;693&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;CMDBDynamicIREProcessor&lt;/sys_name&gt;
+        &lt;sys_package display_value="Configuration Management (CMDB)" source="com.snc.cmdb"&gt;8f64bce83c31311068bcf327dfe37f7e&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0a90d4700b50201099b8ea7885673aa4&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-10-07 00:30:47&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:43</sys_created_on>
+        <sys_id>6860f49583b01210c6695855eeaad395</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>CMDBDynamicIREProcessor</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_6860f49583b01210c6695855eeaad395</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:43</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

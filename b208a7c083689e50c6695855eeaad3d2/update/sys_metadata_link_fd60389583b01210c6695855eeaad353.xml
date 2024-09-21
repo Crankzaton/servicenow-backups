@@ -1,0 +1,586 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0b7dcfbca700011003396c94d17901c7</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_sow_chg.ChangeInfoSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;ChangeInfoSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ChangeInfoSNC = Class.create();
+ChangeInfoSNC.prototype = {
+
+	LOG_PROPERTY: 'com.snc.change_management.sow_chg_info.log.level',
+
+	CHG_CTX_SIDEBAR_CFG_CACHE: 'change_ctx_sidebar_config',
+
+	PLUGIN_CHANGE_SUCCESS_SCORE: 'com.snc.change_management.change_success_score',
+	PLUGIN_CHANGE_SUCCESS_PROBABILITY: 'com.snc.change_management.success_probability',
+	PLUGIN_CONFLICT_DETECTION: 'com.snc.change.collision',
+	PLUGIN_CAB: 'com.snc.change_management.cab',
+	
+	TABLES: {
+		SYS_USER_GRMEMBER: 'sys_user_grmember',
+		SYS_USER: 'sys_user'
+	},
+
+	initialize: function (gr) {
+		this._log = new global.GSLog(this.LOG_PROPERTY, this.type);
+		this._log.includeTimestamp();
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug('[initialize] type: ' + this.type);
+
+		this._gr = gr;
+		this._grSysId = gr.getUniqueValue().toString();
+	},
+
+	// get data required for change contextual sidebar
+	getRecordInfo: function () {
+		var result = {};
+		result.cards = this.getCards();
+		result.headerInfo = this.getHeaderInfo();
+		result.change_request = this.getChangeRequestFields();
+		result.riskActions = this.getRiskActions();
+		result.changeDateInfo = this.getChangeDateInfo();
+		result.loggedInUserGroup = this.getLoggedInUserGroup();
+		result.cabMeeting = this.getCABMeeting();
+		return result;
+	},
+
+	getCards: function() {
+		var recInfoCards = {};
+		if (!this._gr || !this._gr.canRead())
+			return recInfoCards;
+
+		var table = this._gr.getTableName();
+
+		var changeCtxSidebarCards = this._getChangeCtxSidebarCards(table);
+		for (var i = 0; i &lt; changeCtxSidebarCards.length; i++) {
+			var changeCtxSidebarCard = changeCtxSidebarCards[i];
+			if (GlideFilter.checkRecord(this._gr, changeCtxSidebarCard.condition))
+				recInfoCards[changeCtxSidebarCard.card_id] = true;
+		}
+
+		var evaluator;
+		var chgCtxSidebarCardGr = new GlideRecord('chg_ctx_sidebar_card');
+		chgCtxSidebarCardGr.addActiveQuery();
+		chgCtxSidebarCardGr.addQuery('table', table);
+		chgCtxSidebarCardGr.addQuery('use_advanced_condition', true);
+		chgCtxSidebarCardGr.query();
+		while (chgCtxSidebarCardGr.next()) {
+			var matched = false;
+			if (!evaluator) {
+				evaluator = new GlideScopedEvaluator();
+				evaluator.putVariable('current', this._gr);
+				evaluator.putVariable('answer', false);
+			}
+			evaluator.evaluateScript(chgCtxSidebarCardGr, 'advanced_condition');
+			if (evaluator.getVariable('answer'))
+				recInfoCards[chgCtxSidebarCardGr.getValue('card_id')] = true;
+		}
+
+		return recInfoCards;
+	},
+
+	_getChangeCtxSidebarCards: function(table) {
+		table = table || '';
+		var key = new SOWChangeUtils().getCacheKey(table, true);
+		var chgCtxSidebarCards = sn_scoped_cache.ScopedCacheManager.get(this.CHG_CTX_SIDEBAR_CFG_CACHE, key);
+
+		if (chgCtxSidebarCards)
+			return JSON.parse(chgCtxSidebarCards);
+
+		chgCtxSidebarCards = [];
+
+		var chgCtxSidebarCardGr = new GlideRecord('chg_ctx_sidebar_card');
+		chgCtxSidebarCardGr.addActiveQuery();
+		chgCtxSidebarCardGr.addQuery('table', table);
+		chgCtxSidebarCardGr.addQuery('use_advanced_condition', false);
+		chgCtxSidebarCardGr.query();
+		while (chgCtxSidebarCardGr.next()) {
+			var chgCtxSidebarCard = {};
+			chgCtxSidebarCard.name = chgCtxSidebarCardGr.getDisplayValue();
+			chgCtxSidebarCard.condition = chgCtxSidebarCardGr.condition + '';
+			chgCtxSidebarCard.card_id = chgCtxSidebarCardGr.card_id + '';
+			chgCtxSidebarCards.push(chgCtxSidebarCard);
+		}
+
+		sn_scoped_cache.ScopedCacheManager.put(this.CHG_CTX_SIDEBAR_CFG_CACHE, key, JSON.stringify(chgCtxSidebarCards));
+
+		return chgCtxSidebarCards;
+	},
+
+	// get header data for change contextual sidebar 	
+	getHeaderInfo: function () {
+		var result = {};
+		result.mainHeading = gs.getMessage('Record information');
+
+		var updatedBy;
+		var userGr = new GlideRecord(this.TABLES.SYS_USER);
+		userGr.addActiveQuery();
+		userGr.addQuery('user_name', this._gr.getDisplayValue('sys_updated_by'));
+		userGr.query();
+
+		if (userGr.next() &amp;&amp; userGr.getValue('name'))
+			updatedBy = userGr.getValue('name');
+		else
+			updatedBy = this._gr.getDisplayValue('sys_updated_by');
+
+		result.updateMsg = gs.getMessage('Last updated by {0}', updatedBy);
+		result.updatedTime = this._gr.sys_updated_on.getDisplayValue();
+		return result;
+	},
+
+	getChangeRequestFields: function () {
+		var result = {};
+		result.state = {
+			value: this._gr.getValue('state'),
+			display_value: this._gr.state.getDisplayValue()
+		};
+		result.model = {
+			label: gs.getMessage('{0} success score', this._gr.chg_model.getLabel()),
+			value: this._gr.getValue('chg_model'),
+			display_value: this._gr.chg_model.getDisplayValue()
+		};
+		result.type = {
+			label: gs.getMessage('{0} success score', this._gr.type.getLabel()),
+			value: this._gr.getValue('type'),
+			display_value: this._gr.type.getDisplayValue()
+		};
+		result.risk = {
+			label: this._gr.risk.getLabel(),
+			value: this._gr.getValue('risk'),
+			display_value: this._gr.risk.getDisplayValue()
+		};
+
+		result.impactStacked = [];
+		var impactStacked = {
+			label: this._gr.impact.getLabel(),
+			value: {
+				type: 'html',
+				value: '&lt;span&gt;' + this._gr.impact.getDisplayValue() + '&lt;/span&gt;'
+			}
+		};
+		result.impactStacked.push(impactStacked);
+
+		result.riskEvaluatorStacked = this.getRiskEvaluator();
+
+		result.scheduleStacked = [];
+		if (this.isPluginActive(this.PLUGIN_CONFLICT_DETECTION)) {
+			var scheduleStacked = {
+				label: this._gr.conflict_last_run.getLabel(),
+				value: {
+					type: 'string',
+					value: this._gr.conflict_last_run.getDisplayValue()
+				}
+			};
+			result.scheduleStacked.push(scheduleStacked);
+
+			result.conflict_status = {
+				label: this._gr.conflict_status.getLabel(),
+				value: this._gr.getValue('conflict_status'),
+				display_value: this._gr.conflict_status.getDisplayValue()
+			};
+		}
+
+		result.cmdb_ci = {
+			label: this._gr.cmdb_ci.getLabel(),
+			value: this._gr.getValue('cmdb_ci'),
+			display_value: this._gr.cmdb_ci.getDisplayValue()
+		};
+
+		result.assignmentGroupStacked = [];
+		var assignmentGroupStacked = {
+			label: this._gr.assignment_group.getLabel(),
+			value: this._gr.assignment_group.getDisplayValue(),
+			clickable: false,
+			id: this._gr.getValue('assignment_group') + '-link'
+		};
+		if (this._gr.assignment_group)
+			result.assignmentGroupStacked.push(assignmentGroupStacked);
+
+		result.assignment_group = {
+			sysId: this._gr.assignment_group + '',
+			label: this._gr.assignment_group.getLabel(),
+			value: this._gr.getValue('assignment_group'),
+			display_value: this._gr.assignment_group.getDisplayValue()
+		};
+
+		result.assigned_to = {
+			sysId: this._gr.assigned_to + '',
+			label: this._gr.assigned_to.getLabel(),
+			labelAction: gs.getMessage('Assign'),
+			labelUnassigned: gs.getMessage('This change has not been assigned yet'),
+			value: {
+				type: 'string',
+				value: this._gr.assigned_to.getDisplayValue()
+			},
+			caller: this.getUserProfile(this._gr.assigned_to.getRefRecord()),
+			actions: {
+				label: gs.getMessage('Secondary assigned to actions'),
+				contactAction: {
+					label: gs.getMessage('Contact')
+				},
+				reassignAction: {
+					label: gs.getMessage('Reassign')
+				}
+			}
+		};
+
+		result.requested_by = {
+			sysId: this._gr.requested_by + '',
+			label: this._gr.requested_by.getLabel(),
+			labelUnassigned: gs.getMessage('{0} is not populated', this._gr.requested_by.getLabel()),
+			value: {
+				type: 'string',
+				value: this._gr.requested_by.getDisplayValue()
+			},
+			caller: this.getUserProfile(this._gr.requested_by.getRefRecord())
+		};
+
+		if (this.isPluginActive(this.PLUGIN_CHANGE_SUCCESS_SCORE)) {
+			result.change_success_score = new sn_chg_score.ChangeSuccess().getScoresForChange(this._gr);
+			if (result.change_success_score.team_success_score)
+				result.change_success_score.team_success_score.label = gs.getMessage('Change success score');
+		}
+
+		result.riskCard = {
+			label: gs.getMessage('Scorecard')
+		};
+
+		return result;
+	},
+
+	getRiskActions: function () {
+		return new SOWChangeUtils().calculateRisk(this._gr.getUniqueValue());
+	},
+
+	isPluginActive: function(plugin) {
+		return ((GlidePluginManager.isActive(plugin) + '').toLowerCase() === 'true');
+	},
+
+	getRiskEvaluator: function() {
+		var result = [];
+		if (!this.isPluginActive(this.PLUGIN_CHANGE_SUCCESS_PROBABILITY))
+			return result;
+
+		var changeProbabilityDetailsGr = new GlideRecord('sn_chg_probability_details');
+		changeProbabilityDetailsGr.addQuery('change_request', this._gr.getUniqueValue());
+		changeProbabilityDetailsGr.query();
+		if (!changeProbabilityDetailsGr.next())
+			return result;
+
+		var probabilitySuccess = {
+			label: gs.getMessage('Probability of success'),
+			value: {
+				type: 'html',
+				value: '&lt;span&gt;' + changeProbabilityDetailsGr.new_probability.getDisplayValue() + '&lt;/span&gt;'
+			}
+		};
+		result.push(probabilitySuccess);
+		return result;
+	},
+
+	getChangeDateInfo: function () {
+		var result = {};
+		result.heading = gs.getMessage('Schedule');
+		result.actionTooltip = gs.getMessage('Edit Schedule');
+		result.planned = [];
+		result.actual = [];
+
+		var plannedStart = {
+			label: this._gr.start_date.getLabel(),
+			value: {
+				type: 'string',
+				value: this._gr.start_date ? this._gr.start_date.getDisplayValue() : '-'
+			}
+		};
+
+		var plannedEnd = {
+			label: this._gr.end_date.getLabel(),
+			value: {
+				type: 'string',
+				value: this._gr.end_date ? this._gr.end_date.getDisplayValue() : '-'
+			}
+		};
+
+		result.plannedHasValue = !!(this._gr.start_date || this._gr.end_date);
+
+		var actualStart = {
+			label: this._gr.work_start.getLabel(),
+			value: {
+				type: 'string',
+				value: this._gr.work_start ? this._gr.work_start.getDisplayValue() : '-'
+			}
+		};
+
+		var actualEnd = {
+			label: this._gr.work_end.getLabel(),
+			value: {
+				type: 'string',
+				value: this._gr.work_end ? this._gr.work_end.getDisplayValue() : '-'
+			}
+		};
+
+		result.actualHasValue = !!(this._gr.work_start || this._gr.work_end);
+
+		result.planned.push(plannedStart);
+		result.planned.push(plannedEnd);
+		result.actual.push(actualStart);
+		result.actual.push(actualEnd);
+
+		return result;
+	},
+
+	getUserProfile: function (userGr) {
+		if (!userGr)
+			return {};
+
+		var userSysId = userGr.getUniqueValue();
+		var userInfo = {
+			userID: userSysId,
+			avatar: userGr.avatar ? '/' + userGr.avatar + '.iix?t=small' : '',
+			initials: this._getInitials(userGr.getValue('name')),
+			name: userGr.name.getDisplayValue(),
+			title: userGr.title ? userGr.title.getDisplayValue() : '-',
+			vip: userGr.vip ? [{ label: gs.getMessage('VIP'), color: 'critical' }] : [],
+			department: userGr.department.getDisplayValue(),
+			timeZone: userGr.time_zone.getDisplayValue() || '',
+			subtitle: this._getSubtitle(userGr)
+		};
+
+		// As per design docs limit to 6 fields, so one more could be added if needed
+		this._populateUserField('phone', 'phone', true, false, userGr, userInfo);
+		this._populateUserField('mobile_phone', 'mobile', true, false, userGr, userInfo);
+		this._populateUserField('email', 'email', true, true, userGr, userInfo);
+		this._populateUserAddress(userGr, userInfo);
+
+		return userInfo;
+	},
+
+	_getSubtitle: function(userGr) {
+		var subtitle = '';
+
+		if (!userGr)
+			return subtitle;
+
+		var subtitleArr = [];
+
+		if (userGr.title &amp;&amp; userGr.title.getDisplayValue())
+			subtitleArr.push(userGr.title.getDisplayValue());
+
+		if (userGr.department &amp;&amp; userGr.department.getDisplayValue())
+			subtitleArr.push(userGr.department.getDisplayValue());
+
+		if (subtitleArr.length === 1)
+			subtitle = subtitleArr.join('');
+
+		if (subtitleArr.length &gt; 1)
+			subtitle = subtitleArr.join(' · ');
+
+		return subtitle;
+	},
+
+	_populateUserField: function(field, type, clickable, useValue, userGr, userInfo) {
+		if (!field || !type || !userGr || !userInfo)
+			return;
+
+		if (userGr[field].canRead()) {
+			var fieldValue = useValue ? userGr.getValue(field) : userGr[field].getDisplayValue();
+
+			if (fieldValue)
+				userInfo[field] = {
+					id: field,
+					label: userGr[field].getLabel(),
+					value: fieldValue,
+					type: type,
+					clickable: clickable
+				};
+		}
+	},
+
+	_populateUserAddress: function(userGr, userInfo) {
+		if (!userGr || !userInfo)
+			return;
+
+		var address = [];
+		var addressLabel = gs.getMessage('Address');
+
+		if (userGr.location) {
+			var locationGr = userGr.location.getRefRecord();
+
+			if (locationGr) {
+				addressLabel = locationGr.getLabel();
+
+				if (locationGr.getDisplayValue('name'))
+					address.push(locationGr.getDisplayValue('name'));
+				else {
+					if (locationGr.street.getDisplayValue())
+						address.push(locationGr.street.getDisplayValue());
+
+					if (locationGr.city.getDisplayValue())
+						address.push(locationGr.city.getDisplayValue());
+
+					if (locationGr.state.getDisplayValue())
+						address.push(ocationGr.state.getDisplayValue());
+
+					if (locationGr.zip.getDisplayValue())
+						address.push(locationGr.zip.getDisplayValue());
+
+					if (locationGr.country.getDisplayValue())
+						address.push(locationGr.country.getDisplayValue());
+				}
+			}
+		} else {
+			if (userGr.street.getDisplayValue())
+				address.push(userGr.street.getDisplayValue());
+
+			if (userGr.city.getDisplayValue())
+				address.push(userGr.city.getDisplayValue());
+
+			if (userGr.state.getDisplayValue())
+				address.push(userGr.state.getDisplayValue());
+
+			if (userGr.zip.getDisplayValue())
+				address.push(userGr.zip.getDisplayValue());
+		}
+		var addressValue = address.join(', ').replace(/\,\ $/, '');
+
+		if (addressValue) {
+			userInfo.address = {
+				id: 'address',
+				label: addressLabel,
+				value: addressValue,
+				type: 'address'
+			};
+		}
+
+		return userInfo;
+	},
+
+	getLoggedInUserGroup: function() {
+		var result = [];
+		var groupGr = new GlideRecord('sys_user_grmember');
+		groupGr.addQuery('group.active', 'true');
+		groupGr.addQuery('user', gs.getUserID());
+		groupGr.query();
+
+		while (groupGr.next()) {
+			result.push({
+				displayValue: groupGr.group.getDisplayValue(),
+				value: groupGr.getValue('group')
+			});
+		}
+		return result;
+	},
+	
+	getCABMeeting: function() {
+		var result = {};
+		
+		result.label = gs.getMessage('CAB meeting');
+
+		if (!this.isPluginActive(this.PLUGIN_CAB)) {
+			result.hasMeeting = false;
+			return result;
+		}
+		
+		var cabAgendaItemSysIds = [];
+		var cabAgendaItemGr = new GlideRecord('cab_agenda_item');
+		cabAgendaItemGr.addQuery('state', 'IN', 'in_progress,pending');
+		cabAgendaItemGr.addQuery('task', this._gr.getUniqueValue());
+		cabAgendaItemGr.query();
+		while (cabAgendaItemGr.next())
+			cabAgendaItemSysIds.push(cabAgendaItemGr.cab_meeting + '');
+
+		result.hasMeeting = cabAgendaItemSysIds.length &gt; 0;
+
+		if (!result.hasMeeting)
+			return result;
+
+		var cabMeetingGr = new GlideRecord('cab_meeting');
+		cabMeetingGr.addQuery('sys_id', cabAgendaItemSysIds);
+		cabMeetingGr.addQuery('state', 'IN', 'in_progress,pending');
+		cabMeetingGr.orderBy('start');
+		cabMeetingGr.query();
+
+		if (cabMeetingGr.next()) {
+			result.cabStacked = [];
+
+			result.cabStacked.push({
+				label: cabMeetingGr.name.getLabel(),
+				value: {
+					type: 'string',
+					value: cabMeetingGr.name.getDisplayValue()
+				}
+			});
+			result.cabStacked.push({
+				label: cabMeetingGr.start.getLabel(),
+				value: {
+					type: 'string',
+					value: cabMeetingGr.start.getDisplayValue()
+				}
+			});
+			result.cabStacked.push({
+				label: cabMeetingGr.manager.getLabel(),
+				value: {
+					type: 'string',
+					value: cabMeetingGr.manager.getDisplayValue()
+				}
+			});
+
+			result.cabLink = '/cab/?id=cab_workbench&amp;sys_id=' + cabMeetingGr.getUniqueValue();
+		} else
+			result.hasMeeting = false;
+
+		return result;
+	},
+
+	_getInitials: function (fullname) {
+		if (!fullname)
+			return '';
+
+		var names = fullname.split(' ');
+		var initials = '';
+		names.forEach(function (name) {
+			initials += name[0];
+		});
+		return initials;
+	},
+
+	type: 'ChangeInfoSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-11-23 18:40:19&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0b7dcfbca700011003396c94d17901c7&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;166&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ChangeInfoSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Change Management for Service Operations Workspace" source="sn_sow_chg"&gt;bccbdbb023213010785ddc1756bf6579&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Change Management for Service Operations Workspace"&gt;bccbdbb023213010785ddc1756bf6579&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0b7dcfbca700011003396c94d17901c7&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-03-01 10:58:48&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:48</sys_created_on>
+        <sys_id>fd60389583b01210c6695855eeaad353</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ChangeInfoSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_fd60389583b01210c6695855eeaad353</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:48</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

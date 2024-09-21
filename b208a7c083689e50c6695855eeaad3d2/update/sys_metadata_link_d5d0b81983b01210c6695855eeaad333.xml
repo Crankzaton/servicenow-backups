@@ -1,0 +1,267 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1edd3121eb510200c8690e815206fe98</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.EmailDiagnosticsV2&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Diagnostics info for email sending/receiving and sms sending. &lt;/description&gt;
+        &lt;name&gt;EmailDiagnosticsV2&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var EmailDiagnosticsV2 = Class.create();
+
+EmailDiagnosticsV2.prototype = {
+
+    initialize: function() {
+        this.STATE_RANKS = {
+            "-1": 1, //Error
+            None: 2,
+            "2": 3, //Queued
+            "1": 4, //Running
+            "0": 5 //Ready
+        };
+
+        this.SMTP_SENDER_JOB_ID = "d8e37da5c0a80064009ff6d19882218a";
+        this.SMS_SENDER_JOB_ID = "90f73fab0a0a0b130078bef17cd2809f";
+        this.EMAIL_READER_JOB_ID = "52fb24f70a0005fc008b6be3853ca58c";
+
+        this.smtpSenderInfo = this._getJobInfo(this.SMTP_SENDER_JOB_ID);
+        this.smsSenderInfo = this._getJobInfo(this.SMS_SENDER_JOB_ID);
+        this.readerInfo = this._getJobInfo(this.EMAIL_READER_JOB_ID);
+
+        this.lastSent = this._getLastEmail('sent');
+        this.lastReceived = this._getLastEmail('received');
+        this.sendingEnabled = this._getTypedProperty('glide.email.smtp.active', false);
+        this.receivingEnabled = this._getTypedProperty('glide.email.read.active', false);
+        this.sendReadyCount = this.getSendReadyCount();
+
+        this.smtpSenderState = this._getJobState(this.smtpSenderInfo);
+        this.smtpSenderLastRun = this._getLastRunTime(this.smtpSenderInfo);
+        this.smtpSenderDuration = this._getLargestProcessingTime(this.smtpSenderInfo);
+
+        this.smsSenderState = this._getJobState(this.smsSenderInfo);
+        this.smsSenderLastRun = this._getLastRunTime(this.smsSenderInfo);
+        this.smsSenderDuration = this._getLargestProcessingTime(this.smsSenderInfo);
+
+        this.emailReaderState = this._getJobState(this.readerInfo);
+        this.emailReaderLastRun = this._getLastRunTime(this.readerInfo);
+        this.emailReaderDuration = this._getLargestProcessingTime(this.readerInfo);
+    },
+
+    isSendingOperational: function() {
+        //Email Sending Stats
+        var sendReadyThresholdExceeded = this.isSendReadyThresholdExceeded();
+        //SMTP Sender
+        var smtpSenderDurationThresholdExceeded = this.isSmtpProcessingThresholdExceeded();
+        var smtpLastRunThresholdExceeded = this.isSmtpLastRunThresholdExceeded();
+
+        //SMS Sender
+        var smsSenderDurationThresholdExceeded = this.isSmsProcessingThresholdExceeded();
+        var smsLastRunThresholdExceeded = this.isSmsLastRunThresholdExceeded();
+
+        return this.sendingEnabled &amp;&amp; !sendReadyThresholdExceeded &amp;&amp; this.smtpSenderState != "Error" &amp;&amp; this.smtpSenderState != "None" &amp;&amp;
+            !smtpSenderDurationThresholdExceeded &amp;&amp; !smtpLastRunThresholdExceeded &amp;&amp; this.smsSenderState != "Error" &amp;&amp;
+            this.smsSenderState != "None" &amp;&amp; !smsSenderDurationThresholdExceeded &amp;&amp; !smsLastRunThresholdExceeded;
+    },
+
+    isReceivingOperational: function() {
+        var readerDurationThresholdExceeded = this.isReaderProcessingThresholdExceeded();
+        var readerLastRunThresholdExceeded = this.isReaderLastRunThresholdExceeded();
+
+        return this.receivingEnabled &amp;&amp; !readerDurationThresholdExceeded &amp;&amp; !readerLastRunThresholdExceeded &amp;&amp; this.emailReaderState != "Error" &amp;&amp; this.emailReaderState != "None";
+    },
+
+    isSendReadyThresholdExceeded: function() {
+        return this.sendReadyCount &gt; this.sendReadyThreshold();
+    },
+
+    isSmtpProcessingThresholdExceeded: function() {
+        return this.smtpSenderDuration &gt; this.smtpSenderProcessingTimeThreshold();
+    },
+
+    isSmsProcessingThresholdExceeded: function() {
+        return this.smsSenderDuration &gt; this.smsSenderProcessingTimeThreshold();
+    },
+
+    isSmtpLastRunThresholdExceeded: function() {
+        return gs.dateDiff(gs.minutesAgo(this.smtpJobLastRunThreshold()), this.smtpSenderLastRun ,true) &lt; 0;
+    },
+
+    isSmsLastRunThresholdExceeded: function() {
+        return gs.dateDiff(gs.minutesAgo(this.smsJobLastRunThreshold()), this.smsSenderLastRun ,true) &lt; 0;
+    },
+
+    isReaderProcessingThresholdExceeded: function() {
+        return this.emailReaderDuration &gt; this.readerProcessingTimeThreshold();
+    },
+
+    isReaderLastRunThresholdExceeded: function() {
+        return gs.dateDiff( gs.minutesAgo(this.readerJobLastRunThreshold()), this.emailReaderLastRun,true) &lt; 0;
+    },
+
+    sendReadyThreshold: function() {
+        return gs.getProperty('glide.email_diag.threshold.send_ready', 200);
+    },
+
+    smtpSenderProcessingTimeThreshold: function() {
+        return GlideProperties.getInt('glide.email_diag.threshold.smtp_sender.runtime', 10000);
+    },
+
+    smsSenderProcessingTimeThreshold: function() {
+        return GlideProperties.getInt('glide.email_diag.threshold.sms_sender.runtime', 10000);
+    },
+
+    smtpJobLastRunThreshold: function() {
+        return gs.getProperty('glide.email_diag.threshold.smtp_sender.last_run', 10);
+    },
+
+    smsJobLastRunThreshold: function() {
+        return gs.getProperty('glide.email_diag.threshold.sms_sender.last_run', 10);
+    },
+
+    readerProcessingTimeThreshold: function() {
+        return GlideProperties.getInt('glide.email_diag.threshold.email_reader.runtime', 10000);
+    },
+
+    readerJobLastRunThreshold: function() {
+        return gs.getProperty('glide.email_diag.threshold.email_reader.last_run', 10);
+    },
+
+    getSendReadyCount: function() {
+        var emailAgg = new GlideAggregate("sys_email");
+        emailAgg.addQuery("type","send-ready");
+        emailAgg.addQuery("sys_created_on", "&gt;", gs.hoursAgo(48));
+        emailAgg.addAggregate("COUNT");
+        emailAgg.query();
+        if (!emailAgg.next())
+            return 0;
+
+        return parseInt(emailAgg.getAggregate("COUNT"));
+    },
+
+    _getJobInfo: function(jobId) {
+        var trigger = new GlideRecord("sys_trigger");
+        trigger.addQuery("job_id", jobId);
+        trigger.query();
+        var smtpJobs = [];
+        while (trigger.next()) {
+            var stateDisplay = trigger.getDisplayValue("state");
+
+            var job = {};
+            job.lastRun = new GlideDateTime(trigger.getValue('sys_updated_on'));
+            job.duration = trigger.getValue('processing_duration');
+            job.state = (stateDisplay) ? trigger.getValue('state') : 'None';
+            job.id = trigger.getUniqueValue();
+
+            smtpJobs.push(job);
+        }
+
+        return smtpJobs;
+    },
+
+    _getJobState: function(states) {
+        if (states.length === 0) {
+            return 'No Job Defined';
+        }
+        var lowestSenderRank = this.STATE_RANKS[states[0].state];
+
+        for (var i = 0; i &lt;= states.length; i++) {
+            var state = states[i].state;
+
+            var rank = this.STATE_RANKS[state];
+
+            if (rank &lt; lowestSenderRank) {
+                lowestSenderRank = rank;
+            }
+        }
+        return this._getStateString(lowestSenderRank);
+    },
+
+    _getLargestProcessingTime: function(senders) {
+        var processingTime = 0;
+
+        for (var i = 0; i &lt; senders.length; i++) {
+            var duration = senders[i].duration;
+            if (duration &gt; processingTime)
+                processingTime = duration;
+        }
+
+        return processingTime;
+    },
+
+    _getLastRunTime: function(senders) {
+        var lastRun = senders[0].lastRun;
+
+        for (var i = 1; i &lt; senders.length; i++) {
+            if (lastRun &lt; senders[i].lastRun)
+                lastRun = senders[i].lastRun;
+        }
+
+        return lastRun;
+    },
+
+    _getTypedProperty: function (inProp, inDef) {
+        var prop = gs.getProperty(inProp, inDef);
+        if (prop.toLowerCase() == "true") {
+            return true;
+        }
+        if (prop.toLowerCase() == "false") {
+            return false;
+        }
+        return prop;
+    },
+
+    _getLastEmail:function(type) {
+        var email = new GlideRecord("sys_email");
+        email.addQuery("type",type);
+        email.addQuery("sys_created_on", "&gt;", gs.hoursAgo(24));
+        email.orderByDesc("sys_updated_on");
+        email.setLimit(1);
+        email.query();
+
+        return (email.next()) ? email.sys_updated_on : null;
+    },
+
+    _getStateString: function(stateRank) {
+        for (var key in this.STATE_RANKS) {
+            if (stateRank == this.STATE_RANKS[key]) {
+                return key;
+            }
+        }
+    },
+
+    type: 'EmailDiagnosticsV2'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2015-07-16 21:49:00&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1edd3121eb510200c8690e815206fe98&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;1&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;EmailDiagnosticsV2&lt;/sys_name&gt;
+        &lt;sys_package display_value="Subscription Based Notifications" source="com.glide.notification"&gt;8f83b4243c31311068bcf327dfe37f87&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1edd3121eb510200c8690e815206fe98&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2015-07-21 22:59:16&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:41</sys_created_on>
+        <sys_id>d5d0b81983b01210c6695855eeaad333</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>EmailDiagnosticsV2</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_d5d0b81983b01210c6695855eeaad333</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:41</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,718 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0e362ca7ebb41110506f7558b5522840</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.VAAISearchHelperUtah&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;VAAISearchHelperUtah&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var VAAISearchHelperUtah = Class.create();
+
+// allowed max size of field value.
+VAAISearchHelperUtah.ALLOWED_MAX_FIELD_VALUE_SIZE = 400; // this number is bigger than the card's display size.
+
+//highlight start tag
+VAAISearchHelperUtah.HIGHLIGHT_START_TAG = '&lt;highlight&gt;';
+
+//highlight end tag
+VAAISearchHelperUtah.HIGHLIGHT_END_TAG = '&lt;/highlight&gt;';
+
+// Field names that may need to resize the field value if required. 
+// If registered here, the field value will get resized if the size of the value exceeds the limit- VAAISearchHelperUtah.ALLOWED_MAX_FIELD_VALUE_SIZE 
+// add here more if needed. 
+VAAISearchHelperUtah.FIELD_NAMES_FOR_RESIZING 
+	= ['description','header','title', 'name', 'summary', 'ai_search_teaser_text', 'ai_search_teaser_title' ,'columns.description','columns.name'];
+  
+// allowed max limit for the topic input
+VAAISearchHelperUtah.RESULT_MAX_SIZE = parseInt(gs.getProperty('glide.cs.runtime.user_input_max_length'));
+
+// result too large error
+VAAISearchHelperUtah.RESULT_TOO_LARGE = 'result_too_large';
+
+VAAISearchHelperUtah.processResults = function(searchResults, vaSystem, vaInputs, vaVars) {
+	var results =  JSON.parse(searchResults);
+	vaSystem.setAtlasSearchPerformed();
+
+	var result = results.result[0];
+
+	var errors = [];
+	errors = results.result[0].errors;
+	if ((gs.nil(errors) || errors.length == 0) &amp;&amp; (results.result[0].status != "200"))
+		errors.push({"errorType" : "Return Status", "message": "Return status was not 200"});
+
+	var executionResult = result.executionResult;
+
+	var geniusSearchResults = null;
+	var nonGeniusResults = null;
+	var searchMetadata = {};
+	
+	if (errors.length == 0) {
+
+		// genius results
+		var anyGeniusResults = executionResult.geniusResultsTemplates.items.length &gt; 0;
+		if (anyGeniusResults)
+			geniusSearchResults = executionResult.geniusResultsTemplates.items[0];
+
+		// regular results
+		var items = executionResult.searchResultsTemplates.items.slice(0,
+				parseInt(gs.getProperty("com.glide.cs.ai_search.max_regular_result")));
+
+		if (items.length &gt; 0)
+			nonGeniusResults = items;
+		
+		// search metadata
+		var searchInfo = {
+			search_id: VAClickMetrics.createGUID(),
+			is_logged_in: vaVars.is_logged_in,
+			user_id: vaVars.user_id,
+			session_id: vaVars.session_id
+		};
+		searchMetadata = VAAISearchHelperUtah.buildSearchMetadata(result, searchInfo);
+		
+		// process the search result metrics.
+		VAAISearchHelperTokyo.processSearchResultMetrics(searchMetadata, geniusSearchResults, nonGeniusResults, vaSystem, vaInputs, vaVars);
+	}
+
+	var searchMetadataStr = !gs.nil(searchMetadata) ? JSON.stringify(searchMetadata) : null ;
+	var geniusResultsStr = !gs.nil(geniusSearchResults) ? JSON.stringify(geniusSearchResults) : null ;
+	var nonGeniusResultsStr = !gs.nil(nonGeniusResults) ? JSON.stringify(nonGeniusResults) : null;
+	var errorsStr = !gs.nil(errors) ? JSON.stringify(errors) : null;
+
+	return {
+		searchMetadata: searchMetadataStr,
+		geniusSearchResults: geniusResultsStr,
+		searchResults: nonGeniusResultsStr,
+		errors: errorsStr
+	};
+};
+
+VAAISearchHelperUtah.buildSearchMetadata = function(result, searchInfo) {
+	var executionResult = result.executionResult;
+	var searchMetadata = {};
+
+	searchMetadata.click_metrics = {};
+	if (executionResult != null)
+		searchMetadata.glide_signals = executionResult.searchMetadata;
+
+	// adding user_id and session_id to pass around user_id and session_id 
+	// until the end of the flow for glide-signals's event tracking.
+	searchMetadata.is_logged_in = searchInfo.is_logged_in;
+	searchMetadata.user_id = searchInfo.user_id;
+	searchMetadata.session_id = searchInfo.session_id;
+
+	searchMetadata.search_id = searchInfo.search_id;
+
+	searchMetadata.search_result_count = 0;
+	if (executionResult != null &amp;&amp; executionResult.geniusResultsTemplates != null &amp;&amp; executionResult.geniusResultsTemplates.items != null)
+		searchMetadata.search_result_count += executionResult.geniusResultsTemplates.items.length;
+	if (executionResult != null &amp;&amp; executionResult.searchResultsTemplates != null &amp;&amp; executionResult.searchResultsTemplates.items != null)
+		searchMetadata.search_result_count += executionResult.searchResultsTemplates.items.length;
+
+	// the time taken reported by the payload.
+	searchMetadata.execution_time = result.executionTime;
+	return searchMetadata;
+};
+
+VAAISearchHelperUtah.createResultMap = function(searchMetadata, searchResults, vaSystem, vaInputs, vaVars) {
+	
+	var logger = VAAISearchHelperTokyo.getLogger(vaVars.loggingContext);
+	try {
+		var response = JSON.parse(searchResults);
+		var groupedResultsMap = {};
+		var maxResults = VAAISearchHelperUtah.getRegularSearchDisplaySize(response);
+
+		for (var i = 0; i &lt; maxResults; i++) {
+			var sysId = response[i].propValues.model.sysId;
+			var title = VAAISearchHelperUtah.buildSearchTitle(response[i].propValues);
+			groupedResultsMap[sysId] = GlideStringUtil.unEscapeHTML(title);
+			
+			
+			// create SEARCH_RESULT_DISPLAYED event.
+			// This createResultMap method can be called multiple times. 
+			// So, we need to rely on this flag to avoid sending the same payload multiple times.
+			var shouldSend = vaVars.sendDisplayedSearchResultClickMetricsEvent;
+			
+			if (!gs.nil(shouldSend) &amp;&amp; shouldSend) {
+				var searchResult = response[i];
+				var metadata = JSON.parse(searchMetadata);
+				VAAISearchClickMetricsURLHelper.createDisplayedSearchResultEventMetrics(metadata, searchResult, vaSystem, vaInputs, vaVars, i); 
+			}
+		}
+		return groupedResultsMap;
+	} catch(ex) {
+		logger.error('VAAISearchHelperUtah: Error generating regular search result map: {0}', ex);
+		// Return any links that have been successfully generated
+		return groupedResultsMap;
+	}
+
+};
+
+/**
+ * Generates Genius result card response 
+ */
+VAAISearchHelperUtah.generateGeniusCardResponse = function(searchMetadata, geniusSearchResults, vaSystem, vaInputs, vaVars, dynamicChoiceNodeName) {
+	return global.VAAISearchHelperUtah.generateSearchCardResponse (
+		global.AISearchConstants.RESULT_TYPE_GENIUS, searchMetadata, geniusSearchResults, vaSystem, vaInputs, vaVars, dynamicChoiceNodeName, 0);
+};
+
+/**
+ * Generates Regular result card response 
+ */
+VAAISearchHelperUtah.generateSearchResultsResponse = function(searchMetadata, searchResults, vaSystem, vaInputs, vaVars, dynamicChoiceNodeName) {
+	var logger = VAAISearchHelperTokyo.getLogger(vaVars.loggingContext);
+	logger.info('Generating search result response');
+	try {
+		var metadata = JSON.parse(searchMetadata);
+		var response = JSON.parse(searchResults);
+
+		// Only show first three search results - GroupedPartsOutMsg is limited to 3
+		var maxResults = VAAISearchHelperUtah.getRegularSearchDisplaySize(response);
+
+		for (var i = 0; i &lt; maxResults; i++) {
+			var searchResult = response[i];
+			var propValues = searchResult.propValues;
+			var model = propValues.model;
+			if (model.sysId == vaInputs.display_options) {
+				var result = VAAISearchHelperTokyo.stripHighlightTags(JSON.stringify(searchResult));
+				return global.VAAISearchHelperUtah.generateSearchCardResponse (
+					global.AISearchConstants.RESULT_TYPE_SEARCH, searchMetadata, result, vaSystem, vaInputs, vaVars, dynamicChoiceNodeName, i);
+			}
+		}
+		return "";
+	} catch(ex) {
+		logger.error('VAAISearchHelperUtah: Error generating search response: {0}', ex);
+		// Return any links that have been successfully generated
+		return "";
+		
+	}
+};
+
+VAAISearchHelperUtah.getSearchResults = function(searchResults, geniusSearchResults, searchMetadata, vaSystem) {
+	var resultsArr = [searchResults, geniusSearchResults, searchMetadata];
+	var resultsTooLarge = false;
+
+	for (var i = 0; i &lt; resultsArr.length; i++) {
+		var result = JSON.parse(resultsArr[i]);
+		if (result.hasOwnProperty('error') &amp;&amp; result.error === VAAISearchHelperUtah.RESULT_TOO_LARGE) {
+			resultsTooLarge = true;
+		}
+	}
+	
+	if (!resultsTooLarge) {
+		return {
+			searchResults: searchResults,
+			geniusSearchResults: geniusSearchResults,
+			searchMetadata: searchMetadata,
+			errors: ''
+		};
+	}
+	
+	return VAAISearchHelperUtah.getSearchResultsFromFDIH(vaSystem.getConversationId(), JSON.parse(searchMetadata));
+};
+
+/**
+ * Search results may be too large to pass from the Topic Block back to the calling topic.
+ * Grab the most recent search results from the table sys_cs_fdih_incovation for this conversation.
+ *
+ * @param conversationId
+ * @return {*[]} array of search results or empty array
+ */
+VAAISearchHelperUtah.getSearchResultsFromFDIH = function(conversationId, initialSearchMetadata) {
+	var fdihInvocationList = sn_cs.VASystemObject.getFDIHInvocationsFromConversation(conversationId);
+	var fdihInvocations = [];
+
+	// fdihInvocationList is a Java list; lets convert it to a JS list of objects so that we can sort
+	for (var i = 0; i&lt;fdihInvocationList.length; i++) {
+		var invocation = fdihInvocationList[i];
+
+		if (invocation.name !== 'global.atlas_search')
+			continue;
+
+		fdihInvocations.push({
+			sysCreatedOn : invocation.sysCreatedOn,
+			outputsAsString: invocation.outputsAsString
+		});
+	}
+
+	// Sort by sys_created_on
+	fdihInvocations.sort(function (a, b) {
+		var gdtA = new GlideDateTime(a.sysCreatedOn);
+		var gdtB = new GlideDateTime(b.sysCreatedOn);
+
+		return gdtB.compareTo(gdtA);
+	});
+
+	var searchResults = [];
+	var geniusSearchResults = [];
+	var searchMetadata = [];
+	var errors = '';
+	try {
+		var rawResults = JSON.parse(fdihInvocations[0].outputsAsString);
+		var result = rawResults.search_result.result[0];
+		var executionResult = result.executionResult;
+		searchResults = executionResult.searchResultsTemplates.items;
+		geniusSearchResults = executionResult.geniusResultsTemplates.items[0];
+		
+		// if search metadata isn't too large, no need to re-build it
+		searchMetadata = initialSearchMetadata;
+		if (initialSearchMetadata.hasOwnProperty("error") &amp;&amp; initialSearchMetadata.error === VAAISearchHelperUtah.RESULT_TOO_LARGE) {
+			searchMetadata = VAAISearchHelperUtah.buildSearchMetadata(result, initialSearchMetadata);
+		}
+		
+	} catch (error) {
+		VAAISearchHelperTokyo.getLogger().warn("No search results found for conversation: {0}", conversationId);
+		errors = error;
+	}
+
+	var searchMetadataStr = !gs.nil(searchMetadata) ? JSON.stringify(searchMetadata) : null ;
+	var geniusResultsStr = !gs.nil(geniusSearchResults) ? JSON.stringify(geniusSearchResults) : null ;
+	var searchResultsStr = !gs.nil(searchResults) ? JSON.stringify(searchResults) : null;
+	var errorsStr = !gs.nil(errors) ? JSON.stringify(errors) : null;
+
+	return {
+		searchMetadata: searchMetadataStr,
+		geniusSearchResults: geniusResultsStr,
+		searchResults: searchResultsStr,
+		errors: errorsStr
+	};
+};
+
+/**
+ * Returns the display size for the regular search response.
+ * @param results : regular search results
+ * @return the allowed max search result number to display.
+ */
+VAAISearchHelperUtah.getRegularSearchDisplaySize = function(results) {
+	var resultSize = gs.nil(results) ? 0 : Math.min(results.length,
+		parseInt(gs.getProperty("com.glide.cs.ai_search.max_regular_result")));
+	return Math.min(resultSize, 10);
+};
+
+VAAISearchHelperUtah.buildSearchTitle = function(props) {
+	var titleParts = [];
+	var titleFields = [
+		"prefix",
+		"titleEmoji",
+		"title"
+	];
+	for (var i in titleFields) {
+		var titleField = titleFields[i];
+		var titleFieldValue = props[titleField];
+		if (!gs.nil(titleFieldValue))
+			titleParts.push(titleFieldValue);
+	}
+	var title = titleParts.join(" ");
+	return VAAISearchHelperTokyo.stripHighlightTags(title);
+};
+
+VAAISearchHelperUtah.generateCustomResultList = function(searchMetadata, searchResults, header, vaSystem, vaInputs, vaVars, dynamicChoiceNodeName) {
+	var logger = VAAISearchHelperTokyo.getLogger(vaVars.loggingContext);
+	logger.info('Generating custom result list');
+	try {
+		var metadata = JSON.parse(searchMetadata);
+		var response = JSON.parse(searchResults);
+		
+		var linkOutMsg = new sn_cs.GroupedPartsOutMsg();
+		linkOutMsg.setHeader(header);
+
+		// Only show first three search results - GroupedPartsOutMsg is limited to 3
+		var maxResults = VAAISearchHelperUtah.getRegularSearchDisplaySize(response);
+
+		for (var i = 0; i &lt; maxResults; i++) {
+			var searchResult = response[i];
+			var propValues = searchResult.propValues;
+			var model = propValues.model;
+			var url = "";
+			if (model.sysId == vaInputs.display_options) {
+
+				// able to provide url to override
+				if (!gs.nil(searchResult.auto_resolution_url)) {
+					url = searchResult.auto_resolution_url;
+				}
+
+				if (gs.nil(url)) {
+					var actionName = propValues.clickAction.name;
+					var actionPayload = propValues.clickAction.actionPayload;
+
+					if (!gs.nil(actionPayload)) {
+						url = VAAISearchHelper.correctURLIfRequired(actionPayload.url);
+						url = !gs.nil(url) ? url : VAAISearchHelperTokyo.createURLByActionPayload(actionPayload.table, actionPayload.sysId, actionName, vaSystem, true, dynamicChoiceNodeName);
+					}
+					else
+						url = VAAISearchHelperTokyo.createURLByModel(model.table, model.sysId, vaSystem, true, dynamicChoiceNodeName);
+				}
+
+				// create a click metrics URL.
+				url = global.VAAISearchClickMetricsURLHelper.createSearchResultEventMetricsURL(metadata, searchResult, vaSystem, vaInputs, vaVars, url, i);
+
+				var context = VAAISearchHelperTokyo.buildSearchContext(propValues);
+				var title = VAAISearchHelperTokyo.buildSearchTitle(propValues);
+				var description = propValues.description;
+				logger.debug('Adding custom link response: title={0}, url={1}, description={2}, context={3}',
+					title, url, description, context);
+
+				linkOutMsg.addLinkPart(title, url, description, context);
+
+				return linkOutMsg;
+			}
+		}
+	} catch(ex) {
+		logger.error('VAAISearchHelperUtah: Error generating custom link response: {0}', ex);
+		// Return any links that have been successfully generated
+		return linkOutMsg;
+	}
+};
+
+VAAISearchHelperUtah.calculateResultsToDisplay = function(vaSystem, vaInputs, vaVars) {
+	var resultsToDisplay = "error";
+
+	try {
+        var errors = vaVars.errors;
+        if (gs.nil(vaVars.errors))
+            errors = [];
+		else {
+			errors = errors.split(',');}
+
+        var isError = vaVars.didFdihInvocationTimeOut ||
+        (gs.nil(vaVars.geniusResults) &amp;&amp; gs.nil(vaVars.searchResults)) || errors.length &gt; 0;
+
+        var isGeniusResult = global.VAAISearchHelperTokyo.shouldDisplayGeniusResult(vaVars.geniusResults, vaVars.loggingContext);
+
+        var isRegularResult = gs.nil(vaVars.geniusResults) &amp;&amp; !gs.nil(vaVars.searchResults);
+
+        if (isError)
+            resultsToDisplay = "error";
+        else if(isGeniusResult)
+            resultsToDisplay = "geniusResult";
+        else if(isRegularResult)
+            resultsToDisplay = "regularResult";
+    } catch (e) {
+        global.VAAISearchHelperTokyo.getLogger(vaVars.loggingContext).warn('Unable to calculate which results to display, falling back to error branch.');
+    }
+	
+	return resultsToDisplay;
+};
+
+VAAISearchHelperUtah.calculateResultsToDisplayWithContext = function(vaSystem, vaInputs, vaVars, vaContext) {
+	var resultsToDisplay = "error";
+	try {
+        var errors = vaVars.errors;
+        if (gs.nil(vaVars.errors))
+            errors = [];
+		else {
+			errors = errors.split(',');}
+        var isError = vaVars.didFdihInvocationTimeOut ||
+        (gs.nil(vaVars.geniusResults) &amp;&amp; gs.nil(vaVars.searchResults)) || errors.length &gt; 0;
+        var isGeniusResult = global.VAAISearchHelperUtah.shouldDisplayGeniusResultWithContext(vaVars.geniusResults, vaVars.loggingContext, vaContext);
+        var isRegularResult = !gs.nil(vaVars.searchResults);
+        if (isError)
+            resultsToDisplay = "error";
+        else if(isGeniusResult)
+            resultsToDisplay = "geniusResult";
+        else if(isRegularResult)
+            resultsToDisplay = "regularResult";
+    } catch (e) {
+        global.VAAISearchHelperTokyo.getLogger(vaVars.loggingContext).warn('Unable to calculate which results to display, falling back to error branch.');
+    }
+	
+	return resultsToDisplay;
+};
+
+VAAISearchHelperUtah.shouldDisplayGeniusResultWithContext = function(geniusSearchResults, loggingContext, vaContext) {
+	try {
+		if(gs.nil(geniusSearchResults))
+			return false;
+		var searchResponse = JSON.parse(geniusSearchResults);
+		var model = searchResponse.propValues.model;
+		if(searchResponse.template === 'sn-va-genius-person-card') {
+			return !gs.nil(model["columns.table"]) &amp;&amp; !gs.nil(model["columns.sys_id"]);
+		} else if (searchResponse.template === 'sn-va-genius-catalog-card'){
+			return VAAISearchHelperUtah.isCatalogOrKnowledgeSearchGeniusResultValid(searchResponse);
+		} else if(searchResponse.template === 'sn-va-genius-qa-card'){
+			// For GenAI results, additionally check if the device type is supported
+			var cardName = searchResponse.propValues.cardName.toString();
+			if (cardName == "GAIQACard") {
+				var hasGenAISupport = VAAISearchHelperUtah.isGenAIGeniusResultSupportedOnDevice(searchResponse, vaContext, loggingContext);
+				if (!hasGenAISupport)
+					return false;
+			}
+			return VAAISearchHelperUtah.isCatalogOrKnowledgeSearchGeniusResultValid(searchResponse);
+		} else {
+			return false;
+		}
+	} catch(ex){
+		VAAISearchHelper.getLogger(loggingContext).error(
+			'VAAISearchHelper: Error calculating whether to show genius result: {0}', ex);
+		return false;
+	}
+};
+
+VAAISearchHelperUtah.isCatalogOrKnowledgeSearchGeniusResultValid = function(searchResponse) {
+	var model = searchResponse.propValues.model;
+	var header = searchResponse.propValues.identifier;
+	var description = searchResponse.propValues.description;
+	var table = model["columns.table"];
+	var sys_id = model["columns.sys_id"];
+	return (!gs.nil(table) &amp;&amp; !gs.nil(sys_id)) || !gs.nil(header) || !gs.nil(description);
+};
+
+VAAISearchHelperUtah.isGenAIGeniusResultSupportedOnDevice = function(searchResponse, vaContext, loggingContext) {
+	var hasGenAISupport = false;
+	var extensionPoints = new GlideScriptedExtensionPoint().getExtensions("global.NowAssistDeviceSupportExtensionPoint");
+	for (var i = 0; i &lt; extensionPoints.length; i++) {
+		var currentResult = extensionPoints[i].isGenAIGeniusTemplateSupported(vaContext.deviceType);
+		hasGenAISupport = hasGenAISupport || currentResult;
+	}
+	VAAISearchHelper.getLogger(loggingContext).info("VAAISearchHelperUtah: GenAI results supported on deviceType {0} : {1}", vaContext.deviceType, hasGenAISupport);
+	return hasGenAISupport;
+};
+
+/**
+* Goes through the passed object recursively and resize the field values if required. 
+* The candidate field name has to be registered in VAAISearchHelperUtah.FIELD_NAMES_FOR_RESIZING
+* For VA, it's important that the return's size is within the allowed size... If the size is bigger than what is allowed,
+* we'll have to resize the result.
+* This gets called at the end of AI Search topic block, as the size too large problem is for output variables from a topic block
+*/
+VAAISearchHelperUtah.resizeResultIfRequired = function(result, resultName, vaVars) {
+	
+	if (gs.nil(result))
+		return null;
+	
+	var maxLimit = VAAISearchHelperUtah.RESULT_MAX_SIZE;
+	var resultStr = JSON.stringify(result);
+	
+	// if the result size is ok, then return the string.
+	if (resultStr.length &lt;= maxLimit)
+		return resultStr;
+	
+	// if not ok, then let's try to reduce the result size.
+	resizeResultIfRequired(result);
+		
+	// Check the size again.
+	resultStr = JSON.stringify(result);
+	
+	if (resultStr.length &lt;= maxLimit)
+		return resultStr;
+	
+	
+	// special case for metadata - as it is the largest culprit for being too large
+	if (resultName == 'Search metadata' &amp;&amp; !gs.nil(result.glide_signals) &amp;&amp; !gs.nil(result.glide_signals.searchResultMetadata)
+		&amp;&amp; !gs.nil(result.glide_signals.searchResultMetadata.searchAnalyticsPayload)) {
+		result.glide_signals.searchResultMetadata.searchAnalyticsPayload.searchResults = [];
+
+		resultStr = JSON.stringify(result);
+		
+		if (resultStr.length &lt;= maxLimit) {
+			VAAISearchHelperTokyo.getLogger().warn("Search metadata was trimmed of search results to make sure it is less than the max input size");
+			return resultStr;
+		}
+	}
+
+	var error = { error: VAAISearchHelperUtah.RESULT_TOO_LARGE };
+
+	if (resultName == 'Search metadata') {
+		// these properties were created when processing the results initially
+		// we are adding them here so that they can be re-added back into the metadata later
+		error.search_id = result.search_id;
+		error.is_logged_in = result.is_logged_in;
+		error.user_id = result.user_id;
+		error.session_id = result.session_id;
+	}
+
+	// if still wrong, then log it and return error object
+	global.VAAISearchHelperTokyo.getLogger(
+		vaVars.loggingContext).error('The result of {0} exceeded the max input size:{1}, but currentSize:{2}', resultName, maxLimit, resultStr.length);
+	
+	return JSON.stringify(error);
+};
+
+/**
+* Tests if the filed value for the field name needs to be reduced if the size exceeds the limit.
+*/
+VAAISearchHelperUtah.shouldReduceFieldValueSize = function(fieldName) {
+	return !gs.nil(fieldName) &amp;&amp; (VAAISearchHelperUtah.FIELD_NAMES_FOR_RESIZING.indexOf(fieldName.toLowerCase()) != -1);
+};
+
+/**
+* Returns the reduced field value if the length exceeds the limit. 
+* The original value is returnedd if the length is within the limit.
+*/
+VAAISearchHelperUtah.getResizedFieldValue = function(fieldValue) {
+	
+	if (gs.nil(fieldValue))
+		return fieldValue;
+	
+	var rtnVal = fieldValue;
+	
+	// should not break highlight tag. if exists in the field value,
+	// need to adjust the size carefully.
+	var fieldValLength = fieldValue.length;
+	
+	var endPos = fieldValLength - 1 ; // index = length -1
+	
+	if (fieldValLength &gt; VAAISearchHelperUtah.ALLOWED_MAX_FIELD_VALUE_SIZE) {
+		
+		endPos = VAAISearchHelperUtah.ALLOWED_MAX_FIELD_VALUE_SIZE - 1;
+		
+		var indicesOfStartTag = allIndexOf(fieldValue, VAAISearchHelperUtah.HIGHLIGHT_START_TAG);
+		
+		if(indicesOfStartTag.length &gt;0 ) { 
+			
+			// if start tags exist, find end tags , too.
+			var indicesOfEndTag = allIndexOf(fieldValue, VAAISearchHelperUtah.HIGHLIGHT_END_TAG);
+			
+			// check if the end position is between startTag and endTag
+			// if that happens, we need to include the endTag in order not to break the tags.
+			// we don't want to remove tags here since it can be utilized by client in the future.
+			endPos = ajdustEndPosition(indicesOfStartTag, indicesOfEndTag);
+		}
+		
+		//substring the original value with the new end position.
+		if (endPos &lt; fieldValLength)
+			rtnVal = rtnVal.substring(0, endPos);
+	}
+	
+	return rtnVal;
+};
+
+VAAISearchHelperUtah.generateSearchCardResponse = function(resultType, searchMetadata, searchResults, vaSystem, vaInputs, vaVars, dynamicChoiceNodeName, order) {
+	var metadata = JSON.parse(searchMetadata);
+	var searchResponse = JSON.parse(searchResults);
+	var index = order;
+	VAAISearchHelperTokyo.getLogger(vaVars.loggingContext).info('Generating search result - result type:{0}', resultType);
+
+	var cardCreator = global.VASearchCardCreatorFactoryUtah.getCreator(resultType, metadata, searchResponse, vaSystem, vaInputs, vaVars, index, dynamicChoiceNodeName);
+
+	// check if providing url
+	if (!gs.nil(searchResponse.auto_resolution_url))
+		cardCreator.setURL(searchResponse.auto_resolution_url);
+
+	return cardCreator.createCard();
+};
+
+/**
+* Traverse through the passed object recursively and readjust the field value length for the pre-determined field name.
+*/
+function resizeResultIfRequired(obj, fieldName) {
+	
+	if (gs.nil(obj))
+		return null;
+	
+	if (typeof obj === 'string' || obj instanceof String) {
+		
+		// if the passed object is string, check the length and return the reduced value if needed.
+		if (VAAISearchHelperUtah.shouldReduceFieldValueSize(fieldName)) 
+			return VAAISearchHelperUtah.getResizedFieldValue(obj);
+
+	}
+	else if (Array.isArray(obj)) {
+	
+		// if the object is an array, traverse all the elements.
+		for (var i=0; i&lt; obj.length; i++)
+			resizeResultIfRequired(obj[i]);
+		
+	}
+	else if (typeof obj ==='object') {
+		
+		for (var name in obj) {
+			
+			var element = obj[name];
+		
+			var newVal = resizeResultIfRequired(element, name);
+			
+			// if the newVal is not null, the value could have been resized. update the object value.
+			if (!gs.nil(newVal)) 
+				obj[name] = newVal;
+		}
+	}
+	return null;
+}
+
+
+/**
+* Find all string occurences
+*/
+function allIndexOf(src, searchStr) {
+	
+	var indices = [];
+	for (var pos = src.indexOf(searchStr); pos !== -1; pos = src.indexOf(searchStr, pos + 1))
+		indices.push(pos);
+    
+    return indices;
+}
+
+/**
+* Adjust the end position if the max limit exists between highlight start and end tag. 
+* highlight start and end tags need to be always guaranteed in pairs
+*/
+function ajdustEndPosition(indicesOfStartTag, indicesOfEndTag) {
+	
+	var startTagIndex;  // index of highlight start tag
+	var endTagIndex;  // index of highlight end tag
+	
+	// the end position index. index = max length -1
+	var endPos = VAAISearchHelperUtah.ALLOWED_MAX_FIELD_VALUE_SIZE -1; 
+	
+	// to be self depensive.
+	if (endPos&lt;0 )
+		return 0;
+	
+	// traverse all both indices and find if the end position is in between startTagIndex and endTagIndex
+	// if the sizes are different, stop looping at the max one for both.
+	for (var i=0; i&lt;indicesOfStartTag.length &amp;&amp; i&lt;indicesOfEndTag.length; i++) {
+		
+		startTagIndex = indicesOfStartTag[i];
+		endTagIndex = indicesOfEndTag[i];
+		
+		if (startTagIndex &lt;= endPos &amp;&amp; endTagIndex &gt;= endPos) {
+			// return the new end position. It needs to include the entire end tag 
+			endPos = endTagIndex + VAAISearchHelperUtah.HIGHLIGHT_END_TAG.length;
+			break;
+		}
+		else if (endTagIndex &lt;= endPos &amp;&amp; endTagIndex + VAAISearchHelperUtah.HIGHLIGHT_END_TAG.length &gt;= endPos) {
+			// return the new end position. It needs to include the entire end tag 
+			endPos = endTagIndex + VAAISearchHelperUtah.HIGHLIGHT_END_TAG.length;
+			break;
+		}
+	}
+	
+	return endPos;
+}
+
+]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-07-25 22:27:02&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0e362ca7ebb41110506f7558b5522840&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;298&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;VAAISearchHelperUtah&lt;/sys_name&gt;
+        &lt;sys_package display_value="Virtual Agent Platform Topic Blocks" source="com.glide.cs.topic_blocks"&gt;289d7c203c75311068bcf327dfe37f6e&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0e362ca7ebb41110506f7558b5522840&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-04-04 23:12:52&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:10:02</sys_created_on>
+        <sys_id>4970f89583b01210c6695855eeaad33a</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>VAAISearchHelperUtah</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_4970f89583b01210c6695855eeaad33a</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:10:02</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

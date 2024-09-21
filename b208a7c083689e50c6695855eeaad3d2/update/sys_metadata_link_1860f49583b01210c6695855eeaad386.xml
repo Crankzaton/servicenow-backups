@@ -1,0 +1,236 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0a4fea300bd31300ea4446c863673a27</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.PmFinancialsBaselineAggregatorAPI&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;PmFinancialsBaselineAggregatorAPI&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var PmFinancialsBaselineAggregatorAPI = Class.create();
+PmFinancialsBaselineAggregatorAPI.prototype = {
+    initialize: function() {
+		this.precisionDigits = 2;
+		this.percentFields = ["discount_rate", "roi", "irr_value", "expected_roi"];
+		this.isMultiCurrencyEnabled = new ProjectCurrencyUtil().isMultiCurrencyEnabled();
+		this.projectCurrency = '';
+    },
+
+	getBaselineIdFromHeader: function(sysClassName,taskId,headerId){
+		return new BaselineFactory().getBaselineFromHeader(sysClassName,taskId,headerId);
+	},
+
+	getBaselineInfo: function(params){
+		/*
+		var params = {
+                    taskID:   Task.sys_id,
+                    sysClassName: Task.sys_class_name,
+                    baselineID1: params.baselineID1,
+                    baselineID2: params.baselineID2
+
+                };
+		}*/
+		
+		var baselineConfig =  this._getBaselineConfig(params.sysClassName);
+		if(!baselineConfig)
+			return null;
+		var res = this._getHeaderData(baselineConfig,params);
+		return res;
+	},
+	
+	_getBaselineConfig: function(sourceTable){
+		var baselineAPI = new BaselineAPI();
+		var baselineConfig = baselineAPI.getBaselineConfigBySourceTable(sourceTable); 
+		if(!baselineConfig)
+			this.logError(gs.getMessage('Error while fetching Baseline Config'));
+		return baselineConfig;
+	},
+	
+	_getHeaderData: function(config,params){
+		var result ={
+			primary_source_values: {},
+			secondary_source_values: {},
+			variance_values:{}
+		};
+		if(this.isMultiCurrencyEnabled){
+			this.projectCurrency = new ProjectCurrencyUtil().getProjectCurrency(params.taskID ,params.sysClassName);
+		}
+		var baselineConfig = config[0];
+		var sourceTable = baselineConfig.source_table;
+		var fieldMaps = baselineConfig.configMap;
+		var fieldValue, gr, tables ={}; 
+		baselineConfig.dotWalkColumn = fieldMaps[baselineConfig.primary_reference];
+		baselineConfig.compareBaselines = params.baselineID2? true: false;
+		baselineConfig.baselineId2 = params.baselineID2;
+		baselineConfig.baselineId1 = params.baselineID1;
+		var baselineGr =  new GlideRecord(baselineConfig.baseline_table);
+		baselineGr.get(baselineConfig.baselineId1);
+		for (var field in fieldMaps) {
+			fieldValue = {};
+			if (fieldMaps.hasOwnProperty(field)) {
+				fieldValue = this._getFieldValues(baselineConfig, baselineGr, {'source_column':field,'baseline_column':fieldMaps[field]});
+			}
+			
+			if(fieldValue.hasOwnProperty('primary_field'))
+				result.primary_source_values[field] = fieldValue.primary_field;
+			if(fieldValue.hasOwnProperty('baseline_field'))
+				result.secondary_source_values[field] = fieldValue.baseline_field;
+			if(fieldValue.hasOwnProperty('variance_field'))
+				result.variance_values[field] = fieldValue.variance_field;
+		}
+		/*To get names and sys_id*/
+		if(baselineConfig.compareBaselines){
+			gr =  new GlideRecord(baselineConfig.baseline_table);
+			gr.get(baselineConfig.baselineId2);
+			result.primary_source_values['name'] = {'value':gr.getValue('baseline_name')};
+			result.primary_source_values['sys_id'] = {'value':gr.getValue('sys_id')};
+		} else {
+			var sourceId = params.taskID;
+			gr = new GlideRecord(sourceTable);
+			gr.get(sourceId);
+			result.primary_source_values['name'] = {'value':gr.getValue('short_description')};
+			result.primary_source_values['sys_id'] = {'value':sourceId};
+		}
+		result.secondary_source_values['name'] = {'value':baselineGr.getValue('baseline_name')};
+		result.secondary_source_values['sys_id'] = {'value':baselineGr.getValue('sys_id')};
+		return result;
+	},
+	
+	_getValueFromGlide: function(gr,field){
+		
+		var result= {};
+		if(!gr.isValidRecord()){
+			return null;
+		}
+		var glideEle = gr.getElement(field);
+		
+		if(glideEle !=null &amp;&amp; glideEle.getED()){
+			var internalType = glideEle.getED().getInternalType();
+			if(internalType == 'currency'){
+				result.value = (gr[field].getCurrencyValue() || 0);
+				result.code = gr[field].getCurrencyCode();
+			}else if(internalType == 'currency2'){
+				result.value = (gr[field].amount || 0);
+				result.code = gr[field].currency;
+			}
+			else if(internalType == 'decimal' || result.type == 'number')
+				result.value = gr.getValue(field) || 0;
+			else 
+				return null;
+			result.label = glideEle.getLabel();
+			result.type = internalType;
+		}
+		return result;
+	},
+	
+	_getFieldValues: function(baselineConfig, baselineGr, fieldMapping){
+		if(!baselineGr.isValidRecord())
+			return;
+		
+		var result = {},primarySourceVal ={},baselineVal = {},varianceVal = {};
+		if (baselineConfig.compareBaselines) {
+			var bGr =  new GlideRecord(baselineConfig.baseline_table);
+			bGr.get(baselineConfig.baselineId2);
+			primarySourceVal = this._getValueFromGlide(bGr,fieldMapping.baseline_column) || {};
+			varianceVal.value = primarySourceVal.value || 0;
+		} else {
+			var sourceRef = baselineGr[baselineConfig.dotWalkColumn].getRefRecord();
+			primarySourceVal = this._getValueFromGlide(sourceRef,fieldMapping.source_column)||{};
+			
+		}
+		
+		baselineVal = this._getValueFromGlide(baselineGr,fieldMapping.baseline_column)||{};
+		
+		
+		if(primarySourceVal &amp;&amp; primarySourceVal.hasOwnProperty('value')){
+			varianceVal.value = primarySourceVal.value || 0;
+			varianceVal.valueInPercentage = "0.00%";
+			result.variance_field = varianceVal;
+			if(primarySourceVal.type ==  "currency"){
+				primarySourceVal.displayValue = PPMCurrencyHelper.getFormattedAmountWithCurrency(primarySourceVal.value,this.precisionDigits);
+			}else if(primarySourceVal.type ==  "currency2"){
+				primarySourceVal.displayValue = PPMCurrencyHelper.getFormattedAmountWithCurrency(primarySourceVal.value,this.precisionDigits,primarySourceVal.code);
+			}else{
+				primarySourceVal.displayValue = parseInt(primarySourceVal.value).toFixed(2);
+			}
+			result.primary_field = primarySourceVal;
+			
+		}
+			
+		if(baselineVal &amp;&amp; baselineVal.hasOwnProperty('value')){
+			varianceVal.value -= baselineVal.value;
+			varianceVal.valueInPercentage = parseInt(varianceVal.value) || parseInt(primarySourceVal.value) ? ((varianceVal.value/primarySourceVal.value)*100).toFixed(2) + "%" : "0.00%";
+			result.variance_field = varianceVal;
+			if(baselineVal.type ==  "currency"){
+				baselineVal.displayValue = PPMCurrencyHelper.getFormattedAmountWithCurrency(baselineVal.value,this.precisionDigits);
+			}else if(baselineVal.type ==  "currency2"){
+				baselineVal.displayValue = PPMCurrencyHelper.getFormattedAmountWithCurrency(baselineVal.value,this.precisionDigits,baselineVal.code);
+			}else{
+				baselineVal.displayValue = parseInt(baselineVal.value).toFixed(2);
+			}
+			result.baseline_field = baselineVal;
+		}
+		if(result.hasOwnProperty('variance_field')){
+		    varianceVal.type = primarySourceVal.type || baselineVal.type;
+			varianceVal.label = primarySourceVal.label;
+			if(varianceVal.type ==  "currency"){
+				result.variance_field.displayValue = PPMCurrencyHelper.getFormattedAmountWithCurrency(result.variance_field.value,this.precisionDigits);
+			}else if(varianceVal.type ==  "currency2"){
+				result.variance_field.displayValue = PPMCurrencyHelper.getFormattedAmountWithCurrency(result.variance_field.value,this.precisionDigits,primarySourceVal.code);
+			}else{
+				result.variance_field.displayValue = parseInt(result.variance_field.value).toFixed(2);
+				if(this.percentFields.indexOf(fieldMapping.source_column) &gt; -1){
+					varianceVal.valueInPercentage = "";
+				}
+			}
+		}
+		primarySourceVal.visible = false;
+		baselineVal.visible = false;
+		varianceVal.visible = false;
+		
+		return result;
+	},
+	
+	logError: function(description, e/*exception object*/){
+		gs.debug("PmFinancialsBaselineAggregatorAPI: " + description);
+		if(e){
+			gs.debug(JSON.stringify(e));
+		}
+	},
+	
+    type: 'PmFinancialsBaselineAggregatorAPI'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2018-07-12 08:30:32&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0a4fea300bd31300ea4446c863673a27&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;163&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;PmFinancialsBaselineAggregatorAPI&lt;/sys_name&gt;
+        &lt;sys_package display_value="PPM Standard" source="com.snc.financial_planning_pmo"&gt;92ef82e747e64210cd4e1ce4316d43e3&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0a4fea300bd31300ea4446c863673a27&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2019-09-16 08:17:04&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:09:42</sys_created_on>
+        <sys_id>1860f49583b01210c6695855eeaad386</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>PmFinancialsBaselineAggregatorAPI</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_1860f49583b01210c6695855eeaad386</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:09:42</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,268 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>18398e0e430121102aeb1ca57bb8f21c</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_entitlement.TableInfoService&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Table Info Service&lt;/description&gt;
+        &lt;name&gt;TableInfoService&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var TableInfoService = Class.create();
+TableInfoService.prototype = {
+    initialize: function(appFamilyInfoService) {
+        this.appFamilyInfoService = appFamilyInfoService;
+        this.TASK_EXTENSIONS = null;
+        this.TABLE_CACHE = {};
+        this.CUSTOM_TABLE_CACHE = {};
+        this.CUSTOM_TABLE_LIST = [];
+
+        this.IGNORED_TABLES = this._getIgnoredTables();
+        //this.readAllCustomTableInfo();
+    },
+
+    /**
+     * readAllCustomTableInfo
+     * Read and cache information about all custom tables from ua_custom_table_inventory
+     */
+    readAllCustomTableInfo: function () {
+        var cti = new GlideRecord('ua_custom_table_inventory');
+        cti.query();
+        while (cti.next()) {
+            if (!gs.nil(cti.getDisplayValue('license'))) {
+                this.CUSTOM_TABLE_CACHE[cti.getValue('table_name')] = {
+                    'isCustom': true,
+                    'mapped': true,
+                    'sysId': cti.getUniqueValue()
+                };
+            } else {
+                this.CUSTOM_TABLE_CACHE[cti.getValue('table_name')] = {
+                    'isCustom': true,
+                    'mapped': false,
+                    'sysId': cti.getUniqueValue()
+                };
+            }
+        }
+        this.CUSTOM_TABLE_LIST = Object.keys(this.CUSTOM_TABLE_CACHE);
+        return;
+    },
+
+    /**
+     * Return te list of tables which are grandfathered in per ua_custom_table_inventory and ua_exempted_table_inventory
+     * @returns {array} of table names
+     */
+    getIgnoredTables: function() {
+        return this.IGNORED_TABLES;
+    },
+
+    /**
+     * getTableInfo
+     * Return information about a table in sys_db_object. Any other table like structures (like views) are not
+     * covered here.
+     * @param {string} tableName Name of table
+     * @returns {object} an object with information about the table.
+     * The app_id will be one of package name from license_family or scope id or 'platform'
+     * The subscriptionAppId which is the subscription to which the table may have been mapped is the same as app_id for now
+     */
+    getTableInfo: function (tableName) {
+        if (Object.prototype.hasOwnProperty.call(this.TABLE_CACHE, tableName))
+            return this.TABLE_CACHE[tableName];
+
+        var ti = new GlideRecord('sys_db_object');
+        ti.addQuery('name', '=', tableName);
+        ti.query();
+        if (!ti.next())
+            return null;
+
+        var tableInfo = {
+            'name': tableName,
+            'sysId': ti.getUniqueValue(),
+            'isCustom': null,
+            'isTaskExt': null,
+            'isRemoteTable': (ti.getValue('scriptable_table') == true),
+            'appName': null,
+            'appId': null,
+            'subscriptionAppId': null,
+            'appFamilySysId': null,
+            'scope': ti.sys_scope.scope.toString(),
+            'package': ti.sys_package.source.toString(),
+            'source': null,
+            'customTable': null
+        };
+
+        // no special processing for custom tables for now. The application reported will be the app to which table belongs
+        // and if global, will be that
+        /*
+        var customTableInfo = this._getCustomTableInfo(tableName);
+        tableInfo.isCustom = customTableInfo.isCustom;
+        tableInfo.customTable = customTableInfo.sysId;
+
+        if (!tableInfo.isCustom &amp;&amp; ti.sys_package.sys_class_name.toString() == 'sys_app')
+            tableInfo.isCustom = true;
+        if (!tableInfo.isCustom &amp;&amp; tableName.substring(0, 2) == 'u_' &amp;&amp; ti.sys_package.toString() == 'global')
+            tableInfo.isCustom = true;
+        */
+
+        if (tableInfo.isCustom) {
+            tableInfo['source'] = 'Unknown';
+            tableInfo['appId'] = 'custom_unmapped';
+            tableInfo['appName'] = 'Unmapped';
+            tableInfo['subscriptionAppId'] = tableInfo['appId'];
+        } else {
+            var packageInfo = this.appFamilyInfoService.getPackageApp(tableInfo['package'], null);
+            tableInfo['appFamilies'] = packageInfo;
+            tableInfo['appName'] = packageInfo.name;
+            tableInfo['appId'] = packageInfo.id;
+            tableInfo['subscriptionAppId'] = packageInfo.id;
+            tableInfo['appFamilySysId'] = packageInfo.appSysId;
+            tableInfo['source'] = 'App Family';
+
+            if ((gs.nil(tableInfo['appName']) || tableInfo['appId'] == 'unk') &amp;&amp; tableInfo['scope'] != 'global') {
+                packageInfo = this.appFamilyInfoService.getPackageApp(null, tableInfo['scope']);
+                tableInfo['appFamilies'] = packageInfo;
+                tableInfo['appName'] = packageInfo.name;
+                tableInfo['appId'] = packageInfo.id;
+                tableInfo['subscriptionAppId'] = packageInfo.id;
+                tableInfo['appFamilySysId'] = packageInfo.appSysId;
+                tableInfo['source'] = 'App Family (scope)';
+            }
+
+            if ((gs.nil(tableInfo['appName']) || tableInfo['appId'] == 'unk') &amp;&amp; tableInfo['scope'] != 'global') {
+                tableInfo['appName'] = tableInfo['scope'];
+                tableInfo['appId'] = tableInfo['scope'];
+                tableInfo['subscriptionAppId'] = tableInfo['scope'];
+                tableInfo['appFamilySysId'] = packageInfo.appSysId;
+                tableInfo['source'] = 'Scope';
+            }
+
+            // special handling for platform
+            if ((gs.nil(tableInfo['appName']) || tableInfo['appId'] == 'unk') &amp;&amp; tableInfo['scope'] == 'global') {
+                if (tableInfo['package'].substring(0, 9) == 'com.glide' || tableInfo['package'].substring(0, 11) == 'apps/system' || tableInfo['package'].substring(0, 8) == 'com.snc.') { //
+                    // if we have a known platform package, put it in the platform family
+                    tableInfo['appName'] = 'Now Platform';
+                    tableInfo['appId'] = 'platform';
+                    tableInfo['subscriptionAppId'] = 'platform';
+                    tableInfo['source'] = 'Package Name';
+                } else if (gs.nil(tableInfo['package']) &amp;&amp; tableName.substring(0, 4) == 'sys_') {
+                    tableInfo['appName'] = 'Now Platform';
+                    tableInfo['appId'] = 'platform';
+                    tableInfo['subscriptionAppId'] = 'platform';
+                    tableInfo['source'] = 'Table Name';
+                }
+            }
+        }
+
+        tableInfo.isTaskExt = this.isTaskExtension(tableName);
+        this.TABLE_CACHE[tableName] = tableInfo;
+
+        return this.TABLE_CACHE[tableName];
+    },
+
+
+    getTableHierarchy: function (baseTable) {
+        // TODO unify this
+        if (gs.getCurrentScopeName() == 'rhino.global') {
+            var result = [];
+            var tables = GlideDBObjectManager.get().getHierarchy(baseTable);
+            for (var i = 0 ; i &lt; tables.size(); ++i)
+                result.push(tables.get(i));
+
+                return result;
+        } else
+            return new GlideTableHierarchy(baseTable).getHierarchy();
+    },
+
+    getTableAncestors: function (baseTable) {
+        // TODO unify this
+        var result = [];
+        if (gs.getCurrentScopeName() == 'rhino.global') {
+            var tables = GlideDBObjectManager.get().getTables(baseTable);
+            for (var i = 0 ; i &lt; tables.size(); ++i)
+                result.push(tables.get(i));
+
+                return result;
+        } else
+            result = new GlideTableHierarchy(baseTable).getTables();
+        // remove the first element which is the table itself
+        result.slice(1, result.length);
+    },
+
+    isTaskExtension: function(tableName) {
+        return new global.ArrayUtil().contains(this._getTaskExtensions(), tableName);
+    },
+
+    getCustomTableList : function() {
+        return this.CUSTOM_TABLE_LIST;
+    },
+
+    hasCustomTable : function(tableName) {
+        return Object.prototype.hasOwnProperty.call(this.CUSTOM_TABLE_CACHE, tableName);
+    },
+
+    _getTaskExtensions: function() {
+        if (this.TASK_EXTENSIONS == null)
+            this.TASK_EXTENSIONS = this.getTableHierarchy('task');
+
+            return this.TASK_EXTENSIONS;
+    },
+
+    _getIgnoredTables: function () {
+        var ignoredTables = [];
+        var c = new GlideRecord('ua_custom_table_inventory');
+        c.addQuery('allotment_type', '=', '2'); // grandfathered
+        c.query();
+        while (c.next()) {
+            ignoredTables.push(c.getValue('table_name'));
+        }
+        var e = new GlideRecord('ua_exempted_table_inventory');
+        e.query();
+        while (e.next()) {
+            ignoredTables.push(e.getValue('table_name'));
+        }
+        return ignoredTables;
+    },
+
+    _getCustomTableInfo: function (tableName) {
+        if (Object.prototype.hasOwnProperty.call(this.CUSTOM_TABLE_CACHE, tableName))
+            return this.CUSTOM_TABLE_CACHE[tableName];
+
+        return {
+            'isCustom': false
+        };
+    },
+
+    type: 'TableInfoService'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-02-17 20:15:48&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;18398e0e430121102aeb1ca57bb8f21c&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;2&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;TableInfoService&lt;/sys_name&gt;
+        &lt;sys_package display_value="Licensing Engine" source="sn_entitlement"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Licensing Engine"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_18398e0e430121102aeb1ca57bb8f21c&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-02-18 05:54:27&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:10:58</sys_created_on>
+        <sys_id>faa0f8d583b01210c6695855eeaad3d2</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>TableInfoService</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_faa0f8d583b01210c6695855eeaad3d2</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:10:58</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

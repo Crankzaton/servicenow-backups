@@ -1,0 +1,355 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>8244857877311110bb931b699a5a9953</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_fix"&gt;
+    &lt;sys_script_fix action="INSERT_OR_UPDATE"&gt;
+        &lt;before&gt;false&lt;/before&gt;
+        &lt;description&gt;Maintain the MID Config Parameter behavior for the upgraded customers (from before Utah)&lt;/description&gt;
+        &lt;name&gt;Maintain pre-Utah MID Settings&lt;/name&gt;
+        &lt;record_for_rollback&gt;true&lt;/record_for_rollback&gt;
+        &lt;script&gt;&lt;![CDATA[/*
+* Maintain the MID Config Parameter behavior for the upgraded customers
+*
+* This fix script will take care of:
+* - New precedence for choosing MID settings from MID property and MID Config Parameter tables
+*   In previous releases, the precedence of choosing value for a MID Server setting was as
+*   1. MID-specific property (highest precedence)
+*   2. Global property 
+*   3. Config parameter.
+*   
+*   In Utah the precedence changed to the following order
+*   1. Config Parameter (highest precedence)
+*   2. MID-Specific Property 
+*   3. Global MID property
+*   Fix job modifies the value of config parameters that are also defined as properties
+*
+* - Defining Global Config Parameter is not allowed
+*   Sets the 'ecc_agent' field 'mandatory' in 'ecc_agent_config'
+*
+* - Update 'sys_override' in 'ecc_agent_property' to 'ecc_agent_property' (Correct Value)
+*/
+ 
+var FIX_SCRIPT_PREFIX_LOG_MSG = 'Fix Script-- Maintain MID Settings: ';
+gs.log(FIX_SCRIPT_PREFIX_LOG_MSG + 'Start updating the existing MID Config parameters for the new precedence');
+var startTime = new Date().getTime();
+var updatedConfigParam = 0;     // Number of updated Config Parameter records by the fix script
+var tagSysId = null;            // sys_id of 'NO Overwrite' tag for updated parameters for Down MID Servers.
+								// sys_id will be assigned when the tag created
+_updateMIDConfigInfo();
+_updateMIDPropertyInfo();
+
+gs.log(FIX_SCRIPT_PREFIX_LOG_MSG + 'Finished. ' + updatedConfigParam + ' record(s) were updated in ecc_agent_config');
+var endTime = new Date().getTime();
+gs.log(FIX_SCRIPT_PREFIX_LOG_MSG + '[Total execution time = ' + (endTime - startTime) + ' ms]');
+ 
+ 
+/**
+ * @description For every MID Config record
+ *      - If the config parameter is a MID-specific config parameter and is defined as property too, we update the config parameter value 
+ *      - If the config parameter is a global config parameter and is defined as property too, it is replaced 
+ * 		by MID-Specific config Parameters
+ * and in the table schema, 'ecc_agent' field in 'ecc_agent_config' is marked as 'mandatory' 
+ */
+function _updateMIDConfigInfo() {
+	var midInfo = _collectMidsInfo();// Collect the current settings of the MID Servers
+	var globalConfigInfo = {};       // Object to collect Global Config Parameters information
+	globalConfigInfo.names = [];
+	globalConfigInfo.sys_ids = [];
+	
+	// Iterate over all config parameters in the most recent update order
+	var configGr = new GlideRecord('ecc_agent_config');
+	configGr.addQuery('param_name', 'IN', midInfo.commonConfigPropertyNames);
+	configGr.orderByDesc('sys_updated_on');
+	configGr.query();
+	while (configGr.next()) {
+		var paramName = configGr.param_name + '';
+		var midSysId = configGr.ecc_agent + '';
+		// Verify if we need to update the value according to the new precednce
+		if (midSysId) {     // Mid-specified config parameter 
+			_processMidSpecificConfigParameter(midInfo, configGr);
+		} else {            // Global parameter (Config parameter record with empty ecc_agent field)
+			globalConfigInfo.names.push(paramName);
+			globalConfigInfo.sys_ids.push(configGr.sys_id +'');
+			_convertGlobalToSpecificConfigParam(midInfo, configGr);
+		}
+	}
+	
+	if (!globalConfigInfo.sys_ids || globalConfigInfo.sys_ids.length == 0) {
+		gs.log(FIX_SCRIPT_PREFIX_LOG_MSG + 'No global config parameter needs precedence fix');
+	} else {
+		_fixPrecedenceForGlobalConfigParameters(midInfo, globalConfigInfo);
+	}
+	
+	gs.log(FIX_SCRIPT_PREFIX_LOG_MSG + 'Mark ecc_agent field in ecc_agent_config table as mandatory');
+	_updateAttributeInDictionary('ecc_agent_config', 'ecc_agent', 'mandatory', true);
+}
+
+/**
+ * @description Update the sys_overrides in ecc_agent_property to ecc_agent_property
+ */
+function _updateMIDPropertyInfo() {
+	gs.log(FIX_SCRIPT_PREFIX_LOG_MSG + 'Set sys_overrides in ecc_agent_property table to ecc_agent_property');
+	_updateAttributeInDictionary('ecc_agent_property', 'sys_overrides', 'reference', 'ecc_agent_property');
+}
+/**
+ * @description If precedence fix is required for a global config parameter and there is no existing mid-specific record
+ * 				we create the new record with proper value for missing records
+ * @param midInfo {Object} - Object containing setting information for every MID Server
+ * @param globalConfigInfo {Object} - Object containing the Global Config parameters names and sys_ids
+ */
+ 
+function _fixPrecedenceForGlobalConfigParameters(midInfo, globalConfigInfo) {
+	// For every MID Server if there is a global record which we couldn't replace with an exsiting
+	// old MID-Specific config parameter, we create a new MID-Specific config parameter
+	for (var mid in midInfo) {
+		for (var p = 0 ; p &lt; globalConfigInfo.names.length ; p++) {
+			var param = globalConfigInfo.names[p];
+			if (midInfo[mid].config_info &amp;&amp; midInfo[mid].config_info[param] &amp;&amp; midInfo[mid].config_info[param].sys_id == null) {
+				var val = midInfo[mid].config_info[param].value;
+				// Need to maintain the old precedence: update the value to the property value
+				if (_needPrecedenceMaintenance(midInfo, param, val, mid)) {
+					val = midInfo[mid].property_info[param].value;
+					// Create a new MID-Specific config parameter record in the same domain as MID Server
+					var newRecord = new GlideRecord('ecc_agent_config');
+					newRecord.initialize();
+					newRecord.setValue('param_name', param);
+					newRecord.setValue('sys_domain', midInfo[mid].domain);
+					newRecord.setValue('ecc_agent', mid);
+					newRecord.setValue('value', val);
+					newRecord.setWorkflow(false);
+					var newSysId = newRecord.insert();
+					gs.debug(FIX_SCRIPT_PREFIX_LOG_MSG + 'Insert a new Mid-Specific parameter. The new record sys_id: ' + newSysId );
+
+					// Tag the new record to prevent over-write when MID Server comes Up
+					if ( midInfo[mid].status == "Down")  {
+						gs.log(FIX_SCRIPT_PREFIX_LOG_MSG + 'Tag the Config param record with sys_id: ' + newSysId);
+						_tagRecord( newSysId + '', tagSysId);
+					}
+				}
+			}
+		}
+	}
+}
+
+/**
+ * @description Identify which MID Servers affected by the Global Config Parameter (configGr) and, 
+ *      if so, create an identically named MID-specific parameter for each affected MID in the midInfo object.
+ * @param midInfo {Object} - Object containing MID Server settings information 
+ * @param configGr {GlideRecord} - Glide record of a Global Config Parameter
+ */
+
+function _convertGlobalToSpecificConfigParam(midInfo, configGr) {
+	var paramName = configGr.param_name + '';
+	var paramValue = configGr.value + '';
+	var domainSep = gs.getProperty("glide.sys.domain.use_record_domain_for_processes") == 'true';
+	var availableMids = _getVisibleMIDsInDomain(configGr, domainSep);
+	
+	gs.log(FIX_SCRIPT_PREFIX_LOG_MSG + 'Replace global config parameter ' + paramName + ' with Mid-specific Config parameters');
+	for (var i = 0; i &lt; availableMids.length; i++) {
+		var curMid = availableMids[i];
+		
+		// Skip this MID Server if
+		// - MID Server was connected to the instance after creating the global record OR
+		// - There is another record for the same parameter created after global and it was
+		//   already processed and the global parameter doesn't affect
+		if (configGr.sys_updated_on &lt; midInfo[curMid].created_on || midInfo[curMid].config_info[paramName])
+			continue;
+		
+		// Collecting data for the parameter
+		midInfo[curMid].config_info[paramName] = {};
+		midInfo[curMid].config_info[paramName].sys_id = null;
+		midInfo[curMid].config_info[paramName].value = paramValue;
+	}
+}
+
+/**
+* @description for every MID Server we collect status, creation date, domain, CommonPropertyConfig
+* @returns {Object} including status, creation date, domain, CommonPropertyConfig for every MID Server
+*/
+function _collectMidsInfo() {
+	var midSettings = new MidSettingsUtil();
+	var commonConfigPropertyNames = midSettings.getCommonMidPropertyConfigParams();
+	var midInfo = {};
+	
+	if (!commonConfigPropertyNames)
+		gs.log(FIX_SCRIPT_PREFIX_LOG_MSG + 'No config parameter was defined as property. No precedence maintenance is needed.');
+    
+	midInfo.commonConfigPropertyNames = commonConfigPropertyNames;            
+	var midGr = new GlideRecord('ecc_agent');
+	midGr.query();
+	while (midGr.next()) {
+		var midSysId = midGr.sys_id + '';
+		midInfo[midSysId] = {};
+		midInfo[midSysId].status = midGr.status + '';
+		midInfo[midSysId].created_on = midGr.sys_created_on + '';
+		midInfo[midSysId].domain = midGr.sys_domain + '';
+		midInfo[midSysId].property_info = commonConfigPropertyNames ? midSettings.getMidPropertyValues(midSysId, commonConfigPropertyNames): null;
+        midInfo[midSysId].config_info = {};
+	}
+	return midInfo;
+}
+
+/**
+ * @description Returns all MID Server visible in the input domain
+ * @param domainGr {GlideRecord} - the GlideRecord to get the domain
+ * @param domainSep {Boolean} - it is true if the instance is domainSeparated
+ * @returns {array} array of sys_ids of all MID Servers visible in the input domain
+ */
+function _getVisibleMIDsInDomain(domainGr, domainSep){
+	var mids =[];
+	var gr = new GlideRecord('ecc_agent');
+	if (domainSep)
+		gr.addDomainQuery(domainGr);
+	gr.query();
+	while(gr.next())
+		mids.push(gr.sys_id + '');
+	
+	return mids;      
+}
+
+/**
+ * @description Verify if with the new precedence, the input parameter needs to update
+ * @param midInfo {Object} - Object containing MID Server settings information 
+ * @param paramName {String} - name of the config parameter
+ * @param paramValue {String} - value of the config parameter defined in ecc_agent_config table
+ * @param midSysId {String} - sys_id of the corresponding MID Server
+ * @returns {Boolean} true, if the parameter is also defined as a property with different value in 'ecc_agent_property'
+ */
+function _needPrecedenceMaintenance(midInfo, paramName, paramValue, midSysId) {
+	if (!midInfo[midSysId].property_info)
+		return false;
+	
+	if (midInfo[midSysId].property_info[paramName] &amp;&amp; midInfo[midSysId].property_info[paramName].value != paramValue)
+		return true;
+	
+	return false;
+}
+
+/**
+ * @description Tag the input config parameter record with 'NO Overwrite'
+ * @param configSysId {String} - sys_id of the config record to tag
+ * @param tagSysId {String} - sys_id of 'NO Overwrite', if it is null, the new tag will be created
+ */
+
+function _tagRecord(configSysId, tagSysId) {
+	var tagUtil = new TagUtil();
+	if (!tagSysId)
+		tagSysId = tagUtil.createTag('NO Overwrite');
+	var title = 'NO Overwrite - ' + configSysId ;
+	tagUtil.insertTagEntry(title, tagSysId, 'ecc_agent_config', configSysId);
+}
+
+/**
+ * @description For the input MID-specific config record, we verify if the record needs update regarding 
+ *              the new Precedence or existing Global config Parameter
+ * @param midInfo {Object} - Object containing MID Server settings information 
+ * @param configGr {GlideRecord} - Glide record of the current MID-Specific config Parameter
+ */
+function _processMidSpecificConfigParameter(midInfo, configGr) {
+	var paramName = configGr.param_name + '';
+	var midSysId = configGr.ecc_agent + '';
+	var paramValue = configGr.value + '';
+	var needTag = false;
+	
+	// The parameter was already visited
+	if (midInfo[midSysId].config_info[paramName]) {
+		
+		// No action is needed, the param was defined by another more recent mid-specific record
+		if (midInfo[midSysId].config_info[paramName].sys_id)
+			return;
+		
+		// A global record for the property was processed. midInfo[midSysId].config_info[paramName] is available without sys_id
+		// We are replacing global record with the existing mid-specific parameter with the proper value
+		var newValue = midInfo[midSysId].config_info[paramName].value;
+		var precedMain = _needPrecedenceMaintenance(midInfo, paramName, newValue, midSysId);
+		if (precedMain) {
+			newValue = midInfo[midSysId].property_info[paramName].value;
+			configGr.setValue('value', newValue);
+			configGr.setWorkflow(false);
+			configGr.update();
+			midInfo[midSysId].config_info[paramName].sys_id = configGr.sys_id +'';
+			gs.debug(FIX_SCRIPT_PREFIX_LOG_MSG + 'Update Config param record with sys_id: ' + configGr.sys_id  + ', change ' + paramName
+					+ ' value from ' + paramValue + ' to ' + newValue);
+		
+			updatedConfigParam++;
+			needTag = true;
+		}
+		
+	} else {
+		// The current specific-mid record is the most recent record to define this param
+		midInfo[midSysId].config_info[paramName] = {};
+		midInfo[midSysId].config_info[paramName].sys_id = midSysId;
+		midInfo[midSysId].config_info[paramName].value = paramValue;
+		
+		
+		if ( _needPrecedenceMaintenance(midInfo, paramName, paramValue, midSysId)) {
+			var propValue = midInfo[midSysId].property_info[paramName].value;
+			configGr.setValue('value', propValue);
+			configGr.setWorkflow(false);
+			configGr.update();
+			gs.debug(FIX_SCRIPT_PREFIX_LOG_MSG + 'Update Config param record with sys_id: ' + configGr.sys_id  + ', change ' + paramName
+				+ ' value from ' + paramValue + ' to ' + propValue);
+			updatedConfigParam++;
+			needTag = true;
+		}
+	}
+	
+	// If the MID Server is down, we need to tag the record to prevent over-writing by config.xml in MID Server start-up
+	if (midInfo[midSysId].status == "Down" &amp;&amp; needTag) {
+		gs.debug(FIX_SCRIPT_PREFIX_LOG_MSG + 'Tag Config param record with sys_id: ' + configGr.sys_id );
+		_tagRecord(configGr.sys_id + '', tagSysId);
+	}
+}
+
+/**
+ * @description Update the attribute a column in a table with the new value
+ * @param tableName {String} - name of the table in dictionary
+ * @param colName {String} - column name
+ * @param attribute {String} - attribute of the column that we want to change
+ * @param newValue {String} - the new value of the attribute
+ */
+function _updateAttributeInDictionary(tableName, colName, attribute, newValue) {
+	var gr = new GlideRecord('sys_dictionary');
+	gr.addQuery('name', tableName);
+	gr.addQuery('element', colName);
+	gr.query();
+	if(gr.next()) {
+		gr.setValue(attribute, newValue);
+		gr.setWorkflow(false);
+		gr.update();
+	}
+}
+ 
+ ]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_fix&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-09-05 04:38:51&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;8244857877311110bb931b699a5a9953&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;5&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;Maintain pre-Utah MID Settings&lt;/sys_name&gt;
+        &lt;sys_package display_value="MID Server" source="com.glideapp.agent"&gt;a6877ce83cb1311068bcf327dfe37f69&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_fix_8244857877311110bb931b699a5a9953&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-10-27 18:03:34&lt;/sys_updated_on&gt;
+        &lt;unloadable&gt;false&lt;/unloadable&gt;
+    &lt;/sys_script_fix&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:22:20</sys_created_on>
+        <sys_id>9d43fc9d83b01210c6695855eeaad321</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Maintain pre-Utah MID Settings</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_9d43fc9d83b01210c6695855eeaad321</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:22:20</sys_updated_on>
+        <tablename>sys_script_fix</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>116030740700201028ef0a701ad3003b</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_nlu_workbench.NLUBatchTestProcessor&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Utilities to process the batch test set data and upload to utterance table&lt;/description&gt;
+        &lt;name&gt;NLUBatchTestProcessor&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var NLUBatchTestProcessor = Class.create();
+
+var constants = NLUWorkbenchConstants.constants;
+var tables = NLUWorkbenchConstants.tables;
+
+function getOnStartScript(testSetId) {
+    return "(function runTransformScript(source, map, log, target) { \
+    var importSetId = import_set.getUniqueValue(); \
+	var dataSource = import_set.getValue('data_source'); \
+	var updatedData = { properties: 'charset=utf-8' }; \
+    global.NLUSystemUtil.updateOrInsert('sys_data_source', 'sys_id', dataSource, updatedData); \
+    var gr = new GlideRecord('" + tables.NLU_BATCH_TEST_SET + "'); \
+    if (gr.get('" + testSetId + "')) { \
+        gr.setValue('status', 'uploading'); \
+        gr.setValue('import_set', importSetId); \
+        gr.update(); \
+    } \
+})(source, map, log, target);";
+}
+
+function getOnBeforeScript(testSetId) {
+    return "(function runTransformScript(source, map, log, target) { \
+	var expectedintent = source.getValue('u_expected_intent');\
+	if(expectedintent != null &amp;&amp; expectedintent.toLowerCase() == 'not relevant') { \
+		source.setValue('u_expected_intent',''); \
+		expectedintent = '';\
+	} \
+	if(typeof expectedintent === 'string' &amp;&amp; expectedintent.split(',').length &gt; " + constants.MAX_EXPECTED_INTENTS + ") { \
+		ignore = true; \
+	}\
+    target.test_set = '" + testSetId + "'; \
+})(source, map, log, target);";
+}
+
+function getOnBeforeScriptDefaultTestset(testSetId, modelIntents) {
+    return "(function runTransformScript(source, map, log, target) { \
+	var expectedintent = source.getValue('u_expected_intent');\
+	target.test_set = '" + testSetId + "'; \
+	if(expectedintent != null &amp;&amp; expectedintent.toLowerCase() == 'not relevant') { \
+        source.setValue('u_expected_intent',''); \
+        expectedintent = '';\
+    } \
+	var modelIntents = " + JSON.stringify(modelIntents) + ";\
+	ignore = NLUBatchTestSet.canIgnoreUtterance(expectedintent, modelIntents);\
+	if (!ignore) {\
+	    var expectedIntentsArr = NLUBatchTestSet.getMappedModelIntents(expectedintent, modelIntents); \
+	    source.setValue('u_expected_intent', expectedIntentsArr.join(',')); \
+	}\
+})(source, map, log, target);";
+}
+
+function getOnCompleteScript(testSetId) {
+    return "(function runTransformScript(source, map, log, target) { \
+    var gr = new GlideRecord('" + tables.NLU_BATCH_TEST_SET + "'); \
+    if (gr.get('" + testSetId + "')) { \
+        gr.setValue('status', error ? 'upload_failed' : 'uploaded'); \
+        gr.update(); \
+    } \
+})(source, map, log, target);";
+}
+
+(function() {
+    NLUBatchTestProcessor.createBatchTestSet = function(data) {
+        try {
+            var fileName = data.file &amp;&amp; data.file.name;
+            var fileSize = data.file &amp;&amp; data.file.size;
+            var testSetName = data.name;
+            var testSetLanguage = data.language;
+            var testSetId = data.testSetId;
+            var associatedModel = data.model;
+
+            // Basic validations of file:
+            if (data.file) {
+                if (!NLUFileUtil.checkFileSize(fileSize)) {
+                    throw new Error(gs.getMessage('File size exceeds max filesize of {0} MB', NLUFileUtil.getMaxFileSize()));
+                }
+                var fileArr = NLUFileUtil.getFileNameAndExtension(fileName, constants.VALID_FILE_TYPES);
+                if (!fileArr) {
+                    throw new Error(gs.getMessage('Please upload a file with a valid extension'));
+                }
+                var fileNameWithoutExt = fileArr[0];
+            }
+
+            // Create record in nlu_batch_test_set
+            if (!testSetId) {
+                testSetId = NLUBatchTestSet.addRecord(
+                    testSetName || fileNameWithoutExt,
+                    testSetLanguage || constants.DEFAULT_LANGUAGE, !data.file &amp;&amp; 'uploaded', associatedModel);
+                if (!testSetId) {
+                    throw new Error(gs.getMessage('Failed to create a batch test set record'));
+                }
+            }
+
+            if (!data.file) {
+                return {
+                    status: 'success',
+                    testSetId: testSetId,
+                };
+            }
+
+            // Create staging table for import set
+            var fields = [{
+                    name: 'expected_intent',
+                    length: 500
+                },
+                {
+                    name: 'utterance',
+                    length: 512
+                }
+            ];
+            var stageTableStructure = NLUImportSetUtils.createStageTable('NLU Batch Test Stage Table', fields);
+            if (!stageTableStructure) {
+                throw new Error(gs.getMessage('Failed to create a staging table for import set'));
+            }
+
+            // Create &amp; associate a transform map for the stage table
+            var mapSysId = NLUImportSetUtils.createTransformMap('NLU Batch Test Transform Map',
+                stageTableStructure, tables.NLU_BATCH_TEST_UTTERANCE, testSetId, {
+                    u_expected_intent: 'intent'
+                });
+            if (!mapSysId) {
+                throw new Error(gs.getMessage('Failed to create transform map for staging table: {0}', stageTableStructure['tableName']));
+            }
+            NLUImportSetUtils.createTransformMapScripts(mapSysId, [{
+                    event: 'onStart',
+                    script: getOnStartScript(testSetId)
+                },
+                {
+                    event: 'onBefore',
+                    script: associatedModel ?
+                        getOnBeforeScriptDefaultTestset(testSetId, NLUBatchTestSet.getModelIntentsFromTestId(testSetId)) : getOnBeforeScript(testSetId)
+                },
+                {
+                    event: 'onComplete',
+                    script: getOnCompleteScript(testSetId)
+                }
+            ], 'sn_nlu_workbench');
+
+            return {
+                status: 'success',
+                testSetId: testSetId,
+                stageTable: stageTableStructure['tableName'],
+                transformMap: mapSysId
+            };
+        } catch (e) {
+            return {
+                status: 'failure',
+                message: e.message
+            };
+        }
+    };
+
+    NLUBatchTestProcessor.prototype = {
+        initialize: function() {},
+        type: 'NLUBatchTestProcessor'
+    };
+
+})();]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-10-21 14:48:35&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;116030740700201028ef0a701ad3003b&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;76&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;NLUBatchTestProcessor&lt;/sys_name&gt;
+        &lt;sys_package display_value="NLU Workbench - Advanced Features" source="sn_nlu_workbench"&gt;31f5f491c3a710100bf407720f40ddf4&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="NLU Workbench - Advanced Features"&gt;31f5f491c3a710100bf407720f40ddf4&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_116030740700201028ef0a701ad3003b&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-04-26 18:58:54&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:10:22</sys_created_on>
+        <sys_id>0280b0d583b01210c6695855eeaad30d</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>NLUBatchTestProcessor</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_0280b0d583b01210c6695855eeaad30d</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:10:22</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

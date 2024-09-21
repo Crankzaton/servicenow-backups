@@ -1,0 +1,394 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>221b2482d7932100b7490ee60e61032c</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.PlannedTaskStateUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Planned Task State Management Utility.  This is extension to Task State Management Utility with support for default open state,default skipped state&amp;#13;
+Configurations are define in the task.state dictionary element, usually using dictionary overrides for planned task since state values vary by table.&lt;/description&gt;
+        &lt;name&gt;PlannedTaskStateUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[/*
+ * Planned Task State Management Utility
+ * primarily used by the Task Active State Management business rule to set the active
+ * field based on state changes
+ * Can be called by any server script to determine inactive states, default work, or default
+ * close states for a given table
+ */
+
+/*
+ * Usage:
+ * var stateUtil = new PlannedTaskStateUtil(current);
+ * var openState = stateUtil.getDefaultOpenState();
+ * var skippedState = stateUtil.getDefaultSkippedState();
+ */
+
+var PlannedTaskStateUtil = Class.create();
+
+PlannedTaskStateUtil.PENDING_STATES = "pending_states";
+PlannedTaskStateUtil.OPEN_STATES = "open_states";
+PlannedTaskStateUtil.WORK_IN_PROGRESS = "work_in_progress_states";
+PlannedTaskStateUtil.CLOSE_STATES = "close_states";
+PlannedTaskStateUtil.SKIPPED_STATES = "skipped_states";
+
+PlannedTaskStateUtil.prototype = {
+	
+	/*
+ 	* static properties and default values
+ 	*/
+	ATTR_DEFAULT_OPEN : "default_open_state",
+	ATTR_DEFAULT_SKIPPED : "default_skipped_state",
+	ATTR_DEFAULT_PENDING : "default_pending_state",
+	ATTR_DEFAULT_WORK : "default_work_state",
+	ATTR_DEFAULT_CLOSE : "default_close_state",
+	SYSTEM_DEFAULT_OPEN : 1, // task closed complete state
+	SYSTEM_DEFAULT_SKIPPED : 7, // task closed skipped state
+	SYSTEM_DEFAULT_PENDING : -5,	//task pending state
+	SYSTEM_DEFAULT_WORK : 2, // task work in progress state
+	SYSTEM_PENDING_STATES : [-5],	//as of now only one pending state, user can override in dictionary if more pending states are required.
+	SYSTEM_OPEN_STATES	 : [1],
+	SYSTEM_WORK_IN_PROGRESS : [2],
+	SYSTEM_CLOSE_STATES : [3,4,7],
+	
+	/*
+ 	* Init
+ 	* called by new PlannedTaskStateUtil(gr)
+ 	* @param task GlideRecord
+ 	*/
+	initialize : function(/*GlideRecord*/ task) {
+		
+		if (!task)
+			return;
+		var sysClassName;
+		if(task.sys_class_name){
+			sysClassName = task.sys_class_name;
+		}else{
+			sysClassName = task.getTableName();
+		}
+		var taskRec = new GlideRecord(sysClassName);
+		taskRec.initialize();
+		this.task = taskRec;
+		this.stateBuckets = {};
+		this.stateElement = this.task.state;
+		this.stateAttributeExists = false; // default to false
+		
+		
+		// get optional attributes or use default values
+		this._getDefaultOpen();
+		this._getDefaultSkipped();
+		this._getDefaultPending();
+		this._getDefaultWorkState();
+		this._getDefaultClose();
+		this._getPendingStates();
+		this._getOpenStates();
+		this._getWorkInProgressStates();
+		this._getCloseStates();
+		this._getSkippedStates();
+		this._populateStateBuckets();
+	},
+
+	getDefaultState: function(table) {
+		var tableDescriptor = new GlideTableDescriptor(table);
+		var elementDescriptor = tableDescriptor.getElementDescriptor('state');
+		var defaultState = elementDescriptor.getDefault();
+		return defaultState? defaultState : this.getDefaultPendingState();
+    },
+	
+	/*
+ 	* Get the value for the default work state, defaults to 1 if not specified
+ 	* @return int
+ 	*/
+	getDefaultOpenState : function() {
+		return this.defaultOpen;
+	},
+	
+	/*
+ 	* Get the value for the default close state, defaults to 3 if not specified
+ 	* @return int
+ 	*/
+	getDefaultSkippedState : function() {
+		return this.defaultSkipped;
+	},
+	
+	/*
+ 	* Get the value for the default pending state, defaults to -5 if not specified
+ 	* @return int
+ 	*/
+	getDefaultPendingState : function() {
+		return this.defaultPending;
+	},
+	
+	getDefaultWorkState : function() {
+		return this.defaultWork;
+	},
+	
+	getDefaultCloseState : function() {
+		return this.defaultClose;
+	},
+	
+	getPendingStates : function() {
+		return this.pendingStates;
+	},
+	
+	getOpenStates : function() {
+		return this.openStates;
+	},
+	
+	getWorkInProgressStates : function() {
+		return this.workInProgressStates;
+	},
+	
+	getCloseStates : function() {
+		return this.closeStates;
+	},
+
+	getSkippedStates: function() {
+		return this.skippedStates;
+	},
+	
+	
+	 /*
+    * Get the active status of a given state
+    * @param state value of the state field choice
+    * @return boolean true if state is an active state
+    */
+   isStateInactive : function(state) {
+      state = state + "";
+      var arrUtil = new ArrayUtil();
+      if (arrUtil.contains(this.closeStates, state))
+         return true;
+      
+      return false;
+   },
+	
+	
+	isStateOpen : function(state) {
+		state = state + "";
+		var arrUtil = new ArrayUtil();
+		if (arrUtil.contains(this.openStates, state))
+			return true;
+		
+		return false;
+	},
+	
+	isStateWIP : function(state) {
+		state = state + "";
+		var arrUtil = new ArrayUtil();
+		if (arrUtil.contains(this.workInProgressStates, state))
+			return true;
+		
+		return false;
+	},
+	
+	isStatePending : function(state) {
+		state = state + "";
+		var arrUtil = new ArrayUtil();
+		if (arrUtil.contains(this.pendingStates, state))
+			return true;
+		
+		return false;
+	},
+	
+	//private methods used in init()
+	_getDefaultOpen : function() {
+		var value = this.stateElement.getAttribute(this.ATTR_DEFAULT_OPEN);
+		if (value)
+			this.defaultOpen = value;
+		else
+			this.defaultOpen = this.SYSTEM_DEFAULT_OPEN;
+	},
+	
+	_getDefaultSkipped : function() {
+		var value = this.stateElement.getAttribute(this.ATTR_DEFAULT_SKIPPED);
+		if (value)
+			this.defaultSkipped = value;
+		else
+			this.defaultSkipped = this.SYSTEM_DEFAULT_SKIPPED;
+	},
+	
+	_getDefaultPending : function() {
+		var value = this.stateElement.getAttribute(this.ATTR_DEFAULT_PENDING);
+		if (value)
+			this.defaultPending = value;
+		else
+			this.defaultPending = this.SYSTEM_DEFAULT_PENDING;
+	},
+	
+	_getDefaultWorkState: function() {
+		// See if a value exists for the default work state attribute
+		var value = this.stateElement.getAttribute(this.ATTR_DEFAULT_WORK);
+		
+		if (value)
+			this.defaultWork = value;
+		else
+			this.defaultWork = this.SYSTEM_DEFAULT_WORK;
+	},
+	
+	_getDefaultClose : function() {
+		var value = this.stateElement.getAttribute(this.ATTR_DEFAULT_CLOSE);
+		if (value)
+			this.defaultClose = value;
+		else
+			this.defaultClose = this.SYSTEM_DEFAULT_CLOSE;
+	},
+	
+	_getPendingStates : function() {
+		var attribute = this.stateElement.getAttribute(PlannedTaskStateUtil.PENDING_STATES);
+		if(attribute){
+			var states = attribute.split(";");
+			this.pendingStates = states;
+		}
+		else {
+			this.pendingStates = this.SYSTEM_PENDING_STATES;
+		}
+	},
+	
+	_getOpenStates : function() {
+		var attribute = this.stateElement.getAttribute(PlannedTaskStateUtil.OPEN_STATES);
+		if(attribute){
+			var states = attribute.split(";");
+			this.openStates = states;
+		}
+		else {
+			this.openStates = this.SYSTEM_OPEN_STATES;
+		}
+	},
+	
+	_getWorkInProgressStates : function() {
+		var attribute = this.stateElement.getAttribute(PlannedTaskStateUtil.WORK_IN_PROGRESS);
+		if(attribute){
+			var states = attribute.split(";");
+			this.workInProgressStates = states;
+		}
+		else {
+			this.workInProgressStates = this.SYSTEM_WORK_IN_PROGRESS;
+		}
+		
+	},
+	
+	_getCloseStates : function() {
+		var attribute = this.stateElement.getAttribute(PlannedTaskStateUtil.CLOSE_STATES);
+		if(attribute){
+			var states = attribute.split(";");
+			this.closeStates = states;
+		}
+		else {
+			this.closeStates = this.SYSTEM_CLOSE_STATES;
+		}
+	},
+
+	_getSkippedStates: function() {
+		var attribute = this.stateElement.getAttribute(PlannedTaskStateUtil.SKIPPED_STATES);
+		this.skippedStates = [];
+		if(!JSUtil.nil(attribute)){
+			var states = attribute.split(";");
+			this.skippedStates = states;
+		}
+	},
+	
+	_populateStateBuckets : function() {
+		var state;
+		
+		for(var index in this.pendingStates){
+			state = this.pendingStates[index];
+			this.stateBuckets[state] = PlannedTaskStateUtil.PENDING_STATES;
+		}
+		for(index in this.openStates){
+			state = this.openStates[index];
+			this.stateBuckets[state] = PlannedTaskStateUtil.OPEN_STATES;
+		}
+		for(index in this.workInProgressStates){
+			state = this.workInProgressStates[index];
+			this.stateBuckets[state] = PlannedTaskStateUtil.WORK_IN_PROGRESS;
+		}
+		for(index in this.closeStates){
+			state = this.closeStates[index];
+			this.stateBuckets[state] = PlannedTaskStateUtil.CLOSE_STATES;
+		}
+	},
+	
+	getBucketForState : function(state) {
+		if(this.stateBuckets.hasOwnProperty(state)){
+			return this.stateBuckets[state];
+		}
+		return null;
+	},
+	
+	isValidState : function(bucketName, state) {
+		if(this.stateBuckets.hasOwnProperty(state)){
+			var cl = GlideSysChoice(this.task.getTableName(),'state');
+			var stateChoices = cl.getChoices();
+			var choice;
+			while(stateChoices.next()){
+				choice = stateChoices.getValue('value');
+				if(choice == state){
+					return (this.stateBuckets[state] == bucketName) ? true : false;
+				}
+			}
+		}
+		return false;
+	},
+	
+	getDefaultStateForBucket : function(bucketName){
+		if(bucketName == PlannedTaskStateUtil.PENDING_STATES)
+			return this.getDefaultPendingState();
+		else if(bucketName == PlannedTaskStateUtil.OPEN_STATES)
+			return this.getDefaultOpenState();
+		else if(bucketName == PlannedTaskStateUtil.WORK_IN_PROGRESS)
+			return this.getDefaultWorkState();
+		else if(bucketName == PlannedTaskStateUtil.CLOSE_STATES)
+			return this.getDefaultCloseState();
+		else 
+			return null;
+	},
+	
+	getValidStateForBucket : function(bucket, state) {
+		if (this.isValidState(bucket, state)) {
+			return state;
+		} else {
+			var defaultState = this.getDefaultStateForBucket(bucket);
+			return defaultState;
+		}
+	},
+	
+	getStateBuckets: function() {
+		return this.stateBuckets;
+	},
+	
+	type : "PlannedTaskStateUtil"
+};
+]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2014-09-22 22:47:09&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;221b2482d7932100b7490ee60e61032c&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;69&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;PlannedTaskStateUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Planned Task_v2" source="com.snc.planned_task_v2"&gt;92ef82e747e64210cd4e1ce4316d43f1&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_221b2482d7932100b7490ee60e61032c&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-25 09:41:12&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:04</sys_created_on>
+        <sys_id>3ee0fc1983b01210c6695855eeaad312</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>PlannedTaskStateUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_3ee0fc1983b01210c6695855eeaad312</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:04</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

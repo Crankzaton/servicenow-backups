@@ -1,0 +1,277 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>086ee815736210103bb6a4fa54f6a751</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_fix"&gt;
+    &lt;sys_script_fix action="INSERT_OR_UPDATE"&gt;
+        &lt;before&gt;false&lt;/before&gt;
+        &lt;description&gt;Fix script performs following updates:-
+1. Updates the annotation representation from word indexes to starting and ending character positions.
+2. Updates the lookup type NLU Vocabulary records
+3. Auto trains the table lookups&lt;/description&gt;
+        &lt;name&gt;Update NLU Annotation and Vocabulary&lt;/name&gt;
+        &lt;record_for_rollback&gt;false&lt;/record_for_rollback&gt;
+        &lt;script&gt;&lt;![CDATA[/*
+ * Pre-Quebec annotation Format  - [{"indexes":[3,4,5],"annotatedString":"I want to {{phrase=\"reset my password\"}}"}]
+ * Quebec annotation Format - [{"annotatedString":"I want to {{phrase=\"reset my password\"}}","start":10,"end":26}]
+ */
+
+var tables = NLUConstants.tables;
+var vocabTypes = NLUConstants.VOCAB_TYPES;
+var arrayUtil = new ArrayUtil();
+
+function updateAnnotationRepresentation() {
+
+    var entityUtteranceGlideRecord = new GlideRecord(tables.M2M_SYS_NLU_UTTERANCE_ENTITY);
+    entityUtteranceGlideRecord.query();
+
+    while (entityUtteranceGlideRecord.next()) {
+        try {
+            var annotationObjectArray = JSON.parse(entityUtteranceGlideRecord.getValue('annotation'));
+            var utterance = entityUtteranceGlideRecord.utterance.getRefRecord().getValue('utterance');
+            if (gs.nil(utterance))
+                throw new Error('Empty utterance');
+
+            var j = 0;
+            for (j; j &lt; annotationObjectArray.length; j++) {
+
+                var annotationObject = annotationObjectArray[j];
+                var annotationObjectIndexArray = annotationObject.indexes;
+
+                if (gs.nil(annotationObjectIndexArray))
+                    throw new Error('Invalid Annotation Format');
+
+                var annotationWordStartIndex = annotationObjectIndexArray[0];
+                var annotationWordEndIndex = annotationObjectIndexArray[annotationObjectIndexArray.length - 1];
+
+                var annotationCharacterStartIndex;
+                var annotationCharacterEndIndex;
+
+                var utteranceTokens = utterance.split(/(\s+)/);
+
+                var i = 0;
+                var annotationCharacterPosition = 0;
+                var annotationWordCount = 0;
+                var whitespaceRegex = /\s+/;
+                for (i; i &lt; utteranceTokens.length; i++) {
+                    var token = utteranceTokens[i];
+                    annotationCharacterPosition += token.length;
+                    if (token.match(whitespaceRegex) != null)
+                        continue;
+
+                    if (annotationWordStartIndex === annotationWordCount)
+                        annotationCharacterStartIndex = annotationCharacterPosition - token.length;
+                    if (annotationWordEndIndex === annotationWordCount) {
+                        annotationCharacterEndIndex = annotationCharacterPosition - 1;
+                        break;
+                    }
+                    annotationWordCount += 1;
+                }
+
+                annotationObject.start = annotationCharacterStartIndex;
+                annotationObject.end = annotationCharacterEndIndex;
+
+                delete annotationObject.indexes;
+
+            }
+            entityUtteranceGlideRecord.setValue('annotation', JSON.stringify(annotationObjectArray));
+            entityUtteranceGlideRecord.setWorkflow(false);
+            entityUtteranceGlideRecord.autoSysFields(false);
+            entityUtteranceGlideRecord.update();
+            gs.info('Updated the annotation value of M2M_SYS_NLU_UTTERANCE_ENTITY table for the record ' + entityUtteranceGlideRecord.getUniqueValue());
+        } catch (e) {
+            gs.error('Error while updating the annotation of M2M_SYS_NLU_UTTERANCE_ENTITY table for the record ' + entityUtteranceGlideRecord.getUniqueValue() + ' ' + e.message);
+
+        }
+
+    }
+
+}
+
+function getUniqueHandleName(handleName) {
+    var sequence = 0;
+    var vocabGR = new GlideRecord(tables.SYS_NLU_VOCABULARY);
+    vocabGR.addNullQuery('model');
+    vocabGR.addQuery('type', vocabTypes.lookup);
+    vocabGR.addQuery('name', 'LIKE', handleName + '%');
+    vocabGR.query();
+
+    while (vocabGR.next()) {
+        var recordHandle = vocabGR.getValue('name');
+        var vocabularyDuplicateHandleSuffixRegex = new RegExp(handleName + '([0-9]+)$');
+        if (vocabularyDuplicateHandleSuffixRegex.test(recordHandle)) {
+            var recordHandleSequence = parseInt(recordHandle.match(vocabularyDuplicateHandleSuffixRegex)[1]);
+            if (recordHandleSequence &gt; sequence)
+                sequence = recordHandleSequence;
+        }
+    }
+
+    sequence += 1;
+    return handleName + sequence;
+}
+
+function updateUtteranceEntityAnnotationHandleName(utteranceID, oldHandleName, newHandleName) {
+    var annotationRegex = new RegExp('(^|\\s|\\")' + oldHandleName + '($|\\s|\\")');
+    var annotationGR = new GlideRecord(tables.M2M_SYS_NLU_UTTERANCE_ENTITY);
+    annotationGR.addQuery('utterance', utteranceID);
+    annotationGR.query();
+    while (annotationGR.next()) {
+        var recordUpdated = false;
+        var annotationArray = JSON.parse(annotationGR.getValue('annotation'));
+        for (var i = 0; i &lt; annotationArray.length; i++) {
+            var annotation = annotationArray[i];
+            var annotatedString = annotation.annotatedString;
+            while ((annotationRegex.test(annotatedString))) {
+                annotatedString = annotatedString.replace(annotationRegex, function(match) {
+                    return match.replace(oldHandleName, newHandleName);
+                });
+                recordUpdated = true;
+            }
+            annotation.annotatedString = annotatedString;
+        }
+
+        if (recordUpdated) {
+            annotationGR.setValue('annotation', JSON.stringify(annotationArray));
+            annotationGR.setWorkflow(false);
+            annotationGR.autoSysFields(false);
+            annotationGR.update();
+        }
+    }
+}
+
+function updateUtteranceHandleName(modelID, oldHandleName, newHandleName) {
+    var utteranceRegex = new RegExp('(^|\\s)' + oldHandleName + '($|\\s)');
+    var utteranceGR = new GlideRecord(tables.SYS_NLU_UTTERANCE);
+    utteranceGR.addQuery('intent.model', modelID);
+    var query = utteranceGR.addQuery('utterance', 'CONTAINS', ' ' + oldHandleName + ' ');
+    query.addOrCondition('utterance', 'STARTSWITH', oldHandleName + ' ');
+    query.addOrCondition('utterance', 'ENDSWITH', ' ' + oldHandleName);
+    query.addOrCondition('utterance', oldHandleName);
+    utteranceGR.query();
+
+    while (utteranceGR.next()) {
+        var utterance = utteranceGR.getValue('utterance');
+        if (utteranceRegex.test(utterance)) {
+            updateUtteranceEntityAnnotationHandleName(utteranceGR.getUniqueValue(), oldHandleName, newHandleName);
+            while ((utteranceRegex.test(utterance))) {
+                utterance = utterance.replace(utteranceRegex, function(match) {
+                    return match.replace(oldHandleName, newHandleName);
+                });
+            }
+            utteranceGR.setValue('utterance', utterance);
+            utteranceGR.setWorkflow(false);
+            utteranceGR.autoSysFields(false);
+            utteranceGR.update();
+        }
+    }
+}
+
+function getLookupHandleNamesFromVocabularyTable() {
+    var handleNames = [];
+    var lookupGR = new GlideRecord(tables.SYS_NLU_VOCABULARY);
+    lookupGR.addQuery('type', 'IN', vocabTypes.lookup + ',' + vocabTypes.static_lookup);
+    lookupGR.addNullQuery('model');
+    lookupGR.query();
+    while (lookupGR.next()) {
+        handleNames.push(lookupGR.getValue('name'));
+    }
+    return handleNames;
+}
+
+function updateLookUpTypeVocabularyRecords() {
+    var lookupIdsToBeTrained = [];
+    var uniqueHandleNames = getLookupHandleNamesFromVocabularyTable();
+    var lookupGR = new GlideRecord(tables.SYS_NLU_VOCABULARY);
+    lookupGR.addQuery('type', vocabTypes.lookup);
+    lookupGR.addNotNullQuery('model');
+    lookupGR.query();
+    while (lookupGR.next()) {
+        try {
+            var oldHandleName = lookupGR.getValue('name');
+            var newHandleName = null;
+            if (oldHandleName.indexOf('_') &gt; -1)
+                newHandleName = oldHandleName.replace(/_/g, '');
+
+            if (newHandleName || arrayUtil.contains(uniqueHandleNames, oldHandleName)) {
+
+                if (newHandleName) {
+                    if (arrayUtil.contains(uniqueHandleNames, newHandleName))
+                        newHandleName = getUniqueHandleName(newHandleName);
+                } else
+                    newHandleName = getUniqueHandleName(oldHandleName);
+                updateUtteranceHandleName(lookupGR.getValue('model'), '@' + oldHandleName, '@' + newHandleName);
+                lookupGR.setValue('name', newHandleName);
+                uniqueHandleNames.push(newHandleName);
+            } else
+                uniqueHandleNames.push(oldHandleName);
+            lookupGR.setValue('vocabulary_json', JSON.stringify({
+                fields: [{
+                    name: lookupGR.getValue('field_name'),
+                    enable_lookup: true,
+                    multiple_values: false
+                }],
+                options: {
+                    enable_fuzzy_matching: true,
+                    language: 'en',
+                    case_sensitive: false,
+                    lookup_fields_appear_together: false,
+                    sync_frequency: 'run_once',
+                },
+            }));
+
+            lookupGR.setValue('model', '');
+            lookupGR.setValue('field_name', '');
+            lookupGR.setWorkflow(false);
+            lookupGR.autoSysFields(false);
+            lookupGR.update();
+            lookupIdsToBeTrained.push(lookupGR.getUniqueValue());
+            gs.info('Succesfully updated lookup type NLU vocabulary record : ' + lookupGR.getUniqueValue());
+        } catch (e) {
+            gs.error('Error in updating lookup type NLU vocabulary reocrd : ' + lookupGR.getUniqueValue());
+        }
+    }
+
+    var lookupTrainScript = "gs.info('Post Upgrade Table lookup train result' + JSON.stringify(NLULookup.trainMultipleLookups(['" + lookupIdsToBeTrained.join("','") + "'], { 'autoTrain': true })))";
+    var solutionSysTrigger = new GlideRecord("sys_trigger");
+    solutionSysTrigger.initialize();
+    solutionSysTrigger.setValue("name", 'NLU Post Upgrade Lookup Training');
+    solutionSysTrigger.setValue("script", lookupTrainScript);
+    solutionSysTrigger.setValue("trigger_type", 0);
+    solutionSysTrigger.insert();
+}
+
+(function() {
+    updateLookUpTypeVocabularyRecords();
+    updateAnnotationRepresentation();
+})();]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_fix&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-08-09 15:15:11&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;086ee815736210103bb6a4fa54f6a751&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;27&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;Update NLU Annotation and Vocabulary&lt;/sys_name&gt;
+        &lt;sys_package display_value="NLU Workbench - Core" source="com.glide.nlu"&gt;302438683c31311068bcf327dfe37f2f&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_fix_086ee815736210103bb6a4fa54f6a751&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2020-11-06 07:50:49&lt;/sys_updated_on&gt;
+        &lt;unloadable&gt;false&lt;/unloadable&gt;
+    &lt;/sys_script_fix&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:18:56</sys_created_on>
+        <sys_id>ef72f81d83b01210c6695855eeaad3df</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Update NLU Annotation and Vocabulary</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_ef72f81d83b01210c6695855eeaad3df</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:18:56</sys_updated_on>
+        <tablename>sys_script_fix</tablename>
+    </sys_metadata_link>
+</record_update>

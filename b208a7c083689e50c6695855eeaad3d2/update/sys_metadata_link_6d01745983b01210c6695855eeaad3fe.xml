@@ -1,0 +1,224 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>261ba8e307a6201028ef0a701ad30077</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.NLUMappingsProcessor&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Processess the NLU Model mapping data and populates the primary entries for model, intent, entity &lt;/description&gt;
+        &lt;name&gt;NLUMappingsProcessor&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var NLUMappingsProcessor = Class.create();
+
+(function() {
+
+    var tables = NLUConstants.tables;
+
+    NLUMappingsProcessor.getNameField = function(table) {
+        return table === tables.SYS_NLU_MODEL ? 'display_name' : 'name';
+    };
+
+    NLUMappingsProcessor.getPrimary = function(sysId, mappings) {
+        for (var i in mappings) {
+            var eachMapping = mappings[i];
+            if (eachMapping.secondary.indexOf(sysId) !== -1) return eachMapping.primary;
+        }
+        return null;
+    };
+
+    NLUMappingsProcessor.unlinkPrimary = function(gr) {
+        var table = gr.getTableName();
+        var primaryField = NLUImportUtil.FIELDS_DATA[table].primaryField;
+        while (gr.next()) {
+            gr.setValue(primaryField, '');
+            gr.update();
+        }
+    };
+
+    NLUMappingsProcessor.getAllModels = function(modelIds) {
+        var modelGr = new GlideRecord(tables.SYS_NLU_MODEL);
+        modelGr.addQuery('sys_id', 'IN', modelIds.join());
+        modelGr.query();
+        return modelGr;
+    };
+
+    NLUMappingsProcessor.getAllIntents = function(modelIds) {
+        var intentGr = new GlideRecord(tables.SYS_NLU_INTENT);
+        intentGr.addQuery('model', 'IN', modelIds.join());
+        intentGr.query();
+        return intentGr;
+    };
+
+    NLUMappingsProcessor.getAllEntities = function(modelIds) {
+        var entityGr = new GlideRecord(tables.SYS_NLU_ENTITY);
+        var joinQuery = entityGr.addJoinQuery(tables.M2M_SYS_NLU_INTENT_ENTITY, 'sys_id', 'entity');
+        joinQuery.addCondition('intent.model', 'IN', modelIds.join());
+        entityGr.addEncodedQuery('^NQmodel.sys_idIN' + modelIds.join());
+        entityGr.query();
+        return entityGr;
+    };
+
+    NLUMappingsProcessor.prototype = {
+
+        initialize: function() {
+            this.primaryIdNameMap = {};
+        },
+
+        saveMappings: function(mappings) {
+
+            this.processPrimaryModel(mappings.models.primary);
+            this.checkRemovedModels(mappings.models);
+
+            var secondaryModels = mappings.models.secondary;
+            this.processSecondary(NLUMappingsProcessor.getAllModels(secondaryModels), [mappings.models]);
+
+            if (mappings.intents) {
+                var secIntentsGr = NLUMappingsProcessor.getAllIntents(secondaryModels);
+                var unmappedPrimaryIds = this.processSecondary(secIntentsGr, mappings.intents);
+                var context = this;
+                var primaryField = NLUImportUtil.FIELDS_DATA[tables.SYS_NLU_INTENT].primaryField;
+                unmappedPrimaryIds.forEach(function(priIntentId) {
+                    var intentName = context.primaryIdNameMap[tables.SYS_NLU_INTENT][priIntentId];
+                    secondaryModels.forEach(function(secModelId) {
+                        var secIntentGr = new NLUModel(secModelId).getIntents('name=' + intentName);
+                        if (!secIntentGr.next()) {
+                            var newIntentGr = new GlideRecord(tables.SYS_NLU_INTENT);
+                            newIntentGr.initialize();
+                            newIntentGr.setValue('model', secModelId);
+                            newIntentGr.setValue(primaryField, priIntentId);
+                            context.updateName(newIntentGr, priIntentId);
+                            newIntentGr.insert();
+                        }
+                    });
+                });
+            }
+
+            if (mappings.entities)
+                this.processSecondary(NLUMappingsProcessor.getAllEntities(secondaryModels), mappings.entities);
+        },
+
+        checkRemovedModels: function(modelMapping) {
+            var primaryField = NLUImportUtil.FIELDS_DATA[tables.SYS_NLU_MODEL].primaryField;
+            var gr = new GlideRecord(tables.SYS_NLU_MODEL);
+            gr.addQuery(primaryField, modelMapping.primary);
+            gr.query();
+            var modelIds = [];
+            while (gr.next()) {
+                var modelId = gr.getUniqueValue();
+                if (modelMapping.secondary.indexOf(modelId) === -1) {
+                    modelIds.add(modelId);
+                    gr.setValue(primaryField, '');
+                    gr.update();
+                }
+            }
+            if (modelIds.length &gt; 0) {
+                NLUMappingsProcessor.unlinkPrimary(NLUMappingsProcessor.getAllIntents(modelIds));
+                NLUMappingsProcessor.unlinkPrimary(NLUMappingsProcessor.getAllEntities(modelIds));
+            }
+        },
+
+        processPrimaryModel: function(modelId) {
+            var nluModel = new NLUModel(modelId);
+            var gr = nluModel.getGR();
+            if (gr.get(modelId)) {
+                this.updatePrimary(gr);
+                var intentGr = nluModel.getIntents();
+                while (intentGr.next()) {
+                    // Enable all primary intents
+                    intentGr.setValue('enable', true);
+                    if (!this.updatePrimary(intentGr)) {
+                        intentGr.update();
+                    }
+                }
+
+                var entityGr = nluModel.getEntities();
+                while (entityGr.next()) this.updatePrimary(entityGr);
+            } else {
+                throw new Error(gs.getMessage('Model {0} does not exists!', modelId));
+            }
+        },
+
+        updatePrimary: function(gr) {
+            var table = gr.getTableName();
+
+            if (!this.primaryIdNameMap[table]) this.primaryIdNameMap[table] = {};
+            var nameField = NLUMappingsProcessor.getNameField(table);
+            this.primaryIdNameMap[table][gr.getUniqueValue()] = gr.getValue(nameField);
+
+            var primaryField = NLUImportUtil.FIELDS_DATA[table].primaryField;
+            if (gr.getValue(primaryField)) {
+                gr.setValue(primaryField, '');
+                return gr.update();
+            }
+            return null;
+        },
+
+        processSecondary: function(gr, mappings) {
+            var table = gr.getTableName();
+            var unmappedPrimaryIds = Object.keys(this.primaryIdNameMap[table]);
+            var primaryField = NLUImportUtil.FIELDS_DATA[table].primaryField;
+            while (gr.next()) {
+                var oldPrimaryId = gr.getValue(primaryField);
+                var newPrimaryId = NLUMappingsProcessor.getPrimary(gr.getUniqueValue(), mappings);
+                if (newPrimaryId) {
+                    if (newPrimaryId !== oldPrimaryId) gr.setValue(primaryField, newPrimaryId);
+                    this.updateName(gr, newPrimaryId);
+                    gr.update();
+                    var mappedEntryIndex = unmappedPrimaryIds.indexOf(newPrimaryId);
+                    if (mappedEntryIndex !== -1) unmappedPrimaryIds.splice(mappedEntryIndex, 1);
+                } else if (oldPrimaryId) {
+                    // User removed the mapping:
+                    gr.setValue(primaryField, '');
+                    gr.update();
+                }
+            }
+
+            // These are the primary ids, which do not have any mapping:
+            return unmappedPrimaryIds;
+        },
+
+        updateName: function(gr, newPrimaryId) {
+            var table = gr.getTableName();
+            var nameField = NLUMappingsProcessor.getNameField(table);
+            var newName = this.primaryIdNameMap[table][newPrimaryId];
+            if (table === tables.SYS_NLU_MODEL) newName = newName + ' ' + NLUModel.getLanguage(gr).toUpperCase();
+            if (newName) gr.setValue(nameField, newName);
+        },
+
+        type: 'NLUMappingsProcessor'
+    };
+
+})();]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-03-03 14:54:03&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;261ba8e307a6201028ef0a701ad30077&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;19&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;NLUMappingsProcessor&lt;/sys_name&gt;
+        &lt;sys_package display_value="NLU Workbench - Core" source="com.glide.nlu"&gt;302438683c31311068bcf327dfe37f2f&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_261ba8e307a6201028ef0a701ad30077&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2021-06-07 16:01:14&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:31</sys_created_on>
+        <sys_id>6d01745983b01210c6695855eeaad3fe</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>NLUMappingsProcessor</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_6d01745983b01210c6695855eeaad3fe</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:31</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

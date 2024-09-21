@@ -1,0 +1,471 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1b54c60667100200a5a0f3b457415aac</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.PwdIdentifyStageBL&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Business logic for the first stage, Identify, of the Password Reset flow&lt;/description&gt;
+        &lt;name&gt;PwdIdentifyStageBL&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var PwdIdentifyStageBL = Class.create();
+PwdIdentifyStageBL.prototype = Object.extendsObject(PwdResetStageBaseBL, {
+
+    REQUEST_TYPE: 1, // self-service reset password
+
+    DEFAULT_SELF_SERVICE_PROCESS_ID: 'c6b0c20667100200a5a0f3b457415ad5',
+
+    NOTIFY_EMAIL: "2",
+    PWD_RESET_URL_NOTIFICATION: "9546d4509f131200f45c7b9ac42e70ca",
+    UNSUBSCRIBE_NOTIFICATION_FILTER: "c1bfa4040a0a0b8b001eeb0f3f5ee961",
+
+    PWD_RESET_NOTITIFICATION_EVENT: 'pwd.reset.identify.error.notification',
+	
+	USER_NOT_EXIST: 1,
+	BLOCKED: 2,
+	LOCKED: 3,
+	NOT_ENROLLED: 4,
+	NOT_BELONG_TO_PROCESS:  5,
+	NOTIFICATIONS_DISABLED: 6,
+	LDAP_USER: 7,
+	
+	WEB: "Web",
+	VIRTUAL_AGENT: "VA",
+	WINDOWS: "Windows",
+	IVR:  "IVR",
+
+    initialize: function() {
+        this.STAGE = PwdConstants.STAGE_IDENTIFICATION;
+        this.invalidRequest = false;
+        this.requestSource = 0; //Default is Web
+    },
+
+    // @param idenObjs [{user_input, processor_id}]
+    verifyIdentity: function(processId, idenObjs, captchaText, webRequest, processCaptcha) {
+
+        // return error if the process is undefined.
+        var process = new SNC.PwdProcess(processId);
+        if (!process.exists()) {
+            this.logError("Process does not exist (" + processId + ").", "");
+            return "process does not exists";
+        }
+
+        //If captcha is enabled, check if the answer is correct.
+        if ((processCaptcha == null || processCaptcha == true) &amp;&amp; process.getDisplayCaptcha()) {
+            if (this._isGoogleCaptchaUsed()) {
+                if (!this._vefifyGoogleCaptchaToken(captchaText)) {
+                    this.logWarning("unsuccessful Google recaptcha validation", "");
+                    return "bad captcha";
+                }
+            } else if (!this._verifyDefaultCaptcha(captchaText)) {
+
+                // this is the default captcha.
+                // Check if the passed captch matches the one that was shown to the user:
+                this.logWarning("Captcha does not match", "");
+                return "bad captcha";
+            }
+        } // end of captcha handling.
+
+        // Fetch user sys ID based on the user input
+
+        var userSysId;
+        var res = this._getUserSysId(idenObjs, process, webRequest);
+        if (!res.status)
+            return res.returnMsg;
+        else
+            userSysId = res.userSysId;
+
+
+        // Start logging the password reset request:
+        var trackingMgr = this.trackingMgr;
+        var request_id = trackingMgr.createRequest(processId, userSysId, gs.getSessionID(), this.REQUEST_TYPE);
+        this.requestSource = this._getRequestSource(webRequest.getParameter('sysparm_request_source') + "");
+        // Prepare session params to pass to next step:
+        gs.getSession().putProperty('sysparm_request_id', request_id);
+        gs.getSession().putProperty('sysparm_sys_user_id', userSysId);
+        gs.getSession().putProperty('sysparm_user_input', idenObjs[0].user_input);
+        gs.getSession().putProperty('sysparm_directory', this.type);
+
+        if (this.invalidRequest) {
+            var userDoesnotExistMsg = "User does not exist associated with process_id = " + processId + " and request_id = " + request_id;
+            this.logWarning(userDoesnotExistMsg, request_id);
+            return this._updateResetRequest(userSysId, request_id, false, this.USER_NOT_EXIST);
+        }
+
+        var gr = new GlideRecord("pwd_reset_request");
+        gr.get(request_id);
+
+        // For the default self service process, return error if the user is locked out and process unlock_account is off
+        if (this._lockedOutError(userSysId, processId)) {
+            var lockedOutMsg = "User cannot reset password as user associated with process_id = " + processId + " and user_sys_id = " + userSysId + ") is locked out";
+            return this._raiseNotificationEvent(lockedOutMsg, request_id, gr, userSysId, this.LOCKED);
+        }
+
+        // return error if the user is blocked
+        if (trackingMgr.isRequestLocked(userSysId, processId)) {
+            var blockedMsg = "User cannot reset password as user associated with process_id = " + processId + " and user_sys_id = " + userSysId + ") is blocked";
+            return this._raiseNotificationEvent(blockedMsg, request_id, gr, userSysId, this.BLOCKED);
+        }
+
+        // Return error if the user does not belong to this process:
+        var enrollMgr = new SNC.PwdEnrollmentManager();
+        if (!enrollMgr.doesUserBelongToProcess(userSysId, processId)) {
+            var userMsg = "User cannot reset password as user does not belong to process (process_id = " + processId + ", user_sys_id = " + userSysId + ")";
+            return this._raiseNotificationEvent(userMsg, request_id, gr, userSysId, this.NOT_BELONG_TO_PROCESS);
+        }
+
+        // Return error if the process emails a password reset url or emails new password via email, but the user has disabled notifications, or url notification for primary email
+        if (process.getEmailPasswordResetUrl() || process.getSendEmail()) {
+            var userGr = new GlideRecord("sys_user");
+            userGr.get(userSysId);
+            var email = userGr.getValue("email");
+            var mobile = userGr.getValue("mobile_phone");
+            var disabledNotifMsg = "User cannot reset password as user disabled notifications for email (process_id = " + processId + ", user_sys_id = " + userSysId + ")";
+            if ((gs.nil(email) &amp;&amp; gs.nil(mobile)) || userGr.getValue("notification") != this.NOTIFY_EMAIL) {
+                return this._raiseNotificationEvent(disabledNotifMsg, request_id, gr, userSysId, this.NOTIFICATIONS_DISABLED);
+            }
+
+            var deviceGr = new GlideRecord("cmn_notif_device");
+            deviceGr.addQuery("user", userSysId);
+            deviceGr.addQuery("email_address", email);
+            deviceGr.addQuery("type", "Email"); //DEF0061843
+            deviceGr.query();
+            deviceGr.next();
+
+            var notifGr = new GlideRecord("cmn_notif_message");
+            notifGr.addQuery("user", userSysId);
+            notifGr.addQuery("device", deviceGr.getValue("sys_id"));
+            notifGr.addQuery("notification", this.PWD_RESET_URL_NOTIFICATION);
+            notifGr.query();
+            notifGr.next();
+            var notifFilter = notifGr.getValue("notification_filter");
+			
+            deviceGr = new GlideRecord("cmn_notif_device");
+            deviceGr.addQuery("user", userSysId);
+            deviceGr.addQuery("phone_number", mobile);
+            deviceGr.addQuery("type", "SMS"); //DEF0061843
+            deviceGr.query();
+            deviceGr.next();
+
+            notifGr = new GlideRecord("cmn_notif_message");
+            notifGr.addQuery("user", userSysId);
+            notifGr.addQuery("device", deviceGr.getValue("sys_id"));
+            notifGr.addQuery("notification", this.PWD_RESET_URL_NOTIFICATION);
+            notifGr.query();
+            notifGr.next();
+            var notifFilterSMS = notifGr.getValue("notification_filter");
+			
+            if (notifFilterSMS == this.UNSUBSCRIBE_NOTIFICATION_FILTER &amp;&amp; notifFilter == this.UNSUBSCRIBE_NOTIFICATION_FILTER) {
+                return this._raiseNotificationEvent(disabledNotifMsg, request_id, gr, userSysId, this.NOTIFICATIONS_DISABLED);
+            }
+        }
+
+        var count = 0;
+        var processManager = new SNC.PwdProcessManager();
+
+        // Retrieve and save all MANDATORY verifications:
+        var mandatoryVerificationIds = processManager.getProcessVerificationIdsByMandatoryFlag(processId, true);
+
+        var vArr = mandatoryVerificationIds.toArray();
+        var verificationId;
+        var userEnrolled;
+        var verification;
+        var notEnrolledMsg;
+
+        for (var i = 0; i &lt; vArr.length; i++) {
+            verificationId = mandatoryVerificationIds.get(i);
+            userEnrolled = enrollMgr.isUserEnrolledByVerificationId(userSysId, verificationId);
+            if (!userEnrolled) {
+                notEnrolledMsg = "User cannot reset password as user is not enrolled (process_id = " + processId + ", user_sys_id = " + userSysId + ")";
+                return this._raiseNotificationEvent(notEnrolledMsg, request_id, gr, userSysId, this.NOT_ENROLLED);
+            }
+            count++;
+        }
+
+        // Retrieve and save all OPTIONAL verifications:
+        var optionalVerificationIds = processManager.getProcessVerificationIdsByMandatoryFlag(processId, false);
+
+        vArr = optionalVerificationIds.toArray();
+        for (i = 0; i &lt; vArr.length; i++) {
+            verificationId = optionalVerificationIds.get(i);
+            userEnrolled = enrollMgr.isUserEnrolledByVerificationId(userSysId, verificationId);
+            if (userEnrolled) {
+                count++;
+            }
+        }
+
+        if (count &lt; process.getMinVerifications()) {
+            notEnrolledMsg = "User cannot reset password as user is not enrolled (process_id = " + processId + ", user_sys_id = " + userSysId + ")";
+            return this._raiseNotificationEvent(notEnrolledMsg, request_id, gr, userSysId, this.NOT_ENROLLED);
+        }
+
+        if (this._verifyLDAPUser(userSysId, processId)) {
+            var LDAPUserMsg = "User cannot reset password as user is verified as LDAP (process_id = " + processId + ", user_sys_id = " + userSysId + ")";
+            return this._raiseNotificationEvent(LDAPUserMsg, request_id, gr, userSysId, this.LDAP_USER);
+        }
+
+        // Update the password-reset request record (yey!, this is a valid, enrolled user):
+        return this._updateResetRequest(userSysId, request_id, true);
+    },
+	
+	_getRequestSource: function(requestSource) {
+		switch (requestSource) {
+			case this.WEB:
+				return 0;
+			case this.VIRTUAL_AGENT:
+				return 1;
+			case this.WINDOWS:
+				return 2;
+			case this.IVR:
+				return 3;
+			default:
+				return 0;
+		}
+	},
+
+    _raiseNotificationEvent: function(warningMsg, requestId, gr, userSysId, invalidReason) {
+        this.logWarning(warningMsg, requestId);
+        this.invalidRequest = true;
+        gs.eventQueue(this.PWD_RESET_NOTITIFICATION_EVENT, gr, userSysId, null);
+		this.logInfo("User identified successfully but cannot reset password due to errors (user_sys_id = " + userSysId + ")", requestId);
+        return this._updateResetRequest(userSysId, requestId, false, invalidReason);
+    },
+
+    _updateResetRequest: function(userSysId, requestId, isValid, invalidReason) {
+		if (isValid)
+			this.logInfo("User identified successfully (user_sys_id = " + userSysId + ")", requestId);
+        var req = new GlideRecord('pwd_reset_request');
+        if (req.get(requestId)) {
+            if (this.invalidRequest) {
+                req.invalid = 1; // request marked as invalid
+                req.invalid_reason = invalidReason;
+                req.update();
+            }
+            if (req.lock_state != 0) {
+                req.lock_state = 0; // unknown
+                req.update();
+            }
+            req.source = this.requestSource;
+            req.update();
+        }
+
+        this._resetVerificationsStatus(requestId);
+
+        return "ok";
+    },
+
+    _resetVerificationsStatus: function(requestId) {
+        var gr = new GlideRecord('pwd_map_request_to_verification');
+        gr.addQuery('request', requestId);
+        gr.query();
+        while (gr.next()) {
+            gr.setValue('status', 'not_verified');
+            gr.update();
+        }
+    },
+
+    /**
+     * Tests if google captcha is being used or not.
+     */
+    _isGoogleCaptchaUsed: function() {
+        if (gs.getSession().getProperty('sysparm_is_desktop_request') == 'true') {
+            return false;
+        }
+        return gs.getProperty('password_reset.captcha.google.enabled') == 'true';
+    },
+
+    _vefifyGoogleCaptchaToken: function(token) {
+
+        var captcha = new global.GoogleCaptcha();
+        return captcha.verifyCaptcha(token);
+    },
+
+    /**************
+     * Provide default behavior. Since identification type is not mandatory
+     * in paswod reset process.
+     * mandatory field in pwd_verification table.
+     *
+     * returns userSysId
+     *
+     * Params:
+     * @userInput
+     */
+    _getDefaultUserSysId: function(userInput) {
+        var gr = new GlideRecord('sys_user');
+        gr.addQuery('user_name', userInput);
+        gr.query();
+        if (!gr.next()) {
+            this.invalidRequest = true;
+            return userInput;
+        }
+        return gr.sys_id;
+    },
+
+    _getUserSysId: function(idenObjs, process, webRequest) {
+        var userSysId = '';
+        var res = {
+            status: false
+        };
+
+        for (var i = 0; i &lt; idenObjs.length; i++) {
+            var idenObj = idenObjs[i];
+
+            // No identification type for the process then go with the default one
+            if (idenObj.processor_id == 'default') {
+                res.userSysId = this._getDefaultUserSysId(idenObj.user_input);
+                if (gs.nil(res.userSysId)) {
+                    this.logWarning("User does not exist (" + idenObj.user_input + ")", "");
+                    res.returnMsg = "user does not exists";
+                } else
+                    res.status = true;
+                return res;
+            }
+
+            // Evaluate identification type extension script to get user sys ID
+            var tmpRes = this._getUserSysIdExtensionScript(idenObj.user_input, idenObj.processor_id, process, webRequest);
+            // Identification fails
+            if (!tmpRes.status) {
+                this.logError(tmpRes.activityLogMsg, "");
+                res.returnMsg = tmpRes.returnMsg;
+                return res;
+            }
+            // User does not exist or user sys ID does not match
+            else if (gs.nil(tmpRes.userSysId)) {
+                this.logWarning("User does not exist (" + idenObj.user_input + ")", "");
+                res.returnMsg = "user does not exists";
+                return res;
+            } else if (i &gt; 0 &amp;&amp; tmpRes.userSysId != userSysId) {
+                this.invalidRequest = true;
+                tmpRes.userSysId = idenObj.user_input;
+            }
+            userSysId = tmpRes.userSysId;
+        }
+
+        res.status = true;
+        res.userSysId = userSysId;
+        return res;
+    },
+
+    /**************
+     * Params:
+     * @identificationProcessorScript - Script that is used for verification
+     * @userInput
+     * @idenProcessorId
+     * @process
+     * @returns object {status:    - signals if function has valid result 
+     *                  userSysId: - Sys-id for user or null if not found
+     *                  returnMsg
+     *                  activityLogMsg}
+     */
+    _getUserSysIdExtensionScript: function(userInput, idenProcessorId, process, webRequest) {
+        var res = {};
+        res.status = false;
+        try {
+            // Invoke the specific identification form processor extension
+            // Published interface for identification_form_processors:
+            //
+            // @param params.processId   The sys-id of the calling password-reset process (table: pwd_process)
+            // @param params.userInput   The user input to verify the identity
+            // @param request            The form request object. fields in the form can be accessed using: request.getParameter('&lt;element-id&gt;')
+            // @return The sys-id of the user that corresponds to the requested input; if no user was found, null should be returned.			
+            var params = new SNC.PwdExtensionScriptParameter();
+            params.processId = process.getId();
+            params.userInput = userInput;
+            var identificationExtension = new SNC.PwdExtensionScript(idenProcessorId + '');
+            var identifyResult = identificationExtension.processForm(params, webRequest);
+
+            // Check we have either a null (no user found), a string or GlideElement (representing a Sys-id) result - Every other type we consider breaking the contract
+            var resultType = (typeof(identifyResult) !== 'undefined') ? Object.prototype.toString.call(identifyResult).slice(8, -1).toLowerCase() : undefined;
+            res.status = true;
+            if (!((resultType !== undefined &amp;&amp; identifyResult === null) ||
+                    (resultType === 'GlideElement'.toLowerCase()) ||
+                    ((resultType === 'String'.toLowerCase()) &amp;&amp; (identifyResult.trim().length &gt; 0)))) {
+
+                res.activityLogMsg = "Error running identification processor " + idenProcessorId + ". " +
+                    "Unexpected return value: " + identifyResult;
+
+                res.returnMsg = "user identification failed";
+                res.userSysId = userInput;
+                this.invalidRequest = true;
+                return res;
+            }
+            if (resultType !== undefined &amp;&amp; identifyResult !== null) {
+                res.userSysId = identifyResult.toString();
+            } else {
+                this.invalidRequest = true;
+                res.userSysId = userInput;
+            }
+        } catch (err) {
+            // Most likely the processing script does not exists!!!
+            res.activityLogMsg = "Error running identification processor " + idenProcessorId + ". " + err;
+            res.returnMsg = "user identification failed";
+        }
+
+        return res;
+    },
+
+    /**************
+     * returns true/false whether the captcha that is passed to the function is indeed the one that was presented to the user.
+     *
+     * Params:
+     * @captcha - String containing the input captcha
+     */
+    _verifyDefaultCaptcha: function(captchaText) {
+        return new sn_pwdreset_api.PwdImageCaptcha().validateCaptchaValue(captchaText);
+    },
+
+    _lockedOutError: function(userSysId, processId) {
+        if (processId == this.DEFAULT_SELF_SERVICE_PROCESS_ID) {
+            var grProcess = new GlideRecord("pwd_process");
+            grProcess.get(processId);
+            if (!grProcess.unlock_account) {
+                var grUser = new GlideRecord("sys_user");
+                grUser.get(userSysId);
+                return grUser.locked_out;
+            }
+        }
+        return false;
+    },
+
+    // Skip the reset process for LDAP users when using self service password reset.
+    _verifyLDAPUser: function(userSysId, processId) {
+        if (processId == 'c6b0c20667100200a5a0f3b457415ad5' &amp;&amp; SNC.PasswordResetUtil.isLDAPUser(userSysId))
+            return true;
+        return false;
+    },
+
+    type: 'PwdIdentifyStageBL'
+});]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;cheng.liu&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2015-05-29 18:33:32&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1b54c60667100200a5a0f3b457415aac&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;94&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;PwdIdentifyStageBL&lt;/sys_name&gt;
+        &lt;sys_package display_value="Password Reset" source="com.glideapp.password_reset"&gt;1399f4e43cf1311068bcf327dfe37fe4&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1b54c60667100200a5a0f3b457415aac&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-09-05 13:44:00&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:16</sys_created_on>
+        <sys_id>4bb0b01983b01210c6695855eeaad391</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>PwdIdentifyStageBL</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_4bb0b01983b01210c6695855eeaad391</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:16</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

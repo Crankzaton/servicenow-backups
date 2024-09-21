@@ -1,0 +1,1088 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>114ce4a553a720102365ddeeff7b122a</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_cmdb_ws.CMDBWorkspaceUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;CMDBWorkspaceUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var CMDBWorkspaceUtil = Class.create();
+CMDBWorkspaceUtil.prototype = Object.extendsObject(CMDBWsConstants, {
+    initialize: function() {
+        this.log = new global.GSLog("com.snc.sn_cmdb_ws.log.level", this.type);
+    },
+
+    /**
+     * Helper function that prepends reference field alias to all fields specified in a query
+     *
+     * @param {String} query         query supplied by a condition builder
+     * @param {String} tableAlias    tableAlias that's prepended to each field in a query
+     *
+     * @example
+     * this.appendTableName("operational_status=1^nameSTARTSWITHPS", "ci_item")
+     * // returns ci_item.operational_status=1^ci_item.nameSTARTSWITHPS
+     *
+     * @return {String} Returns a query with field names that are prepended with tableAlias specified
+     */
+    appendRefAlias: function(query, tableAlias) {
+        if (!query)
+            return "";
+
+        //first replace any ^OR or ^NQ at the end of the string with ##OR or ##NQ
+        query = query.replace(/\^OR$/g, "##OR");
+        query = query.replace(/\^NQ$/g, "##NQ");
+        query = query.replace(/\^EQ$/g, "##EQ");
+
+        //first replace ^ORs with ##OR - intentionally padding them with ##
+        query = query.replace(/\^OR/g, "##OR" + tableAlias + ".");
+
+        //next replace ^NQs
+        query = query.replace(/\^NQ/g, "##NQ" + tableAlias + ".");
+
+        //next replace ^EQs
+        query = query.replace(/\^EQ/g, "##EQ" + tableAlias + ".");
+
+        //next replace just ^s with the tableAlias dot
+        query = query.replace(/\^/g, "^" + tableAlias + ".");
+
+        //lastly replace ##ORs with ^OR and replace ##NQs with ^NQ
+        query = query.replace(/##OR/g, '^OR');
+        query = query.replace(/##NQ/g, '^NQ');
+        query = query.replace(/##EQ/g, '^EQ');
+        var encodedQuery = gs.nil(query) ? "" : tableAlias + "." + query;
+
+        return encodedQuery;
+    },
+
+    transformUnderscoreStrToFirstLetterUpperCase: function(value) {
+        if (global.JSUtil.nil(value)) {
+            return '';
+        }
+        value = value.toLowerCase();
+        value = value.replaceAll('_', ' ');
+        value = value.charAt(0).toUpperCase() + value.slice(1);
+        return value;
+    },
+
+
+    /*
+     * Iterates thru all the encoded queries within each CMDB Group
+     * and gets counts for each which are written to sn_cmdb_ws_group_query_metadata.
+     * Also adds up all the count for the group as a whole.
+     *   Note: the group count is only for encoded queries
+     *   and doesn't include manually selected or QueryBuilder queries.
+     * The counts are the number of matching CIs for the encoded queries and the group as a whole.
+     */
+
+    populateNoOfMatchingCIsForEncQrys: function() {
+        var logMsgs = false;
+        var gr = new GlideRecord(this.TABLES.CMDB_GROUP);
+        gr.addQuery(this.COLS.GROUP_TYPE, this.WORKSPACE_PARAM);
+        gr.query();
+
+        if (logMsgs) {
+            this.log.info('Total Group Count: ' + gr.getRowCount());
+        }
+
+        while (gr.next()) {
+            if (logMsgs) {
+                this.log.info('Current group name: ' + gr.group_name);
+            }
+            var countForGroup = 0;
+            countForGroup += this.getNoOfMatchingCIsOnEncQrys(gr.sys_id);
+            this.insUpdCntGrpMetadata(gr.sys_id, countForGroup);
+        }
+
+        //remove orphaned group metadata records not picked up by cascade delete
+        this.remOrphanedGrpRecords();
+        //remove orphaned group query metadata records not picked up by cascade delete
+        this.remOrphanedGrpQryRecords();
+    },
+
+    /**
+     * Helper function that counts the number of matching CIs on Encoded Queries and
+     * inserts/update count into the sn_cmdb_ws_group_query_metadata table
+     * @param {String} groupSysId
+     *
+     * @return {Number} Returns the count of Matching CIs on encoded queries for a group
+     */
+    getNoOfMatchingCIsOnEncQrys: function(groupSysId) {
+
+        var tableDisplayNames = {};
+        var shouldUseSimpleCondition = this.isSimpleConditionEnabled();
+        var gr = new GlideRecord(this.TABLES.CMDB_GROUP_CONTAINS_ENCODED_QUERY);
+        gr.addQuery(this.COLS.GROUP, groupSysId);
+        gr.query();
+        var countForGroup = 0;
+
+        while (gr.next()) {
+            var className = gr.getValue(this.COLS.CLASS);
+            var condition = gr.getValue(this.COLS.CONDITION);
+            if (shouldUseSimpleCondition) {
+                condition = gr.getValue(this.COLS.SIMPLE_CONDITION);
+            }
+
+            if (gs.tableExists(className)) {
+                var ga = new GlideAggregate(className);
+                var numCIs = 0;
+                ga.addAggregate(this.COUNT_AGGREGATE);
+
+                if (condition)
+                    ga.addEncodedQuery(condition);
+                ga.query();
+
+                if (ga.next())
+                    numCIs = parseInt(ga.getAggregate(this.COUNT_AGGREGATE));
+
+                countForGroup += numCIs;
+
+                if (!tableDisplayNames[className]) {
+                    tableDisplayNames[className] = new GlideRecord(className).getClassDisplayValue();
+                }
+                this.insUpdCntGrpQryMetadata(gr.sys_id, numCIs, tableDisplayNames[className]);
+            }
+
+        }
+        return countForGroup;
+    },
+
+    isSimpleConditionEnabled: function() {
+        return this.getSystemProperty(this.SYS_PROPERTIES_NAME.SHOULD_USE_SIMPLE_CONDITION, this.DATATYPE.BOOLEAN);
+    },
+
+    /**
+     * Helper function to update/insert count of CIs in sn_cmdb_ws_group_query_metadata table
+     * @params {String} sysId
+     * @params {Number} countCIs
+     * @params {String} tableDisplayName
+     */
+    insUpdCntGrpQryMetadata: function(sysId, countCIs, tableDisplayName) {
+
+        var gr = new GlideRecord(this.TABLES.SN_CMDB_WS_GROUP_QUERY_METADATA);
+        var foundQuery = gr.get(this.COLS.ENCODED_QUERY, sysId);
+
+        if (foundQuery) {
+            gr.setValue(this.COLS.CI_COUNT, countCIs);
+            gr.setValue(this.COLS.NAME, tableDisplayName);
+            gr.update();
+        } else {
+            gr.initialize();
+            gr.setValue(this.COLS.ENCODED_QUERY, sysId);
+            gr.setValue(this.COLS.CI_COUNT, countCIs);
+            gr.setValue(this.COLS.NAME, tableDisplayName);
+            gr.insert();
+        }
+    },
+
+    /**
+     * Helper function to update/insert count of CIs in sn_cmdb_ws_group_query_metadata table
+     * @params {String} sysId
+     * @params {Number} countForGroup
+     */
+    insUpdCntGrpMetadata: function(sysId, countForGroup) {
+
+        var gr = new GlideRecord(this.TABLES.SN_CMDB_WS_GROUP_METADATA);
+        var foundGroup = gr.get(this.COLS.GROUP, sysId);
+
+        if (foundGroup) {
+            gr.setValue(this.COLS.CI_COUNT, countForGroup);
+            gr.update();
+        } else {
+            gr.initialize();
+            gr.setValue(this.COLS.GROUP, sysId);
+            gr.setValue(this.COLS.CI_COUNT, countForGroup);
+            gr.insert();
+        }
+    },
+
+
+    /**
+     * Helper function to removed orphaned records from sn_cmdb_ws_group_metadata table
+     *
+     */
+    remOrphanedGrpRecords: function() {
+        var grGrpMeta = new GlideRecord(this.TABLES.SN_CMDB_WS_GROUP_METADATA);
+        grGrpMeta.query();
+
+        while (grGrpMeta.next()) {
+            var grGrp = new GlideRecord(this.TABLES.CMDB_GROUP);
+            var hasGroupMatch = grGrp.get(grGrpMeta.group);
+            if (!hasGroupMatch) {
+                grGrpMeta.deleteRecord();
+            }
+        }
+    },
+
+    /**
+     * Helper function to removed orphaned records from sn_cmdb_ws_group_metadata table
+     *
+     */
+    remOrphanedGrpQryRecords: function() {
+        var grGrpQry = new GlideRecord(this.TABLES.SN_CMDB_WS_GROUP_QUERY_METADATA);
+        grGrpQry.query();
+
+        while (grGrpQry.next()) {
+            var grEncQry = new GlideRecord(this.TABLES.CMDB_GROUP_CONTAINS_ENCODED_QUERY);
+            var hasGroupMatch = grEncQry.get(grGrpQry.encoded_query);
+            if (!hasGroupMatch) {
+                grGrpQry.deleteRecord();
+            }
+        }
+    },
+
+    populateManagementAggregates: function() {
+        //only aggregating rejected CIs for now
+        this._populateRejectedCIs();
+    },
+
+    _populateRejectedCIs: function() {
+        var rejectedCis = this.getRowCount(this.TABLES.CMDB_CI, 'attestation_status=Rejected');
+
+        this.updateBaseAggDataState(this.STATES.DRAFT, this.STATES.RETIRED, this.CATEGORY.REJECTED_CIS);
+        this.populateBaseAggData(this.CATEGORY.REJECTED_CIS, null, rejectedCis, this.STATES.DRAFT);
+
+        this.updateBaseAggDataState(this.STATES.READY, this.STATES.RETIRED, this.CATEGORY.REJECTED_CIS);
+        this.updateBaseAggDataState(this.STATES.DRAFT, this.STATES.READY, this.CATEGORY.REJECTED_CIS);
+    },
+
+    /**
+     * Helper function to check if CIs Managed By Me should be included on landing page
+     * @return {Boolean}
+     */
+    showCIsManagedByMe: function() {
+        var propEnabled = this.getSystemProperty(this.SYS_PROPERTIES_NAME.CIS_MANAGED_BY_ME, this.DATATYPE.BOOLEAN);
+        var hasMinimumRole = this.userHasRole(this.ROLES.SN_CMDB_EDITOR);
+
+        return propEnabled &amp;&amp; hasMinimumRole;
+    },
+
+    /**
+     * Helper function to check if Total CIs should be included on landing page
+     * @return {Boolean}
+     */
+    showTotalCIs: function() {
+        var propEnabled = this.getSystemProperty(this.SYS_PROPERTIES_NAME.ENABLE_TOTAL_CIS, this.DATATYPE.BOOLEAN, 'true');
+        return propEnabled;
+    },
+
+    /**
+     * Helper function to check if Important Actions should be included on the landing page
+     * @return {Boolean}
+     */
+    showImportantActions: function() {
+        var isAdminOrMaint = this.isUserAdminOrMaint();
+        var isCMDBAdmin = this.userHasRole(this.ROLES.SN_CMDB_ADMIN);
+        var isCMDBEditor = this.userHasRole(this.ROLES.SN_CMDB_EDITOR);
+
+        return (isAdminOrMaint || isCMDBAdmin || isCMDBEditor);
+    },
+
+    /**
+     * Helper function to check if CMDB Health should be included on the landing page
+     * @return {Boolean}
+     */
+    showCmdbHealth: function() {
+        var isAdminOrMaint = this.isUserAdminOrMaint();
+        var hasAssetRole = this.userHasRole(this.ROLES.ASSET);
+        var isCMDBEditor = this.userHasRole(this.ROLES.SN_CMDB_EDITOR);
+        var isCMDBUser = this.userHasRole(this.ROLES.SN_CMDB_USER);
+
+        return (isAdminOrMaint || isCMDBEditor || (isCMDBUser &amp;&amp; hasAssetRole));
+    },
+
+    /**
+     * Parse a string to a boolean
+     * @params {String}
+     * @return {boolean}
+     */
+    parseBooleanString: function(booleanString) {
+        if (booleanString)
+            return booleanString === 'true' ? true : false;
+        return false;
+    },
+
+    /**
+     * Parse a string to a number
+     * @params {String}
+     * @return {Number}
+     */
+    parseNumericString: function(numericString) {
+        if (numericString) {
+            var val = Number(numericString);
+            return isNaN(val) ? null : val;
+        }
+        return;
+    },
+
+    /**
+     * Helper function to check if current user has given role
+     * @return {Boolean}
+     */
+    userHasRole: function(role) {
+        return gs.hasRole(role);
+    },
+
+    /**
+     * Helper function to check if current user is admin or maint
+     * @return {Boolean}
+     */
+    isUserAdminOrMaint: function() {
+        return this.userHasRole(this.ROLES.ADMIN) || this.userHasRole(this.ROLES.MAINT);
+    },
+
+    /**
+     * Helper function to check if the given table has any action config that we have set
+     * @return {Boolean}
+     */
+    tableHasActionConfig: function(table) {
+        return this.hasRecord(this.TABLES.M2M_ACTION_ASSIGNMENT_ACTION_CONFIG, null, {
+            'action_configuration': this.CMDB_WORKSPACE_ACTION_CONFIG_ID,
+            'action_assignment.table': table
+        });
+    },
+
+    /**
+     * Helper function to get if the given table and query result in at least one valid record
+     * @params {String} table
+     * @params {String} encodedQuery
+     * @params {Object} query
+     * @return {boolean} whether the table has at least one record that satifies the queries
+     */
+    hasRecord: function(table, encodedQuery, query) {
+        var gr = new GlideRecord(table);
+        this.addQueryConditions(gr, encodedQuery, query);
+
+        gr.setLimit(1);
+        gr.query();
+        return gr.hasNext();
+    },
+
+    /**
+     * Helper function to get the row count on the given table with given queries
+     * @params {String} table
+     * @params {String} encodedQuery
+     * @params {Object} query
+     * @return {number} row count that satisfies the query condition
+     */
+    getRowCount: function(table, encodedQuery, query) {
+        if (gs.tableExists(table)) {
+            var ga = new GlideAggregate(table);
+            this.addQueryConditions(ga, encodedQuery, query);
+            ga.addAggregate(this.COUNT_AGGREGATE);
+            ga.query();
+            if (ga.next()) {
+                return ga.getAggregate(this.COUNT_AGGREGATE);
+            }
+        }
+
+        return 0;
+    },
+
+    addQueryConditions: function(gr, encodedQuery, query) {
+        if (encodedQuery) {
+            gr.addEncodedQuery(encodedQuery);
+        }
+        if (query) {
+            var fields = Object.keys(query);
+            for (var i = 0; i &lt; fields.length; i++) {
+                gr.addQuery(fields[i], query[fields[i]]);
+            }
+        }
+    },
+
+    /**
+     * Helper function to get GA object on given table with given queries and group by
+     * @params {String} table
+     * @params {String} encodedQuery
+     * @params {Object} query
+     * @params {String} groupBy
+     * @return {GlideAggregate} Queried groups with counts from given table with query condition
+     */
+    getRowCountByGroup: function(table, encodedQuery, query, groupBy) {
+        var ga = new GlideAggregate(table);
+        this.addQueryConditions(ga, encodedQuery, query);
+        ga.addAggregate(this.COUNT_AGGREGATE);
+        ga.groupBy(groupBy);
+        ga.query();
+
+        return ga;
+    },
+
+    /**
+     * Helper function to check if a plugin is active
+     * @params {String} pluginId
+     * @return {boolean} whether the given plugin is active or not
+     */
+    isPluginActive: function(pluginId) {
+        return new GlidePluginManager().isActive(pluginId);
+    },
+
+    /**
+     * Helper function to get the value for the given sys_property
+     * @params {String} key
+     * @params {DATATYPE} datatype
+     * @params {any} defaultValue
+     * @return {Object} value 
+     */
+    getSystemProperty: function(key, dataType, defaultValue) {
+        var val = gs.getProperty(key, defaultValue);
+        switch (dataType) {
+            case this.DATATYPE.BOOLEAN:
+                return this.parseBooleanString(val);
+            case this.DATATYPE.NUMBER:
+                return this.parseNumericString(val);
+            default:
+                return val;
+        }
+    },
+
+    /**
+     * Helper function to check if license is active for given appId
+     * @params {String} appId
+     * @return {Object} whether the license is active or not 
+     */
+    hasActiveLicense: function(appId) {
+        return new sn_lef.GlideLicenseAPI().hasLicenseForFeature("app_id", appId);
+    },
+
+    populateBaseAggData: function(chart, groupby, count, state, groupbyTable, dynamicGroupby) {
+        var gr = new GlideRecord(this.TABLES.SN_CMDB_WS_BASE_AGGREGATE_DATA);
+        gr.initialize();
+        gr.setValue(this.COLS.CHART, chart);
+        if (groupby)
+            gr.setValue(this.COLS.GROUP_BY, groupby);
+        if (groupbyTable)
+            gr.setValue(this.COLS.GROUP_BY_TABLE, groupbyTable);
+        if (dynamicGroupby)
+            gr.setValue(this.COLS.DYNAMIC_GROUP_BY, dynamicGroupby);
+        gr.setValue(this.COLS.COUNT, count);
+        gr.setValue(this.COLS.STATE, state);
+        gr.insert();
+    },
+
+    updateBaseAggDataState: function(sourceState, targetState, chart) {
+        var gr = new GlideRecord(this.TABLES.SN_CMDB_WS_BASE_AGGREGATE_DATA);
+        if (chart)
+            gr.addQuery(this.COLS.CHART, chart);
+        gr.addQuery(this.COLS.STATE, sourceState);
+        gr.setValue(this.COLS.STATE, targetState);
+        gr.updateMultiple();
+    },
+
+    deleteFeatureCategoryAggregate: function(featureId, state, groupby) {
+        var gr = new GlideRecord(this.TABLES.SN_CMDB_WS_BASE_AGGREGATE_DATA);
+        gr.addQuery(this.COLS.CHART, featureId);
+        if (global.JSUtil.notNil(state)) {
+            gr.addQuery(this.COLS.STATE, state);
+        }
+        if (global.JSUtil.notNil(groupby)) {
+            gr.addQuery(this.COLS.GROUP_BY, groupby);
+        }
+        gr.query();
+        while (gr.next()) {
+            gr.deleteRecord();
+        }
+    },
+
+    updateDraftFeatureCategoryAggregate: function(featureId, state, count, groupby) {
+        var gr = new GlideRecord(this.TABLES.SN_CMDB_WS_BASE_AGGREGATE_DATA);
+        gr.addQuery(this.COLS.CHART, featureId);
+        gr.addQuery(this.COLS.STATE, this.STATES.DRAFT);
+        if (global.JSUtil.notNil(groupby)) {
+            gr.addQuery(this.COLS.GROUP_BY, groupby);
+        }
+        gr.query();
+        while (gr.next()) {
+            if (global.JSUtil.notNil(state)) {
+                gr.setValue(this.COLS.STATE, state);
+            }
+            if (global.JSUtil.notNil(count)) {
+                gr.setValue(this.COLS.COUNT, count);
+            }
+            gr.update();
+        }
+    },
+
+    getAggregateData: function(featureId, groupByFilter, stateFilter) {
+        var result = [];
+        var gr = new GlideRecord(this.TABLES.SN_CMDB_WS_BASE_AGGREGATE_DATA);
+        gr.addQuery(this.COLS.CHART, featureId);
+        if (groupByFilter) {
+            gr.addQuery(this.COLS.GROUP_BY, groupByFilter);
+        }
+        if (stateFilter) {
+            gr.addQuery(this.COLS.STATE, stateFilter);
+        }
+        gr.query();
+
+        while (gr.next()) {
+            result.push({
+                chart: gr.getValue(this.COLS.CHART),
+                groupBy: gr.getValue(this.COLS.GROUP_BY),
+                count: +gr.getValue(this.COLS.COUNT),
+                updatedDt: gr.getValue(this.COLS.SYS_UPDATED_ON)
+            });
+        }
+
+        return result;
+    },
+
+    isJson: function(str) {
+        try {
+            return JSON.parse(str);
+        } catch (e) {
+            return false;
+        }
+    },
+
+    getRelative24hrEncodedQuery: function(column) {
+        return column + "RELATIVEGT@hour@ago@24";
+    },
+
+    /**
+     * Generic method to make outbound REST API call.
+     * @params {String} url
+     * @return {Object} response with status and body
+     */
+    httpGet: function(url) {
+        var response;
+        try {
+            var sm = new sn_ws.RESTMessageV2();
+            sm.setEndpoint(url);
+            sm.setHttpMethod('get');
+            response = sm.execute();
+            var responseBody = response.haveError() ? response.getErrorMessage() : JSON.parse(response.getBody());
+            response = {
+                status: response.getStatusCode(),
+                body: responseBody
+            };
+        } catch (ex) {
+            var errorMessage = ex.getMessage ? ex.getMessage() : "Error fetching data";
+            response = {
+                status: 500,
+                body: errorMessage
+            };
+        }
+        return response;
+    },
+
+    /**
+     * Gets AppStore url.
+     * @return {String} appstore url
+     */
+    getAppStoreBaseUrl: function() {
+        return this.getSystemProperty(this.SYS_PROPERTIES_NAME.APPSTORE_BASE_URL, this.DATATYPE.STRING, "https://store.service-now.com/");
+    },
+
+    /**
+     * Given relative path for appstore, this returns the absolute url relevant for this instance
+     */
+    buildAppStoreUrl: function(relativePath) {
+        var baseUrl = this.getAppStoreBaseUrl();
+        baseUrl = baseUrl.replace(/\/+$/, "");
+        var relPath = relativePath.replace(/^\/+/, "");
+        return baseUrl + "/" + relPath;
+    },
+
+    invokePAJob: function(paJobId, jobName) {
+        var paJobRecord = new GlideRecord(this.TABLES.SYSAUTO_PA);
+        if (paJobRecord.get(paJobId)) {
+            var paJobName = paJobRecord.getValue(this.COLS.NAME);
+            gs.debug("Invoking job : '{0}' to calculate trends for aggregated charts", paJobName);
+            var paTriggerId = gs.executeNow(paJobRecord);
+            gs.info("Triggered job : '{0} ' with trigger id : {1} ", paJobName, paTriggerId);
+        } else {
+            gs.error("Failed to find PA job with sys Id {0} and cannot execute the {1} job", paJobId, jobName);
+        }
+    },
+
+    invokeWsAggregatesMonthlyPAJob: function() {
+        this.invokePAJob(this.SCHEDULED_JOBS.CMDB_WS_AGGREGATES_MONTHLY_PA_JOB, "CMDB Workspace Monthly Collection");
+    },
+
+    invokeWsAggregatesDailyPAJob: function() {
+        this.invokePAJob(this.SCHEDULED_JOBS.CMDB_WS_AGGREGATES_DAILY_PA_JOB, "CMDB Workspace Aggregates Collection");
+    },
+
+    invokeWsOnDemandPAJobWithLookback: function() {
+        this.invokePAJob(this.SCHEDULED_JOBS.CMDB_WS_COLLECTION_ON_DEMAND_WITH_LOOKBACK, "CMDB Workspace Collection On Demand With Lookback");
+    },
+
+    invokeScriptJob: function(scriptJobId, jobName) {
+        var scriptJobRecord = new GlideRecord(this.TABLES.SYSAUTO_SCRIPT);
+        if (scriptJobRecord.get(scriptJobId)) {
+            var scriptJobName = scriptJobRecord.getValue(this.COLS.NAME);
+            gs.debug("Invoking job : '{0}'", scriptJobName);
+            var scriptTriggerId = gs.executeNow(scriptJobRecord);
+            gs.info("Triggered job : '{0} ' with trigger id : {1} ", scriptJobName, scriptTriggerId);
+        } else {
+            gs.error("Failed to find script job with sys_id {0} and cannot execute the {1} job", scriptJobId, jobName);
+        }
+    },
+
+    invokeWsPopulateAggregatesDailyScriptJob: function() {
+        this.invokeScriptJob(this.SCHEDULED_JOBS.CMDB_WS_POPULATE_AGGREGATES_DAILY, "CMDB Workspace - Populate aggregates Daily");
+    },
+
+    invokeWsPopulateAggregatesMonthlyScriptJob: function() {
+        this.invokeScriptJob(this.SCHEDULED_JOBS.CMDB_WS_POPULATE_AGGREGATES_MONTHLY, "CMDB Workspace - Populate aggregates Monthly");
+    },
+
+    /**
+     * Abbreviates a number
+     * @params {Number} num
+     * @return {String} abbreviated number
+     */
+    abbreviateNumber: function(num) {
+        if (global.JSUtil.nil(num)) return null;
+
+        var formatNumStr = function(numberStr, suffix) {
+            if (numberStr.endsWith('.0')) {
+                return numberStr.slice(0, -2) + suffix;
+            }
+            return numberStr + suffix;
+        };
+
+        if (num &lt; 1e3) {
+            return num.toString();
+        }
+
+        if (num &gt;= 1e3 &amp;&amp; num &lt; 1e6) {
+            return formatNumStr((num / 1e3).toFixed(1), 'K');
+        }
+
+        if (num &gt;= 1e6 &amp;&amp; num &lt; 1e9) {
+            return formatNumStr((num / 1e6).toFixed(1), 'M');
+        }
+
+        return formatNumStr((num / 1e9).toFixed(1), 'B');
+    },
+
+    getJobLastCompletedInfo: function(jobId) {
+        var completedDateTime = gs.getMessage("N/A");
+        var gr = new GlideRecord(this.TABLES.PA_JOB_LOGS);
+        gr.addQuery(this.COLS.JOB, jobId);
+        gr.addQuery(this.COLS.STATE, this.PA_JOB_LOGS_STATE.COLLECTED_OK);
+        gr.setLimit(1);
+        gr.orderByDesc(this.COLS.SYS_CREATED_ON);
+        gr.query();
+        if (gr.next()) {
+            completedDateTime = gr.getDisplayValue(this.COLS.COMPLETED);
+        }
+        return completedDateTime;
+    },
+
+    getCMDBWsPAJobsLastCompletedInfo: function() {
+        var result = {};
+        var jobs = {};
+        jobs[this.SCHEDULED_JOB_RUN_TYPE.AGGREGATES_DAILY_JOB] = this.SCHEDULED_JOBS.CMDB_WS_AGGREGATES_DAILY_PA_JOB;
+        jobs[this.SCHEDULED_JOB_RUN_TYPE.AGGREGATES_MONTHLY_JOB] = this.SCHEDULED_JOBS.CMDB_WS_AGGREGATES_MONTHLY_PA_JOB;
+
+        for (var runType in jobs) {
+            var dateTime = this.getJobLastCompletedInfo(jobs[runType]);
+            result[runType] = gs.getMessage("Last updated: {0}", dateTime);
+        }
+        return result;
+    },
+
+    /**
+     * Gets scores and details for given indicator, breakdown and breakdownElements
+     * @params {String} indicatorId
+     * @params {String} breakdownId
+     * @params {Array} breakdownElementId
+     * @params {Number} periodInDays - Number of days to fetch the data for
+     * @params {Object} dataConfigOverride - override the default dataConfigurations for ScriptableParDataAPI
+     * @return {Object}
+     */
+    getIndicatorDetails: function(indicatorId, breakdownId, breakdownElementId, periodInDays, dataConfigOverride) {
+        var result;
+        var uuid = {
+            indicator: indicatorId
+        };
+
+        if (!global.JSUtil.nil(breakdownId)) {
+            uuid.breakdowns = [{
+                sysId: breakdownId
+            }];
+
+            if (!global.JSUtil.nil(breakdownElementId)) {
+                uuid.breakdowns[0].elementSysIds = [breakdownElementId];
+            }
+        }
+
+        if (global.JSUtil.nil(periodInDays)) {
+            periodInDays = 30;
+        }
+
+        var defaultDataConfiguration = {
+            sortBy: null,
+            sortOrder: null,
+            sourceType: "indicator",
+            dataCategory: "trend",
+            order: 0,
+            aggregateBy: 4,
+            includeLiveScore: null,
+            trendBy: "anything",
+            trendInterval: "date",
+            trendMinuteInterval: null,
+            includeChange: null,
+            includeChangePercentage: null,
+            includeGlobalTargets: false,
+            includePersonalTargets: false,
+            includeForecast: false,
+            includeForecastRange: false,
+            includeTrend: false,
+            includeBand: false,
+            includeGapPercentage: null,
+            includeSparkline: null,
+            includeComments: false,
+            includeGlobalThresholds: false,
+            includePersonalThresholds: false,
+            startTime: "P" + periodInDays + "D",
+            endTime: null
+        };
+
+        var defaultConfig = {
+            dataConfigurations: []
+        };
+
+        // merge the default configuration with the config object passed as argument
+        var dataConfiguration = this.mergeObjects(defaultDataConfiguration, dataConfigOverride || {}, {
+            uuid: uuid
+        });
+
+        var config = {
+            dataConfigurations: [dataConfiguration]
+        };
+
+        try {
+            var api = new ScriptableParDataAPI(JSON.stringify(config));
+            var _rawData = api.getData();
+            result = JSON.parse(api.getData())[0].response;
+            // ScriptableParDataAPI returns data as array of array like [['value'], [1], [2]], converting that to array of object like [{value: 1}, {value: 2}]
+            var _data = result.data;
+            if (!global.JSUtil.nil(_data)) {
+                var _dataFields = _data[0];
+                var _mappedData = [];
+                for (var i = 1; i &lt; _data.length; i++) {
+                    var elm = {};
+                    for (var j = 0; j &lt; _dataFields.length; j++) {
+                        elm[_dataFields[j]] = Number(_data[i][j]);
+                    }
+                    // convert timestamp integer into date
+                    if (elm.timestamp) {
+                        elm.timestamp = this.epochTimestampToDate(elm.timestamp);
+                    }
+                    _mappedData.push(elm);
+                }
+                result.dataObjArr = _mappedData;
+            } else {
+                result.data = [];
+                result.dataObjArr = [];
+            }
+        } catch (e) {
+            gs.error("Error fetching indicator details: IndicatorId - {0}, BreakdownId - {1}, BreakdownElementId - {2}. Error {3}", [indicatorId, breakdownId, breakdownElementId, e]);
+            result = {};
+        }
+        return result;
+    },
+
+    /**
+     * Checks if at least one score is greater than given value
+     */
+    atLeastOneScoreGreaterThan: function(scores, gtValue) {
+        if (global.JSUtil.nil(scores)) {
+            return false;
+        }
+        var val = global.JSUtil.nil(gtValue) ? 0 : gtValue;
+        for (var idx in scores) {
+            if (scores[idx].value &gt; val) return true;
+        }
+        return false;
+    },
+
+    getSysChoiceId: function(encodedQuery, query) {
+        var gr = new GlideRecord(this.TABLES.SYS_CHOICE);
+        this.addQueryConditions(gr, encodedQuery, query);
+        gr.setLimit(1);
+        gr.query();
+        return gr.next() ? gr.getUniqueValue() : '';
+    },
+
+    getTableSysId: function(tableName) {
+        var dbo = new GlideRecord(this.TABLES.SYS_DB_OBJECT);
+        dbo.addQuery(this.COLS.NAME, tableName);
+        dbo.setLimit(1);
+        dbo.query();
+
+        return dbo.next() ? dbo.getUniqueValue() : '';
+    },
+
+    buildCustomEncodedQuery: function(fields, operator, value, booleanOperator) {
+        var defBooleanOperator = this.OPERATORS.OR;
+        var encodedQuery = "";
+        for (var i = 0; i &lt; fields.length; i++) {
+            if (i != 0) {
+                encodedQuery += booleanOperator ? booleanOperator : defBooleanOperator;
+            }
+
+            encodedQuery += value ? fields[i] + operator + value : fields[i] + operator;
+        }
+        return encodedQuery;
+    },
+
+    addBaseAggDataGroupByTableDetails: function(chart, tablesFromQuery) {
+        var tableSysIds = Object.keys(tablesFromQuery);
+        var grBaseAggData = new GlideRecord(this.TABLES.SN_CMDB_WS_BASE_AGGREGATE_DATA);
+        grBaseAggData.addQuery(this.COLS.CHART, chart);
+        grBaseAggData.addQuery(this.COLS.STATE, this.STATES.READY);
+        grBaseAggData.addQuery(this.COLS.GROUP_BY_TABLE, this.COLS.IN, tableSysIds);
+        grBaseAggData.query();
+        while (grBaseAggData.next()) {
+            var tableObj = tablesFromQuery[grBaseAggData.getValue(this.COLS.GROUP_BY_TABLE)];
+            tableObj.label = grBaseAggData.getDisplayValue(this.COLS.GROUP_BY_TABLE);
+            tableObj.name = grBaseAggData.getDisplayValue(this.COLS.GROUP_BY_TABLE + this.COLS.DOT + this.COLS.NAME);
+        }
+    },
+
+    getCMDBRelatedEntryRefFields: function(tableName) {
+        var relEntryObj = {};
+        var refFields = [];
+
+        var grRelEntry = new GlideRecord(this.TABLES.CMDB_RELATED_ENTRY);
+        grRelEntry.addActiveQuery();
+        if (tableName) {
+            grRelEntry.addQuery(this.COLS.TABLE, tableName);
+        } else {
+            grRelEntry.orderBy(this.COLS.TABLE);
+        }
+        grRelEntry.query();
+        while (grRelEntry.next()) {
+            refFields = [];
+            tableName = grRelEntry.getValue(this.COLS.TABLE);
+
+            if (relEntryObj[tableName]) {
+                refFields = relEntryObj[tableName];
+            }
+
+            var refField = grRelEntry.getValue(this.COLS.REFERENCED_FIELD);
+            if (refFields.indexOf(refField) == -1) {
+                refFields.push(refField);
+            }
+
+            relEntryObj[tableName] = refFields;
+        }
+
+        return relEntryObj;
+    },
+
+    /**
+     * Helper function to check if Service Graph connectors tab should be included on the CMDB Performance page
+     * @return {Boolean}
+     */
+    showPerformanceInsightSGCTab: function() {
+        var isAdminOrMaint = this.isUserAdminOrMaint();
+        var isCMDBInstAdmin = this.userHasRole(this.ROLES.CMDB_INST_ADMIN);
+        var hasIntegrationData = this.getRowCount(this.TABLES.CMDB_INST_APPLICATION, this.COLS.NAME + this.OPERATORS.NOTLIKE + this.IH_ETL_DEMODATA_PREFIX) &gt; 0;
+
+        return (isAdminOrMaint || isCMDBInstAdmin) &amp;&amp; hasIntegrationData;
+    },
+
+    /**
+     * Helper function to check if CMDB Performance should be displayed
+     * @return {Boolean}
+     */
+    showCmdbPerformance: function() {
+        var isAdminOrMaint = this.isUserAdminOrMaint();
+        var isCMDBAdmin = this.userHasRole(this.ROLES.SN_CMDB_ADMIN);
+
+        return (isAdminOrMaint || isCMDBAdmin);
+    },
+
+    /**
+     * Returns decimal number with given scale. If scale is not passed, default value i.e 2 is considered.
+     */
+    getDecimalNumberWithGivenScale: function(number, scale) {
+        var defaultScale = 2;
+        return (number.indexOf(".") &gt; -1) ? number.slice(0, (number.indexOf(".")) + (scale ? (scale + 1) : (defaultScale + 1))) : number;
+    },
+
+    populateAggregatesByTable: function(groupGa, groupedTableCol, chart) {
+        var count = 0;
+        var tableName = '';
+        while (groupGa.next()) {
+            count = groupGa.getAggregate(this.COUNT_AGGREGATE);
+            tableName = groupGa.getValue(groupedTableCol);
+            this.populateBaseAggData(chart, null, count, this.STATES.DRAFT, this.getTableSysId(tableName));
+        }
+
+        // Update the existing records in "Ready" state to "Retired"
+        this.updateBaseAggDataState(this.STATES.READY, this.STATES.RETIRED, chart);
+        // Update the existing records in "Draft" state to "Ready"
+        this.updateBaseAggDataState(this.STATES.DRAFT, this.STATES.READY, chart);
+    },
+
+    parseBaseAggEncodedQuery: function(query) {
+        var chartId;
+        var tablesFromQuery = {};
+        var queryBlocks = query.split('^');
+        for (var i = 0; i &lt; queryBlocks.length; i++) {
+            var currentQueryBlock = queryBlocks[i];
+            var parts = currentQueryBlock.split(/(=|!=)/);
+            var field = parts[0];
+            var operator = parts[1];
+            var value = parts[2];
+            if (field == this.COLS.CHART &amp;&amp; operator == this.OPERATORS.EQUAL) {
+                chartId = value;
+            } else if (field == this.COLS.GROUP_BY_TABLE) {
+                tablesFromQuery[value] = {
+                    operator: operator
+                };
+            }
+        }
+
+        return {
+            chartId: chartId,
+            tablesFromQuery: tablesFromQuery
+        };
+    },
+
+    rebuildTableCondition: function(tableCol, nameOperatorObj) {
+        var transformedQuery = [];
+        for (var key in nameOperatorObj) {
+            var obj = nameOperatorObj[key];
+            transformedQuery.push(tableCol + obj.operator + obj.name);
+        }
+
+        return transformedQuery.join('^');
+    },
+
+    /**
+     * Merges objects passed as arguments and returns the merged object
+     */
+    mergeObjects: function() {
+        var merged = {};
+        for (var i = 0; i &lt; arguments.length; i++) {
+            var obj = arguments[i];
+            for (var key in obj) {
+                if (obj.hasOwnProperty(key)) {
+                    merged[key] = obj[key];
+                }
+            }
+        }
+        return merged;
+    },
+
+    epochTimestampToDate: function(timestamp) {
+        var dt = new GlideDateTime();
+        dt.setValue(timestamp);
+        return dt.getDate().getValue();
+    },
+
+    lookupIndicatorId: function(indicator) {
+        var id = null;
+        var gr = new GlideRecord(this.TABLES.PA_INDICATORS);
+        if (gr.get(indicator)) {
+            id = gr.getValue(this.COLS.ID);
+        }
+        return id;
+    },
+
+    /* Helper function to copy scores from one indicator to another,
+     * @params {String} sourceIndicator
+     * @params {String} targetIndicator
+     * @return null - nothing to be returned, scores from sourceIndicator should be inserted to the pa_scores_l1 table, as scores for targetIndicator
+     *
+     */
+    migratePaIndicatorScores: function(sourceIndicator, targetIndicator) {
+        //first, look up 'id' of each indicator, because pa_scores_l1 takes in indicator id, and not the sys_id. Not sure why
+        var sourceIndicatorId = this.lookupIndicatorId(sourceIndicator);
+        var targetIndicatorId = this.lookupIndicatorId(targetIndicator);
+        //grab the earliest date of the pa scores for new indicator
+        var earliestScoreDate = null;
+        var gr = new GlideRecord(this.TABLES.PA_SCORES_L1);
+        gr.addQuery(this.COLS.INDICATOR, targetIndicatorId);
+        gr.orderBy(this.COLS.START_AT);
+        gr.setLimit(1);
+        gr.query();
+
+        //get scores before earliest date for old indicator
+        var earliestDate = null;
+        if (gr.next()) {
+            earliestDate = gr.getValue(this.COLS.START_AT);
+        }
+
+        //grab all pa_scores_l1 records for sourceIndicator, before the earliest score date of new indicator
+        //for each of the scores, create another score entry with the same scores and dates, for the new indicator
+        gr = new GlideRecord(this.TABLES.PA_SCORES_L1);
+        gr.addQuery(this.COLS.INDICATOR, sourceIndicatorId);
+        if (earliestDate) {
+            gr.addQuery(this.COLS.START_AT, this.OPERATORS.LESSTHAN, earliestDate);
+        }
+
+        gr.query();
+        while (gr.next()) {
+            var scoreDate = gr.getValue(this.COLS.START_AT);
+            var scoreValue = gr.getValue(this.COLS.VALUE);
+            //create new scores for the new indicator.
+            var newGr = new GlideRecord(this.TABLES.PA_SCORES_L1);
+            newGr.initialize();
+            newGr.setValue(this.COLS.INDICATOR, targetIndicatorId); //new indicator id
+            newGr.setValue(this.COLS.START_AT, scoreDate);
+            newGr.setValue(this.COLS.VALUE, scoreValue);
+            newGr.insert();
+        }
+
+    },
+
+    migrateDeprecatedIndicatorScores: function() {
+        var oldTotalCiIndicator = 'b6dd71e077511110ee0d0cc2fa5a990e';
+        var newTotalCiIndicator = 'b1fb06f0ef572110785294c1ed97d705';
+        this.migratePaIndicatorScores(oldTotalCiIndicator, newTotalCiIndicator);
+
+        var oldStaleCiIndicator = 'b193c12f53d911108726ddeeff7b1266';
+        var newStaleCiIndicator = 'cf7956b6533e6110ba6cddeeff7b122d';
+        this.migratePaIndicatorScores(oldStaleCiIndicator, newStaleCiIndicator);
+
+        var oldDupeCiIndicator = 'ec434a5e53c6201032b7ddeeff7b1223';
+        var newDupeCiIndicator = '15a4982053c36110ba6cddeeff7b12c3';
+        this.migratePaIndicatorScores(oldDupeCiIndicator, newDupeCiIndicator);
+    },
+
+    type: 'CMDBWorkspaceUtil'
+});]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-04-15 22:06:50&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;114ce4a553a720102365ddeeff7b122a&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;253&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;CMDBWorkspaceUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="CMDB Workspace" source="sn_cmdb_ws"&gt;c8ab76825371201032b7ddeeff7b1280&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="CMDB Workspace"&gt;c8ab76825371201032b7ddeeff7b1280&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_114ce4a553a720102365ddeeff7b122a&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;maint&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-06-25 17:07:51&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:10:21</sys_created_on>
+        <sys_id>3d80b0d583b01210c6695855eeaad306</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>CMDBWorkspaceUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_3d80b0d583b01210c6695855eeaad306</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:10:21</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

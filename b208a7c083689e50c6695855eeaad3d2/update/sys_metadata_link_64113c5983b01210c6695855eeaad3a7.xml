@@ -1,0 +1,741 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>289da9c8bf30110058c9beba3f073919</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.RoadmapUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;true&lt;/client_callable&gt;
+        &lt;description&gt;Timeline Visualization API to generate data for lanes and items on the road.&lt;/description&gt;
+        &lt;name&gt;RoadmapUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[/**
+
+
+ * JavaScript utility functions for Roadmap API.
+ * This script provides API to access data for the lanes and panels to be rendered on the Roadmap.
+ * 
+ */
+ 
+var RoadmapUtil = Class.create();
+
+RoadmapUtil.prototype = {     
+    STATUS_CODE : {
+        SUCCESS : 1,
+        INVALID : 2
+    },
+            
+    initialize: function() {
+        this.loglevel = gs.getProperty("com.snc.roadmap.loglevel");
+		this.data = {};	
+		this.data.meta = {};
+		this.data.lanes = [];
+		this.data.laneIds = [];
+		this.data.laneIds_filtered = [];
+		this.data.config = {};
+		this.lanes = [];
+		this.laneIds = [];
+		this.maxItemsPerLane = 0;
+		this.firstMarkerPart1 = "";
+		this.firstMarkerPart2 = 0;
+		this.lastMarkerPart1 = "";
+		this.lastMarkerPart2 = 0;
+		this.firstItemStartDatePerDB = null; //first item per the item table
+		this.firstItemStartDateOnRoad = null; 	//first item per the current fetch
+		this.laneItemsInCurrentMonth = 0;
+		this.laneItemsCurrentMonth = null;
+		this.status = this.STATUS_CODE.SUCCESS;
+		this.forward = false;
+    },
+
+    /*
+	 * Returns data for all the lanes in JSON format as per the selected lane table and filters as set in the roadmap configuration page.
+	 * 
+	 * @method getRoadmapLanes
+	 * @param key : A mandatory field used as the key for the table "roadmap_page" (e.g. "name") to access the configuration record.
+	 * @param keyVal : A mandatory field used as the key value for the table "roadmap_page" (e.g. "CIO Roadmap") to access the configuration record.
+	 *
+	 * API Usage 
+	 *     var roadmapUtil = new RoadmapUtil();
+	 *     var key = "name";
+	 *     var keyVal = "CIO Roadmap";
+	 *     var response = roadmapUtil.getRoadmapLanes(key, keyVal);
+	 */
+    getRoadmapLanes: function(key, keyVal) {
+    	this.util = new RoadmapCommonUtil("Roadmap3D");
+    	this.util.infoPrint("getRoadmapLanes::key=" + key + " keyVal=" + keyVal);
+    	this.config = new RoadmapConfig("Roadmap3D");
+		var itemQuery = null;
+    	this.initLanesConfig();
+		if (this.config.setConfiguration(this.util, this.data, key, keyVal, itemQuery)) {
+			this.initLanesMetaData();
+			this.util.addLanes(this.data, this.data.config.maxLanes);
+			//this.printData();
+		}
+    	if (this.data.config.format == "json") {
+    		var json = new JSON();
+        	var jsonResponse = json.encode(this.data);
+			this.util.infoPrint("getRoadmapLanes::jsonResponse=\n" + jsonResponse);
+			return jsonResponse;
+    	} 
+		this.util.infoPrint("getRoadmapLanes xmlResponse=\n" + this.data);	
+    	return this.data;
+	},
+
+    /*
+	 * Returns 3D view data for lanes and panels (e.g. items for each lane) in the JSON format
+	 * The data returned is as per the selected lane table, item table and filters for the lanes/items as set in the roadmap configuration page.
+	 * The lanes/items for any given query result are numbered 0..(n-1), when there are n lanes/items.
+	 * 
+	 * @method getRoadmapItems
+	 * @param key : A mandatory field used as the key for the table "roadmap_page" to access configuration record.
+	 * For example if the items to be fetched based on the roadmap configuration record having "name" as "CIO Roadmap",
+	 * then the key should be "name"
+	 * @param keyVal : A mandatory field used as the key value for the table "roadmap_page" to access configuration record.
+	 * For example if the items to be fetched based on the roadmap configuration record having "name" as "CIO Roadmap",
+	 * then keyVal should be "CIO Roadmap"
+	 * @itemQuery : An optional field used to filter the items from the item table, if the field is empty then the items are selected 
+	 * based on the item query filter in the configuration page. 
+	 * @param fetchStartDate : An optional field that lets you set the fetch start date from which to get the items
+	 * which defaults to first item date in the item table
+	 * @param laneIds : An optional field that lets you set the lanes for which the data should be returned by the API
+	 * which if empty defaults to first 8 lanes from the lane table. It should be a JSON array list as per the example below.
+	 * @param forward : An optional field that defaults to true to fetch items in the forward direction
+	 * which can be set to false for backward direction.
+     *	 
+	 * API Usage 
+	 *     var roadmapUtil = new RoadmapUtil();
+	 *     var key = "name";
+	 *     var keyVal = "CIO Roadmap";
+	 *     var itemQuery = "gs.monthsAgoStart(9)^EQ^ORDERBYend_date";
+	 *     var fetchStartDate = gs.now();
+	 *     var forward = true;	
+     * 	   var selectedLanes = ["0d563434bf30110058c9beba3f0739d5","32a67434bf30110058c9beba3f07392c","02b67434bf30110058c9beba3f07393b"];
+	 *     var laneIds = new JSON().encode(selectedLanes);
+	 *     var response = roadmapUtil.getRoadmapItems(key, keyVal, itemQuery, fetchStartDate, laneIds, forward);
+	 * 
+	 */
+    getRoadmapItems: function(key, keyVal, itemQuery, fetchStartDate, laneIds, forward) {
+		var userPreferenceName = 'roadmap_user_session_3d_lane_ids_' + keyVal;
+    	this.util = new RoadmapCommonUtil("Roadmap3D");
+    	this.config = new RoadmapConfig("Roadmap3D");
+    	this.util.debugPrint("getRoadmapItems key=" + key  + " keyVal=" + keyVal +  " itemQuery=" + itemQuery + " fetchStartDate=" + fetchStartDate + " forward=" + forward);
+    	var laneIdsArr = "";
+		if (laneIds) {
+			laneIdsArr = new JSON().decode(laneIds);
+			gs.getUser().setPreference(userPreferenceName, laneIds);
+		}
+		else {
+			laneIdsArr = gs.getUser().getPreference(userPreferenceName) || "";
+			laneIdsArr = new JSON().decode(laneIdsArr);
+		}
+		if (!JSUtil.nil(forward))
+			forward = forward.toString();						
+		if (this.config.setConfiguration(this.util, this.data, key, keyVal, itemQuery)) {
+			this.util.initMetaData(this.data, fetchStartDate, laneIdsArr, forward);
+			/*
+			 * PRB725647: Skipping this call as it is extending fetch end date and that is
+			 * exceeding maxFetchDuration
+			 * this.updateFetchTime(fetchStartDate);
+			 */
+        	this.setLastMarker();
+			this.addLanesAndItems(laneIdsArr);
+			this.buildMarkerList(fetchStartDate);
+			//this.printData();
+		} 
+    	if (this.data.config.format == "json") {
+    		var json = new JSON();
+        	var jsonResponse = json.encode(this.data);
+			this.util.infoPrint("getRoadmapItems::jsonResponse=\n" + jsonResponse);
+			return jsonResponse;
+    	} 
+		this.util.infoPrint("getRoadmapItems xmlResponse=\n" + this.data);	
+    	return this.data;
+    },
+	
+	updateFetchTime : function(fetchStartDate) {
+		//set fetch end to the end of the quarter
+		var fetchEndLast = this.util.getLastDayOfQuarter(this.data.meta.fetch_end_date);
+		this.util.debugPrint("updateFetchTime fetch_end_date=" + this.data.meta.fetch_end_date + " fetchEndLast=" + fetchEndLast);
+		this.data.meta.fetch_end_date = fetchEndLast;		
+	},
+	
+	/*
+	 * Returns a JSON object for the list of choices for a given field of table
+	 * 
+	 * @method getChoices
+	 * @param table : The table for which field needs to used
+	 * @param field : The field for which list of choices will be extracted 
+	 * 
+	 */
+	getChoices : function(table, field) {
+		var glideChoice = new GlideSysChoice(table,field);
+		var gr = glideChoice.getChoices();
+		var result = [];
+		var choice;
+		while(gr != null &amp;&amp; gr.next()){
+			if (gr.getValue("inactive") != 'true' &amp;&amp; gr.getValue("inactive") != '1') {
+				choice = {};
+				choice['value'] = gr.getValue('value');
+				choice['label'] = gr.getValue('label');
+				result.push(choice);
+			}
+		}
+		var json = new JSON();
+		var jsonResponse = json.encode(result);
+		return jsonResponse;		
+
+	},
+	
+	/*
+ 	* Returns a JSON object for the list of choice fields for a given table
+ 	*
+ 	* @method getChoiceFieldNames
+ 	* @param table : The table for which field needs to used
+ 	* @param field : The field for which list of choices will be extracted
+ 	*
+ 	*/
+	getChoiceFieldNames : function(table) {
+		var relatedTables =  GlideDBObjectManager.getTables(table);
+		var tabArray=relatedTables.toArray();
+		var tables = '';
+		for(var x in tabArray){
+			tables += tabArray[x] + ',';
+		}
+		var choice = new GlideAggregate("sys_choice");
+		choice.addQuery('name', "IN",tables );
+		choice.groupBy('element');
+		choice.query();
+		var result = [];
+		while(choice.next()){
+			result.push(choice.getValue("element"));
+		}
+		
+		this.util.debugPrint("getChoiceFieldNames table=" + table + ":" + " result=" + result + " count=" + choice.getRowCount());
+		var json = new JSON();
+		var jsonResponse = json.encode(result);
+		return jsonResponse;
+		
+	},
+			
+	initLanesConfig : function() {
+		this.data.config.format = "json";	
+		this.data.config.laneMapper = {};
+		this.data.config.laneMapper.laneSysId = "sys_id";
+		this.data.config.laneKey = "laneSysId";
+	},
+			
+	initLanesMetaData : function() {
+		this.data.meta.lanes = 0;  				// Signifies the number of lanes
+		this.data.meta.lanesTotal = 0;  		// Signifies the total number of lanes
+	},
+	
+	
+	buildMarkerList : function (fetchStartDate) {
+		if (this.data.meta.firstAPICall) 
+			this.setFirstMarkerPerFirstAPICall(fetchStartDate);
+		else
+			this.setFirstMarkerPerRefech();			
+		this.util.debugPrint("buildMarkerList::firstMarkerPart1=" + this.firstMarkerPart1 + " firstMarkerPart2=" + this.firstMarkerPart2 + 
+			" lastMarkerPart1=" + this.lastMarkerPart1 + " lastMarkerPart2=" + this.lastMarkerPart2);
+	
+		/*			
+		if (this.data.meta.itemsPerLane == 0) {
+			this.util.debugPrint("buildMarkerList::skipping this.data.meta.itemsPerLane=" + this.data.meta.itemsPerLane);
+			return;
+		}
+		*/		
+		var maxPart1 = Math.ceil(this.data.config.minMonths/3);
+		this.util.debugPrint("buildMarkerList::	maxPart1 = " + maxPart1);	
+		var markerVal;	
+		var quarterCount = 0;
+		//first year
+		if (this.firstMarkerPart2 == this.lastMarkerPart2)
+			maxPart1 = this.lastMarkerPart1
+
+		if (this.firstMarkerPart2 &lt;= this.lastMarkerPart2) {
+			for (var part1=	this.firstMarkerPart1; part1 &lt;= maxPart1; part1++) {
+				markerVal = gs.getMessage('quarterly')[0] + part1 + "-" + this.firstMarkerPart2;
+				this.data.meta.markerNames.push(markerVal);
+				quarterCount++;
+			}	
+		}
+		
+		for (var part2=	this.firstMarkerPart2+1; part2 &lt; this.lastMarkerPart2 ; part2++) {
+			for (var part1=	1; part1 &lt;= 4; part1++) {
+				markerVal = gs.getMessage('quarterly')[0] + part1 + "-" + part2;
+				this.data.meta.markerNames.push(markerVal);
+				quarterCount++;
+			}
+		}
+		//last year
+		if (this.lastMarkerPart2 &gt; this.firstMarkerPart2) {
+			for (var part1=	1; part1 &lt;= this.lastMarkerPart1 || quarterCount &lt; 4 ; part1++) {
+				markerVal = gs.getMessage('quarterly')[0] + part1 + "-" + this.lastMarkerPart2;
+				this.data.meta.markerNames.push(markerVal);
+				quarterCount++;
+			}
+		}
+		if (this.data.meta.markerNames.length &gt; 0 &amp;&amp; this.data.meta.markerNames.length &lt; 4) {
+			//force to have at least 4 quarters to keep slider happy which renders minimum 4 quarters
+			for (var count = this.data.meta.markerNames.length; count &lt; 4; count++) {
+				if (part1 &gt; 4) {
+					part1 = 1;
+					this.lastMarkerPart2++;
+				}
+				markerVal = gs.getMessage('quarterly')[0] + part1 + "-" + this.lastMarkerPart2;
+				part1++;
+				this.data.meta.markerNames.push(markerVal);
+				quarterCount++;
+			}			
+		}
+		this.data.meta.roadMarkers = this.data.meta.markerNames.length;
+	},
+	
+	gatLastMarkerForCurrentLane : function () {
+		this.util.debugPrint("gatLastMarkerForCurrentLane:: firstMarkerPart1=" + this.firstMarkerPart1 + " firstMarkerPart2=" + this.firstMarkerPart2 + 
+					" lastMarkerPart1=" + this.lastMarkerPart1 + " lastMarkerPart2=" + this.lastMarkerPart2);
+		var maxPart1 = Math.ceil(this.data.config.minMonths/3);
+		var markerVal;	
+		var lastMarkerForCurrentLane=0;
+		//first year
+		for (var part1=	this.firstMarkerPart1; part1 &lt;= maxPart1; part1++)
+			lastMarkerForCurrentLane++;		
+		for (var part2=	this.firstMarkerPart2+1; part2 &lt; this.lastMarkerPart2 ; part2++) {
+			for (var part1=	1; part1 &lt;= this.lastMarkerPart1; part1++) 
+				lastMarkerForCurrentLane++;
+		}
+		//last year
+		if (this.lastMarkerPart2 &gt; this.firstMarkerPart2) {
+			for (var part1=	1; part1 &lt;= maxPart1; part1++) 
+				lastMarkerForCurrentLane++;			
+		}
+	},
+	    	    	
+	addLanesAndItems : function(laneIdsArr) {
+		this.util.addLanes(this.data, this.data.config.maxLanesPerRoad, laneIdsArr);
+		var totalItemsInCurrentFetch = 0;
+		for (var laneIdx = 0; laneIdx &lt; this.data.lanes.length; laneIdx++) {
+			var laneToItemMapKeyVal = this.data.lanes[laneIdx].laneToItemMapKeyVal;
+			this.data.lanes[laneIdx].laneTotalItems = 0;
+			this.data.lanes[laneIdx].laneTotalItemsInCurrentFetch = 0;
+			this.data.lanes[laneIdx].items = [];	
+			this.data.lanes[laneIdx].laneTotalItems = this.getTotalRecordCount(laneIdx, laneToItemMapKeyVal);
+			var grItems = this.getfillItemsForLane(laneIdx, laneToItemMapKeyVal, true); //useEnd : true
+			if (grItems != null) {				
+				this.data.lanes[laneIdx].laneTotalItemsInCurrentFetch = grItems.getRowCount();
+				if (this.data.lanes[laneIdx].laneTotalItemsInCurrentFetch &gt; 0) {
+					this.fillItemsForLane(laneIdx, laneToItemMapKeyVal, grItems);
+					if (this.data.lanes[laneIdx].laneTotalItemsInCurrentFetch &gt; this.data.meta.itemsPerLaneTotal)
+						this.data.meta.itemsPerLaneTotal= this.data.lanes[laneIdx].laneTotalItemsInCurrentFetch;
+					this.addItemsForLane(laneIdx, laneToItemMapKeyVal);
+					totalItemsInCurrentFetch += this.data.lanes[laneIdx].laneTotalItemsInCurrentFetch;
+				}
+			}
+		}
+		if (totalItemsInCurrentFetch == 0) 
+			this.checkforRoadEnd();
+	},
+	
+	checkforRoadEnd : function () {
+		var grItems;
+		var laneTotalItemsInCurrentFetch = 0;
+		for (var laneIdx = 0; laneIdx &lt; this.data.lanes.length; laneIdx++) {
+			var laneToItemMapKeyVal = this.data.lanes[laneIdx].laneToItemMapKeyVal;
+			grItems = this.getfillItemsForLane(laneIdx, laneToItemMapKeyVal, false); //useEnd : false
+			if (grItems != null) {
+				var recordCount = grItems.getRowCount();
+				laneTotalItemsInCurrentFetch += recordCount;
+				this.util.debugPrint("checkforRoadEnd::laneIdx=" + laneIdx + " recordCount=" + recordCount + " fetch_start_date=" + this.data.meta.fetch_start_date);
+			}
+		}
+		if (laneTotalItemsInCurrentFetch == 0)
+			this.data.meta.road_end = true;			
+		this.util.debugPrint("checkforRoadEnd::=laneTotalItemsInCurrentFetch=" + laneTotalItemsInCurrentFetch + " fetch_start_date=" + this.data.meta.fetch_start_date);
+	},
+	
+	getfillItemsForLane : function(laneIdx, laneSysId, useEnd) { 
+		this.util.debugPrint("getfillItemsForLane laneIdx=" + laneIdx + " useEnd=" + useEnd);
+		this.lanes[laneIdx] = {};
+	    var grItems = new GlideRecordSecure(this.data.config.itemsTable);
+	    var fetchEndDate;
+		var panelIds;
+		this.data.lanes[laneIdx].itemsNotInCurrentFetch = 0;
+		if (!this.util.empty(this.data.config.itemsExtraQuery))
+			grItems.addEncodedQuery(this.data.config.itemsExtraQuery);
+	    if (!this.util.empty(this.data.config.mapTable)) {
+	    	panelIds = this.getItemIdsMapTable(laneIdx, laneSysId, useEnd);
+	    	if (panelIds.length == 0) {
+	    		this.util.debugPrint("getfillItemsForLane::laneIdx=" + laneIdx + " empty panelIds length=" + panelIds.length);
+	    		return null;
+	    	}	    	
+			grItems.addQuery("sys_id", "IN", panelIds.join(","));
+			this.util.debugPrint("getfillItemsForLane::laneIdx=" + laneIdx + " panelIds=" + panelIds);
+		} else {
+			panelIds = this.getItemIdsNonMapTable(laneIdx, laneSysId, useEnd);
+			grItems.addQuery("sys_id", "IN", panelIds.join(","));
+			this.util.debugPrint("getfillItemsForLane::laneIdx=" + laneIdx + " laneSysId=" + laneSysId);
+		}
+		
+		var allgrItems = panelIds.length;
+		if (!this.util.empty(this.data.config.itemsExtraQuery))
+			allgrItems = this.getAllItemsCount(panelIds);
+		
+		grItems.setLimit(this.data.config.maxItemsPerLane);
+		grItems.query();
+		
+		this.data.lanes[laneIdx].itemsNotInCurrentFetch = allgrItems - grItems.getRowCount();
+		
+		return grItems;
+	},
+	
+	getAllItemsCount : function(panelIds) {
+		var countAllItemsValue = 0;
+		var countItems =new GlideAggregate(this.data.config.itemsTable);
+		countItems.addEncodedQuery(this.data.config.itemsExtraQuery);
+		countItems.addQuery("sys_id", "IN", panelIds.join(","));
+		countItems.addAggregate('COUNT');
+		countItems.query();
+		
+		if(countItems.next())
+			countAllItemsValue = countItems.getAggregate('COUNT');
+		
+		return countAllItemsValue;
+	},
+
+	fillItemsForLane : function(laneIdx, laneSysId, grItems) { 
+		var recordCount = grItems.getRowCount();		
+		this.util.debugPrint("fillItemsForLane laneIdx=" + laneIdx + " fetchStartDate=" + this.data.meta.fetch_start_date + 
+			" getRowCount= " + grItems.getRowCount() + " query: " + grItems.getEncodedQuery());
+		this.lanes[laneIdx].items = [];
+		var len = 0;
+		while (grItems.next()) {
+			if (this.addItemPerMapper(laneIdx, len, grItems))
+				len++;
+		}
+		if (len &gt; 0) {
+			if (len &gt; this.data.meta.itemsPerLane)
+				this.data.meta.itemsPerLane = len;
+		}		
+	},
+			
+	getItemIdsMapTable : function(laneIdx, laneSysId, useEnd) {
+		var panelIds = [];
+		var grMap = new GlideRecordSecure(this.data.config.mapTable);
+		//grMap.setLimit(this.data.config.maxItemsPerLane);
+		grMap.addQuery("portfolio", laneSysId);
+		grMap.addNotNullQuery("project.pm_project");
+		var itemDateKey = "project.pm_project." + this.data.config.itemMapper.itemDate;
+		grMap.orderBy(itemDateKey);
+		grMap.addNotNullQuery(itemDateKey);
+		if (useEnd) {
+			grMap.addQuery(itemDateKey, "&gt;=", this.util.getTimeDisplayInternal(this.data.meta.fetch_start_date));
+			grMap.addQuery(itemDateKey, "&lt;=", this.util.getTimeDisplayInternal(this.data.meta.fetch_end_date));		
+		} else {
+			//In this case we are checking for the road end (e.g. any items after the fetch_end_date).
+			grMap.addQuery(itemDateKey, "&gt;", this.util.getTimeDisplayInternal(this.data.meta.fetch_end_date));
+		}
+		grMap.query();
+		var recordCount = grMap.getRowCount();
+		this.util.debugPrint("getItemIdsMapTable useEnd=" + useEnd + " recordCount=" + recordCount + " table=" + this.data.config.mapTable + 
+			" laneSysId=" + laneSysId + " query=" + grMap.getEncodedQuery() + " startDate=" + this.util.getTimeDisplayInternal(this.data.meta.fetch_start_date)
+			+ " endDate=" + this.util.getTimeDisplayInternal(this.data.meta.fetch_end_date));
+		while (grMap.next()) {
+			panelIds.push(grMap.project.pm_project.toString());
+		}
+
+		return panelIds;
+	},
+	
+	getItemIdsNonMapTable : function(laneIdx, laneSysId, useEnd) {
+		var panelIds = [];
+		var grItems = new GlideRecordSecure(this.data.config.itemsTable);
+		//grItems.setLimit(this.data.config.maxItemsPerLane);
+		var orderByCondition =  this.data.config.itemMapper.itemDate;
+		grItems.orderBy(orderByCondition);
+		grItems.addQuery(this.data.config.laneToItemMapKey, laneSysId);	
+		grItems.addNotNullQuery(this.data.config.itemMapper.itemDate);
+		if (useEnd) {		
+			grItems.addQuery(this.data.config.itemMapper.itemDate, "&gt;=", this.util.getTimeDisplayInternal(this.data.meta.fetch_start_date));
+			grItems.addQuery(this.data.config.itemMapper.itemDate, "&lt;=", this.util.getTimeDisplayInternal(this.data.meta.fetch_end_date));	
+		} else {
+			//In this case we are checking for the road end (e.g. any items after the fetch_end_date).
+			grItems.addQuery(this.data.config.itemMapper.itemDate, "&gt;", this.util.getTimeDisplayInternal(this.data.meta.fetch_end_date));
+		}		
+		grItems.query();
+		var recordCount = grItems.getRowCount();
+		this.util.debugPrint("getItemIdsNonMapTable recordCount=" + recordCount + " table=" + this.data.config.itemsTable + " laneSysId=" + laneSysId + " query=" + grItems.getEncodedQuery());
+		while (grItems.next()) {
+			panelIds.push(grItems.getUniqueValue());
+			this.util.debugPrint("getItemIdsNonMapTable " + grItems.getUniqueValue() + ":" + grItems[this.data.config.laneToItemMapKey].getDisplayValue() + "-&gt;" + 
+				grItems.getValue(this.data.config.itemMapper.itemName) + ":" + grItems.getValue(this.data.config.itemMapper.itemDate));
+		}
+
+		return panelIds;
+	},
+		
+	getTotalRecordCount : function (laneIdx, laneSysId) {
+		var recordCountAll = 0;
+		if (!this.util.empty(this.data.config.mapTable)) {
+	    	recordCountAll = this.getTotalMappedItemsCount(laneIdx, laneSysId);	    	
+		} else {
+			var grItems = new GlideRecordSecure(this.data.config.itemsTable);
+			grItems.addQuery(this.data.config.laneToItemMapKey, laneSysId);	
+			grItems.addNotNullQuery(this.data.config.itemMapper.itemDate);
+			grItems.addQuery(this.data.config.itemMapper.itemDate, "!=" , "");
+			grItems.addQuery(this.data.config.itemMapper.itemDate, "&gt;" , "1970-01-01");
+			if (!this.util.empty(this.data.config.itemsExtraQuery))
+				grItems.addEncodedQuery(this.data.config.itemsExtraQuery);
+			grItems.query();
+			recordCountAll = grItems.getRowCount();
+			this.util.debugPrint("getTotalRecordCount lane =" + laneIdx + " count=" + recordCountAll + " query=" + grItems.getEncodedQuery());
+		}
+		return recordCountAll;
+	},
+
+	getTotalMappedItemsCount : function(laneIdx, laneSysId) {
+		var recordCountAll = 0;
+		var panelIds = [];
+		var grMap = new GlideRecordSecure(this.data.config.mapTable);
+		grMap.addQuery("portfolio", laneSysId);
+		grMap.addNotNullQuery("project.pm_project");
+		var itemDateKey = "project.pm_project." + this.data.config.itemMapper.itemDate;
+		grMap.addNotNullQuery(itemDateKey);
+		if (!this.util.empty(this.data.config.itemsExtraQuery)) {
+			var itemsExtraQuery = this.data.config.itemsExtraQuery;
+			// itemsExtraQuery will be applied on project table. So appending it to each query item
+			itemsExtraQuery = itemsExtraQuery.split("^").map( function(query) { return "project.pm_project." + query; }).join("^");
+			grMap.addEncodedQuery(itemsExtraQuery);
+		}
+		grMap.query();
+		var recordCountAll = grMap.getRowCount();
+		this.util.debugPrint("getTotalMappedItemsCount laneIdx=" + laneIdx + " recordCountAll=" + recordCountAll);
+		return recordCountAll;
+	},
+	
+	addItemPerMapper : function (laneIdx, len, grItems) {
+	    var newItem = {};
+	    if (!this.util.empty(this.data.config.itemMapper)) {
+	    	var grKeyVal;
+	    	var grKey;
+		    for (var mapProp in  this.data.config.itemMapper) {
+		    	grKey = this.data.config.itemMapper[mapProp];		    	
+		    	grKeyVal = grItems.getDisplayValue(grKey);			
+		    	if (mapProp == "itemDate" || mapProp == "itemEndDate" || mapProp == "itemStartDate") {		    		
+		    		if (this.util.empty(grKeyVal)) {
+						this.util.debugPrint("addItemPerMapper skipping laneIdx=" + laneIdx + " len=" + len + " grKey=" + grKey + " grKeyVal=" + grKeyVal);
+						return false;
+					}
+				} 
+				
+				if(mapProp == 'itemName') {
+					newItem['itemNameSafe'] = GlideStringUtil.escapeHTML(grKeyVal);
+				}
+				
+				newItem[mapProp] = grKeyVal;
+				
+				this.util.debugPrint("addItemPerMapper: laneIdx=" + laneIdx + " len=" + len + " newItem[" + mapProp + "]=" + newItem[mapProp] + " from grItems[" + grKey+ "]=" + grKeyVal);
+		    }
+		}
+		this.util.setItemColor(newItem, grItems, this.data.config);
+		this.lanes[laneIdx].items[len] = newItem;		
+		return true;
+	},
+	
+	mapItemData : function (itemData) {
+		var item = {};
+		for (var mapProp in  itemData) {
+			if (mapProp == "itemDate" || mapProp == "itemEndDate" || mapProp == "itemStartDate") {			
+				item[mapProp] = this.util.getTimeDisplay(itemData[mapProp]);
+			}
+			else
+				item[mapProp] = itemData[mapProp];
+			//this.util.debugPrint("mapItemData: item[" + mapProp + "]=" + item[mapProp] + " from grItem[" + mapProp+ "]=" + itemData[mapProp]);
+		}
+		return item;		
+	},
+
+
+	addItemsForLane : function(laneIdx, laneSysId) { 
+		var itemCount = (this.lanes[laneIdx].items).length;
+		//this.util.debugPrint("addItemsForLane laneIdx=" + laneIdx + " itemCount=" + itemCount);
+		var prevMarker = "";
+		var itemsPerMarker = 0, laneItemsPerMonth=0;
+		var roadMarkers = 1;
+		var itemStoredCount = 0;
+		for (var idx=0; idx &lt; itemCount ; idx++) {
+			var item = this.lanes[laneIdx].items[idx];		
+			var itemDt = item["itemDate"];	
+			var gdtMarkerLocation = new GlideDateTime();
+			gdtMarkerLocation.setDisplayValue(itemDt);
+			if (this.firstItemStartDateOnRoad == null || itemDt &lt; this.firstItemStartDateOnRoad)
+				this.firstItemStartDateOnRoad = itemDt.toString();
+			this.util.debugPrint("addItemsForLane this.firstItemStartDateOnRoad=" + this.firstItemStartDateOnRoad);	
+			var itemData = this.mapItemData(item);
+			itemData.marker = prevMarker;
+			itemsPerMarker++;
+			if (this.setMarkerData(gdtMarkerLocation, itemData, roadMarkers, itemsPerMarker)) {
+				prevMarker = itemData.marker;
+				itemsPerMarker =0;
+				roadMarkers++;
+			}
+			this.data.lanes[laneIdx].items[idx] = itemData;
+			//this.util.debugPrint("addItemsForLane idx=" + idx + " itemCount=" + itemCount + " addItemsForLane ---------- " + itemData.itemName + " " + itemData.itemSysId);
+			if (this.data.meta.itemsPerLane &gt; this.data.config.maxItemsPerLane) {
+				this.util.debugPrint("addItemsForLane reached limit maxItemsPerLane=" + this.data.meta.itemsPerLane + " max=" + this.data.config.maxItemsPerLane);
+				break;
+			}
+		}
+		//this.data.lanes[laneIdx].laneTotalItems = this.lanes[laneIdx].laneTotalItems;
+		if (idx &gt;= this.data.meta.itemsPerLane)
+			this.data.meta.itemsPerLane = idx;
+	},
+		
+	/*
+	 * Not required for the first call as it done based on the first item fetched from DB, but all the subsequent calls need to set the first marker here.
+	 */	
+	setFirstMarkerPerRefech : function() {
+		if (this.data.meta.firstAPICall) //for the first fetch the start marker will be based on the first item
+			return;
+		var gdtStart = new GlideDateTime();
+		gdtStart.setDisplayValue(this.data.meta.fetch_start_date);
+		var year = gdtStart.getYearLocalTime();
+		var month = parseInt(gdtStart.getMonthLocalTime());
+		var day = gdtStart.getDayOfMonth();
+		var markerPart1 = Math.ceil((month - this.data.config.startMonthForFirstQuarter + 1)/3);
+		var markerVal = gs.getMessage('quarterly')[0] + markerPart1 + "-" + year;
+		this.firstMarkerPart2 = year;
+		this.firstMarkerPart1 = markerPart1;
+	},
+	
+	setFirstMarkerPerFirstAPICall : function(fetchStartDate) {
+		if (!this.data.meta.firstAPICall) 
+			return;
+		var startDateToUse = this.data.meta.fetch_start_date;	
+		/*
+		if (this.firstItemStartDateOnRoad == null &amp;&amp; fetchStartDate == null)
+			startDateToUse = gs.now();
+		else if (this.firstItemStartDateOnRoad == null) 
+			startDateToUse = fetchStartDate;
+		else 
+			startDateToUse = this.firstItemStartDateOnRoad;
+		*/
+		var gdt = new GlideDateTime();	
+		gdt.setDisplayValue(startDateToUse);
+		var year = gdt.getYearLocalTime();
+		var month = gdt.getMonthLocalTime();
+		this.firstMarkerPart1 = Math.ceil((month - this.data.config.startMonthForFirstQuarter + 1)/3);
+		this.firstMarkerPart2 = year;
+		this.data.meta.fetch_start_date = startDateToUse;
+		this.util.debugPrint("setFirstMarkerPerFirstAPICall year=" + year + " month=" + month + " for startDateToUse=" + startDateToUse);
+	},
+	
+	setMarkerData : function(gdtStart, panelData, roadMarkers, itemsPerMarker) {
+		var markerChanged = false;
+		var year = gdtStart.getYearLocalTime();
+		var month = parseInt(gdtStart.getMonthLocalTime());
+		var day = gdtStart.getDayOfMonth();
+		var markerPart1;
+		var markerVal;
+		if (this.laneItemsCurrentMonth != month) {
+			this.laneItemsCurrentMonth = month;
+			this.laneItemsInCurrentMonth = 1;
+		} else {
+			this.laneItemsInCurrentMonth++;
+		}
+		//this.util.debugPrint("this.laneItemsCurrentMonth=" + this.laneItemsCurrentMonth + " month=" + year + ":" + month + " this.laneItemsInCurrentMonth=" + this.laneItemsInCurrentMonth);
+
+		if (this.laneItemsInCurrentMonth &gt; this.data.meta.laneItemsPerMonth)
+			this.data.meta.laneItemsPerMonth = this.laneItemsInCurrentMonth;
+		
+		
+		if (this.data.config.granularity == "Quarterly") {		
+			markerPart1 = Math.ceil((month - this.data.config.startMonthForFirstQuarter + 1)/3);
+			markerVal = gs.getMessage('quarterly')[0] + markerPart1 + "-" + year;
+			//this.util.debugPrint("setMarkerData panelData.marker=" + panelData.marker + " markerVal=" + markerVal + " " + year + ":" + month + ":" + day );
+		}	
+		if (panelData.marker !== markerVal) {
+			this.util.debugPrint("**********" + panelData.marker + " " + markerVal);
+			panelData.marker = markerVal;
+			markerChanged = true;	
+			if (itemsPerMarker &gt; this.data.meta.itemsPerMarker)
+				this.data.meta.itemsPerMarker = itemsPerMarker;
+			//this.util.debugPrint(panelData.itemName.toString() + " " + panelData.marker  + " this.data.meta.itemsPerMarker=" + this.data.meta.itemsPerMarker + " itemsPerMarker=" + itemsPerMarker);	
+		}
+		return markerChanged;
+	},
+	
+	setLastMarker : function() {
+	    var gdtEnd = new GlideDateTime();
+	    gdtEnd.setDisplayValue(this.data.meta.fetch_end_date);
+		var year = gdtEnd.getYearLocalTime();
+		var month = parseInt(gdtEnd.getMonthLocalTime());
+		this.lastMarkerPart2 = year;
+		this.lastMarkerPart1= Math.ceil((month - this.data.config.startMonthForFirstQuarter + 1)/3);
+		this.util.debugPrint("setLastMarker year=" + year + " month=" + month + " for fetch_end_date=" + this.data.meta.fetch_end_date);
+	},
+	
+	roadmapDefinedForTable: function(tableName) {
+		var gr = new GlideRecordSecure('roadmap_page');
+		gr.addQuery('item_table', tableName);
+		gr.query();
+		if (gr.hasNext())
+			return true;
+		
+		// No roadmap defined for the table
+		return false;
+	},
+	
+	getRoadmapForTable: function(tableName) {
+		var gr = new GlideRecordSecure('roadmap_page');
+		gr.addQuery('item_table', tableName);
+		gr.addQuery('isdefault', true);
+		gr.query();
+		if (gr.next())
+			return gr.getValue('sys_id');
+		
+		// see if there is atleast one roadmap defined which is not default. Return the first one
+		var dgr = new GlideRecordSecure('roadmap_page');
+		dgr.addQuery('item_table', tableName);
+		dgr.query();
+		if (dgr.next())
+			return dgr.getValue('sys_id');
+		
+		// No roadmap defined for the table
+		return "";
+	},
+		    
+	type : 'RoadmapUtil'
+}]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2013-10-28 19:47:41&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;289da9c8bf30110058c9beba3f073919&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;978&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;RoadmapUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Timeline Visualization" source="com.snc.timeline_visualization"&gt;e7ff8ee747e64210cd4e1ce4316d438c&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_289da9c8bf30110058c9beba3f073919&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-04-04 08:36:07&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:12:44</sys_created_on>
+        <sys_id>64113c5983b01210c6695855eeaad3a7</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>RoadmapUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_64113c5983b01210c6695855eeaad3a7</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:12:44</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

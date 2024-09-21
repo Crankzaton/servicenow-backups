@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1d386658777321107d731dd91e5a99f3</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_entitlement.UserSubscriptionMapper&lt;/api_name&gt;
+        &lt;caller_access&gt;2&lt;/caller_access&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;API to be invoked when groups are added/ removed to the subscription or users added/removed to the subscription&lt;/description&gt;
+        &lt;name&gt;UserSubscriptionMapper&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var UserSubscriptionMapper = Class.create();
+UserSubscriptionMapper.prototype = {
+    initialize: function() {
+        this._sysUserGrmemberDAOService = new SysUserGrmemberDAO();
+        this._userHasSubscriptionDaoService = new UserHasSubscriptionDao();
+        this._groupHasSubscriptionDaoService = new GroupHasSubscriptionDAO();
+        this._logSourceName = `sn_entitlement.${this.type}`;
+    },
+
+    /**
+     * This function will associate the users from the newly added group to the respective subscription that the group 
+     * has been added to. If the user is already mapped to the subscription as part of another group, then will be skipped.
+     * 
+     * @param {Map} subscriptionIdToAddedGroupsMap . Key will be the subscription_entitlement sys_id and values will be list of added groups.
+     * 
+     */
+    syncUserForGroupsAddedToSubscription: function(subscriptionIdToAddedGroupsMap) {
+        if (global.JSUtil.nil(subscriptionIdToAddedGroupsMap))
+            return;
+        const startTime = Date.now();
+        subscriptionIdToAddedGroupsMap.forEach((listOfAddedGroupSysIds, subId) =&gt; {
+
+            if (global.JSUtil.nil(listOfAddedGroupSysIds) || global.JSUtil.isEmpty(listOfAddedGroupSysIds))
+                return;
+
+            //Get list of users present in the added groups. 
+            const userSysIdsFromAddedGroups = this._sysUserGrmemberDAOService.getUsersByGroupIds(listOfAddedGroupSysIds);
+
+            //If there are no users in the new groups continue to next subscription
+            if (global.JSUtil.nil(userSysIdsFromAddedGroups) || userSysIdsFromAddedGroups.size == 0)
+                return;
+
+            //Get list of users already mapped to this subscription to determin if the above user sys ids are already present or not
+            const subscribedUserIds = this._userHasSubscriptionDaoService.getUserIdsBySubscriptionId(subId);
+
+            let userSysIdsToSubscribe = [];
+
+            //iterate over the userSysIdsTobeAdded to check if they are already subscribed
+            userSysIdsFromAddedGroups.forEach(userId =&gt; {
+                if (!subscribedUserIds.has(userId)) // if the new groups users are not already subscribed to the subscription through a different group add to the list
+                    userSysIdsToSubscribe.push(userId);
+            });
+
+            userSysIdsToSubscribe.forEach((userId) =&gt; {
+                this._userHasSubscriptionDaoService.insert(userId, subId);
+            });
+            gs.info(`${this._logSourceName}- syncUserForGroupsAddedToSubscription: Processed ${userSysIdsToSubscribe.length} users for subscription ${subId}. Time taken : ${Date.now() - startTime}`);
+
+        });
+    },
+
+    /**
+     * This function will remove the users  from the deleted group, mapping to the respective subscription from the user_has_subscription table.
+     * However, if the user is already mapped to the subscription as part of another group still associated with the subscription, then the user - subscription mapping record will be retained..
+     * 
+     * @param {Map} subscriptionIdToDeletedGroupsMap . Key will be the subscription_entitlement sys_id and values will be list of removed groups.
+     *
+     */
+    syncUserForGroupsDeletedFromSubscription: function(subscriptionIdToDeletedGroupsMap) {
+        if (global.JSUtil.nil(subscriptionIdToDeletedGroupsMap))
+            return;
+        const startTime = Date.now();
+        subscriptionIdToDeletedGroupsMap.forEach((listOfGroups, subId) =&gt; {
+            //Get list of users present in the above groups. Need to add null check
+            if (global.JSUtil.nil(listOfGroups) || global.JSUtil.isEmpty(listOfGroups))
+                return;
+            //Get list of users belonging to the groups that are removed from the subscription
+            const userIdsFromDeletedGroups = this._sysUserGrmemberDAOService.getUsersByGroupIds(listOfGroups);
+
+            if (global.JSUtil.nil(userIdsFromDeletedGroups) || userIdsFromDeletedGroups.size == 0)
+                return;
+
+            //IF the above users do not belong to any other group that is still mapped to this subscription, then they can be deleted. Else will have to retain the record.
+            // SMV1 will be deleting the group to subscription mappings before invoking this API for deleted groups
+
+            //Get the groups that are still subscribed to the subscription
+            const subscribedGroups = this._groupHasSubscriptionDaoService.getGroupIdsBySubscriptionId(subId);
+
+            let userSysIdsToUnSubscribe = []; // variable to hold the final list of users to be unsubscribed.
+            let usersToRetain = new Set();
+
+            //If there are other groups mapped to the subscription, get the list of users which are part of deleted groups and also belong to other groups mapped to subscription
+            if (global.JSUtil.notNil(subscribedGroups) || !global.JSUtil.isEmpty(subscribedGroups)) {
+                //If there are users belonging to these groups and also to groups that are unmapped from subscription
+                // those users still need to be associated with the subscription and not deleted from user_has_sub for the subid
+                usersToRetain = this._sysUserGrmemberDAOService.getUsersBelongingToGroups(subscribedGroups, userIdsFromDeletedGroups);
+            }
+            // Users that need to be unsubscribed are ones which are not present in the above list
+            userIdsFromDeletedGroups.forEach(userId =&gt; {
+                if (!usersToRetain.has(userId))
+                    userSysIdsToUnSubscribe.push(userId);
+            });
+            //Delete records for users from userSysIdsToUnSubscribe belonging to the subscription
+            userSysIdsToUnSubscribe.forEach((userId) =&gt; {
+                this._userHasSubscriptionDaoService.delete(userId, subId);
+            });
+            gs.info(`${this._logSourceName}- syncUserForGroupsDeletedFromSubscription: Processed ${userSysIdsToUnSubscribe.length} users for subscription ${subId}. Time taken : ${Date.now() - startTime}`);
+
+        });
+    },
+    /**
+     * This function will clean up the user has subscription table for each subscription and add all the users from the associated groups to the table.
+     * 
+     */
+    syncUsersToSubscriptions: function() {
+        const startTime = Date.now();
+        //Get list of users already mapped to this subscription to determin if the above user sys ids are already present or not
+        this._userHasSubscriptionDaoService.updateAllRecordsForDelete();
+
+        //get Map of subscriptions to groups
+        const subscriptionToGroupsMap = this._groupHasSubscriptionDaoService.getMapofSubscriptionIdToMappedGroups();
+
+        //Iterate over each Map entry for subId -&gt; List of associated groups
+        if (subscriptionToGroupsMap.size === 0) {
+            gs.info('No group to subscription mapping records are present.');
+            return;
+        }
+        subscriptionToGroupsMap.forEach((listOfAddedGroupIds, subId) =&gt; {
+            const subIdIterationStartTime = Date.now();
+            const userIdsToSubscribe = new Set();
+            //Get set of users from the list of groups
+            listOfAddedGroupIds.forEach((groupId) =&gt; {
+                const userIdsArray = this._sysUserGrmemberDAOService.getUsersByGroupId(groupId);
+                userIdsArray.forEach(userId =&gt; userIdsToSubscribe.add(userId));
+            });
+            //insert mapping to subscription for all users
+            userIdsToSubscribe.forEach((userId) =&gt; {
+                this._userHasSubscriptionDaoService.insert(userId, subId);
+            });
+            gs.debug(`${this._logSourceName}- syncUsersToSubscriptions: Processed ${userIdsToSubscribe.size} users for subscription ${subId}. Time taken to process : ${Date.now() - subIdIterationStartTime}`);
+
+        });
+        gs.info(`${this._logSourceName}- syncUsersToSubscriptions: Processed  users subscription Mapping. Time taken to process : ${Date.now() - startTime}`);
+    },
+
+
+
+    type: 'UserSubscriptionMapper'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;maint&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-06-29 04:56:59&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1d386658777321107d731dd91e5a99f3&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;145&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;UserSubscriptionMapper&lt;/sys_name&gt;
+        &lt;sys_package display_value="Licensing Engine" source="sn_entitlement"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Licensing Engine"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1d386658777321107d731dd91e5a99f3&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;maint&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-08-29 17:23:43&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:11:30</sys_created_on>
+        <sys_id>3ec0341983b01210c6695855eeaad373</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>UserSubscriptionMapper</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_3ec0341983b01210c6695855eeaad373</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:11:30</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

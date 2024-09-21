@@ -1,0 +1,230 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>37aba01583701210c6695855eeaad35a</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules"&gt;
+    &lt;x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE"&gt;
+        &lt;abort_action&gt;false&lt;/abort_action&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;action_delete&gt;false&lt;/action_delete&gt;
+        &lt;action_insert&gt;false&lt;/action_insert&gt;
+        &lt;action_query&gt;false&lt;/action_query&gt;
+        &lt;action_update&gt;true&lt;/action_update&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;add_message&gt;false&lt;/add_message&gt;
+        &lt;advanced&gt;true&lt;/advanced&gt;
+        &lt;change_fields&gt;false&lt;/change_fields&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;collection/&gt;
+        &lt;condition/&gt;
+        &lt;description/&gt;
+        &lt;execute_function&gt;false&lt;/execute_function&gt;
+        &lt;filter_condition/&gt;
+        &lt;is_rest&gt;false&lt;/is_rest&gt;
+        &lt;message/&gt;
+        &lt;name&gt;Workflow Classification Threshold Stats&lt;/name&gt;
+        &lt;order&gt;100&lt;/order&gt;
+        &lt;priority&gt;100&lt;/priority&gt;
+        &lt;rest_method/&gt;
+        &lt;rest_method_text/&gt;
+        &lt;rest_service/&gt;
+        &lt;rest_service_text/&gt;
+        &lt;rest_variables/&gt;
+        &lt;role_conditions/&gt;
+        &lt;script&gt;&lt;![CDATA[(function executeRule(current, previous /*null when async*/ ) {
+    if (is_workflow_classification(current.sys_id)) {
+        gs.info(gs.getMessage("Solution {0}: Business rule for workflow classification threshold stats population started execution.", current.sys_id));
+        var threshold_record_sys_id = get_threshold_record_sys_id(current.sys_id);
+        var stats = read_stats_from_attachment(threshold_record_sys_id);
+        var threshold_stats = stats['solution_stats']['class_level_stats'];
+        var distribution_stats = stats['class_distribution']['labels'];
+        var msg = "";
+        if (!threshold_stats) {
+            msg += "Threshold Stats at stats['solution_stats']['class_level_stats'] doesnot exist.";
+        }
+        if (!distribution_stats) {
+            msg += " Distribution Stats at stats['class_distribution']['labels'] doesnot exist.";
+        }
+        if (msg != "") {
+            var errMsg = gs.getMessage("Solution {0}: Incorrect format of the JSON in the threshold_stats artifact. Error: {1}.", [current.sys_id, msg]);
+            gs.error(errMsg);
+            throw new Error(errMsg);
+        }
+        var stats_id = insert_to_solution_stats_table(current.sys_id);
+        insert_to_pc_lookup_table(threshold_stats, distribution_stats, current.sys_id, stats_id);
+        insert_excluded_classes(stats['excluded_classes'], distribution_stats, current.sys_id);
+        gs.info(gs.getMessage("Solution {0}: Business rule for workflow classification threshold stats population execution finished", current.sys_id));
+    }
+})(current, previous);
+function is_workflow_classification(sol_sys_id) {
+    var gr = new GlideRecord('ml_solution');
+    gr.query("sys_id", sol_sys_id);
+    gr.next();
+    var sol_props = JSON.parse(gr.solution_properties);
+    if (String(gr.capability) == "workflow_classification_trainer") {
+        return true;
+    }
+    return false;
+}
+function get_threshold_record_sys_id(sys_id) {
+    var gr = new GlideRecord('ml_model_artifact');
+    gr.addQuery('solution', sys_id);
+    gr.addQuery('model_id', "threshold_stats");
+    gr.query();
+    if (!gr.next()) {
+        var errMsg = gs.getMessage('Solution {0}: Artifact threshold_stats doesnot exist for the current solution.', sys_id);
+        gs.error(errMsg);
+        throw new Error(errMsg);
+    }
+    return gr.sys_id;
+}
+function read_stats_from_attachment(solutionSysID) {
+    var attachment = new sn_ml_ui.GlideSysAttachment();
+    var errMsg = "";
+    try {
+        var agr = attachment.getAttachments('ml_model_artifact', solutionSysID);
+    } catch (error) {
+        errMsg = gs.getMessage("Solution {0}: Error fetching threshold_stats attachment, failed with error {1}.", [solutionSysID, error]);
+        gs.error(errMsg);
+        throw new Error(errMsg);
+    }
+    try {
+        if (agr.next()) {
+            var stats = JSON.parse(attachment.getContent(agr));
+            gs.debug(gs.getMessage('Solution {0}: Threshold Stats as read from file : {0}', [solutionSysID, JSON.stringify(stats)]));
+        }
+        return stats;
+    } catch (error) {
+        errMsg = gs.getMessage("Solution {0}: Incorrect format of the JSON in the artifact. Error: {1}.", [solutionSysID, error]);
+        gs.error(errMsg);
+        throw new Error(errMsg);
+    }
+}
+function insert_to_solution_stats_table(sys_id) {
+    var sol_stats = new GlideRecord("ml_solution_stats");
+    sol_stats.initialize();
+    sol_stats["status"] = "success";
+    return sol_stats.insert();
+}
+function insert_to_pc_lookup_table(threshold_stats, distribution_stats, sol_sys_id, stats_id) {
+    gs.info(gs.getMessage("Solution {0}: Inserting stats into the ml_pc_lookup table", sol_sys_id));
+    var errMsg = "";
+    for (var class_key in threshold_stats) {
+        if (class_key == "Snow_ML_Others") {
+            continue;
+        }
+        try {
+            class_stats = threshold_stats[class_key];
+            var default_threshold = class_stats["default"]["threshold"] * 100;
+            var default_precision = class_stats["default"]["precision"] * 100;
+            var default_recall = class_stats["default"]["recall"] * 100;
+            var default_coverage = class_stats["default"]["coverage"] * 100;
+        } catch (error) {
+            errMsg = gs.getMessage("Solution {0}: Error while reading default stats for class {1}. Error: {2}", [sol_sys_id, class_key, error]);
+            gs.error(errMsg);
+            throw new Error(errMsg);
+        }
+        gs.debug(gs.getMessage("Solution {0}: Default PCR values: Threshold {1}, Precision: {2}, Coverage: {3}, Recall: {4}.", [sol_sys_id, default_threshold, default_precision, default_coverage, default_recall]));
+        try {
+            var class_table = new GlideRecord("ml_class");
+            class_table.initialize();
+            class_table["name"] = class_key;
+            class_table["solution"] = sol_sys_id;
+            class_table["solution_stats"] = stats_id;
+            class_table["distribution"] = distribution_stats[class_key] * 100;
+            var class_sys_id = class_table.insert();
+            var class_stats = class_stats["combinations"];
+            for (var threshold in class_stats) {
+                var precision = class_stats[threshold]["precision"] * 100;
+                var coverage = class_stats[threshold]["coverage"] * 100;
+                var recall = class_stats[threshold]["recall"] * 100;
+                threshold *= 100;
+                var gr = new GlideRecord('ml_pc_lookup');
+                gr.initialize();
+                gr["solution"] = sol_sys_id;
+                gr['class_name'] = class_sys_id;
+                gr['threshold'] = threshold;
+                gr['precision'] = precision;
+                gr['coverage'] = coverage;
+                gr['recall'] = recall;
+                gr['type'] = "threshold";
+                var pc_lookup_sys_id = gr.insert();
+                if (precision == default_precision &amp;&amp; recall == default_recall &amp;&amp; coverage == default_coverage &amp;&amp; threshold == default_threshold) {
+                    update_ml_class_table_pc_lookup(class_sys_id, pc_lookup_sys_id);
+                }
+            }
+        } catch (error) {
+            errMsg = gs.getMessage("Solution {0}: Error while adding stats to the ml_pc_lookup table. Error: {1}.", [sol_sys_id, error]);
+            gs.error(errMsg);
+            throw new Error(errMsg);
+        }
+    }
+}
+function update_ml_class_table_pc_lookup(class_sys_id, pc_lookup_id) {
+    try {
+        var class_rec = new GlideRecord('ml_class');
+        class_rec.addQuery('sys_id', class_sys_id);
+        class_rec.query();
+        if (class_rec.next()) {
+            class_rec.setValue('pc_lookup', pc_lookup_id);
+            class_rec.update();
+        }
+    } catch (error) {
+        var errMsg = gs.getMessage("Error while adding pc_lookup_sys_id to the ml_class table. Error: {0} for class {1}", [error, class_sys_id]);
+        gs.error(errMsg);
+        throw new Error(errMsg);
+    }
+}
+function insert_excluded_classes(excluded_classes, distribution_stats, solution_id) {
+    try {
+        for (var class_key in excluded_classes) {
+            var excluded_class_table = new GlideRecord("ml_excluded_classes");
+            excluded_class_table.initialize();
+            excluded_class_table.setValue("class", class_key);
+            excluded_class_table.setValue("rowcount", excluded_classes[class_key]);
+            excluded_class_table.setValue("distribution", distribution_stats[class_key] * 100);
+            excluded_class_table.setValue("solution", solution_id);
+            excluded_class_table.insert();
+        }
+    } catch (error) {
+        var errMsg = gs.getMessage("Solution {0}: Error while adding excluded classes to ml_excluded_class table. {1}", [solution_id, error]);
+        gs.error(errMsg);
+        throw new Error(errMsg);
+    }
+}]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;x_938076_now_utils_now_utils_business_rules&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2024-09-21 07:49:11&lt;/sys_created_on&gt;
+        &lt;sys_domain&gt;global&lt;/sys_domain&gt;
+        &lt;sys_domain_path&gt;/&lt;/sys_domain_path&gt;
+        &lt;sys_id&gt;37aba01583701210c6695855eeaad35a&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;Workflow Classification Threshold Stats&lt;/sys_name&gt;
+        &lt;sys_overrides/&gt;
+        &lt;sys_package display_value="Now Utils" source="x_938076_now_utils"&gt;b208a7c083689e50c6695855eeaad3d2&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Now Utils"&gt;b208a7c083689e50c6695855eeaad3d2&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;x_938076_now_utils_now_utils_business_rules_37aba01583701210c6695855eeaad35a&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-09-21 07:49:11&lt;/sys_updated_on&gt;
+        &lt;template/&gt;
+        &lt;when&gt;before&lt;/when&gt;
+    &lt;/x_938076_now_utils_now_utils_business_rules&gt;
+    &lt;sys_translated_text action="delete_multiple" query="documentkey=37aba01583701210c6695855eeaad35a"/&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:00:21</sys_created_on>
+        <sys_id>133ee45183b01210c6695855eeaad3cf</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Workflow Classification Threshold Stats</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_133ee45183b01210c6695855eeaad3cf</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:00:21</sys_updated_on>
+        <tablename>sys_script</tablename>
+    </sys_metadata_link>
+</record_update>

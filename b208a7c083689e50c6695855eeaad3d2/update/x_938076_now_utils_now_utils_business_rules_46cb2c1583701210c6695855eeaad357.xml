@@ -1,0 +1,317 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules">
+    <x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection/>
+        <condition>current.serial_number.changes() || current.serial_number.hasValue() || current.correlation_id.changes() || current.correlation_id.hasValue() || current.ip_address.changes() || current.ip_address.hasValue()</condition>
+        <description>When a computer is virtual this BR will create a relationship between the cmdb_ci_computer and the VM record.</description>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>Virtual Computer Check</name>
+        <order>100</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[/*
+* Maybe move this to an event on device complete if this ends up being a perforamnce issue.
+*    The reason is this BR would run as long there's data in serial_number or correlation_id.
+*/
+
+(function(){
+ var g_disco_functions = new DiscoveryFunctions();
+ 
+ var fVMGr = current;
+ var fInstanceGr;
+ var fHypervisorGr;
+ 
+ startVirtualComputerCheck();
+ 
+ function startVirtualComputerCheck() {
+  // Putting the easier ones to identify at the front so we don't spend extra effort looking up the others
+  if (isSolarisZone())
+   handleSolariZone();
+  else if (isVMWare()) {
+   // only process rec if just inserted or serial_number changed AND serial_number is non-nil
+   if (!(current.serial_number.changes() && JSUtil.notNil(current.serial_number)))
+    return;
+   
+   handleVMWare();
+  } else if (isHyperV())
+   handleHyperV();
+  else if (!isCredentialless())
+   return;
+   
+  current.virtual = true; 
+  
+  // By this point we know if we have found a vm instance record
+  if (JSUtil.nil(fInstanceGr))
+   return;
+  
+  // We DO have an instance record, so let's create the "instantiates" relationship between VM and Instance
+  g_disco_functions.createRelationshipIfNotExists(fVMGr, fInstanceGr, "Instantiates::Instantiated by");  
+  
+  // Now, let's find the hypervisor...
+  fHypervisorGr = findVMWareByImage(fInstanceGr);
+  if (JSUtil.nil(fHypervisorGr))
+   return;
+
+  // The HyperVisor DOES exist, so let's create the "virtualized by" 'relationship between VM and Hypervisor
+  // However, before we do that, let's see if VM already has relationship with another Hypervisor and if so, we
+  // need to migrate the relationship. 
+  // *note: This shouldn't happen if the relationship was properly managed from the VM instance side. 
+  // But we'll do it just in case...
+  reconcileRelationVMtoHyperVisor();
+  
+ }
+
+ function isSolarisZone() {
+  if (fVMGr.sys_class_name != "cmdb_ci_solaris_server")
+   return false;
+  
+  if (!fVMGr.correlation_id.hasValue())
+   return false;
+   
+  if (!fVMGr.correlation_id.startsWith("zone-"))
+   return false;  
+
+  return true;   
+ } 
+ 
+ function isVMWare(){
+  if (!fVMGr.serial_number.hasValue())
+   return false;
+   
+  if (!fVMGr.serial_number.toLowerCase().startsWith("vmware-"))
+   return false;  
+  
+  return true;  
+ }
+ 
+ function isHyperV() {
+  var serialNumber = fVMGr.serial_number;
+  if (!serialNumber.hasValue())
+   return false;
+  
+  var instGr = new GlideRecord("cmdb_ci_hyper_v_instance");
+  var serials = ['chassis_serial', 'bios_serial', 'baseboard_serial'];
+  return serials.some(
+   function(serial) {
+    instGr.initialize();
+    if (instGr.get(serial, serialNumber)) {
+     fInstanceGr = instGr;
+     return true;
+    }
+   }
+  );
+ }
+
+ function handleSolariZone() {
+  var matchingId = fVMGr.correlation_id.substring(5);
+
+  var gr = new GlideRecord('cmdb_ci_solaris_instance');
+  gr.addQuery('correlation_id', matchingId);
+  gr.query();
+  if (gr.next())
+   fInstanceGr = gr; 
+ }
+ 
+ function isCredentialless() {
+  var potentialVmInstances, potentialGuests;
+
+  // Check to see if this is a record being created by credentialless discovery.  If so we'll attempt to
+  // reconcile with a VMWare VM based on IP.  We're limiting the check to VMWare VMs because that limits the
+  // risk while solving the associated INT.
+  if (!current.ip_address || !current.ip_address.changes() || current.discovery_source != 'CredentiallessDiscovery')
+   return;
+
+  potentialVmInstances = new GlideRecord('cmdb_ci_vmware_instance');
+  potentialVmInstances.addQuery('ip_address', current.ip_address);
+  potentialVmInstances.setLimit(2);
+  potentialVmInstances.query();
+
+  // find all potential "other" guests with the IP
+  potentialGuests = new GlideRecord('cmdb_ci_computer');
+  potentialGuests.addQuery('ip_address', current.ip_address);
+  potentialGuests.addQuery('sys_id', '!=', current.sys_id);
+  potentialGuests.setLimit(2);
+  potentialGuests.query();
+
+  commonVMWareHandling(potentialVmInstances, potentialGuests);
+
+  return !!fInstanceGr;
+ }
+
+ function handleVMWare() {
+  var serial_number, matchingId, potentialVmInstances, potentialGuests, warnMsg;
+  serial_number = fVMGr.serial_number;
+  matchingId = fVMGr.serial_number.substring(7);
+
+  // find all potential VM instances with this serial number
+  potentialVmInstances = new GlideRecord('cmdb_ci_vmware_instance');
+  potentialVmInstances.addQuery('correlation_id', matchingId);
+  potentialVmInstances.query();
+
+  // find all potential "other" guests with the same serial number
+  potentialGuests = new GlideRecord('cmdb_ci_computer');
+  potentialGuests.addQuery('serial_number', serial_number);
+  potentialGuests.addQuery('sys_id', '!=', fVMGr.sys_id);
+  potentialGuests.query();
+
+  commonVMWareHandling(potentialVmInstances, potentialGuests);
+
+  if (!fInstanceGr) {
+   warnMsg = gs.getMessage('Unable to uniquely match VMWare instance with guest based on serial number: {0}.\n'
+    + 'The correct VMWare instance associated with this guest will be resolved during the next vCenter discovery.', serial_number);
+   DiscoveryLogger.warn(warnMsg, "Virtual Computer Check", "");
+  }
+ }
+
+ function commonVMWareHandling(potentialVmInstances, potentialGuests) {
+  var unreconciledVmInstances, unreconciledGuests, unreconciledVmSize, unreconciledGuestSize;
+
+  // if there's only one VM instance, and no other guests
+  // save the VM instance and return
+  if (potentialVmInstances.getRowCount() == 1 && potentialGuests.getRowCount() == 0) {
+   potentialVmInstances.next();
+   fInstanceGr = potentialVmInstances;
+   return;
+  }
+  
+  unreconciledGuests = [];
+  while (potentialGuests.next()) {
+   unreconciledGuests.push(potentialGuests.getValue('sys_id'));
+  }
+  
+  unreconciledVmInstances = [];
+  // Filter out any VM instances & guests that are already reconciled with a relationship.
+  while (potentialVmInstances.next()) {
+   var vmInstance = potentialVmInstances.getValue('sys_id');
+   var isReconciled = JSUtil.getBooleanValue(potentialVmInstances, 'guest_reconciled');
+   
+   // if a relationship between this guest and a VM instance already exists then return
+   if (isReconciled && g_disco_functions.relationshipExists(fVMGr, vmInstance, "Instantiates::Instantiated by"))
+    return;
+   
+   if (isReconciled) {
+    // if the relationship between another guest and this VM instance exists, then don't consider it an unreconciled relationship
+    var relFound = false;
+    for (var i = unreconciledGuests.length - 1; i >= 0; i--) {
+     if (g_disco_functions.relationshipExists(unreconciledGuests[i], vmInstance, "Instantiates::Instantiated by")) {
+      relFound = true;
+      unreconciledGuests.splice(i,1);
+     }
+    }
+    if (!relFound)
+     unreconciledVmInstances.push(vmInstance);
+   } else
+    unreconciledVmInstances.push(vmInstance);
+  }
+  
+  unreconciledVmSize = unreconciledVmInstances.length;
+  unreconciledGuestSize = unreconciledGuests.length;
+  
+  // If we have no unreconciled VM instances then return
+  if (unreconciledVmSize == 0)
+   return;
+  
+  // If we have only 1 unreconciled VM instance and no other unreconciled guests
+  // save the VM instance and return
+  if (unreconciledVmSize == 1 && unreconciledGuestSize == 0) {
+   fInstanceGr = unreconciledVmInstances[0];
+   return;
+  }
+ }
+ 
+ function handleHyperV() {
+  matchingId = fVMGr.serial_number+'';
+  // The fInstanceGr is already handled in isHyperV() method. Just so that we don't waste another query.
+ }
+ 
+ function findVMWareByImage(instGr) {
+  var gr = new GlideRecord("cmdb_rel_ci");
+  gr.query("parent", instGr.sys_id);
+  gr.query("type", g_disco_functions.findCIRelationshipType("cmdb_rel_type", "Registered on::Has registered"));
+  gr.query();
+  if (gr.next())
+   return gr.child;
+  else {
+   //There are no Registered on::Has registered relationships for vm instance,
+   //i.e vm was migrated and Registered on::Has registered was deleted, deleting the Virtualized by::Virtualizes relationships
+   var relGr = new GlideRecord('cmdb_rel_ci');
+   relGr.addQuery("parent", fVMGr.sys_id);
+   relGr.addQuery("type", g_disco_functions.findCIRelationshipType("cmdb_rel_type", "Virtualized by::Virtualizes"));
+   relGr.query();
+   if (relGr.next())
+    relGr.deleteMultiple();
+  }
+ 
+  return;
+ } 
+ 
+ function reconcileRelationVMtoHyperVisor() {
+  var gr = new GlideRecord('cmdb_rel_ci');
+  gr.query('parent', fVMGr.sys_id);
+  gr.query('type', g_disco_functions.findCIRelationshipType("cmdb_rel_type", "Virtualized by::Virtualizes"));
+  gr.query();
+
+  // If we found nothing, then let's simply create the relationship between VM and Hypervisor
+  if (gr.getRowCount() == 0) {  
+   g_disco_functions.createRelationshipIfNotExists(fVMGr, fHypervisorGr, "Virtualized by::Virtualizes");  
+   return;
+  }
+  
+  // We found existng relationship(s) between VM and HyperVisor(s). Theoretically there should be only 1
+  // If we did find multiple, then We want to just correct the first relationship and then delete the rest
+  var done = false;
+  while (gr.next()) {
+   if (done == true) {
+    gr.deleteRecord();
+    continue;
+   }
+   
+   // If they don't match, let's re-point the child to the correct hypervisor
+   if ((gr.child.sys_id + '') !== (fHypervisorGr.sys_id + '')) { 
+    gr.child = fHypervisorGr.sys_id;
+    gr.update();       
+   } // The other possibliy is that the sys_id matches, in which case there would be nothing to do 
+      
+   done = true;
+  }  
+ } 
+ 
+})();]]></script>
+        <sys_class_name>x_938076_now_utils_now_utils_business_rules</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:49:37</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>46cb2c1583701210c6695855eeaad357</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>Virtual Computer Check</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>x_938076_now_utils_now_utils_business_rules_46cb2c1583701210c6695855eeaad357</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:49:37</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </x_938076_now_utils_now_utils_business_rules>
+    <sys_translated_text action="delete_multiple" query="documentkey=46cb2c1583701210c6695855eeaad357"/>
+</record_update>

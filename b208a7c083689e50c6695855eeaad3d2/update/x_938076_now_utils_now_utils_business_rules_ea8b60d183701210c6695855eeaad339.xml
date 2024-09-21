@@ -1,0 +1,223 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="x_938076_now_utils_now_utils_business_rules">
+    <x_938076_now_utils_now_utils_business_rules action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection/>
+        <condition/>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>gtd_tour_create_or_update</name>
+        <order>100</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function executeRule(current, previous /*null when async*/ ) {
+
+    // Add your code here
+    if (!gs || !sn_tourbuilder)
+        return;
+
+    var tour = {},
+        api = new sn_tourbuilder.GTPlatformAnalyticsAPI(),
+        arrayUtil = new ArrayUtil(),
+        id = current.sys_id.toString(),
+        name = current.name.toString(),
+        starting_page = current.context.toString(),
+        roles = current.roles.toString().split(','),
+        type = current.type.toString(),
+        sys_scope = current.sys_scope.getDisplayValue(),
+        sys_package = current.sys_package.getDisplayValue(),
+        rolesToCheck = ['admin', 'guided_tour_admin'],
+        currentUser = gs.getUser(),
+        eventType = '',
+        payload_id = '';
+
+
+    /*
+    STRY4611846: GTD Usage Data: New Metrics - Tour Creator and Updater Metadata
+    */
+
+    var userRoles = currentUser.getRoles(),
+        userhasAdminroles = [];
+    rolesToCheck.forEach(function(item) {
+        if (userRoles.indexOf(item) !== -1)
+            userhasAdminroles.push(item);
+    });
+
+    var tourHasAdminRoles = arrayUtil.intersect(['admin', 'guided_tour_admin'], roles);
+
+    if (tourHasAdminRoles.length > 0) {
+        api.send({
+            tourId: id,
+            tourName: name,
+            starting_page: starting_page,
+            role: tourHasAdminRoles
+        }, {
+            operationType: current.operation(),
+            eventType: 'tour_insert_update_with_admin_roles'
+        });
+    }
+
+    api.send({
+        tourId: id,
+        tourName: name,
+        starting_page: starting_page,
+        role: userhasAdminroles
+    }, {
+        operationType: current.operation(),
+        eventType: 'tour_insert_update'
+    });
+
+    api.send({
+        tourId: id,
+        tourType: type,
+        sys_scope: sys_scope,
+        sys_package: sys_package
+    }, {
+        operationType: current.operation(),
+        eventType: 'tour_insert_update_1'
+    });
+
+
+    //STRY4701115 - Usage Data: New Metrics - Published and Un-published Tour Metadata
+
+    var status = '',
+        currentStatus = current.status.toString(),
+        previousStatus = previous.status.toString();
+    if (currentStatus === 'published' && previousStatus === 'draft')
+        status = [previousStatus, currentStatus].join('_to_');
+    else if (currentStatus === 'draft' && previousStatus === 'published')
+        status = [previousStatus, currentStatus].join('_to_');
+
+    if (status) {
+
+        api.send({
+            tourId: id,
+            tourName: name,
+            roles: userhasAdminroles
+        }, {
+            operationType: current.operation(),
+            eventType: 'tour_status_change_' + status
+        });
+    }
+
+    /*
+     STRY4701368 - Usage Data: New Metrics - Tour Deactivation and Activation Metadata
+    */
+
+    if (current.operation().toString() === 'update' && current.active.toString() !== previous.active.toString()) {
+        //Active state is changed
+        api = new sn_tourbuilder.GTPlatformAnalyticsAPI();
+        //STRY10051612 : LU&A : Reduce custom key metrics to 5
+        eventType = 'tour_state_active_';
+        payload_id = gs.generateGUID();
+        api.send({
+            payloadId: payload_id,
+            tourId: id,
+            tourName: name,
+            active: current.active.toString(),
+            userId: currentUser.getID(),
+        }, {
+            operationType: current.operation(),
+            eventType: eventType + 'part1'
+        });
+        api = new sn_tourbuilder.GTPlatformAnalyticsAPI();
+        api.send({
+            payloadId: payload_id,
+            userName: currentUser.getName(),
+            roles: userhasAdminroles
+        }, {
+            operationType: current.operation(),
+            eventType: eventType + 'part2'
+        });
+    }
+
+    //STRY8756115 : LU&A: Include new Skippable/Mandatory field info in tour metadata to Central Collection Server
+
+    if (current.status.toString() === 'published' && current.operation().toString() === 'update' && previous.status.toString() === 'draft') {
+        var ga = new GlideAggregate('sys_embedded_tour_step');
+        ga.addQuery('guide', id);
+        ga.addAggregate('COUNT', 'skippable');
+        ga.setGroup(true);
+        ga.groupBy('skippable');
+        ga.query();
+        var totalSteps = skippedSteps = aggrCount = 0;
+        while (ga.next()) {
+            aggrCount = parseInt(ga.getAggregate('COUNT', 'skippable'));
+            if (ga.getDisplayValue('skippable') === 'true')
+                skippedSteps = aggrCount;
+            totalSteps += aggrCount;
+        }
+        //STRY10051612 : Reduce custom key metrics to 5
+        eventType = 'tour_with_step_details_';
+        payload_id = gs.generateGUID();
+        api = new sn_tourbuilder.GTPlatformAnalyticsAPI();
+        api.send({
+            payloadId: payload_id,
+            tourId: id,
+            tourName: name,
+            totalSteps: totalSteps,
+            skippedSteps: skippedSteps,
+        }, {
+            operationType: current.operation(),
+            eventType: eventType + 'part1'
+        });
+        api = new sn_tourbuilder.GTPlatformAnalyticsAPI();
+        api.send({
+            payloadId: payload_id,
+            active: current.active.toString(),
+            userId: currentUser.getID(),
+            userName: currentUser.getName(),
+            roles: current.roles.toString().split(','),
+        }, {
+            operationType: current.operation(),
+            eventType: eventType + 'part2'
+        });
+        api = new sn_tourbuilder.GTPlatformAnalyticsAPI();
+        api.send({
+            payloadId: payload_id,
+            introModal: current.has_intro.toString(),
+            conclModal: current.has_concl.toString()
+        }, {
+            operationType: current.operation(),
+            eventType: eventType + 'part3'
+        });
+    }
+
+})(current, previous);]]></script>
+        <sys_class_name>x_938076_now_utils_now_utils_business_rules</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 07:48:33</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>ea8b60d183701210c6695855eeaad339</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>gtd_tour_create_or_update</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>x_938076_now_utils_now_utils_business_rules_ea8b60d183701210c6695855eeaad339</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 07:48:33</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </x_938076_now_utils_now_utils_business_rules>
+    <sys_translated_text action="delete_multiple" query="documentkey=ea8b60d183701210c6695855eeaad339"/>
+</record_update>
