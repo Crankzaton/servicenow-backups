@@ -1,0 +1,642 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>97e38aca7787d1105f2ea1b35b5a9969</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_cmdb_ws.ApplicationServiceGraphDTOTranslator&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Scripted APIs to get application service details and transform it as per unified map need.&lt;/description&gt;
+        &lt;name&gt;ApplicationServiceGraphDTOTranslator&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ApplicationServiceGraphDTOTranslator = Class.create();
+ApplicationServiceGraphDTOTranslator.prototype = {
+    DEFAULT_NODE_LAYER: "Infrastructure",
+    SA_MAP_VIEW_PROPERTIES_CACHE: "SA_MAP_VIEW_PROPERTIES_CACHE",
+    CLUSTER_ID_SEPARATOR: ":",
+    initialize: function() {
+        this.applicationServiceAPI = new global.ApplicationServiceGraphDataAPIs();
+        this.MAX_CHUNK_SIZE = parseInt(gs.getProperty('sn_cmdb_ws.sm.max_chunk_to_query', '500'));
+        this.SKIP_ERROR_NODES = gs.getProperty('sn_cmdb_ws.sm.skip_error_nodes', "true");
+        this.baseParametersForNodesDefault = {
+            "cmdb_ci": ["sys_class_name", "owned_by", "operational_status", "life_cycle_stage", "life_cycle_stage_status", "discovery_source", "last_discovered", "sys_updated_on"],
+            "cmdb_ci_service_discovered": ["busines_criticality"]
+        };
+        this.baseParametersForEdgesDefault = {
+            "cmdb_ci_endpoint": ["ip_address", "port"]
+        };
+        this.addAdditionalProperties = gs.getProperty("sn_cmdb_ws.sm.add_sm_properties", "false");
+        this.digest = new GlideDigest();
+        this.propertiesForFieldValues = ["sys_class_name"];
+        this.parentToChild = {};
+    },
+
+    /**
+     *
+     *  get application service graph json as per contract with cmdb workspace to display node map.
+     *  @param  {JSON}      bsId - Application service sys id.
+     *                      showLargeMap - true will return entire map even if max nodes limit exceeded else return error.
+     *                      baseParametersForNodes  - key - class name
+     *                                              - value - array of properties needed for that ci and its child classes.
+     *                      baseParametersForEdges  - key - class name
+     *                                              - value - array of properties needed for that ci and its child classes.
+     *                      propertiesWithBothDisplayAndFieldValues - array of properties for which we need both field value and display value.
+     *  @return {JSON} if user is restricted for service it will return true else false.
+     **/
+    getGraphDTO: function(requestJson) {
+        try {
+            if (!requestJson.bsId) {
+                this._throwError(gs.getMessage("Application service id is mandatory in request parameters: {0}", JSON.stringify(requestJson)));
+            }
+            if (!requestJson.getIconFromClass) {
+                this._throwError(gs.getMessage("Method to fetch icons is mandatory input: {0}", JSON.stringify(requestJson)));
+            }
+            var parameters = {
+                "bsId": requestJson.bsId,
+            };
+            if (!requestJson.showLargeMap || requestJson.showLargeMap == true) {
+                parameters["showLargeMap"] = "";
+            }
+
+            var serviceMappingGraphJSON = JSON.parse(this.applicationServiceAPI.getApplicationServiceApiResponse("getMap", parameters));
+            var baseParametersForNodes = (requestJson.baseParametersForNodes &amp;&amp; Object.keys(requestJson.baseParametersForNodes).length != 0) ? requestJson.baseParametersForNodes : this.baseParametersForNodesDefault;
+            var baseParametersForEdges = (requestJson.baseParametersForEdges &amp;&amp; Object.keys(requestJson.baseParametersForEdges).length != 0) ? requestJson.baseParametersForEdges : this.baseParametersForEdgesDefault;
+            this.addAdditionalProperties = requestJson.addAdditionalProperties ? requestJson.addAdditionalProperties : this.addAdditionalProperties;
+            this.propertiesForFieldValues = requestJson.propertiesForFieldValues ? requestJson.propertiesForFieldValues : this.propertiesForFieldValues;
+            this.iconMethod = requestJson.getIconFromClass;
+            return this._transformToCMDBMap(requestJson.bsId, serviceMappingGraphJSON, baseParametersForNodes, baseParametersForEdges);
+        } catch (error) {
+            this._throwError(gs.getMessage("Failed to fetch graph data for service {0}", requestJson.bsId));
+        }
+
+    },
+
+    /**
+     *
+     *  Check is user has access to application service record.
+     *  @param  {string}  bsId - Application service sys id.
+     *  @param  {string}  userId - User id of user if not passed it takes current logged in user.
+     *  @return {boolean} if user is restricted for service it will return true else false.
+     **/
+    isApplicationServiceReadingPermitted: function(bsId, userId) {
+        if (!userId) {
+            userId = gs.getUserID();
+        }
+        var gr = new GlideRecord("cmdb_ci_service_auto");
+        if (gr.get(bsId)) {
+            return applicationServiceAPI.isUserRestrictedForApplicationService(gr, userId);
+        } else {
+            this._throwError(gs.getMessage("Application service with id {0} does not exist", bsId));
+        }
+
+    },
+
+    /**
+     *
+     *  get all services associated with configuration items.
+     *  @param  {Array} ciList - Array of sys ids of configuration
+     *  @return {JSON}  key - configuration item sys id.
+     *                  value - array of application service sys ids of which configuration item is part of.
+     **/
+    getApplicationServicesAssociatedWithCi: function(ciList) {
+        return this.applicationServiceAPI.getApplicationServicesAssociatedWithCi(ciList, true);
+    },
+
+    setBaseParametersForNodes: function(inputParams) {
+        this.baseParametersForNodesDefault = inputParams;
+    },
+
+    setBaseParametersForEdges: function(inputParams) {
+        this.baseParametersForEdgesDefault = inputParams;
+    },
+
+    _transformToCMDBMap: function(bsId, serviceMappingGraphJSON, baseParametersForNodes, baseParametersForEdges) {
+        var nodeList = [],
+            edgeList = [];
+        this._buildNodesAndEdgesListFromDTO(serviceMappingGraphJSON, nodeList, edgeList);
+
+        var propertiesForNodes = this._retrieveNodeProperties(bsId, nodeList, baseParametersForNodes);
+        if (!propertiesForNodes[bsId]) {
+            this._throwError(gs.getMessage('Failed to get properties for service {0}', bsId));
+        }
+        var propertiesForEdges = this._retrieveEdgeProperties(edgeList, baseParametersForEdges);
+
+        var nodeMap = this._buildNodeMap(bsId, nodeList, edgeList, propertiesForNodes, propertiesForEdges);
+        this._addApplicationServiceCount(nodeMap);
+        return this._bfsNodeMap(bsId, nodeMap);
+    },
+
+    // DTO JSON store the grouping nodes and edges in hierarchy structure
+    // This method build one flat list with all the nodes and one flat list with all edges.
+    _buildNodesAndEdgesListFromDTO: function(dtoJSON, nodeList, edgeList) {
+        if (dtoJSON.nodes) {
+            // Add current nodes to result list and trigger the method to check child node and connection for current nodes.
+            dtoJSON.nodes.forEach(function(node) {
+                nodeList.push(node);
+                this._buildNodesAndEdgesListFromDTO(node, nodeList, edgeList);
+            }.bind(this));
+        }
+
+        // Add connection to result list
+        if (dtoJSON.edges) {
+            dtoJSON.edges.forEach(function(edge) {
+                edgeList.push(edge);
+            });
+        }
+    },
+
+    _addApplicationServiceCount: function(nodeMap) {
+        var nodeIds = Object.keys(nodeMap);
+        if (nodeIds.length &gt; 0) {
+            var countForCIs = this.getApplicationServicesAssociatedWithCi(nodeIds);
+            for (var i = 0; i &lt; nodeIds.length; i++) {
+                nodeMap[nodeIds[i]].applicationServicesCount = (countForCIs[nodeIds[i]]) ? countForCIs[nodeIds[i]].length : 0;
+            }
+        }
+    },
+
+    // Create node map with all the properties according CMDB JSON
+    _buildNodeMap: function(bsId, nodeList, edgesList, propertiesForNodes, propertiesForEdges) {
+        try {
+            var cmdbNodesMap = {},
+                entryPointIds = [],
+                connectedEndpointSet = {},
+                classNameSet = {};
+
+            nodeList.forEach(function(node) {
+                if (!(node.type == "DISCOVERY_ERROR_ENDPOINT" &amp;&amp; this.SKIP_ERROR_NODES == "true")) {
+                    var cmdbNode = {};
+                    cmdbNode.icon = this.iconMethod(node.ciType);
+                    // Node has a parent -&gt; node is part of a grouping. Need to update parent group members list.
+                    if (node.parent) {
+                        cmdbNode.groupIds = [];
+                        var parent = node.parent.split(this.CLUSTER_ID_SEPARATOR)[0];
+                        cmdbNode.groupIds.push(parent);
+                        this.parentToChild[parent].push(node.originalId);
+                    }
+
+                    // Node has child node -&gt; node is grouped node.
+                    if (node.nodes &amp;&amp; node.nodes.length &gt; 0) {
+                        cmdbNode.isGroup = true;
+                        cmdbNode.groupType = node.groupType;
+                        this.parentToChild[node.originalId] = [];
+                    }
+
+                    if (node.type === "CONNECTED_ENDPOINT") {
+                        connectedEndpointSet[node.originalId] = node.helperId;
+                        this._addCMDBNodeCommonData(cmdbNode, node.helperId, propertiesForNodes[node.helperId]);
+                        cmdbNodesMap[node.helperId] = cmdbNode;
+                    } else {
+                        this._addCMDBNodeCommonData(cmdbNode, node.originalId, propertiesForNodes[node.originalId], node.ciTypeName, node.name);
+                        cmdbNodesMap[node.originalId] = cmdbNode;
+                    }
+
+                    if (node.type === "ENTRYPOINT")
+                        entryPointIds.push(node.originalId);
+
+                    if (!classNameSet[node.ciType])
+                        classNameSet[node.ciType] = true;
+                }
+            }.bind(this));
+
+            this._addConnectionToNodeMap(edgesList, cmdbNodesMap, propertiesForEdges, connectedEndpointSet);
+            this._addConnectionsToGroup(cmdbNodesMap);
+
+            // Add service node with the endpoints connection(should replace the endpoint layer in the map).
+            this._addServiceNode(bsId, entryPointIds, propertiesForNodes[bsId], cmdbNodesMap);
+            // Add service class name to class name set
+            classNameSet[cmdbNodesMap[bsId].properties.Class] = true;
+            this._addLayerToNodeMap(cmdbNodesMap, classNameSet);
+            return cmdbNodesMap;
+        } catch (e) {
+            this._throwError(gs.getMessage('Failed to build node map for {0} error: {1}', [bsId, e]));
+        }
+    },
+
+    _addCMDBNodeCommonData: function(cmdbNode, id, properties, className, name) {
+        var serviceClassAndName = {};
+        if (!className)
+            serviceClassAndName = this._getServiceClassAndName(id);
+
+        cmdbNode.Class = className ? className : serviceClassAndName.className;
+        cmdbNode.Name = name ? name : serviceClassAndName.name;
+        cmdbNode.properties = properties;
+        cmdbNode.applicationServicesCount = 0;
+        cmdbNode.connections = [];
+        return cmdbNode;
+    },
+
+    _addConnectionsToGroup: function(cmdbNodeMap) {
+        var parents = Object.keys(this.parentToChild);
+        for (var i = 0; i &lt; parents.length; i++) {
+            for (var j = 0; j &lt; this.parentToChild[parents[i]].length; j++) {
+                var cmdbConnection = {};
+                cmdbConnection.sourceId = parents[i];
+                cmdbConnection.targetId = this.parentToChild[parents[i]][j];
+                cmdbConnection.id = this._generateMD5Hex(parents[i] + "_" + cmdbNodeMap[parents[i]].groupType + "_" + this.parentToChild[parents[i]][j]);
+                cmdbConnection._label = this._sanitizeGroupType(cmdbNodeMap[parents[i]].groupType);
+                cmdbConnection.isVirtualConnection = false;
+                cmdbConnection.isReference = false;
+                cmdbConnection.endpoints = [];
+                cmdbNodeMap[parents[i]].connections.push(cmdbConnection);
+            }
+        }
+    },
+
+    _sanitizeGroupType: function(groupName) {
+        var words = groupName.split("_");
+        for (var i = 0; i &lt; words.length; i++) {
+            words[i] = words[i][0].toUpperCase() + words[i].substr(1);
+        }
+
+        return words.join(" ");
+    },
+
+    _addConnectionToNodeMap: function(edgesList, cmdbNodesMap, propertiesForEdges, connectedEndpointSet) {
+        // Map the connections to the relevant parent node.
+        edgesList.forEach(function(edge) {
+            var cmdbConnection = {};
+            cmdbConnection.epId = edge.epId;
+            cmdbConnection.sourceId = connectedEndpointSet[edge.sourceId] ? connectedEndpointSet[edge.sourceId] : edge.sourceId;
+            cmdbConnection.sourceId = cmdbConnection.sourceId.split(this.CLUSTER_ID_SEPARATOR)[0];
+            cmdbConnection.targetId = connectedEndpointSet[edge.targetId] ? connectedEndpointSet[edge.targetId] : edge.targetId;
+            cmdbConnection.targetId = cmdbConnection.targetId.split(this.CLUSTER_ID_SEPARATOR)[0];
+            cmdbConnection.id = this._generateMD5Hex(cmdbConnection.sourceId + "_" + edge.epId + "_" + cmdbConnection.targetId);
+            cmdbConnection._label = "Connection";
+            cmdbConnection.isVirtualConnection = false;
+            cmdbConnection.isReference = false;
+            cmdbConnection.endpoints = [];
+
+            // Add the dynamic connection properties.
+            Object.keys(propertiesForEdges[edge.epId]).forEach(function(property) {
+                cmdbConnection[property] = propertiesForEdges[edge.epId][property];
+            });
+
+            if (cmdbNodesMap.hasOwnProperty(cmdbConnection.targetId)) {
+                // Add the connection to the parent node.
+                if (edge.reverseHidden)
+                    cmdbNodesMap[edge.targetId].connections.push(cmdbConnection);
+                else if (connectedEndpointSet[edge.sourceId])
+                    cmdbNodesMap[connectedEndpointSet[edge.sourceId]].connections.push(cmdbConnection);
+                else if (cmdbNodesMap[edge.sourceId])
+                    cmdbNodesMap[edge.sourceId].connections.push(cmdbConnection);
+            }
+        }.bind(this));
+
+    },
+
+    _addLayerToNodeMap: function(cmdbNodesMap, classNameSet) {
+        // Query the class - layer values.
+        var classLayer = this._getCmdbLayerData(classNameSet);
+
+        // Update the node map with the layer value.
+        Object.keys(cmdbNodesMap).forEach(function(node) {
+            if (cmdbNodesMap[node].properties) {
+                if (classLayer[cmdbNodesMap[node].properties.Class])
+                    cmdbNodesMap[node].layer = classLayer[cmdbNodesMap[node].properties.Class];
+                else {
+                    // If specific class does not have a layer - check it parents.
+                    // Get tables method return all ci class hierarchy in-order.
+                    var tables = new GlideTableHierarchy(cmdbNodesMap[node].properties.Class).getTables();
+                    for (var i = 0; i &lt; tables.length; i++) {
+                        if (classLayer[tables[i]]) {
+                            cmdbNodesMap[node].layer = classLayer[tables[i]];
+                            break;
+                        }
+                    }
+                    // Add default layer value("Infrastructure') if not found parent - should not happen.
+                    cmdbNodesMap[node].layer = cmdbNodesMap[node].layer ? cmdbNodesMap[node].layer : this.DEFAULT_NODE_LAYER;
+                    // Save the result to prevent later parent check logic.
+                    classLayer[cmdbNodesMap[node].properties.Class] = cmdbNodesMap[node].layer;
+                }
+            } else {
+                gs.error("ApplicationServiceGraphDTOTranslator: Unable to get layer information for node " + node + " as properties does not exists");
+            }
+        });
+    },
+
+    _getCmdbLayerData: function(classNameSet) {
+        var classNameHierarchySet = {};
+
+        // Build unique class map(include hierarchy) for layer query.
+        Object.keys(classNameSet).forEach(function(className) {
+            if (!classNameHierarchySet[className]) {
+                // Get tables method return all ci class hierarchy in-order.
+                var tables = new GlideTableHierarchy(className).getTables();
+                tables.forEach(function(table) {
+                    classNameHierarchySet[table] = true;
+                });
+            }
+        });
+
+        // Convert to array.
+        var ciClassList = Object.keys(classNameHierarchySet);
+        var classLayer = {};
+
+        // Query layers in batches and build class - layer map.
+        for (var i = 0; i &lt; ciClassList.length; i += this.MAX_CHUNK_SIZE) {
+            var part = ciClassList.slice(i, i + this.MAX_CHUNK_SIZE);
+            var grLayer = new GlideRecordSecure("cmdb_layer");
+            grLayer.addQuery("class", part);
+            grLayer.query();
+            while (grLayer.next()) {
+                // Build class to layer map with children classes.
+                classLayer[grLayer.getValue("class")] = grLayer.getElement("layer").getChoiceValue();
+            }
+        }
+
+        return classLayer;
+    },
+
+    _addServiceNode: function(serviceId, entryPoints, properties, cmdbNodesMap) {
+        try {
+            var serviceNode = {};
+            properties["Entry Points"] = [];
+            if (!cmdbNodesMap.hasOwnProperty(serviceId)) {
+                var serviceClassAndName = this._getServiceClassAndName(serviceId);
+                serviceNode.Class = serviceClassAndName.className;
+                serviceNode.icon = this.iconMethod(serviceClassAndName.classLabel);
+                serviceNode.Name = serviceClassAndName.name;
+                serviceNode.applicationServicesCount = 0;
+                serviceNode.connections = [];
+            } else {
+                serviceNode = cmdbNodesMap[serviceId];
+            }
+            entryPoints.forEach(function(entryPoint) {
+
+                // Create a copy of the connection object array to change the source id value.
+                var entryPointConnections = JSON.parse(JSON.stringify(cmdbNodesMap[entryPoint].connections));
+
+                // adding entry points for discovered services.
+                if (cmdbNodesMap[entryPoint].Class != "Manual Endpoint")
+                    properties["Entry Points"].push(cmdbNodesMap[entryPoint]["Name"]);
+
+
+                // Change the source id of the connection to the service node.
+                entryPointConnections.forEach(function(connection) {
+                    if (connection.targetId != serviceId) {
+                        connection.sourceId = serviceId;
+                        serviceNode.connections.push(connection);
+                    }
+                    // add entry points for manual endpoints.
+                    if (cmdbNodesMap[entryPoint].Class == "Manual Endpoint") {
+                        properties["Entry Points"].push(cmdbNodesMap[connection.targetId]["Name"]);
+                    }
+                });
+            }.bind(this));
+            serviceNode.properties = properties;
+            cmdbNodesMap[serviceId] = serviceNode;
+        } catch (error) {
+            this._throwError(gs.getMessage('Failed to add service node due to error {0}', error));
+        }
+    },
+
+    _getServiceClassAndName: function(serviceId) {
+        var result = {};
+        var gr = new GlideRecordSecure("cmdb_ci");
+        if (gr.get(serviceId)) {
+            result.className = gr.getDisplayValue("sys_class_name");
+            result.name = gr.getDisplayValue("name");
+            result.classLabel = gr.getValue("sys_class_name");
+        }
+        return result;
+    },
+
+    // Use BFS to build the CMDB graph JSON in the same way in every run.
+    _bfsNodeMap: function(serviceNodeId, cmdbNodesMap) {
+        var result = {
+            ciNodeInfo: {},
+        };
+
+        // BFS with levels - because each node can have connection(next level) and
+        // can have parent(same level) or children(same level) as part of the grouping.
+        var bfsNodeIdQueue = [
+            [serviceNodeId],
+            []
+        ];
+        var bfsLevel = 0;
+
+        // BFS loop - loop end when there is no new nodes in current or next level.
+        while (bfsNodeIdQueue[bfsLevel].length &gt; 0 || bfsNodeIdQueue[bfsLevel + 1].length &gt; 0) {
+            // Get next node from current layer or next layer. if not found - exit the loop.
+            if (bfsNodeIdQueue[bfsLevel].length &gt; 0)
+                var nodeId = bfsNodeIdQueue[bfsLevel].shift();
+            else if (bfsNodeIdQueue[++bfsLevel].length &gt; 0) {
+                nodeId = bfsNodeIdQueue[bfsLevel].shift();
+                bfsNodeIdQueue[bfsLevel + 1] = [];
+            } else {
+                break;
+            }
+
+            // Check we did not visit this node.
+            if (result.ciNodeInfo[nodeId]) continue;
+
+            result.ciNodeInfo[nodeId] = cmdbNodesMap[nodeId];
+
+            // Add the connection target to the bfs next layer.
+            // Add the connections to the result.
+            result.ciNodeInfo[nodeId].connections.forEach(function(connection) {
+                if (connection.targetId === nodeId)
+                    bfsNodeIdQueue[bfsLevel + 1].push(connection.sourceId);
+                else
+                    bfsNodeIdQueue[bfsLevel + 1].push(connection.targetId);
+            });
+
+            //Add child node to current bfs layer.
+            if (this.parentToChild[nodeId])
+                bfsNodeIdQueue[bfsLevel] = bfsNodeIdQueue[bfsLevel].concat(this.parentToChild[nodeId]);
+
+            // Add parent node to current bfs layer.
+            if (cmdbNodesMap[nodeId].groupIds)
+                bfsNodeIdQueue[bfsLevel] = bfsNodeIdQueue[bfsLevel].concat(cmdbNodesMap[nodeId].groupIds);
+        }
+
+        return result;
+    },
+
+    _retrieveNodeProperties: function(bsId, nodeList, baseParameters) {
+        try {
+            var nodeIds = nodeList.map(function(node) {
+                return node.type === "CONNECTED_ENDPOINT" ? node.helperId : node.id;
+            });
+            nodeIds.push(bsId);
+            var basePropertiesForNodes = this._getCItoPropertiesMap(nodeIds, baseParameters);
+            gs.debug("ApplicationServiceGraphDTOTranslator: Successfully retrieved properties for nodes: " + JSON.stringify(basePropertiesForNodes));
+            return basePropertiesForNodes;
+        } catch (error) {
+            this._throwError(gs.getMessage('Failed to retrieve base properties for nodes due to error {0}', error));
+        }
+    },
+
+    _retrieveEdgeProperties: function(edgeList, baseParameters) {
+        try {
+            var epIds = edgeList.map(function(edge) {
+                return edge.epId;
+            });
+
+            var epPropertiesForConnection = this._getCItoPropertiesMap(epIds, baseParameters);
+
+            gs.debug("ApplicationServiceGraphDTOTranslator: Successfully retrieved properties for connections: " + JSON.stringify(epPropertiesForConnection));
+            return epPropertiesForConnection;
+        } catch (error) {
+            this._throwError(gs.getMessage('Failed to retrieve connection properties due to error {0}', error));
+        }
+    },
+
+    _getCItoPropertiesMap: function(sysIds, baseParameters) {
+
+        var ciToPropertiesMap = {};
+        var classToCiMap = {};
+        for (var i = 0; i &lt; sysIds.length; i += this.MAX_CHUNK_SIZE) {
+            var chunk = sysIds.slice(i, i + this.MAX_CHUNK_SIZE);
+            var gr = new GlideRecordSecure("cmdb_ci");
+            gr.addQuery("sys_id", "IN", chunk);
+            gr.query();
+            while (gr.next()) {
+                if (!classToCiMap.hasOwnProperty(gr.getValue("sys_class_name")))
+                    classToCiMap[gr.getValue("sys_class_name")] = [];
+
+                classToCiMap[gr.getValue("sys_class_name")].push(gr.getUniqueValue());
+            }
+        }
+        var classes = Object.keys(classToCiMap);
+        for (var j = 0; j &lt; classes.length; j++) {
+            var propertiesForClass = this._getPropertiesFromView("sa_map_properties", classes[j], baseParameters);
+            if (propertiesForClass.length &gt; 0) {
+                var propertiesNameToLabel = this._getPropertiesLabels(classes[j], propertiesForClass);
+                for (var l = 0; l &lt; classToCiMap[classes[j]].length; l += this.MAX_CHUNK_SIZE) {
+                    var part = classToCiMap[classes[j]].slice(l, l + this.MAX_CHUNK_SIZE);
+                    var grForClass = new GlideRecordSecure(classes[j]);
+                    grForClass.addQuery("sys_id", "IN", part);
+                    grForClass.query();
+                    while (grForClass.next()) {
+                        ciToPropertiesMap[grForClass.getUniqueValue()] = {};
+                        for (var k = 0; k &lt; propertiesForClass.length; k++) {
+                            if (propertiesNameToLabel.hasOwnProperty(propertiesForClass[k])) {
+                                if (this.propertiesForFieldValues.indexOf(propertiesForClass[k]) != -1) {
+                                    ciToPropertiesMap[grForClass.getUniqueValue()][propertiesNameToLabel[propertiesForClass[k]]] = grForClass.getValue(propertiesForClass[k]);
+                                } else {
+                                    ciToPropertiesMap[grForClass.getUniqueValue()][propertiesNameToLabel[propertiesForClass[k]]] = grForClass.getDisplayValue(propertiesForClass[k]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return ciToPropertiesMap;
+    },
+
+    _getPropertiesLabels: function(className, properties) {
+        var nameToLabel = {};
+        var dictionary = new GlideRecord("sys_dictionary");
+        dictionary.addQuery("name", className);
+        dictionary.addQuery("element", "IN", properties);
+        dictionary.query();
+        while (dictionary.next()) {
+            nameToLabel[dictionary.getValue("element")] = dictionary.getValue("column_label");
+        }
+        return nameToLabel;
+    },
+
+    // for the input class we fetch all the parent table names in hierarchy and try to fetch the properties from the input ui view.
+    // if no properties found in the view than we fetch all direct properties for that class and then search for parent class in the view.
+    // at the end we also add the default base properties that needs to be part of the properties as per invokers request.
+    _getPropertiesFromView: function(viewName, className, baseParameters) {
+        var tables = new GlideTableHierarchy(className).getTables();
+        var properties = [];
+        if (this.addAdditionalProperties == "true") {
+            properties = JSON.parse(sn_scoped_cache.ScopedCacheManager.get(this.SA_MAP_VIEW_PROPERTIES_CACHE, className));
+            if (!properties) {
+                properties = [];
+                try {
+                    var tableWithoutViews = [];
+                    for (var k = 0; k &lt; tables.length; k++) {
+                        var gr = new GlideRecord("sys_ui_view");
+                        gr.addQuery("name", viewName);
+                        gr.query();
+                        if (gr.next()) {
+                            var grSection = new GlideRecord("sys_ui_section");
+                            grSection.addQuery("name", tables[k]);
+                            grSection.addQuery('view', gr.getUniqueValue());
+                            grSection.query();
+                            if (grSection.next()) {
+                                var grElement = new GlideRecord("sys_ui_element");
+                                grElement.addQuery("sys_ui_section", grSection.getUniqueValue());
+                                grElement.addNullQuery("type");
+                                grElement.orderBy("position");
+                                grElement.query();
+                                while (grElement.next()) {
+                                    properties.push(grElement.getValue("element"));
+                                }
+                            }
+                        }
+                        if (properties.length &gt; 0)
+                            break;
+                        tableWithoutViews.push(tables[k]);
+                    }
+                    if (tableWithoutViews.length &gt; 0) {
+                        for (var i = 0; i &lt; tableWithoutViews.length; i++) {
+                            var tableProperties = this.applicationServiceAPI.getUniqueClassElementDescriptors(tableWithoutViews[i]);
+                            if (tableProperties.length &gt; 0) {
+                                properties = properties.concat(tableProperties);
+                            }
+                        }
+                    }
+                    sn_scoped_cache.ScopedCacheManager.put(this.SA_MAP_VIEW_PROPERTIES_CACHE, className, JSON.stringify(properties));
+                } catch (error) {
+                    gs.error("ApplicationServiceGraphDTOTranslator: Error fetching properties for " + className + " adding only default properties");
+                }
+            }
+        }
+        for (var l = 0; l &lt; tables.length; l++) {
+            if (baseParameters.hasOwnProperty(tables[l])) {
+                properties.push.apply(properties, baseParameters[tables[l]]);
+            }
+        }
+        return properties;
+    },
+
+    _generateMD5Hex: function(value) {
+        return this.digest.getMD5Hex(value);
+    },
+
+    _throwError: function(err) {
+        gs.error("ApplicationServiceGraphDTOTranslator exception msg : = " + err);
+        throw new sn_ws_err.BadRequestError(err);
+    },
+
+    type: 'ApplicationServiceGraphDTOTranslator'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-11-10 09:47:25&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;97e38aca7787d1105f2ea1b35b5a9969&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;21&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ApplicationServiceGraphDTOTranslator&lt;/sys_name&gt;
+        &lt;sys_package display_value="CMDB Workspace" source="sn_cmdb_ws"&gt;c8ab76825371201032b7ddeeff7b1280&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="CMDB Workspace"&gt;c8ab76825371201032b7ddeeff7b1280&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_97e38aca7787d1105f2ea1b35b5a9969&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-03-04 15:34:41&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:45:56</sys_created_on>
+        <sys_id>b2a87c5183341210c6695855eeaad35a</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ApplicationServiceGraphDTOTranslator</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_b2a87c5183341210c6695855eeaad35a</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:45:56</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

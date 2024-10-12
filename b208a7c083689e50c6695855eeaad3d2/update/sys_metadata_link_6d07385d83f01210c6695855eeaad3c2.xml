@@ -1,0 +1,321 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>73e88a0e430121102aeb1ca57bb8f2b4</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_entitlement.RoleTypeInferer&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;RoleTypeInferer&lt;/description&gt;
+        &lt;name&gt;RoleTypeInferer&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var RoleTypeInferer = Class.create();
+RoleTypeInferer.prototype = {
+    TEXT_FULFILLER: 'fulfiller',
+    TEXT_BUSINESS_STAKEHOLDER: 'business_stakeholder',
+    TEXT_APPROVER: 'approver',
+    TEXT_TIMECARD_USER: 'time_card_user',
+    TEXT_REQUESTOR: 'requester',
+    TEXT_ADMIN: 'admin',
+    TEXT_NONE: 'none',
+    TEXT_USER: 'user',
+    TEXT_CONF_HIGH: 'h',
+    TEXT_CONF_MED: 'm',
+    TEXT_CONF_LOW: 'l',
+    TEXT_CONF_NO: 'no',
+
+    TABLE_TYPE_TASK: 'te',
+    TABLE_TYPE_NON_TASK: 'nt',
+
+    ACL_NOOP: 'n',
+    ACL_UNRESTRICTED: 'u',
+    ACL_RESTRICTED: 'r',
+    ACL_USER_RESTRICTED: 'ur',
+    ACL_APPROVER_RESTRICTED: 'a',
+    ACL_UNKNOWN: 'ukn',
+
+    initialize: function() {
+        // TODO FIX cross referenced constants
+        this.ACL_TASK_EXTENTION_NO_CONDITION = this.ACL_UNRESTRICTED + this.TABLE_TYPE_TASK;
+        this.ACL_NON_TASK_EXTENTION_NO_CONDITION = this.ACL_UNRESTRICTED + this.TABLE_TYPE_NON_TASK;
+        this.ACL_TASK_EXTENTION_WITH_CONDITION = this.ACL_RESTRICTED + this.TABLE_TYPE_TASK;
+        this.ACL_NON_TASK_EXTENTION_WITH_CONDITION = this.ACL_RESTRICTED + this.TABLE_TYPE_NON_TASK;
+        this.ACL_TASK_EXTENTION_WITH_APPROVER_CONDITION = this.ACL_APPROVER_RESTRICTED + this.TABLE_TYPE_TASK;
+        this.ACL_TASK_EXTENTION_WITH_UNKNOWN = this.ACL_UNKNOWN + this.TABLE_TYPE_TASK;
+        this.ACL_NON_TASK_EXTENTION_WITH_UNKNOWN = this.ACL_UNKNOWN + this.TABLE_TYPE_NON_TASK;
+        this.ACL_TASK_EXTENTION_WITH_NOOP = this.ACL_NOOP + this.TABLE_TYPE_TASK;
+        this.ACL_NON_TASK_EXTENTION_WITH_NOOP = this.ACL_NOOP + this.TABLE_TYPE_NON_TASK;
+        this.ACL_NON_TASK_EXTENTION_WITH_APPROVER_CONDITION = this.ACL_APPROVER_RESTRICTED + this.TABLE_TYPE_NON_TASK;
+        this.ACL_TASK_EXTENTION_WITH_USER_CONDITION = this.ACL_USER_RESTRICTED + this.TABLE_TYPE_TASK;
+        this.ACL_NON_TASK_EXTENTION_WITH_USER_CONDITION = this.ACL_USER_RESTRICTED + this.TABLE_TYPE_NON_TASK;
+
+        this.MESSAGES = {};
+        this._loadMessages();
+
+        this.ROLE_ORDER = {};
+        this.ROLE_ORDER[this.TEXT_NONE] = 0;
+        this.ROLE_ORDER[this.TEXT_TIMECARD_USER] = 10;
+        this.ROLE_ORDER[this.TEXT_REQUESTOR] = 20;
+        this.ROLE_ORDER[this.TEXT_APPROVER] = 30;
+        this.ROLE_ORDER[this.TEXT_BUSINESS_STAKEHOLDER] = 40;
+        this.ROLE_ORDER[this.TEXT_FULFILLER] = 50;
+        this.ROLE_ORDER[this.TEXT_ADMIN] = 80;
+
+        this.CONFIDENCE_ORDER = {};
+        this.CONFIDENCE_ORDER[this.TEXT_CONF_NO] = 0;
+        this.CONFIDENCE_ORDER[this.TEXT_CONF_LOW] = 10;
+        this.CONFIDENCE_ORDER[this.TEXT_CONF_MED] = 20;
+        this.CONFIDENCE_ORDER[this.TEXT_CONF_HIGH] = 30;
+    },
+
+    /**
+     * getDefaultDetectedType
+     * Return the defaul detected type object with role type as NONE
+     * @returns {object} object { roleType, confidence, code, message }
+     */
+    getDefaultDetectedType: function() {
+        return {
+            'roleType': this.TEXT_NONE,
+            'confidence': this.TEXT_CONF_NO,
+            'code': null,
+            'message': null
+        };
+    },
+
+    /**
+     * mergeDetectedTypes
+     * Given two detected type objects, return the detected type which is highest in sort order
+     * of role types and confidence
+     * @param {object} detectedType
+     * @param {object} inputDetectedType
+     * @returns {object} object { roleType, confidence, code, message }
+     */
+    mergeDetectedTypes: function(detectedType, inputDetectedType) {
+        var outputDetectedType = {
+            'roleType': detectedType.roleType,
+            'confidence': detectedType.confidence,
+            'code': detectedType.code,
+            'message': detectedType.message
+        }
+        outputDetectedType.roleType = [outputDetectedType.roleType, inputDetectedType.roleType].sort(this._sortRoleTypes.bind(this))[0];
+
+        // if this is the same type, take the highest confidence
+        if (outputDetectedType.roleType == inputDetectedType.roleType) {
+            outputDetectedType.confidence = [outputDetectedType.confidence, inputDetectedType.confidence].sort(this._sortConfidence.bind(this))[0];
+            if (outputDetectedType.confidence == inputDetectedType.confidence) {
+                outputDetectedType.code = inputDetectedType.code;
+                outputDetectedType.message = inputDetectedType.message;
+            }
+        }
+
+        return outputDetectedType;
+    },
+
+    /**
+     * fixTimeCardDetectedType
+     * Return timecard specific role type if input role type is requestor
+     * @param {object} detectedType
+     * @returns {object} object { roleType, confidence, code, message }
+     */
+    fixTimeCardDetectedType: function(detectedType) {
+        if (detectedType.roleType == this.TEXT_REQUESTOR) {
+            return {
+                'roleType': this.TEXT_TIMECARD_USER,
+                'confidence': this.TEXT_CONF_HIGH,
+                'code': detectedType.code,
+                'message': detectedType.message
+            }
+        }
+        return detectedType;
+    },
+
+    /**
+     * getDetectedType
+     * Based on ACL counts by table/acl types, determine role type with confidence level
+     * @param {object} tableInfo Object containing metadata about table
+     * @param {object} acls Aggregate ACL count object
+     * @returns {object} object { roleType, confidence, code, message }
+     */
+    getDetectedType: function(tableInfo, acls) {
+        var detectedType = {
+            'roleType': null,
+            'confidence': null,
+            'message': null
+        };
+
+        if (tableInfo.isTaskExt == true) {
+            //gs.info('predicting for a task table: ' + tableInfo.name);
+            //gs.info(JSON.stringify(acls, null, "&amp;nbsp;"));
+            // task table rules
+            if (acls.table[this.ACL_TASK_EXTENTION_WITH_USER_CONDITION].read &gt; 0 &amp;&amp;
+                acls.table[this.ACL_TASK_EXTENTION_NO_CONDITION].read == 0 &amp;&amp;
+                acls.table[this.ACL_TASK_EXTENTION_WITH_CONDITION].read == 0) {
+                // if you can only read your records, you are a requester
+                detectedType.roleType = this.TEXT_REQUESTOR;
+                detectedType.confidence = this.TEXT_CONF_MED;
+                detectedType.code = 'personalread';
+                detectedType.message = this._getMessage(detectedType.code);
+            } else if ((acls.table[this.ACL_TASK_EXTENTION_NO_CONDITION].write &gt; 0 ||
+                        acls.table[this.ACL_TASK_EXTENTION_WITH_CONDITION].write &gt; 0) &amp;&amp;
+                       (acls.field[this.ACL_TASK_EXTENTION_NO_CONDITION].commentWrite &gt; 0 ||
+                        acls.field[this.ACL_TASK_EXTENTION_WITH_CONDITION].commentWrite &gt; 0) &amp;&amp;
+                        acls.field[this.ACL_TASK_EXTENTION_NO_CONDITION].write == 0 &amp;&amp;
+                        acls.field[this.ACL_TASK_EXTENTION_WITH_CONDITION].write == 0
+                ) {
+                // write to comment fields only on a task extension
+                detectedType.roleType = this.TEXT_BUSINESS_STAKEHOLDER;
+                detectedType.confidence = this.TEXT_CONF_MED;
+                detectedType.code = 'commentwritenotpersonal';
+                detectedType.message = this._getMessage(detectedType.code);
+            } else if (acls.table[this.ACL_TASK_EXTENTION_NO_CONDITION].write &gt; 0) {
+                // write to a task extension with no restriction and there is no user restriction to prevent users from only seeing their records
+                detectedType.roleType = this.TEXT_FULFILLER;
+                detectedType.confidence = this.TEXT_CONF_HIGH;
+                detectedType.code = 'writenotpersonal';
+                detectedType.message = this._getMessage(detectedType.code);
+            } else if (acls.field[this.ACL_TASK_EXTENTION_NO_CONDITION].write &gt; 0) {
+                // write to a field on task extension with no restriction
+                detectedType.roleType = this.TEXT_FULFILLER;
+                detectedType.confidence = this.TEXT_CONF_MED;
+                detectedType.code = 'fieldwrite';
+                detectedType.message = this._getMessage(detectedType.code);
+            } else if (acls.table[this.ACL_TASK_EXTENTION_WITH_CONDITION].write &gt; 0) {
+                // write to a non-task extension with no condition
+                detectedType.roleType = this.TEXT_FULFILLER;
+                detectedType.confidence = this.TEXT_CONF_MED;
+                detectedType.code = 'condwrite';
+                detectedType.message = this._getMessage(detectedType.code);
+            } else if (acls.table[this.ACL_TASK_EXTENTION_NO_CONDITION].read &gt; 0) {
+                // read all records in a task extension
+                detectedType.roleType = this.TEXT_BUSINESS_STAKEHOLDER;
+                detectedType.confidence = this.TEXT_CONF_HIGH;
+                detectedType.code = 'unrestread';
+                detectedType.message = this._getMessage(detectedType.code);
+            } else if (acls.table[this.ACL_TASK_EXTENTION_WITH_CONDITION].read &gt; 0) {
+                // read all records in a task extension
+                detectedType.roleType = this.TEXT_BUSINESS_STAKEHOLDER;
+                detectedType.confidence = this.TEXT_CONF_MED;
+                detectedType.code = 'condread';
+                detectedType.message = this._getMessage(detectedType.code);
+            } else if (acls.table[this.ACL_TASK_EXTENTION_WITH_APPROVER_CONDITION].read &gt; 0) {
+                // found the approval rule
+                detectedType.roleType = this.TEXT_APPROVER;
+                detectedType.confidence = this.TEXT_CONF_HIGH; // this can't happen on accident
+                detectedType.code = 'taskapprove';
+                detectedType.message = this._getMessage(detectedType.code);
+            } else {
+                // there is something here, so must be a requestor
+                detectedType.roleType = this.TEXT_REQUESTOR;
+                detectedType.confidence = this.TEXT_CONF_LOW;
+                detectedType.code = 'defaultreq';
+                detectedType.message = this._getMessage(detectedType.code);
+            }
+        } else {
+            // non-task table rules
+            if (acls.table[this.ACL_NON_TASK_EXTENTION_NO_CONDITION].write &gt; 0 &amp;&amp;
+                acls.table[this.ACL_NON_TASK_EXTENTION_WITH_USER_CONDITION].read == 0 &amp;&amp;
+                acls.table[this.ACL_NON_TASK_EXTENTION_WITH_CONDITION].read == 0) {
+                // write to a non-task extension with no condition
+                detectedType.roleType = this.TEXT_FULFILLER;
+                detectedType.confidence = this.TEXT_CONF_MED;
+                detectedType.code = 'unrestrictwritenontask';
+                detectedType.message = this._getMessage(detectedType.code);
+            } else if (acls.table[this.ACL_NON_TASK_EXTENTION_WITH_CONDITION].write &gt; 0 &amp;&amp;
+                        acls.table[this.ACL_NON_TASK_EXTENTION_WITH_USER_CONDITION].read == 0) {
+                // write to a non-task extension with a non personalized condition based on gs.getUser
+                detectedType.roleType = this.TEXT_FULFILLER;
+                detectedType.confidence = this.TEXT_CONF_LOW;
+                detectedType.code = 'condwritenontask';
+                detectedType.message = this._getMessage(detectedType.code);
+            } else if (acls.table[this.ACL_NON_TASK_EXTENTION_WITH_APPROVER_CONDITION].read &gt; 0) {
+                // there shouldn't be approvers on non-task, but check for it anyway
+                detectedType.roleType = this.TEXT_APPROVER;
+                detectedType.confidence = this.TEXT_CONF_LOW; // this can't happen on accident
+                detectedType.code = 'nontaskapprove';
+                detectedType.message = this._getMessage(detectedType.code);
+            } else {
+                // there is something here, so must be a requestor
+                detectedType.roleType = this.TEXT_REQUESTOR;
+                detectedType.confidence = this.TEXT_CONF_LOW;
+                detectedType.code = 'defaultreq';
+                detectedType.message = this._getMessage(detectedType.code);
+            }
+        }
+
+        return detectedType;
+    },
+
+    _sortRoleTypes: function (first, second) {
+        if (this.ROLE_ORDER[first] &gt; this.ROLE_ORDER[second]) {
+            return -1;
+        }
+        if (this.ROLE_ORDER[first] &lt; this.ROLE_ORDER[second]) {
+            return 1;
+        }
+        return 0;
+    },
+
+    _sortConfidence: function (first, second) {
+        if (this.CONFIDENCE_ORDER[first] &gt; this.CONFIDENCE_ORDER[second]) {
+            return -1;
+        }
+        if (this.CONFIDENCE_ORDER[first] &lt; this.CONFIDENCE_ORDER[second]) {
+            return 1;
+        }
+        return 0;
+    },
+
+    _loadMessages: function () {
+        this.MESSAGES['personalread'] = 'Personalized Read ACL found';
+        this.MESSAGES['writenotpersonal'] = 'Unrestricted Table Write ACL found on Task Table w/ no Personalized Read ACL';
+        this.MESSAGES['commentwritenotpersonal'] = 'Journaled write with no personalization';
+        this.MESSAGES['fieldwrite'] = 'Unrestricted Field Write ACL found on Task Table w/ no Personalized Read ACL on Table';
+        this.MESSAGES['condwrite'] = 'Conditional (not-personalized) write ACL found';
+        this.MESSAGES['unrestread'] = 'Unrestricted read ACL found';
+        this.MESSAGES['condread'] = 'Conditional read ACL found';
+        this.MESSAGES['taskapprove'] = 'Approver ACLs found';
+        this.MESSAGES['defaultreq'] = 'Unable to find a higher association';
+        this.MESSAGES['unrestrictwritenontask'] = 'Unconditional write ACL found with no personalized read ACL';
+        this.MESSAGES['condwritenontask'] = 'Conditional write ACL found with no personalized read ACL';
+        this.MESSAGES['nontaskapprove'] = 'Approver ACLs found on non-task table';
+    },
+
+
+    _getMessage: function (code) {
+        return this.MESSAGES[code];
+    },
+
+    type: 'RoleTypeInferer'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-02-17 20:14:38&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;73e88a0e430121102aeb1ca57bb8f2b4&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;RoleTypeInferer&lt;/sys_name&gt;
+        &lt;sys_package display_value="Licensing Engine" source="sn_entitlement"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Licensing Engine"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_73e88a0e430121102aeb1ca57bb8f2b4&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-02-17 20:14:38&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:38:44</sys_created_on>
+        <sys_id>6d07385d83f01210c6695855eeaad3c2</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>RoleTypeInferer</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_6d07385d83f01210c6695855eeaad3c2</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:38:44</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

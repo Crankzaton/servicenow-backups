@@ -1,0 +1,387 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>a09f09265300111095d2ddeeff7b1204</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_vsc.VSCComplianceUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;VSCComplianceUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var VSCComplianceUtil = Class.create();
+VSCComplianceUtil.prototype = {
+    initialize: function() {},
+    /**
+     * Check if property value matches with the currentVal being passed as function parameter and update compliance state of configuration respectively.
+     *
+     * @param {string} propertyName - The property name of the configuration
+     * @param {string} recValue - Recommended value for configuration
+     * @param {string} defaultValue - Default value for configuration
+     */
+    evaluateCompliance: function(propertyName, recValue, defaultValue) {
+        var grConfig = new GlideRecord('sn_vsc_security_check_configurations');
+        var propVal = gs.getProperty(propertyName) || defaultValue;
+        grConfig.get('config_name', propertyName);
+        if (propVal.toLowerCase().toString() == recValue.toLowerCase().toString()) {
+            grConfig.config_configure = true;
+        } else {
+            grConfig.config_configure = false;
+        }
+
+        // Fetch current property value and set to defaultValue if property has not been set yet
+        grConfig.config_current_value = propVal;
+        var settingArr = grConfig.config_setting.split(","); //Each dependency can belong to multiple configurations
+        grConfig.update();
+        this.updateSettingCompliance(settingArr);
+    },
+
+    /**
+     *Evaluate criteria in configuration groups and set compliance state of configuration whenever configuration is updated.
+     *
+     *@param {List} settingArr - List of all settings that configuration belongs to
+     */
+    updateSettingCompliance: function(settingArr) {
+        var grSetting = new GlideRecord('sn_vsc_instance_hardening_settings');
+        for (var i = 0; i &lt; settingArr.length; i++) {
+            var compliant = false;
+            var grp = new GlideRecord('sn_vsc_security_configuration_groups');
+            grp.addQuery('grp_setting', settingArr[i]);
+            grp.query();
+            while (grp.next() &amp;&amp; !compliant) { //For each group within configuration
+                var configs = grp.grp_list.split(",");
+                var encodedQuery = "config_configure=true^sys_id=" + configs.join("^ORsys_id=");
+                var gr = new GlideRecord('sn_vsc_security_check_configurations');
+                gr.addEncodedQuery(encodedQuery);
+                gr.query();
+                compliant = configs.length === gr.getRowCount();
+            }
+            grSetting.get(settingArr[i]);
+            grSetting.compliance_status = compliant ? 'compliant' : 'non-compliant'; //If any group has all configurations as compliant, then set setting as compliant
+            grSetting.update();
+        }
+    },
+
+    /**
+     * Check if property exists and not contain empty value.
+     *
+     * @param {string} propertyName Name of system property
+     */
+    checkNotNill: function(propertyName) {
+        var grConfig = new GlideRecord('sn_vsc_security_check_configurations');
+        grConfig.get('config_name', propertyName);
+        if (!gs.nil(gs.getProperty(propertyName))) {
+            grConfig.config_configure = true;
+        } else {
+            grConfig.config_configure = false;
+        }
+        grConfig.config_current_value = gs.getProperty(propertyName);
+        var settingArr = grConfig.config_setting.split(","); //Each configuration can belong to multiple settings
+        grConfig.update();
+        this.updateSettingCompliance(settingArr);
+    },
+
+    /**
+     *Check if Plugin is active and registered
+     *
+     *@param {string} pluginName Name of plugin.
+     */
+    checkPlugin: function(pluginName) {
+        var grConfig = new GlideRecord('sn_vsc_security_check_configurations');
+        grConfig.get('config_name', pluginName);
+        if (GlidePluginManager.isActive(pluginName)) {
+            grConfig.config_configure = true;
+        } else {
+            grConfig.config_configure = false;
+        }
+        var settingArr = grConfig.config_setting.split(","); //Each configuration can belong to multiple settings
+        grConfig.update();
+        this.updateSettingCompliance(settingArr);
+    },
+
+    /**
+     * Execute all records from Security Check Configurations table, update the compliance state of configurations respectively.
+     */
+    runComplianceCheck: function() {
+        var evaluator = new GlideScopedEvaluator();
+        var grSetting = new GlideRecord('sn_vsc_instance_hardening_settings');
+        grSetting.query();
+        while (grSetting.next()) {
+            var grConfig = new GlideRecord('sn_vsc_security_check_configurations');
+            grConfig.addQuery('config_setting', 'CONTAINS', grSetting.sys_id);
+            grConfig.query();
+            while (grConfig.next()) {
+                var settingArr = grConfig.config_setting.split(","); //Each configuration can belong to multiple settings
+                evaluator.evaluateScript(grConfig, 'config_evaluation_script', null);
+                this.updateSettingCompliance(settingArr);
+            }
+        }
+    },
+
+    /**
+     * Update the compliance state of given setting.
+     */
+    runSettingComplianceCheck: function(harcId) {
+        var evaluator = new GlideScopedEvaluator();
+        var grSetting = new GlideRecord('sn_vsc_instance_hardening_settings');
+        grSetting.addQuery('sys_id', harcId);
+        grSetting.query();
+        if (grSetting.next()) {
+            var grConfig = new GlideRecord('sn_vsc_security_check_configurations');
+            grConfig.addQuery('config_setting', 'CONTAINS', grSetting.sys_id);
+            grConfig.query();
+            while (grConfig.next()) {
+                var settingArr = grConfig.config_setting.split(","); //Each configuration can belong to multiple settings
+                evaluator.evaluateScript(grConfig, 'config_evaluation_script', null);
+                this.updateSettingCompliance(settingArr);
+            }
+        }
+    },
+
+    /**
+     *Update current value of configurations with user defined value on UI
+     *
+     *@param {object} responses Array of objects containing dependency name and its value.
+     */
+    activateConfigurations: function(responses) {
+        var result = '';
+        var evaluator = new GlideScopedEvaluator();
+        for (var obj in responses) {
+            var gr_dep = new GlideRecord('sn_vsc_security_check_configurations');
+			gr_dep.addEncodedQuery('config_name='+obj+'^config_link=NULL');
+            gr_dep.query();
+            if (gr_dep.next()) {
+                var vars = {
+                    'userInput': responses[obj]
+                };
+                result = evaluator.evaluateScript(gr_dep, 'config_remediation_script', vars);
+            }
+        }
+        return result;
+    },
+
+	/**
+     *Update compliance state of plugins and tabular configs
+     *
+     *@param {setting} sysId of settings
+     */
+    activateSpecialConfigs: function(setting) {
+        var evaluator = new GlideScopedEvaluator();
+        var grConfig = new GlideRecord('sn_vsc_security_check_configurations');
+        grConfig.addEncodedQuery('config_setting=' + setting + '^config_link!=NULL');
+        grConfig.query();
+        while (grConfig.next()) {
+            evaluator.evaluateScript(grConfig, 'config_remediation_script');
+        }
+    },
+    /**
+     * Check if property value matches with the default value being passed as function parameter and update compliance state of configuration respectively.
+     *
+     * @param {string} propertyName - The property name of the configuration
+     * @param {string} recValue - Recommended value for configuration
+     * @param {string} defaultValue - Default value for configuration
+     */
+	evaluateTextValues : function(propertyName, recValue, defaultValue){
+		var complianceState = true;
+		var recValues = recValue.split(",");
+		// set defaut value if the property does not exist
+		var sysPropertyVal = gs.getProperty(propertyName);
+		if (sysPropertyVal == null){
+			sysPropertyVal = defaultValue;
+		}
+		propValues = sysPropertyVal.split(",");
+		var grConfig = new GlideRecord("sn_vsc_security_check_configurations");
+		grConfig.get("config_name", propertyName);
+		if (recValues.length != propValues.length) {
+			complianceState = false;
+		} else {
+			for (var i in propValues){
+				if (recValues.indexOf(propValues[i].trim()) == -1){
+					complianceState = false;
+					break;
+				}
+			}
+		}
+		grConfig.config_current_value = sysPropertyVal;
+		grConfig.config_configure = complianceState;
+		grConfig.update();
+		var settingArr = grConfig.config_setting.split(","); //Each dependency can belong to multiple configurations
+        this.updateSettingCompliance(settingArr); // updated related Hardening setting state
+	},
+	
+	/**
+     * Check if the scanned date already has a scan result , if yes update with the latest scan result, else create one.
+     * @param {string} scanResult - scan_result record
+     */
+	setLatestScanSummary : function(scanResult){
+		var suiteId = '';
+		var gr_exec = new GlideRecord('scan_suite_execution');
+		gr_exec.addQuery('result', current.sys_id);
+		gr_exec.query();
+		if (gr_exec.next()) {
+			suiteId = gr_exec.suite;
+		}
+		var gr_sc_suite = new GlideRecord('label_entry');
+		gr_sc_suite.addEncodedQuery('table=scan_check_suite^table_key=' + suiteId);
+		gr_sc_suite.query();
+		if (gr_sc_suite.next() || suiteId == '833655cc1b94101046e87733cd4bcb4e') {
+			var result_created = new GlideDateTime(current.sys_created_on.getDisplayValue()).getDate();
+			var gr = new GlideRecord('sn_vsc_scan_summary');
+			gr.addQuery('result_created_on', result_created);
+			gr.addQuery('suite', suiteId);
+			gr.query();
+			if (gr.next()) {
+				gr.result = current.sys_id;
+				gr.update();
+			} else {
+				gr.initialize();
+				gr.result = current.sys_id;
+				gr.result_created_on = result_created;
+				gr.suite = suiteId;
+				gr.insert();
+			}
+		}
+	},
+	/***
+	 * Check if the property value is set with recommended integer value, and mark the compliance state of the configuration
+	 * @param {string} configName - configuration name 
+	 * @param {string} propertyName - property name 
+	 * @param {integer} recVal - recommended value
+	 * @param {integer} defaultVal - default value
+	 * @param {string} condition - condition to be evaluated
+	 */
+	evaluateConditionalValue: function(configName, propertyName, recVal, defaultVal, condition) {
+		var propVal = gs.getProperty(propertyName, defaultVal);
+		var res = false;
+		if (!isNaN(propVal)) {
+			if (condition == '&gt;=') {
+				res = propVal &gt;= recVal ? true : false;
+			} else if (condition == '&lt;=') {
+				res = propVal &lt;= recVal ? true : false;
+			} else if (condition == '==') {
+				res = propVal == recVal ? true : false;
+			} else if (condition == '!=') {
+				res = propVal != recVal ? true : false;
+			} else if (condition == '&lt;') {
+				res = propVal &lt; recVal ? true : false;
+			} else if (condition == '&gt;') {
+				res = propVal &gt; recVal ? true : false;
+			}
+		}
+
+		var grConfig = new GlideRecord('sn_vsc_security_check_configurations');
+		grConfig.get('config_name', configName);
+		grConfig.config_configure = res;
+		grConfig.config_current_value = propVal;
+		grConfig.update();
+
+		// update related hardening settings
+		var settingArr = grConfig.config_setting.split(",");
+		new sn_vsc.VSCComplianceUtil().updateSettingCompliance(settingArr);
+	},
+
+    updateComplianceStatusLookUp: function(harcId, complianceStatus) {
+        var grComplianceStatus = new GlideRecord('sn_vsc_harc_compliance_status_lookup');
+        // update the status, if the setting already exists
+        if (grComplianceStatus.get('harc_setting', harcId)) {
+            grComplianceStatus.harc_compliance_status = complianceStatus;
+            grComplianceStatus.update();
+        } else {
+            //create a new entry for the new setting
+            grComplianceStatus.initialize();
+            grComplianceStatus.harc_compliance_status = complianceStatus;
+            grComplianceStatus.harc_setting = harcId;
+            grComplianceStatus.insert();
+        }
+    },
+
+    //Insert into updated_settings table for new settings introduced
+    updateSettingsInsert: function(harcId, complianceStatus) {
+        var upSetting = new GlideRecord("sn_vsc_updated_settings");
+        if (!upSetting.get('u_setting', harcId)) {
+            upSetting.initialize();
+            upSetting.u_compliance_state = complianceStatus;
+            upSetting.u_setting = harcId;
+            upSetting.insert();
+        }
+    },
+
+	getCurrentReleaseVersion : function() {
+		var buildTag = gs.getProperty('glide.buildtag');
+		var releaseLetter = "";
+		if (buildTag != null) {
+			releaseLetter = buildTag.charAt(6);
+		}
+		return releaseLetter;
+	},
+	/**
+	 * There are some configurations that needs to be validated only in the introduced version or higher.
+	 * For such config , mark the config as compliant if the instance is on version prior to introduced version.
+	 */
+	setConfigCompliantByDefault: function(propName, configName, defaultVal) {
+		var propVal = gs.getProperty(propName, defaultVal);
+		var grConfig = new GlideRecord('sn_vsc_security_check_configurations');
+		grConfig.get('config_name', configName);
+		grConfig.config_configure = true;
+		grConfig.config_current_value = propVal;
+		grConfig.update();
+		// update related hardening settings
+		var settingArr = grConfig.config_setting.split(",");
+		new sn_vsc.VSCComplianceUtil().updateSettingCompliance(settingArr);
+	},
+	checkIfConfigNeedValidation: function(introducedVersion) {
+		var requireValidation = false;
+		var releaseLetter = "";
+		var releaseYear;
+		var relevantReleaseLetters = ['u', 'v', 'w', 'x', 'y', 'z'];
+		var introVersionIdx = relevantReleaseLetters.indexOf(introducedVersion);
+		if (introVersionIdx &gt;= 0) {
+			var buildTag = gs.getProperty('glide.buildtag');
+			if (buildTag != null) {
+				releaseLetter = buildTag.charAt(6);
+				var safeDate = 2024;
+				releaseYear = buildTag.split("-")[7];
+				if (buildTag.includes("hotfix")) {
+					releaseYear = buildTag.split("-")[8];
+				}
+				if ((relevantReleaseLetters.indexOf(releaseLetter) &gt;= introVersionIdx) || releaseYear &gt;= safeDate) {
+					requireValidation = true;
+				}
+			}
+		}
+		return requireValidation;
+	},
+    type: 'VSCComplianceUtil'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-06-15 16:07:59&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;a09f09265300111095d2ddeeff7b1204&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;VSCComplianceUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Security Center" source="sn_vsc"&gt;a51d46e3f2014110366b10017c5ba675&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Security Center"&gt;a51d46e3f2014110366b10017c5ba675&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_a09f09265300111095d2ddeeff7b1204&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;maint&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-13 16:57:28&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:46:21</sys_created_on>
+        <sys_id>15c8f09183341210c6695855eeaad39d</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>VSCComplianceUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_15c8f09183341210c6695855eeaad39d</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:46:21</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

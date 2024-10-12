@@ -1,0 +1,979 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>b27f489d5385b01037daddeeff7b126d</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_ds_api.DigitalSignatureUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Handles operations for fetching and saving digital signatures, as well as verifying whether the current user can sign. Entry points can be customized through the DigitalSignatureUtilsProvider extension point.&lt;/description&gt;
+        &lt;name&gt;DigitalSignatureUtils&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var DigitalSignatureUtils = Class.create();
+DigitalSignatureUtils.prototype = {
+    initialize: function() {
+		this.EXTENSION_POINT_NAME = 'sn_ds_api.DigitalSignatureUtilsProvider';
+
+		this.documentType = {
+			ATTACHMENT: 'attachment',
+			HTML: 'html'
+		};
+
+		this.signatureType = {
+			DRAW: 'draw',
+			TYPE: 'type'
+		};
+
+		this.operationTypes = {
+			SIGNATURE_IMAGE: 'signatureimage',
+			E_SIGNATURE: 'esign',
+			GENERATE_PDF: 'generatepdf'
+		};
+
+		this.operationStates = {
+			SUCCESS: 'success',
+			ERROR: 'error'
+		};
+
+		// defaults
+		this.DEFAULT_GENERATED_PDF_NAME = 'signed document';
+		this.DEFAULT_HTML_SIGNATURE_HEIGHT = 40;
+		this.DEFAULT_HTML_SIGNATURE_WIDTH = 100;
+
+		// image constants
+		this.IMAGE_PREFIX = 'data:image/png;base64,';
+		this.PNG_EXTENSION = '.png';
+		this.PNG_IMAGE_CONTENT_TYPE = 'image/png';
+
+		// sys_properties
+		this.SYS_PROPERTY_RETRIEVE_SIGNATURE = 'com.snc.signaturepad.retrieveSignature';
+
+		//user preference
+		this.USER_PREFERENCE_USE_SAVED_SIGNATURE = 'use.saved.signature';
+		// tables
+		this.TABLE_TASK = 'task';
+		this.TABLE_SIGNATURE_IMAGE = 'signature_image';
+		this.TABLE_ESIGN_ACKNOWLEDGEMENT = 'sn_esign_acknowledgement';
+
+		// signature_image fields
+		this.FIELD_USER = 'user';
+		this.FIELD_DOCUMENT = 'document';
+		this.FIELD_TABLE = 'table';
+		this.FIELD_UPDATED_ON = 'sys_updated_on';
+		this.FIELD_DATA = 'data';
+		this.FIELD_IS_DRAWING = 'is_drawing';
+		this.FIELD_SIGNED_NAME = 'signed_name';
+		this.FIELD_SIGNED_ON = 'signed_on';
+		this.FIELD_SIGNATURE_IMAGE_ACKNOWLEDGEMENT_TEXT = 'acknowledgment_text';
+
+		this.SIGNATURE_IMAGE_DATA_PREFIX = 'output = ';
+
+		this.FIELD_CLASS_NAME = 'sys_class_name';
+		this.FIELD_SYS_ID = 'sys_id';
+
+		// e-signature fields
+		this.FIELD_ESIGN_CONFIGURATION = 'sn_esign_esignature_configuration';
+		this.FIELD_ESIGN_DOCUMENT = 'sn_esign_document';
+
+		//e-signature acknowledgement fields
+		this.FIELD_ACKNOWLEDGED = 'acknowledged';
+		this.FIELD_ESIGN_ACKNOWLEDGEMENT_TEXT = 'acknowledgement_text';
+		this.FIELD_ACKNOWLEDGEMENT_TYPE = 'acknowledgement_type';
+		this.FIELD_ESIGN_ACKNOWLEDGEMENT_DOCUMENT = 'document';
+		this.FIELD_ESIGN_DOCUMENT_REVISION = 'document_revision';
+		this.FIELD_KB_ARTICLE = 'kb_article';
+		this.FIELD_SIGNATURE = 'signature';
+		this.FIELD_DOMAIN = 'sys_domain';
+		this.FIELD_TABLE_NAME = 'table_name';
+
+		// signature data fields for validation
+		this.SIGNATURE_DATA_FIELDS = ['tabFocused', 'signature', 'encodedSignature', 'saveSignature'];
+
+		// HTML signature token fields for validation
+		this.SIGNATURE_TOKENS_HTML_REQUIRED_FIELDS = ['signature'];
+
+		// PDF signature token fields for validation
+		this.SIGNATURE_TOKENS_PDF_REQUIRED_FIELDS = ['attachmentSysId', 'mappings'];
+
+		// tokens key for inserting signature data
+		this.SIGNATURE_KEY = 'signature';
+
+		// warning messages
+		this.WARNING_MULTIPLE_EXTENSION_POINTS = gs.getMessage('Multiple Digital Signature API providers found for same record.');
+
+		// error messages
+		this.ERROR_UNABLE_TO_RETRIEVE_SIGNATURE_DATA = gs.getMessage('Unable to retrieve signature data.');
+		this.ERROR_RECORD_NOT_FOUND = gs.getMessage('No record found.');
+		this.ERROR_INSERTING_SIGNATURE = gs.getMessage('Error inserting signature.');
+		this.ERROR_IMAGE_FORMAT_NOT_SUPPORTED = gs.getMessage('Image format not supported.');
+		this.ERROR_CREATING_SIGNATURE_IMAGE = gs.getMessage('Error creating signature_image record.');
+		this.ERROR_CREATING_IMAGE_ATTACHMENT = gs.getMessage('Error creating image attachment record.');
+		this.ERROR_INVALID_TASK_RECORD = gs.getMessage('Invalid task record.');
+		this.ERROR_INVALID_SIGNATURE_DATA = gs.getMessage('Invalid signature data.');
+		this.ERROR_INVALID_TYPE = gs.getMessage('Invalid document type provided, must be attachment or html.');
+		this.ERROR_INVALID_OPERATION = gs.getMessage('Invalid operation provided.');
+		this.ERROR_MISSING_REQUIRED_ARGUMENTS = gs.getMessage('Missing required arguments.');
+		this.ERROR_MISSING_HTML_CONTENT = gs.getMessage('Missing required input: html');
+		this.ERROR_MISSING_SIGNATURE_TOKENS = gs.getMessage('Missing required input: signatureTokens');
+		this.ERROR_MISSING_SIGNATURE_TOKENS_HTML = gs.getMessage('Missing required input: signatureTokens.html');
+		this.ERROR_MISSING_SIGNATURE_TOKENS_PDF = gs.getMessage('Missing required input: signatureTokens.pdf');
+		this.ERROR_NO_HTML_SIGNATURE_TOKEN_FOUND = gs.getMessage('No signature token found in HTML content.');
+
+		// PDF generation status
+		this.STATUS_FAILURE = 'failure';
+	},
+
+	/*
+	 * Checks for extension points that implement the passed in function, and if found,
+	 * runs them
+	 *
+	 * @param {string} table - the record table
+	 * @param {string} sysId - the record sysId
+	 * @param {string} name - the function name to call in the extension point
+	 *
+	 * @returns {object} output
+	 * {
+	 *     response.error? {string} - Error message set if the extension point message fails to run
+	 *     response.warning? {string} - Warning message set if multiple extension points are found for this record
+	 *     response.result? {string} - the output value of running the extension point method
+	 * }
+	 */
+	runExtension: function(table, sysId, name) {
+		if (!table || !sysId || !name)
+			return { error: this.ERROR_MISSING_REQUIRED_ARGUMENTS};
+
+		var output = {};
+
+		var eps = new GlideScriptedExtensionPoint().getExtensions(this.EXTENSION_POINT_NAME);
+		var applicableExtensions = eps.filter(function(ep) {
+			return typeof ep[name] === 'function' &amp;&amp; ep.shouldRun(table, sysId);
+		});
+
+		if (!applicableExtensions.length) {
+			output.extensionPointRan = false;
+			return output;
+		}
+
+		if (applicableExtensions.length &gt; 1)
+			output.warning = this.WARNING_MULTIPLE_EXTENSION_POINTS;
+
+		try {
+			output.result = eps[0][name](table, sysId);
+			output.extensionPointRan = true;
+		} catch (err) {
+			var errorMessage = gs.getMessage("Unable to run {0} method.", name);
+			output.extensionPointRan = false;
+			output.error = errorMessage;
+		}
+
+		return output;
+	},
+
+	/*
+	 * Checks whether the current user can sign a document on a record
+	 *
+	 * @param {string} table - the record table
+	 * @param {string} sysId - the record sysId
+	 *
+	 * @returns boolean
+	 */
+	canSign: canSign,
+
+	/*
+	 * Fetches signature data for a given record
+	 *
+	 * @param {string} table - the record table
+	 * @param {string} sysId - the record sysId
+	 *
+	 * @returns {object} response
+	 * {
+	 *     response.error? {string} - Error message set if the fetch fails
+	 *     response.data? {object}
+	 *         {
+	 *             response.data.attachmentId {string} sysId of the attachment record
+	 *             response.data.acknowledgmentText {string} acknowledgement text
+	 *             response.data.signature {string} signature data
+	 *             response.data.documentType {string} the document type, can be html or pdf
+	 *         }
+	 * }
+	 */
+	getSignatureData: getSignatureData,
+
+	/*
+	 * Signs a document. If attachment, creates a signature_image record from the signature data, and associates it with
+	 * the signed document. If HTML, generates a new PDF document and attaches it to the current record
+	 *
+	 * @param {string}    targetTable - the record table
+	 * @param {string}    targetSysId - the record sysId
+	 * @param {string}    tabFocused - the signature type, can be `draw` or `type`
+	 * @param {string}    signature - the signature data, a simple string if typed, or a stringified bitmap array if drawn
+	 * @param {string}    encodedSignature - base64 encoded image of the signature data
+	 * @param {boolean}   saveSignature - whether to set the save signature user preference
+	 * @param {string}    type - type of document to sign, can be attachment or HTML
+	 * @param {string}    operation - the operation to perform with the signature data. Defaults to generating a signature_image
+	 * @param {object}    signatureTokens? - signature tokens for filling HTML or PDF documents
+	 * @param {string}    signatureTokens.html.signature? - the token to replace with the signature in HTML content
+	 * @param {number}    signatureTokens.html.height? - height of the signature on the generated PDF
+	 * @param {number}    signatureTokens.html.width? - width of the signature on the generated PDF
+	 * @param {string}    signatureTokens.pdf.attachmentSysId? - the sysId of the PDF to sign
+	 * @param {object[]}  signatureTokens.pdf.mappings? - mappings for signature locations on the PDF
+	 *     signature mappings have the following shape:
+	 *         {
+	 *             pageNumber: number,
+	 *             signLeft: number,
+	 *             signTop: number
+	 *             boxWidth: number,
+	 *             boxHeight: number
+	 *         }
+	 * @param {string}    html? - the HTML content
+	 * @param {string}    generatedPdfName? - the filename for the generated document
+	 * @param {string}    agreementText? - the agreement text for this document
+	 *
+	 * @returns {object} response
+	 * {
+	 *     response.error? {string} - Error message set if signing fails
+	 *     response.sys_attachment {object}
+	 *         {
+	 *             response.sys_attachment.signature_image {string} sysId of the generated signature_image attachment
+	 *             response.sys_attachment.generated_pdf_with_signature {string} sysId of the generated pdf attachment
+	 *         }
+	 * }
+	 */
+	signDocument: signDocument,
+
+	/*
+	 * Generates a PDF from an HTML string with a signature attached. Will look for
+	 * a signature token in the HTML body to place the signature
+	 *
+	 * @param {string}  targetTable - the record table
+	 * @param {string}  targetSysId - the record sysId
+	 * @param {string}  signatureData.tabFocused - the signature type, can be `draw` or `type`
+	 * @param {string}  signatureData.signature - the signature data, a simple string if typed, or a stringified bitmap array if drawn
+	 * @param {string}  signatureData.encodedSignature - base64 encoded image of the signature data
+	 * @param {boolean} signatureData.saveSignature - whether to set the save signature user preference
+	 * @param {string}  html? - the HTML content
+	 * @param {object}  signatureTokens - signature tokens for filling the HTML content
+	 * @param {string}  signatureTokens.html.signature - the token to replace with the signature in HTML content
+	 * @param {number}  signatureTokens.html.height - height of the signature on the generated PDF
+	 * @param {number}  signatureTokens.html.width - width of the signature on the generated PDF
+	 * @param {string}  generatedPdfName? - the filename for the generated document
+	 * @param {string}  agreementText? - the agreement text, if provided
+	 *
+	 * @returns {object} response
+	 *         {
+	 *             response.signature_image {string} sysId of the generated signature_image attachment
+	 *             response.generated_pdf_with_signature {string} sysId of the generated pdf attachment
+	 *         }
+	 */
+	_signHTMLTemplateDocument: function(targetTable, targetSysId, signatureData, html, signatureTokens, generatedPdfName, agreementText) {
+		var signatureToken = signatureTokens.html.signature;
+		var signatureHeight = signatureTokens.html.height || this.DEFAULT_HTML_SIGNATURE_HEIGHT;
+		var signatureWidth = signatureTokens.html.width || this.DEFAULT_HTML_SIGNATURE_WIDTH;
+
+		var pdfGenerationAPI = new sn_pdfgeneratorutils.PDFGenerationAPI();
+
+		if (!signatureToken || !html.indexOf(signatureToken) &gt; 0)
+			return {
+				error: this.ERROR_NO_HTML_SIGNATURE_TOKEN_FOUND
+			};
+
+		var signatureImage = this._createSignatureImageHTMLDraft(targetTable, targetSysId, signatureData, agreementText);
+		var updatedHTML = this._replaceSignatureToken(html, signatureData.encodedSignature, signatureToken, signatureHeight, signatureWidth);
+
+		var result = pdfGenerationAPI.convertToPDFWithHeaderFooter(updatedHTML, targetTable, targetSysId, generatedPdfName, {});
+
+		return {
+			signature_image: signatureImage.attachment_id,
+			generated_pdf_with_signature: result.attachment_id
+		};
+	},
+
+	/*
+	 * Takes an HTML content string and replaces signature token with the signature image
+	 *
+	 * @param {string} html
+	 * @param {string} signatureImage
+	 * @param {string} signatureToken
+	 * @param {number} height - height of the signature on the generated PDF
+	 * @param {number} width - width of the signature on the generated PDF
+	 *
+	 * @returns {string} the HTML content with the signature token replaced
+	 */
+	_replaceSignatureToken: function(html, signatureImage, signatureToken, height, width) {
+		return html.replace(this._generateTokenMatch(signatureToken), this._createSignatureImageElement(signatureImage, height, width));
+	},
+
+	/*
+	 * Generates a Regex for a string token
+	 *
+	 * @param {string} token
+	 *
+	 * @returns {object} RegExp
+	 */
+	_generateTokenMatch: function(token) {
+		return new RegExp('\\$\\{' + token + '\\}', 'g');
+	},
+
+	/*
+	 * Takes a base64 encoded signature image and inserts it into an HTML image element string
+	 *
+	 * @param {string} signatureImage
+	 * @param {number} height - height of the signature on the generated PDF
+	 * @param {number} width - width of the signature on the generated PDF
+	 *
+	 * @returns {string}
+	 */
+	_createSignatureImageElement: function(signatureImage, height, width) {
+		return '&lt;img src="' + signatureImage + '" height="' + height + '" width="' + width + '" /&gt;';
+	},
+
+	/*
+	 * Signs a PDF document. Takes in the sys_id of a PDF attachment, and a list of mappings for signature placements,
+	 * and generates a signed PDF
+	 *
+	 * @param {string}    targetTable - the record table
+	 * @param {string}    targetSysId - the record sysId
+	 * @param {object}    signatureData - signature data
+	 * @param {string}    signatureData.tabFocused - the signature type, can be `draw` or `type`
+	 * @param {string}    signatureData.signature - the signature data, a simple string if typed, or a stringified bitmap array if drawn
+	 * @param {string}    signatureData.encodedSignature - base64 encoded image of the signature data
+	 * @param {boolean}   signatureData.saveSignature - whether to set the save signature user preference
+	 * @param {object}    signatureTokens - signature tokens for filling the PDF document
+	 * @param {string}    signatureTokens.pdf.attachmentSysId - the sysId of the PDF to sign
+	 * @param {object[]}  signatureTokens.pdf.mappings - mappings for signature locations on the PDF
+	 *     signature mappings have the following shape:
+	 *         {
+	 *             pageNumber: number,
+	 *             signLeft: number,
+	 *             signTop: number
+	 *             boxWidth: number,
+	 *             boxHeight: number
+	 *         }
+	 * @param {string}    generatedPdfName - the filename for the generated document
+	 * @param {string}    agreementText? - the agreement text for this document
+	 *
+	 * @returns {object} response
+	 *         {
+	 *             response.signature_image {string} sysId of the generated signature_image attachment
+	 *             response.generated_pdf_with_signature {string} sysId of the generated pdf attachment
+	 *         }
+	 */
+	_signPDFDocument: function(targetTable, targetSysId, signatureData, signatureTokens, generatedPdfName, agreementText) {
+		var fields = signatureTokens.fields || {};
+		var attachmentSysId = signatureTokens.pdf.attachmentSysId;
+		var mappings = signatureTokens.pdf.mappings;
+
+		var pdfSignRequestor = new sn_pdfgeneratorutils.PdfMergeSignRequestor();
+		var pdfUtils = new sn_pdfgeneratorutils.PDFGenerationAPI();
+
+		var signatureImage = this._createSignatureImageHTMLDraft(targetTable, targetSysId, signatureData, agreementText);
+
+		mappings.forEach(function(mapping) {
+			pdfSignRequestor.addSignatureMapping(
+				mapping.pageNumber,
+				mapping.signLeft,
+				mapping.signTop,
+				mapping.boxWidth,
+				mapping.boxHeight,
+				signatureImage.attachment_id
+			);
+		});
+
+		var response = pdfUtils.fillFieldsAndMergeSignature(
+			fields,
+			attachmentSysId,
+			targetTable,
+			targetSysId,
+			pdfSignRequestor,
+			generatedPdfName + ".pdf"
+		);
+
+		if (response.status === this.STATUS_FAILURE)
+			return {
+				error: response.message
+			}
+
+		return {
+			signature_image: signatureImage.attachment_id,
+			generated_pdf_with_signature: response.attachment_id
+		};
+	},
+
+	/*
+	 * Takes generated signature data, fetches the acknowledgement data for a record, and
+	 * and uses them to generate a signature_image record
+	 *
+	 * @param {GlideRecord} gr - the record table
+	 * @param {string} signatureData - signature data
+	 *
+	 * @returns {object} response
+	 * {
+	 *     response.error? {string[]} - Error messages set if the record creation fails
+	 *     response.signature_image? {string} - sysId of the created signature_image record
+	 * }
+	 */
+	_signTaskDocument: function(gr, signatureData) {
+		var table = gr.getValue(this.FIELD_CLASS_NAME);
+		var sysId = gr.getValue(this.FIELD_SYS_ID);
+
+		//create signature image
+		var signatureImage = this._createSignatureImageHTMLDraft(table, sysId, signatureData);
+
+		if (signatureImage.attachment_id) {
+			var acknowledgmentText = gr.getElement(this.FIELD_ESIGN_CONFIGURATION).getRefRecord().getValue(this.FIELD_ACKNOWLEDGEMENT_TEXT);
+			var managedDocDetails = new sn_esign.esign_taskUtils().getManagedDocumentDetails(gr.getValue(this.FIELD_ESIGN_DOCUMENT));
+			var documentRevision = managedDocDetails.table_sys_id;
+			var domain = gr.getElement(this.FIELD_ESIGN_CONFIGURATION).getRefRecord().getValue(this.FIELD_DOMAIN);
+			var kbArticle = gr.getElement(this.FIELD_ESIGN_CONFIGURATION).getRefRecord().getValue(this.FIELD_KB_ARTICLE);
+
+			//create acknowledgment record
+			this._saveDocumentAcknowledgement(acknowledgmentText, 'signature', sysId, documentRevision, signatureImage.signature_image_record_sys_id, domain, table, gs.getUserID(), kbArticle);
+			return {
+				signature_image: signatureImage.attachment_id
+			};
+		} else
+			return {
+				error: signatureImage.error
+			};
+	},
+
+	/*
+	 * Takes generated signature data, fetches the acknowledgement data for a record, and
+	 * and uses them to generate a signature_image record
+	 *
+	 * @param {string} acknowledgement_text - the record table
+	 * @param {string} esign_type - e-signature type
+	 * @param {string} sys_id - the record sysId
+	 * @param {string} document_revision - document revision sysId
+	 * @param {string} signature - stringified signature data
+	 * @param {string} domain - stringified signature data
+	 * @param {string} table_name - table name
+	 * @param {string} user_id - user sysId
+	 * @param {string} kb_article - KB article sysId
+	 *
+	 * @returns {object} response
+	 * {
+	 *     response.error? {string[]} - Error messages set if the record creation fails
+	 *     response.success? {string} - sysId of the created signature_image record
+	 * }
+	 */
+	_saveDocumentAcknowledgement : function(acknowledgement_text,
+											esign_type,
+											sys_id,
+											document_revision,
+											signature,
+											domain,
+											table_name,
+											user_id,
+											kb_article) {
+		var grTask = new GlideRecordSecure(this.TABLE_TASK);
+		var result = {};
+		if (grTask.get(sys_id)) {
+			var gr = new GlideRecord(this.TABLE_ESIGN_ACKNOWLEDGEMENT);
+			gr.initialize();
+			gr.setValue(this.FIELD_ACKNOWLEDGED, true);
+			if (acknowledgement_text)
+				gr.setValue(this.FIELD_ACKNOWLEDGEMENT_TEXT, acknowledgement_text);
+			gr.setValue(this.FIELD_ACKNOWLEDGEMENT_TYPE, esign_type);
+			gr.setValue(this.FIELD_ESIGN_ACKNOWLEDGEMENT_DOCUMENT, sys_id);
+			if (kb_article)
+				gr.setValue(this.FIELD_KB_ARTICLE, kb_article);
+			if (document_revision)
+				gr.setValue(this.FIELD_ESIGN_DOCUMENT_REVISION, document_revision);
+			if (signature)
+				gr.setValue(this.FIELD_SIGNATURE, signature);
+			gr.setValue(this.FIELD_DOMAIN, domain);
+			gr.setValue(this.FIELD_TABLE_NAME, table_name);
+			gr.setValue(this.FIELD_USER, user_id);
+			if (gr.insert())
+				result.status = this.operationStates.SUCCESS;
+			else
+				result.status = this.operationStates.ERROR;
+		} else
+			result.status = this.operationStates.ERROR;
+
+		return result;
+	},
+
+	/*
+	 * Takes generated signature data, fetches the acknowledgement data for a record, and
+	 * and uses them to generate a signature_image record
+	 *
+	 * @param {string} table - the record table
+	 * @param {string} sysId - the record sysId
+	 * @param {string} signedDocument - signature data
+	 * @param {string} agreementText? - agreement text
+	 *
+	 * @returns {object} response
+	 * {
+	 *     response.error? {string[]} - Error messages set if the record creation fails
+	 *     response.success? {string} - sysId of the created signature_image record
+	 * }
+	 */
+	_createSignatureImageHTMLDraft: function(table, sysId, signatureData, agreementText) {
+		var signedDocProcess = {
+			error: []
+		};
+
+		//create signature_image record
+		var signType = signatureData.tabFocused;
+		var signImage = signatureData.encodedSignature;
+		var signData = signatureData.signature;
+		var acknowledgmentText = agreementText || this._getSignatureAcknowledgment(table, sysId);
+		var insertedSignatureData = this._insertSignature(table, sysId, signType, signImage, signData, acknowledgmentText);
+
+		if (insertedSignatureData.attachment_id) {
+			signedDocProcess.signature_image_record_sys_id = insertedSignatureData.sys_id;
+			signedDocProcess.attachment_id = insertedSignatureData.attachment_id;
+		}
+		else if (insertedSignatureData.hasOwnProperty(this.operationStates.ERROR))
+			signedDocProcess.error.push(insertedSignatureData.error);
+		else
+			signedDocProcess.error.push(this.ERROR_INSERTING_SIGNATURE);
+
+		return signedDocProcess;
+	},
+
+	/*
+	 * Creates a signature_image record, populates its data with signature data,
+	 * and attaches the generated signature image
+	 *
+	 * @param {string} table - the record table
+	 * @param {string} recordId - the record sysId
+	 * @param {string} signatureType - the type of signature, can be `draw` or `type`
+	 * @param {string} signatureImage - a base64 encoded string of the generated signature image
+	 * @param {string} signatureData - signature data
+	 * @param {string} acknowledgmentText - acknowledgmentText
+	 *
+	 * @returns {object} response
+	 * {
+	 *     response.error? {string} - Error message set if the record creation fails
+	 *     response.success? {string} - sysId of the created signature_image record
+	 * }
+	 */
+	_insertSignature: function(table, recordId, signatureType, signatureImage, signatureData, acknowledgmentText) {
+		if ( !signatureImage.startsWith(this.IMAGE_PREFIX) )
+			return {
+				error: this.ERROR_IMAGE_FORMAT_NOT_SUPPORTED
+			};
+
+		var isDrawing = signatureType === this.signatureType.DRAW;
+		var isTypedSignature = signatureType === this.signatureType.TYPE;
+		var signatureImageRecordId = '';
+
+		var gr = new GlideRecord(this.TABLE_SIGNATURE_IMAGE);
+		gr.initialize();
+		gr.setValue(this.FIELD_USER, gs.getUserID());
+		gr.setValue(this.FIELD_DOCUMENT, recordId);
+		gr.setValue(this.FIELD_TABLE, table);
+		gr.setValue(this.FIELD_IS_DRAWING, isDrawing);
+		gr.setValue(this.FIELD_SIGNED_ON, new GlideDateTime());
+		gr.setValue(this.FIELD_SIGNATURE_IMAGE_ACKNOWLEDGEMENT_TEXT, acknowledgmentText);
+		if (isTypedSignature)
+			gr.setValue(this.FIELD_SIGNED_NAME, signatureData);
+		if (isDrawing)
+			gr.setValue(this.FIELD_DATA, this.SIGNATURE_IMAGE_DATA_PREFIX + signatureData);
+		signatureImageRecordId = gr.insert();
+
+		if (!signatureImageRecordId)
+			return {
+				error: this.ERROR_CREATING_SIGNATURE_IMAGE
+			};
+		else {
+			var imageAttachmentId = this._insertImageAttachment(gr, signatureImage);
+			if (!imageAttachmentId)
+				return {
+					error: this.ERROR_CREATING_IMAGE_ATTACHMENT
+				};
+			else
+				return {
+					sys_id: signatureImageRecordId,
+					attachment_id: imageAttachmentId
+				};
+		}
+	},
+
+	/*
+	 * Attaches the generated image to a signature_image record
+	 *
+	 * @param {GlideRecord} signatureImageRecord - a signature_image record
+	 * @param {string} image - a base64 encoded string of the generated signature image
+	 *
+	 * @returns {string} sysId of the attached image
+	 */
+	_insertImageAttachment: function(signatureImageRecord, image) {
+		var signatureAttachment = new GlideSysAttachment();
+		var signatureAttachmentId = signatureAttachment.writeBase64(
+			signatureImageRecord, signatureImageRecord.getUniqueValue() + this.PNG_EXTENSION,
+			this.PNG_IMAGE_CONTENT_TYPE, image.substring(this.IMAGE_PREFIX.length)
+		);
+
+		return signatureAttachmentId || null;
+	},
+
+	/*
+	 * Fetches the acknowledgement data for a given record
+	 *
+	 * @param {string} table - the record table
+	 * @param {string} sysId - the record sysId
+	 *
+	 * @returns {string} acknowledgement text
+	 */
+	_getSignatureAcknowledgment: function (table, sysId) {
+		var gr = new GlideRecordSecure(table);
+		gr.get(sysId);
+		var acknowledgement = gr.getElement(this.FIELD_ESIGN_CONFIGURATION).getRefRecord().getValue(this.FIELD_ESIGN_ACKNOWLEDGEMENT_TEXT);
+
+		return acknowledgement
+			? acknowledgement.toString()
+			: '';
+	},
+
+	/*
+	 * Updates the user preference for whether to use the saved signature
+	 *
+	 * @param {boolean} saveSignature - whether to use the saved signature to pre-fill the digital signature
+	 *
+	 * @returns {void}
+	 */
+	_updateUseSavedSignaturePref: function(saveSignature) {
+		gs.getUser().savePreference(this.USER_PREFERENCE_USE_SAVED_SIGNATURE, saveSignature);
+	},
+
+	/*
+	 * Fetches the current user's latest signature data for a given record class
+	 * from the signature_image table. Signature data is only retrieved if
+	 * the `retrieveSignature` system property is enabled.
+	 *
+	 * @param {string} table - the record table
+	 *
+	 * @returns {object} signature
+	 * {
+	 *     signature.isDrawn {boolean} - whether the signature image is drawn, or typed if false
+	 *     signature.signedName {string} - text of the signed name, if signature is typed
+	 *     signature.data {string} - stringified contents of the signature data, if signature is drawn
+	 * }
+	 */
+	_retrieveSignatureData: function() {
+		var output = {
+			isDrawn: null,
+			signature: null,
+			saveSignature: null
+		};
+		var retrieveSignature = gs.getProperty(this.SYS_PROPERTY_RETRIEVE_SIGNATURE, 'true') == 'true';
+		if (!retrieveSignature)
+			return output;
+
+		var useSavedSignature = gs.getUser().getPreference(this.USER_PREFERENCE_USE_SAVED_SIGNATURE) == 'true';
+		output.saveSignature = useSavedSignature;
+		if (!useSavedSignature)
+			return output;
+
+		var gr = new GlideRecordSecure(this.TABLE_SIGNATURE_IMAGE);
+		gr.addQuery(this.FIELD_USER, gs.getUserID());
+		gr.orderByDesc(this.FIELD_UPDATED_ON);
+		gr.query();
+
+		if (gr.next()) {
+			var isDrawn = gr.getValue(this.FIELD_IS_DRAWING) === '1';
+			var data = gr.getValue(this.FIELD_DATA);
+			var drawnData = data ? JSON.stringify(data.substring(data.indexOf('['))) : data;
+			var signedName = gr.getValue(this.FIELD_SIGNED_NAME);
+
+			output.isDrawn = isDrawn;
+			output.signature = isDrawn ? drawnData : signedName;
+		}
+
+		return output;
+	},
+
+	/*
+	 * Validates the operation parameter
+	 *
+	 * @param {string} operation - the operation value
+	 *
+	 * @returns {object} output
+	 * {
+	 *     output.valid {boolean} - whether the operation is valid
+	 *     output.operation? {string} - the operation value with case sensitivity removed, if valid
+	 * }
+	 */
+	_validateOperation: function(operation) {
+		var output = {
+			valid: false
+		};
+
+		// default to signature image if no operation provided
+		if (!operation) {
+			output.valid = true;
+			output.operation = this.operationTypes.SIGNATURE_IMAGE;
+			return output;
+		}
+
+		if (typeof operation !== 'string') {
+			output.valid = false;
+			return output;
+		}
+
+		operation = operation.toLowerCase();
+
+		for (key in this.operationTypes) {
+			if (operation === this.operationTypes[key]) {
+				output.valid = true;
+				output.operation = operation;
+				break;
+			}
+		}
+
+		return output;
+	},
+
+	/*
+	 * Validates the presence of all necessary signature data fields
+	 *
+	 * @param {string} data - the signature data
+	 *
+	 * @returns {object} output
+	 * {
+	 *     output.valid {boolean} - whether the signature data is valid
+	 *     output.errors? {string[]} - errors for invalid fields
+	 * }
+	 */
+	_validateSignatureData: function(data) {
+		var output = {
+			valid: true
+		};
+
+		this.SIGNATURE_DATA_FIELDS.forEach(function(field) {
+			if (!data.hasOwnProperty(field) || !field) {
+				output.valid = false;
+				var message = gs.getMessage('Missing value for field {0}', field);
+				output.errors = output.errors ? output.errors.concat(message) : [message];
+			}
+		});
+
+		return output;
+	},
+
+	/*
+	 * Validates the presence of all necessary signature token inputs
+	 *
+	 * @param {string} type - the signature type
+	 * @param {object} signatureTokens - the signature token inputs
+	 *
+	 * @returns {object} output
+	 * {
+	 *     output.valid {boolean} - whether the signatureToken input is valid
+	 *     output.errors {string[]} - errors for invalid fields
+	 * }
+	 */
+	_validateSignatureTokens: function(type, signatureTokens) {
+		var output = {
+			valid: true,
+			errors: []
+		};
+
+		if (!signatureTokens) {
+			output.valid = false;
+			output.errors.push(this.ERROR_MISSING_SIGNATURE_TOKENS);
+			return output;
+		}
+
+		switch (type) {
+			case (this.documentType.HTML): {
+				if (!signatureTokens.html) {
+					output.valid = false;
+					output.errors = this.ERROR_MISSING_SIGNATURE_TOKENS_HTML;
+				} else {
+					this.SIGNATURE_TOKENS_HTML_REQUIRED_FIELDS.forEach(function(field) {
+						if (!signatureTokens.html.hasOwnProperty(field) || !signatureTokens.html[field]) {
+							output.valid = false;
+							var message = gs.getMessage('Missing value for field: {0}', field);
+							output.errors.push(message);
+						}
+					});
+				}
+				break;
+			}
+			case (this.documentType.ATTACHMENT): {
+				if (!signatureTokens.pdf) {
+					output.valid = false;
+					output.errors = this.ERROR_MISSING_SIGNATURE_TOKENS_PDF;
+				} else {
+					this.SIGNATURE_TOKENS_PDF_REQUIRED_FIELDS.forEach(function(field) {
+						if (!signatureTokens.pdf.hasOwnProperty(field) || !signatureTokens.pdf[field]) {
+							output.valid = false;
+							var message = gs.getMessage('Missing value for field: {0}', field);
+							output.errors.push(message);
+						}
+					});
+				}
+				break;
+			}
+		}
+
+		return output;
+	},
+
+	/*
+	 * Takes generated signature data, fetches the acknowledgement data for a record, and
+	 * and uses them to generate a signature_image record
+	 *
+	 * @param {string} table - the record table
+	 * @param {string} sysId - the record sysId
+	 * @param {string} signatureData - signature data
+	 * @param {string} agreementText? - agreement text
+	 *
+	 * @returns {object} response
+	 * {
+	 *     response.signature_image {string} - sysId of the created signature_image record
+	 * }
+	 */
+	_generateSignatureImage: function(targetTable, targetSysId, signatureData, agreementText) {
+		var signatureImage = this._createSignatureImageHTMLDraft(targetTable, targetSysId, signatureData, agreementText); 
+
+		return {
+			signature_image: signatureImage.attachment_id
+		};
+	},
+
+    type: 'DigitalSignatureUtils'
+};
+
+function canSign(table, sysId) {
+    if (!table || !sysId)
+        return null;
+
+    var extResult = this.runExtension(table, sysId, arguments.callee.name);
+    if (extResult.extensionPointRan)
+        return extResult.result;
+
+    var gr = new GlideRecordSecure(table);
+    return gr.get(sysId);
+}
+
+function getSignatureData(table, sysId) {
+    var extResult = this.runExtension(table, sysId, arguments.callee.name);
+    if (extResult.extensionPointRan)
+        return extResult.result;
+
+    var response = {};
+    var data = this._retrieveSignatureData();
+    response.data = data;
+    if (data.signature === null)
+        response.error = this.ERROR_UNABLE_TO_RETRIEVE_SIGNATURE_DATA;
+
+    return response;
+}
+
+function signDocument(
+		targetTable,
+		targetSysId,
+		tabFocused,
+		signature,
+		operation,
+		encodedSignature,
+		saveSignature,
+		type,
+		signatureTokens,
+		html,
+		generatedPdfName,
+		agreementText
+	) {
+	if (!targetTable || !targetSysId)
+		return { error: this.ERROR_MISSING_REQUIRED_ARGUMENTS };
+
+	var signatureData = {
+		tabFocused: tabFocused,
+		signature: signature,
+		encodedSignature: encodedSignature,
+		saveSignature: saveSignature
+	};
+
+	var signatureDataValidation = this._validateSignatureData(signatureData);
+	if (!signatureDataValidation.valid)
+		return { error: this.ERROR_INVALID_SIGNATURE_DATA };
+
+	var operationValidation = this._validateOperation(operation);
+	if (!operationValidation.valid)
+		return { error: this.ERROR_INVALID_OPERATION };
+
+	operation = operationValidation.operation;
+
+	if (operation === this.operationTypes.GENERATE_PDF) {
+		if (type === this.documentType.HTML &amp;&amp; !html)
+			return { error: this.ERROR_MISSING_HTML_CONTENT };
+
+		var signatureTokenValidation = this._validateSignatureTokens(type, signatureTokens);
+		if (!signatureTokenValidation.valid)
+			return {
+				errors: signatureTokenValidation.errors
+			};
+	}
+
+	var extResult = this.runExtension(targetTable, targetSysId, arguments.callee.name);
+	if (extResult.extensionPointRan)
+		return extResult.result;
+
+	this._updateUseSavedSignaturePref(signatureData.saveSignature);
+
+	var isValidDocumentType = type === this.documentType.HTML || type === this.documentType.ATTACHMENT;
+	if (operation === this.operationTypes.GENERATE_PDF &amp;&amp; !isValidDocumentType)
+		return { error: this.ERROR_INVALID_TYPE };
+
+	generatedPdfName = generatedPdfName || this.DEFAULT_GENERATED_PDF_NAME;
+
+	var response = {};
+	var gr = new GlideRecordSecure(targetTable);
+
+	if (gr.get(targetSysId)) {
+		if (!operation || operation === this.operationTypes.SIGNATURE_IMAGE)
+			response.sys_attachment = this._generateSignatureImage(targetTable, targetSysId, signatureData, agreementText);
+		else if (operation === this.operationTypes.E_SIGNATURE)
+			response.sys_attachment = this._signTaskDocument(gr, signatureData);
+		else if (operation === this.operationTypes.GENERATE_PDF) {
+			if (type === this.documentType.ATTACHMENT &amp;&amp; signatureTokens &amp;&amp; signatureTokens.pdf)
+				response.sys_attachment = this._signPDFDocument(targetTable, targetSysId, signatureData, signatureTokens, generatedPdfName, agreementText);
+			else if (type === this.documentType.HTML)
+				response.sys_attachment = this._signHTMLTemplateDocument(targetTable, targetSysId, signatureData, html, signatureTokens, generatedPdfName, agreementText);
+		}
+		else
+			response.error = this.ERROR_INVALID_OPERATION;
+	}
+	else
+		response.error = this.ERROR_RECORD_NOT_FOUND;
+
+	return response;
+}]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-06-28 14:59:22&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;b27f489d5385b01037daddeeff7b126d&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;204&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;DigitalSignatureUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Digital Signature API" source="sn_ds_api"&gt;12287edb537c301037daddeeff7b12cf&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Digital Signature API"&gt;12287edb537c301037daddeeff7b12cf&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_b27f489d5385b01037daddeeff7b126d&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2021-12-17 16:55:45&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 09:18:13</sys_created_on>
+        <sys_id>0810c99d83341210c6695855eeaad316</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>DigitalSignatureUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_0810c99d83341210c6695855eeaad316</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 09:18:13</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

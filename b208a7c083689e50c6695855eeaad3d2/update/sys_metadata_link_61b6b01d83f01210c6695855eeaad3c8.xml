@@ -1,0 +1,676 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>583136a7b7410110635f860eee11a917</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.AutoResolutionNotificationHelper&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Class that has methods to help with response channels related to notifications&lt;/description&gt;
+        &lt;name&gt;AutoResolutionNotificationHelper&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var AutoResolutionNotificationHelper = Class.create();
+
+// OOB response channels that we look for, for a user
+AutoResolutionNotificationHelper.RESPONSE_CHANNEL = {EMAIL: 'Email', SMS: 'SMS', VA: 'Virtual Agent'};
+AutoResolutionNotificationHelper.RESPONSE_CHANNEL_MODE = {ALL: 'all', FIRST_MATCH: 'first_match'};
+
+AutoResolutionNotificationHelper.EMAIL_SYSTEM_STATUS = {READY: 'ready', NOT_READY: 'not-ready'};
+
+AutoResolutionNotificationHelper.prototype = {
+	/**
+	 * This helper is tied to a particular user and IAR config
+	 * @param {string} userSysID - Sys ID of the user record
+	 * @param {string} userTableName - Table where the user with userSysID can be found
+	 * @param {string} arConfigSysID
+	 * @param {AutoResolutionLoggingUtils} logger
+	 */
+	initialize: function(userSysID, userTableName, arConfigSysID, logger) {
+		this.logger = !gs.nil(logger) ? logger :
+			new AutoResolutionLoggingUtils().withName(this.type).withConfiguration(this.arConfigSysID).createLogger();
+		this.userGr = this._getUserGr(userSysID, userTableName);
+		this.arConfigGr = this._getARConfigGr(arConfigSysID);
+		this.initialRecommendationEmailSendSubflow = 'global.iar_send_initial_email_notification';
+		if (gs.nil(this.arConfigGr))
+			this.logger.debug('AutoResolutionNotificationHelper not initialized properly. Looks like invalid ar config: {0}', arConfigSysID);
+
+		this.responseChannelObjectList = this._getResponseChannelObjectList();
+		this.logger.debug('Response channel object for user with sys_id={0} is {1}', userSysID, JSON.stringify(this.responseChannelObjectList));
+	},
+
+	/**
+	 * @typedef {Object} ResponseChannelObject
+	 * @property {string} name - Email, Virtual Agent, or SMS
+	 * @property {boolean} shouldSend
+	 * @property {string} reason - Will contain the reason if shouldSend is false, else will not be present
+	 */
+
+	/**
+	 *
+	 * @return {ResponseChannelObject[]} - If first match is selected, only one of the items in the list will have shouldSend as true
+	 * 										For example: If Email, SMS, Virtual Agent are of order 100, 200 and 300 and first match is found
+	 * 									  	for SMS, the list will contain objects for Email and SMS. Object for SMS will have shouldSend as true
+	 *
+	 */
+	getResponseChannelObjectList: function() {
+		return this.responseChannelObjectList;
+	},
+
+	/**
+	 *
+	 * @returns {{shouldSend: boolean, reason: String}}
+	 */
+	shouldSendEmail: function() {
+		return this._shouldSendNotificationToChannel(AutoResolutionNotificationHelper.RESPONSE_CHANNEL.EMAIL);
+	},
+
+	/**
+	 *
+	 * @returns {{shouldSend: boolean, reason: String}}
+	 */
+	shouldSendSMS: function() {
+		return this._shouldSendNotificationToChannel(AutoResolutionNotificationHelper.RESPONSE_CHANNEL.SMS);
+	},
+
+	/**
+	 *
+	 * @returns {{shouldSend: boolean, reason: String}}
+	 */
+	shouldSendVANotification: function() {
+		return this._shouldSendNotificationToChannel(AutoResolutionNotificationHelper.RESPONSE_CHANNEL.VA);
+	},
+
+	/**
+	 * Sends an Email and SMS for the passed values. Checks if it should send before trying to send.
+	 * @param {GlideRecord} taskGr
+	 * @param {string} emailNotificationId
+	 * @param {GlideRecord} smsTemplateGr
+	 */
+	sendEmailAndSMSNotificationForTask: function(taskGr, emailNotificationId, smsTemplateGr) {
+		// Send Email notification if needed
+		try {
+			if (this.shouldSendEmail().shouldSend)
+				this.sendEmail(taskGr, emailNotificationId);
+			else
+				this.logger.debug('Email not sent for user with sys ID: {0}', this.userGr.getValue('sys_id'));
+		} catch(error) {
+			this.logger.error('Error sending email to user with sys ID {0}. Error: {1}', this.userGr.getValue('sys_id'), error.getMessage());
+		}
+
+		// Send SMS notification if needed
+		try {
+			if (this.shouldSendSMS().shouldSend)
+				this.sendSMS(taskGr.getTableName(), taskGr.getUniqueValue(), smsTemplateGr);
+			else
+				this.logger.debug('SMS not sent for user with sys ID: {0}', this.userGr.getValue('sys_id'));
+		} catch(err) {
+			this.logger.error('Error sending SMS to user with sys ID {0}. Error: {1}', this.userGr.getValue('sys_id'), err);
+		}
+	},
+
+	/**
+	 *
+	 * @param {GlideRecord} targetGr
+	 * @return {string} context sys id of the email flow
+	 * @throws error
+	 */
+	sendEmail: function(targetGr, emailNotificationId) {
+		if (gs.nil(emailNotificationId))
+			throw 'No email notification to send';
+
+		var inputs = {};
+		inputs['target_record_sys_id'] = targetGr.getValue('sys_id'); // Sys ID (GUID)
+		inputs['target_table_name'] = targetGr.getTableName(); // String
+		inputs['notification_sys_id'] = emailNotificationId; // Sys ID (GUID)
+
+		// scriptableFlowRunResult is of type ScriptableFlowRunnerResult (java class)
+		var scriptableFlowRunResult = sn_fd.FlowAPI.getRunner().subflow(this.initialRecommendationEmailSendSubflow).inBackground().withInputs(inputs).run();
+		var contextID = gs.nil(scriptableFlowRunResult) ? null : scriptableFlowRunResult.getContextId();
+		this.logger.debug('Email sent to user with sys_id={0}. Flow context ID={1}', this.userGr.getValue('sys_id'), contextID);
+
+		return contextID;
+	},
+
+	/**
+	 * @param {string} targetTableName table name of the target GlideRecord
+	 * @param {string} targetSysId sys_id of the target GlideRecord
+	 * @param {GlideRecord} notifySMSTemplateGr Template GlideRecord from notify_sms_template table
+	 * @return {string} Unique message SID; stored in the Notify Message [notify_message] record as message_id
+	 * @throws error
+	 */
+	sendSMS: function(targetTableName, targetSysID, notifySMSTemplateGr) {
+		var targetGr = new GlideRecord(targetTableName);
+		if (!targetGr.get(targetSysID))
+			throw 'Could not get target GlideRecord: table=' + targetTableName + ', sys_id=' + targetSysID;
+
+		if (gs.nil(notifySMSTemplateGr))
+			throw 'Notify SMS Template GlideRecord cannot be empty';
+
+		var emailFormatter = new GlideEmailFormatter(targetGr, null, null, new GlideEmailOutbound());
+		var smsBody = emailFormatter.substitute(notifySMSTemplateGr.getValue('template'));
+		smsBody = emailFormatter.evaluateTemplateScript(smsBody);
+
+		// Un escape all the HTML characters, since this is SMS
+		smsBody = GlideStringUtil.unEscapeHTML(smsBody);
+
+		var fromNumber = this.arConfigGr.notify_sms_phone.getRefRecord().getValue('phone_number');
+		var toNumber = new NotifyUtils().getSMSNumberForUser(this.userGr);
+		if (gs.nil(toNumber))
+			throw 'No active SMS device found for user with sys ID: ' + this.userGr.getValue('sys_id');
+
+		// This it the ID returned by Twilio. We can check the status of the message in the twilio console by this ID
+		var messageID = SNC.Notify.sendSMS(fromNumber, toNumber, smsBody, targetGr);
+		this.logger.debug('SMS sent to user with sys_id={0}. Message ID={1}', this.userGr.getValue('sys_id'), messageID);
+
+		return messageID;
+	},
+
+	/**
+	 * Returns true if we can send notifications to any channels configured on the IAR config, for a particular user
+	 * @returns {{shouldSend: boolean, reason: String}}
+	 */
+	shouldSendNotification: function() {
+		// Currently only 3 channels are supported. If more than these need to be supported, refactor this
+
+		var sendSMSResponse = this.shouldSendSMS();
+		var sendSMS = sendSMSResponse.shouldSend;
+		var reason = sendSMSResponse.reason;
+
+		var sendEmailResponse = this.shouldSendEmail();
+		var sendEmail = sendEmailResponse.shouldSend;
+		reason += sendEmailResponse.reason;
+
+		var sendVAResponse = this.shouldSendVANotification();
+		var sendVA = sendVAResponse.shouldSend;
+		reason += sendVAResponse.reason;
+
+		if (sendSMS || sendEmail || sendVA)
+			return {"shouldSend": true, "reason":''};
+		else
+			return {"shouldSend": false, "reason":reason};
+	},
+
+	anyResponseChannelActiveForUserAndConfig: function() {
+		var responseChannelGa = new GlideAggregate(AutoResolutionConstants.RESPONSE_CHANNEL_TABLE_NAME);
+		responseChannelGa.addQuery('active', 'true');
+		responseChannelGa.addQuery('configuration', this.arConfigGr.getValue('sys_id'));
+		responseChannelGa.addAggregate('COUNT');
+		responseChannelGa.query();
+
+		return !responseChannelGa.next() ? false : parseInt(responseChannelGa.getAggregate('COUNT')) &gt; 0;
+	},
+
+	/**
+	 * Gets the SMS template from the specified field on the passed GlideRecord, if the configuration should send SMS
+	 * @param {GlideRecord} gr
+	 * @param {string} field
+	 */
+	getSMSTemplateFromGR: function(gr, field) {
+		if (this.shouldSendSMS().shouldSend)
+			return gr.getElement(field).getRefRecord();
+
+		return null;
+	},
+
+	_getResponseChannelObjectList: function() {
+		var autoResResponseChannelGr = this._getResponseChannelGr();
+		var firstMatch = (this.arConfigGr.getValue('response_channel_selection_mode') === AutoResolutionNotificationHelper.RESPONSE_CHANNEL_MODE.FIRST_MATCH);
+		var responseChannel;
+		var responseChannelObjectList = [];
+		var responseChannelObject;
+		while (autoResResponseChannelGr.next()) {
+			responseChannel = autoResResponseChannelGr.getValue('response_channel');
+			responseChannelObject = {name: responseChannel};
+
+			switch (responseChannel) {
+				case AutoResolutionNotificationHelper.RESPONSE_CHANNEL.EMAIL:
+					var activePrimaryDvcExistsForUser = this._activePrimaryEmailDeviceExistsForUser();
+					this._evaluateResponseChannelObjectForEmail(responseChannelObject, activePrimaryDvcExistsForUser);
+					break;
+				case AutoResolutionNotificationHelper.RESPONSE_CHANNEL.SMS:
+					var activeSMSDeviceFound = this._primaryActiveSMSDeviceFoundForUser();
+					var notifySMSPhonePresentAndSelectedOnConfig =
+						AutoResolutionNotificationHelper.isNotifySMSPhonePresentAndSelectedOnConfig(this.arConfigGr);
+					var userOptedIn = this._isUserOptedIn();
+					this._evaluateResponseChannelObjectForSMS(responseChannelObject, activeSMSDeviceFound, notifySMSPhonePresentAndSelectedOnConfig, userOptedIn);
+					break;
+				case AutoResolutionNotificationHelper.RESPONSE_CHANNEL.VA:
+					var consumerAccountGr = this._getConsumerAccountGr();
+					var isUserSubscrToNotifAndChannelActive = this._isUserSubscribedToNotificationsAndChannelActive();
+					var conversationExistsForConsumerAccount = this._conversationExistsForConsumerAccount(consumerAccountGr);
+					var isVANotificationEnabledOnTheInstance = AutoResolutionNotificationHelper.isVANotificationEnabledOnTheInstance();
+					this._evaluateResponseChannelObjectForVirtualAgent(responseChannelObject, consumerAccountGr, conversationExistsForConsumerAccount,
+						isUserSubscrToNotifAndChannelActive, isVANotificationEnabledOnTheInstance);
+					break;
+				default:
+					responseChannelObject[responseChannel] = this._getUnknownChannelTypeObject(responseChannelObject, responseChannel);
+					break;
+			}
+
+			responseChannelObjectList.push(responseChannelObject);
+
+			// If first match is true, we break
+			if (firstMatch &amp;&amp; responseChannelObject.shouldSend) {
+				this.logger.debug('First match found for channel {0}, for user with sys_id {1}', responseChannel, this.userGr.getValue('sys_id'));
+				break;
+			}
+		}
+
+		return responseChannelObjectList;
+	},
+
+	/**
+	 * Returns true if system wide property is enabled to send notifications on web client for a new user who has no
+	 * conversations
+	 * @returns {boolean}
+	 * @private
+	 */
+	_isNewUserWebClientPropertyEnabled: function() {
+		return gs.getProperty("com.glide.cs.notification_newuser_webclient", 'false') === 'true';
+	},
+
+	_shouldSendNotificationToChannel: function(responseChannelName) {
+		var shouldSendNotificationResponseObject = {};
+		var reason = "";
+		for (var objectIndex in this.responseChannelObjectList) {
+			responseChannelObject = this.responseChannelObjectList[objectIndex];
+			if (responseChannelObject.name === responseChannelName &amp;&amp; responseChannelObject.shouldSend)
+			{
+				shouldSendNotificationResponseObject.shouldSend = true;
+				shouldSendNotificationResponseObject.reason = "";
+				return shouldSendNotificationResponseObject;
+			}
+			else if (responseChannelObject.name === responseChannelName &amp;&amp; !gs.nil(responseChannelObject.reason))
+				reason = responseChannelObject.name + ":" + responseChannelObject.reason;
+		}
+
+		shouldSendNotificationResponseObject.shouldSend = false;
+		shouldSendNotificationResponseObject.reason = reason;
+		return shouldSendNotificationResponseObject;
+	},
+
+	_getConsumerAccountGr: function() {
+		var consumerAccountGr = new GlideRecord('sys_cs_consumer_account');
+		consumerAccountGr.addQuery('consumer.user_id', this.userGr.getValue('sys_id'));
+		consumerAccountGr.query();
+
+		return consumerAccountGr.next() ? consumerAccountGr : null;
+	},
+
+	/**
+	 * @param {ResponseChannelObject} responseChannelObject
+	 * @param {boolean} activePrimaryDeviceFound If there is an active primary_email device found for the user in this.userGr
+	 * @private
+	 */
+	_evaluateResponseChannelObjectForEmail: function(responseChannelObject, activePrimaryDeviceFound) {
+		if (!activePrimaryDeviceFound) {
+			responseChannelObject.shouldSend = false;
+			responseChannelObject.reason = 'Primary email device is not found or is inactive for user with sys ID: ' + this.userGr.getValue('sys_id');
+			return;
+		}
+
+		responseChannelObject.shouldSend = true;
+	},
+
+	/**
+	 * We check
+	 * 	1. If the user is subscribed to notifications and that particular channel is active
+	 * 	2. If the user has a consumer account record and has a conversation of type interactive
+	 * 	3. If VA notifications are enabled on the instance
+	 * @param {ResponseChannelObject} responseChannelObject
+	 * @param {GlideRecord} consumerAccountGr
+	 * @param {boolean} conversationExistsForConsumerAccount
+	 * @param {boolean} isUserSubscrToNotifAndChannelActive
+	 * @param {boolean} isVANotificationEnabledOnTheInstance
+	 * @private
+	 */
+	_evaluateResponseChannelObjectForVirtualAgent: function(responseChannelObject, consumerAccountGr, conversationExistsForConsumerAccount,
+															isUserSubscrToNotifAndChannelActive, isVANotificationEnabledOnTheInstance) {
+
+		var newUserWebClientEnabled = this._isNewUserWebClientPropertyEnabled();
+
+		if (gs.nil(consumerAccountGr) &amp;&amp; !newUserWebClientEnabled) {
+			responseChannelObject.shouldSend = false;
+			responseChannelObject.reason = 'Consumer account not found for user with sys_id: ' + this.userGr.getValue('sys_id');
+			return;
+		}
+
+		// 1. If the user is subscribed to a channel and it is active
+		if (!isUserSubscrToNotifAndChannelActive &amp;&amp; !newUserWebClientEnabled) {
+			responseChannelObject.shouldSend = false;
+			responseChannelObject.reason = 'User with sys_id: ' + this.userGr.getValue('sys_id') + ' is either not subscribed to the notification or the channel is inactive';
+			return;
+		}
+
+		// 2. If a consumer does not have any conversations before
+		if (!conversationExistsForConsumerAccount &amp;&amp; !newUserWebClientEnabled) {
+			responseChannelObject.shouldSend = false;
+			responseChannelObject.reason = 'No interactive conversation found for user with sys_id ' + this.userGr.getValue('sys_id');
+			return;
+		}
+
+		// 3. If VA notification is enabled on the instance
+		if (!isVANotificationEnabledOnTheInstance) {
+			responseChannelObject.shouldSend = false;
+			responseChannelObject.reason = 'VA notification is not enabled on the instance';
+			return;
+		}
+
+		responseChannelObject.shouldSend = true;
+	},
+
+	/**
+	 * We check if the user has a device of type 'SMS' in cmn_notif_device table with active=true and a notify phone number is selected on the IAR config
+	 * @param {ResponseChannelObject} responseChannelObject
+	 * @param {boolean} primarySMSDeviceExistsForUser
+	 * @param {boolean} notifySMSPhoneSelectedOnConfig
+	 * @param {boolean} userOptedIn
+	 * @private
+	 */
+	_evaluateResponseChannelObjectForSMS: function(responseChannelObject, primarySMSDeviceExistsForUser, notifySMSPhonePresentAndSelectedOnConfig, userOptedIn) {
+		if (!primarySMSDeviceExistsForUser) {
+			responseChannelObject.shouldSend = false;
+			responseChannelObject.reason = 'Active SMS device not found or is inactive for user with sys ID: ' + this.userGr.getValue('sys_id');
+			return;
+		}
+
+		if (!notifySMSPhonePresentAndSelectedOnConfig) {
+			responseChannelObject.shouldSend = false;
+			responseChannelObject.reason = 'Notify SMS phone not present or selected on IAR config with sys ID: ' + this.arConfigGr.getValue('sys_id');
+			return;
+		}
+
+		if (!userOptedIn) {
+			responseChannelObject.shouldSend = false;
+			responseChannelObject.reason = 'User with sys_id: ' + this.userGr.getValue('sys_id') + ' has opted out from receiving SMS notifications for IAR with sys ID: ' + this.arConfigGr.getValue('sys_id');
+			return;
+		}
+
+		responseChannelObject.shouldSend = true;
+	},
+
+	_getUnknownChannelTypeObject: function(responseChannelObject, responseChannel) {
+		responseChannelObject.shouldSend = false;
+		responseChannelObject.reason = 'Unknown response channel: ' + responseChannel;
+	},
+
+	_conversationExistsForConsumerAccount: function(consumerAccountGr) {
+		if (gs.nil(consumerAccountGr)) {
+			this.logger.debug('Consumer account is null for user with sys_id: {0}', this.userGr.getValue('sys_id'));
+			return false;
+		}
+
+		var conversationGa = new GlideAggregate('sys_cs_conversation');
+		conversationGa.addQuery('consumer_account', consumerAccountGr.getValue('sys_id'));
+		conversationGa.addQuery('conversation_type', '!=', 'notification');
+		conversationGa.orderByDesc('sys_created_on');
+		conversationGa.addAggregate('COUNT');
+		conversationGa.query();
+
+		var conversationCount = conversationGa.next() ? parseInt(conversationGa.getAggregate('COUNT')) : 0;
+
+		return conversationCount &gt; 0;
+	},
+
+	/**
+	 * Returns true if the user is subscribed to a channel and the channel is active, else returns false
+	 * @return {boolean}
+	 */
+	_isUserSubscribedToNotificationsAndChannelActive: function() {
+		var sysNotificationGr = new GlideRecord('sys_notification');
+		sysNotificationGr.addQuery('table', AutoResolutionConstants.CONTEXT_TABLE_NAME);
+		sysNotificationGr.addQuery('name', 'Issue Auto-Resolution');
+		sysNotificationGr.query();
+		if (!sysNotificationGr.next())
+			return false;
+
+		var prefs = new sn_notification.Preferences(this.userGr);
+		var destinations = prefs.getDestinations();
+		for (var i = 0; i &lt; destinations.length; i++) {
+			var destination = destinations[i];
+			if (destination.isActive(sysNotificationGr))
+				return true;
+		}
+
+		return false;
+	},
+
+	_activePrimaryEmailDeviceExistsForUser: function() {
+		var cmnNotifDeviceGa = new GlideAggregate('cmn_notif_device');
+		cmnNotifDeviceGa.addActiveQuery();
+		cmnNotifDeviceGa.addQuery('user', this.userGr.getValue('sys_id'));
+		cmnNotifDeviceGa.addQuery('type', AutoResolutionNotificationHelper.RESPONSE_CHANNEL.EMAIL);
+		cmnNotifDeviceGa.addQuery('primary_email', 'true');
+		cmnNotifDeviceGa.addAggregate('COUNT');
+		cmnNotifDeviceGa.query();
+
+		return cmnNotifDeviceGa.next() ? (parseInt(cmnNotifDeviceGa.getAggregate('COUNT')) &gt; 0) : false;
+	},
+
+	_primaryActiveSMSDeviceFoundForUser: function() {
+		return !gs.nil(new NotifyUtils().getSMSNumberForUser(this.userGr));
+	},
+
+	_isUserOptedIn: function() {
+		if (!this.arConfigGr.isValidField('notify_sms_phone')) {
+			this.logger.debug('Notify SMS phone field is not present on IAR config={0}. Probably Notify Twilio Direct Driver is not installed', this.arConfigGr.getValue('sys_id'));
+			return false;
+		}
+
+		var notifyNumberGr = !gs.nil(this.arConfigGr.getValue('notify_sms_phone')) ? this.arConfigGr.notify_sms_phone.getRefRecord() : null;
+		if (gs.nil(notifyNumberGr)) {
+			this.logger.debug('No notify SMS phone selected on IAR config with sys_id={0}', this.arConfigGr.getValue('sys_id'));
+			return false;
+		}
+
+		var notifyNumberGr = this.arConfigGr.notify_sms_phone.getRefRecord();
+		var fromNumber = notifyNumberGr.getValue('phone_number');
+
+		// Since we are concerned only about TWILIO, we can use the hardcoded value. If we support more drivers,
+		// we may have to look into NotifyUtilSNC.getProvider
+		var smsPreferenceHandler = new sn_sms_pref.SMSPreferenceHandler(AutoResolutionConstants.TWILIO_SMS_PROVIDER);
+
+		// Check NotifyWorkflow.runIncomingSMSWorkflow() to know how we compute fromNumberType
+		var fromNumberType = notifyNumberGr.getValue('short_code') === null ? 'long' : 'short';
+		var userPhoneNumber = new NotifyUtils().getSMSNumberForUser(this.userGr);
+		var optedInNumberList = smsPreferenceHandler.getOptedInNumbers(fromNumber, fromNumberType, [userPhoneNumber]);
+		return optedInNumberList.length === 1 &amp;&amp; optedInNumberList[0] === userPhoneNumber;
+	},
+
+	_getResponseChannelGr: function() {
+		var autoResResponseChannelGr = new GlideRecord(AutoResolutionConstants.RESPONSE_CHANNEL_TABLE_NAME);
+		autoResResponseChannelGr.addQuery('configuration', this.arConfigGr.getValue('sys_id'));
+		autoResResponseChannelGr.addActiveQuery();
+		autoResResponseChannelGr.orderBy('order');
+		autoResResponseChannelGr.query();
+
+		return autoResResponseChannelGr;
+	},
+
+	_getARConfigGr: function(arConfigSysID) {
+		var arConfigGr = new GlideRecord(AutoResolutionConstants.CONFIG_TABLE_NAME);
+		if (!arConfigGr.get(arConfigSysID)) {
+			this.logger.info('Invalid IAR configuration with sys ID: {0}', arConfigSysID);
+			return null;
+		}
+
+		return arConfigGr;
+	},
+
+	_getUserGr: function(userSysID, userTableName) {
+		var userGr = new GlideRecord(userTableName);
+		if (!userGr.get(userSysID)) {
+			this.logger.debug('User record not found for user with sys_id {0} in table {1}', userSysID, userTableName);
+			return null;
+		}
+
+		return userGr;
+	},
+
+	type: 'AutoResolutionNotificationHelper'
+};
+
+AutoResolutionNotificationHelper.notifyFieldsExistOnConfig = function(arConfigGr) {
+	if (gs.nil(arConfigGr))
+		return false;
+
+	// These fields will exist only if Notify plugin is installed
+	return arConfigGr.isValidField('notify_sms_phone') &amp;&amp; arConfigGr.isValidField('initial_recommendation_sms');
+};
+
+AutoResolutionNotificationHelper.isNotifySMSPhonePresentAndSelectedOnConfig = function(arConfigGr) {
+	return AutoResolutionNotificationHelper.notifyFieldsExistOnConfig(arConfigGr) &amp;&amp; !gs.nil(arConfigGr.getValue('notify_sms_phone'));
+};
+
+AutoResolutionNotificationHelper.getSupportedChannelList = function() {
+	var supportedChannelList = new GlideChoiceList();
+	for (var responseChannelName in AutoResolutionNotificationHelper.RESPONSE_CHANNEL) {
+		supportedChannelList.add(new GlideChoice(AutoResolutionNotificationHelper.RESPONSE_CHANNEL[responseChannelName],
+			AutoResolutionNotificationHelper.RESPONSE_CHANNEL[responseChannelName]));
+	}
+
+	return supportedChannelList;
+};
+
+/**
+ * Check if there exists an active VA notification channel on the sys_notification_channel table
+ * @return {boolean}
+ */
+AutoResolutionNotificationHelper.isVANotificationChannelEnabled = function() {
+	// Use VA-related content table names to find VA notification providers
+	var vaNotificationContentTableNameList = ["sys_notification_va_content", "sys_notification_va_content_messaging"];
+	var notificationProviderGr = new GlideRecord("sys_notification_provider");
+	var notificationProviderQc;
+	vaNotificationContentTableNameList.forEach(function (contentTableName, index) {
+		if (index === 0) {
+			notificationProviderQc = notificationProviderGr.addQuery("content_table", contentTableName);
+		} else {
+			notificationProviderQc.addOrCondition("content_table", contentTableName);
+		}
+	});
+	notificationProviderGr.query();
+
+	var notificationProviderSysIdList = [];
+	while (notificationProviderGr.next()) {
+		notificationProviderSysIdList.push(notificationProviderGr.getUniqueValue());
+	}
+
+	// Use the VA notification providers to find VA notification channels
+	var notificationChannelGr = new GlideRecord("sys_notification_channel");
+	var notificationChannelQc;
+	notificationProviderSysIdList.forEach(function(provider, index) {
+		if (index === 0) {
+			notificationChannelQc = notificationChannelGr.addQuery("provider", provider);
+		} else {
+			notificationChannelQc.addOrCondition("provider", provider);
+		}
+	});
+	notificationChannelGr.addQuery("active", true);
+	notificationChannelGr.query();
+	return notificationChannelGr.next();
+};
+
+/**
+ * Check either web client notification or any other channel's notification is enabled before sending IAR notification
+ * @return {bool|boolean}
+ */
+AutoResolutionNotificationHelper.isVANotificationEnabledOnTheInstance = function() {
+	var chatSetupGr = new GlideRecord('sys_cs_live_agent_setup');
+	chatSetupGr.get(AutoResolutionConstants.LIVE_AGENT_CHAT_SETUP_SYSID);
+	if (chatSetupGr.getValue('notification_enabled') === '1') {
+		return true;
+	} else {
+		var channelGr = new GlideRecord('sys_cs_channel');
+		channelGr.addQuery('type', AutoResolutionConstants.CHAT_TYPE);
+		channelGr.addQuery('enable_notification', true);
+		channelGr.query();
+
+		return channelGr.next();
+	}
+};
+
+AutoResolutionNotificationHelper.isEmailFunctionalityUp = function() {
+	var responseObject = {status: AutoResolutionNotificationHelper.EMAIL_SYSTEM_STATUS.NOT_READY};
+
+	var isSMTPActive = _isSMTPActive();
+	var smtpStatusGr = _getSMTPStatusRecord();
+
+	var emailSendingInactiveMessage = 'Email sending is inactive, messages will not be sent';
+	var smtpAccountNotConfiguredMessage = 'There is currently no active SMTP account configured, cannot send email';
+	var smtpServerConnectionErrorMessage = "Cannot connect to SMTP server: mail.google.com, as: admin, message: Couldn't connect to host, port: mail.google.com, 587; timeout 20000, cause: connect timed out";
+
+	// 1. Check if SMTP active record exists
+	if (!isSMTPActive) {
+		responseObject.message = 'Email sending is not enabled or is inactive on the instance. Record not found for name glide.smtp.active in sys_status table';
+		return responseObject;
+	}
+
+	if (gs.nil(smtpStatusGr)) {
+		responseObject.reason = 'Cannot send email. sys_status record not found for name glide.smtp.status';
+		return responseObject;
+	}
+
+	// 2 and 3. Check for certain values and types for errors and connection issues
+	var value = smtpStatusGr.getValue('value');
+	var type = smtpStatusGr.getValue('type');
+	if ((value === emailSendingInactiveMessage &amp;&amp; type === 'info') || (value === smtpAccountNotConfiguredMessage &amp;&amp; type === 'info') ||
+		(value === smtpServerConnectionErrorMessage &amp;&amp; type === 'warning')) {
+
+		responseObject.reason = value + '. Please check for name glide.smtp.status in sys_status table';
+
+		return responseObject;
+	}
+
+	responseObject.status = AutoResolutionNotificationHelper.EMAIL_SYSTEM_STATUS.READY;
+
+	return responseObject;
+};
+
+function _isSMTPActive() {
+	var sysStatusGa = new GlideAggregate('sys_status');
+	sysStatusGa.addQuery('name', 'glide.smtp.active');
+	sysStatusGa.addAggregate('COUNT');
+	sysStatusGa.query();
+
+	return sysStatusGa.next() ? (parseInt(sysStatusGa.getAggregate('COUNT')) !== 0) : false;
+}
+
+function _getSMTPStatusRecord() {
+	var sysStatusGr = new GlideRecord('sys_status');
+	sysStatusGr.addQuery('name', 'glide.smtp.status');
+	sysStatusGr.query();
+
+	return sysStatusGr.next() ? sysStatusGr : null;
+}]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-01-20 22:39:22&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;583136a7b7410110635f860eee11a917&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;127&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AutoResolutionNotificationHelper&lt;/sys_name&gt;
+        &lt;sys_package display_value="Issue Auto-Resolution" source="com.glide.cs.auto_resolution"&gt;81ddf4a03c75311068bcf327dfe37fa6&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_583136a7b7410110635f860eee11a917&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-02-10 06:24:56&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:37:22</sys_created_on>
+        <sys_id>61b6b01d83f01210c6695855eeaad3c8</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AutoResolutionNotificationHelper</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_61b6b01d83f01210c6695855eeaad3c8</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:37:22</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

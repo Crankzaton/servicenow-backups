@@ -1,0 +1,795 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>5fd70a2887ee1110a4b9ca29dabb356d</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_sow_on_call.OnCallEscalationSOWUtilSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;OnCallEscalationSOWUtilSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var OnCallEscalationSOWUtilSNC = Class.create();
+OnCallEscalationSOWUtilSNC.prototype = {
+	initialize: function () { },
+
+	getEscalationDetails: function (source, table) {
+		var escalationDetails = new global.OnCallEscalationUtil().setCheckAccess(true).getEscalations(source, table, '');
+		var escData = this.formatEscalationData(escalationDetails, source, table);
+		var ocCommon = new global.OnCallCommon();
+		if (ocCommon.getDirection)
+			escData.direction = new global.OnCallCommon().getDirection() || 'ltr';
+		else 
+			escData.direction = 'ltr';
+		return escData;
+	},
+
+	_getUserLocation: function (userSysId) {
+		var userGr = new GlideRecord('sys_user');
+		if (!userGr.get(userSysId)) return "";
+		if (!gs.nil(userGr.getValue('location'))) {
+			var city = userGr.location.city ? userGr.location.city.getDisplayValue() : "";
+			var state = userGr.location.state ? userGr.location.state.getDisplayValue() : "";
+			if (city &amp;&amp; state) return gs.getMessage("{0}, {1}", [city, state]);
+			else return city ? city : state;
+		}
+		return "";
+	},
+
+	getDuration: function (start, end, getSecs) {
+		if (!start &amp;&amp; !end)
+			return 0;
+		var gdtStart = start ? new GlideDateTime(start) : new GlideDateTime();
+		var gdtEnd = end ? new GlideDateTime(end) : new GlideDateTime();
+		if (gdtStart.after(gdtEnd))
+			gdtStart = gdtEnd;
+		var duration = GlideDateTime.subtract(gdtStart, gdtEnd);
+		return getSecs ? Math.abs((gdtEnd.getNumericValue() - gdtStart.getNumericValue()) / 1000) : duration.getDisplayValue();
+	},
+
+	_getDateTimeJS: function (dateTimeStr) {
+		var gdt = new GlideDateTime();
+		gdt.setDisplayValue(dateTimeStr);
+		return {
+			value: gdt.getValue(),
+			display_value: gdt.getDisplayValue(),
+			display_value_internal: gdt.getDisplayValueInternal(),
+			display_value_relative: {}
+		};
+	},
+
+	_computeCompletedEscAttempt: function(escAttempts, escLevelDetails, escEndTime, escIdx, isActiveEscalation) {
+		var that = this;
+		var newAttempts = {};
+		var rejectCount = 0;
+		if (escAttempts &amp;&amp; Object.keys(escAttempts))
+			for (var jdx = 0; jdx &lt; Object.keys(escAttempts).length; jdx++) {
+				var attempt = escAttempts[Object.keys(escAttempts)[jdx]];
+				var isAcceptedAttempt = false;
+				var isAcknowledged = false;
+				var lastAttemptObj = {};
+				var newAttemptArr = [];
+
+				lastAttemptObj.status = "sent";
+				lastAttemptObj.channels = [];
+
+				var respValues = ["accepted", "rejected"];
+
+				for (var idx = 0; idx &lt; respValues.length; idx++) {
+					var expectedResponse = respValues[idx];
+					newAttemptArr = [];
+					//acknowledged scenario
+					for (var kdx = 0; kdx &lt; attempt.length; kdx++) {
+						newAttemptArr.push(attempt[kdx]);
+						if (attempt[kdx].responded_atVal &amp;&amp; attempt[kdx].responseVal &amp;&amp; (attempt[kdx].responseVal.value).includes(expectedResponse)) {
+							isAcceptedAttempt = true;
+							lastAttemptObj.response = JSON.parse(JSON.stringify(attempt[kdx].responseVal));
+							lastAttemptObj.response.value = expectedResponse;
+							if (expectedResponse === "rejected") rejectCount++;
+							lastAttemptObj.attempted_at = that._getDateTimeJS(attempt[kdx].responded_atVal.display_value);
+							lastAttemptObj.responseTime = attempt[kdx].responseTimeVal;
+							lastAttemptObj.contact_attempt = (newAttemptArr.length + 1) + "";
+							lastAttemptObj.responded_at = that._getDateTimeJS(attempt[kdx].responded_atVal.display_value);
+							for (var channelIdx = 0; channelIdx &lt; attempt[kdx].channels.length; channelIdx++) {
+								if (attempt[kdx].channels[channelIdx].response &amp;&amp; attempt[kdx].channels[channelIdx].response.value === expectedResponse) {
+									lastAttemptObj.respondedChannel = attempt[kdx].channels[channelIdx];
+									break;
+								}
+							}
+							newAttemptArr.push(lastAttemptObj);
+							isAcknowledged = true;
+							break;
+						}
+					}
+
+					if (isAcceptedAttempt) break;
+				}
+
+				if (!isActiveEscalation &amp;&amp; !isAcknowledged) {
+					newAttemptArr = [];
+					//unacknowledged scenario
+					if (escIdx &lt; (escLevelDetails.length - 1)) {
+						if (escLevelDetails[escIdx + 1] &amp;&amp; escLevelDetails[escIdx + 1].sys_created_on.display_value)
+							lastAttemptObj.attempted_at = that._getDateTimeJS(escLevelDetails[escIdx + 1].sys_created_on.display_value);
+						else if (escLevelDetails[escIdx + 1] &amp;&amp; escLevelDetails[escIdx + 1].roster_details &amp;&amp; escLevelDetails[escIdx + 1].roster_details.notifications &amp;&amp; escLevelDetails[escIdx + 1].roster_details.notifications.repeats &amp;&amp; escLevelDetails[escIdx + 1].roster_details.notifications.repeats.length)
+							lastAttemptObj.attempted_at = that._getDateTimeJS(escLevelDetails[escIdx + 1].roster_details.notifications.repeats[0].contact_eta ? escLevelDetails[escIdx + 1].roster_details.notifications.repeats[0].contact_eta.display_value : escLevelDetails[escIdx + 1].roster_details.notifications.repeats[0].contacted_at.display_value);
+						else lastAttemptObj.attempted_at = that._getDateTimeJS(escLevelDetails[escIdx + 1].roster_details.notifications.escalated_at.display_value);
+						lastAttemptObj.contact_attempt = attempt.length + 1;
+					} else {
+						lastAttemptObj.attempted_at = that._getDateTimeJS(escEndTime.display_value);
+						lastAttemptObj.contact_attempt = attempt.length + 1;
+					}
+
+					attempt.push(lastAttemptObj);
+				}
+
+				newAttempts[Object.keys(escAttempts)[jdx]] = (newAttemptArr &amp;&amp; newAttemptArr.length &gt; 0) ? newAttemptArr : attempt;
+			}
+
+		return {
+			newAttempts: newAttempts,
+			rejectCount: rejectCount
+		};
+	},
+
+	formatCommunicationType: function (communication) {
+		var communicationType = communication.communication_type.value;
+		var obj = {};
+		obj["type"] = communicationType;
+		obj["status"] = communication.status.value;
+
+		if (communication.response) {
+			obj.response = communication.response;
+		}
+
+		if (communicationType === "voice") {
+			var number = communication.escalatee_type.value == 'user' ? communication.user.contact_number : communication.device.phone_number.value;
+			obj["voice"] = number ? number : gs.getMessage("Not available");
+			obj.label = gs.getMessage("Voice");
+		}
+
+		if (communicationType === "sms") {
+			var number = communication.escalatee_type.value == 'user' ? communication.user.contact_number : communication.device.phone_number.value;
+			obj["sms"] = number ? number : gs.getMessage("Not available");
+			obj.label = gs.getMessage("SMS");
+		}
+
+		if (communicationType === "conference_escalation") {
+			obj["conference_escalation"] = gs.getMessage("Conference escalation");
+			obj.label = "";
+			if (communication.conference_service_provider &amp;&amp; communication.conference_service_provider.display_value) 
+			    obj.label = communication.conference_service_provider.display_value;
+		}
+
+
+		if (communicationType === "email" || communicationType === "teams" || communicationType === "slack") {
+			var emailId = communication.escalatee_type.value == 'user' ? communication.user.email : communication.device.email_address.value;
+			switch (communicationType) {
+				case 'slack':
+					obj.label = gs.getMessage("Slack");
+					obj.slack = emailId ? emailId : gs.getMessage("Not available");
+					break;
+				case 'email':
+					obj.label = gs.getMessage("Email");
+					obj.email = emailId ? emailId : gs.getMessage("Not available");
+					break;
+				case 'teams':
+					obj.teams = emailId ? emailId : gs.getMessage("Not available");
+					obj.label = gs.getMessage("Microsoft Teams");
+					break;
+			}
+		}
+
+		if (communicationType === "mobile_notification") {
+			obj.mobile_notification = "";
+			obj.label = gs.getMessage("Mobile push");
+		}
+
+		return obj;
+	},
+
+
+	getEscalationCommunicationData: function (communication, attempts, contactAttempt, firstContactedAt) {
+		var that = this;
+		var escalateeType = communication.escalatee_type.value;
+		var communicationId = (escalateeType === "user") ? ((communication.user &amp;&amp; communication.user.sys_id) ? communication.user.sys_id : "") : ((communication.device &amp;&amp; communication.device.sys_id &amp;&amp; communication.device.sys_id.value) ? communication.device.sys_id.value : "");
+
+		var escComm = {};
+		communication.attempted_at ? escComm.attempted_at = that._getDateTimeJS(communication.attempted_at.display_value) : null;
+		escComm.status = communication.status.value;
+		escComm.contact_attempt = contactAttempt;
+		var channels = [];
+		var formattedCommunicationType = that.formatCommunicationType(communication);
+		channels.push(formattedCommunicationType);
+		escComm.channels = channels;
+
+		if (!(communicationId in attempts)) attempts[communicationId] = [escComm];
+
+		if (communicationId in attempts) {
+			var isAttemptIncluded = false;
+			for (var idx = 0; idx &lt; attempts[communicationId].length; idx++) {
+				var escContactAttempt = attempts[communicationId][idx];
+				if (escContactAttempt.contact_attempt + "" === contactAttempt + "") {
+					var availableChannels = [];
+					escContactAttempt.channels.forEach(function (channel) {
+						availableChannels.push(channel['type']);
+					});
+
+					if (availableChannels.indexOf(formattedCommunicationType['type']) === -1) {
+						attempts[communicationId][idx].channels.push(formattedCommunicationType);
+					}
+
+					isAttemptIncluded = true;
+				}
+			}
+		}
+
+		if (!isAttemptIncluded) attempts[communicationId].push(escComm);
+
+		return;
+	},
+
+
+	_getShiftCatchAllTime: function (shiftGr) {
+		if (!shiftGr) return 0;
+		return new global.OnCallEscalationUtilSNC().getCatchAllWaitTime(shiftGr);
+	},
+
+
+	formatEscalateeUserDetails: function (userData, response) {
+		var escalateeData = {};
+		escalateeData.escalatee_type = "user";
+		escalateeData.user = userData.user;
+		if (userData.user &amp;&amp; userData.user.sys_id) escalateeData.user.location = this._getUserLocation(userData.user.sys_id);
+		if (response) escalateeData.response = response;
+		return escalateeData;
+	},
+
+	formatEscalateeDeviceDetails: function (deviceData, response) {
+		var escalateeData = {};
+		escalateeData.escalatee_type = "device";
+		escalateeData.device = deviceData;
+		if (response) escalateeData.response = response;
+		return escalateeData;
+	},
+
+	formatEscalateeGroupDetails: function (groupData, escalationId) {
+		var escalateeData = {};
+		escalateeData.escalationId = escalationId;
+		escalateeData.escalatee_type = "group";
+		escalateeData.group = groupData;
+		if (groupData.response) escalateeData.response = groupData.response;
+		return escalateeData;
+	},
+
+	formatEscalationAudienceDetails: function (escLevelData) {
+		var escAudiences;
+		var that = this;
+		var escalatees = [];
+
+		if (escLevelData.escAudiences) escAudiences = escLevelData.escAudiences;
+		else return [];
+
+		var userDetails = escAudiences.userDetails;
+		var deviceDetails = escAudiences.deviceDetails;
+		var groupDetails = escAudiences.groupDetails;
+		if (userDetails.length &gt; 0)
+			userDetails.forEach(function (userData) {
+				escalatees.push(that.formatEscalateeUserDetails(userData));
+			});
+		if (deviceDetails.length &gt; 0)
+			deviceDetails.forEach(function (deviceData) {
+				escalatees.push(that.formatEscalateeDeviceDetails(deviceData));
+			});
+		if (groupDetails.length &gt; 0 &amp;&amp; escLevelData.status === "pending")
+			groupDetails.forEach(function (groupData) {
+				escalatees.push(that.formatEscalateeGroupDetails(groupData));
+			});
+
+		if (escLevelData.status === "active" &amp;&amp; escLevelData.additional_escalations) {
+			var additionalEscalatees = escLevelData.additional_escalations;
+			if (additionalEscalatees &amp;&amp; additionalEscalatees.length &gt; 0)
+				additionalEscalatees.forEach(function (additionalEscalatee) {
+					var isGroupIncluded = false;
+					var groupId = (additionalEscalatee.group &amp;&amp; additionalEscalatee.group.sys_id &amp;&amp; additionalEscalatee.group.sys_id.value) ? additionalEscalatee.group.sys_id.value : "";
+					if (groupId) {
+						escalatees.forEach(function (esGroup) {
+							if (esGroup.escalatee_type === "group" &amp;&amp; esGroup.group &amp;&amp; esGroup.group.sys_id &amp;&amp; esGroup.group.sys_id.value &amp;&amp; esGroup.group.sys_id.value === groupId) {
+								isGroupIncluded = true;
+							}
+						});
+					} !isGroupIncluded ? escalatees.push(that.formatEscalateeGroupDetails(additionalEscalatee.group, additionalEscalatee.escalation_id)) : null;
+				});
+		}
+
+		return escalatees;
+	},
+
+	_getEscalationGr: function (escalationSysId) {
+		var escalationGr = new GlideRecord("on_call_escalation");
+		if (!escalationGr.get(escalationSysId)) return null;
+
+		return escalationGr;
+	},
+
+	_getEscalationEndedStatus: function (escalationGr, rotaId) {
+		var wfContextGr = new GlideRecord("wf_context");
+		var wfContextId = escalationGr.getValue("workflow_context");
+		wfContextGr.get('parent.sys_id', wfContextId);
+		if (wfContextGr.hasNext()) {
+			var wcGr = new GlideRecord("wf_context");
+			wcGr.addQuery('parent.sys_id', wfContextId);
+			wcGr.query();
+			while (wcGr.next())
+				if (wcGr.scratchpad.currentRotaID === rotaId) return wcGr;
+		}
+		else wfContextGr.get(wfContextId);
+
+		return wfContextGr;
+	},
+
+	formatEscalationData: function (escalationDetails, source, table) {
+		var that = this;
+
+		var isActive = false;
+		var isAccepted = true;
+		var minRemainingTime = Infinity;
+		var formattedEscData = [];
+
+		for (var i = 0; i &lt; escalationDetails.length; i++) {
+			var currentEscalation = escalationDetails[i];
+			var shiftDetails = currentEscalation.shifts;
+
+			for (var j = 0; j &lt; shiftDetails.length; j++) {
+				var escalationData = {};
+				escalationData.isEscalationAccepted = false;
+				escalationData.recordSysId = source;
+				escalationData.isCatchAllIncluded = false;
+				escalationData.table = table;
+				escalationData.escalation_id = currentEscalation.sys_id.value;
+				escalationData.group = currentEscalation.group;
+
+				if (currentEscalation.group &amp;&amp; currentEscalation.group.manager &amp;&amp; currentEscalation.group.manager.value)
+					escalationData.group.manager.location = this._getUserLocation(currentEscalation.group.manager.value);
+
+				escalationData.category = currentEscalation.category;
+				escalationData.start_time = this._getDateTimeJS(currentEscalation.start_time.display_value);
+				escalationData.end_time = this._getDateTimeJS(currentEscalation.end_time.display_value);
+				escalationData.isEscalationActive = true;
+				escalationData.elapsedTime = new GlideDateTime(currentEscalation.start_time.value).getNumericValue();
+
+				var escalationGr = this._getEscalationGr(currentEscalation.sys_id.value);
+				var firstActiveStepStartTimeGdt;
+
+				if (currentEscalation.end_time.value) {
+					var levels = currentEscalation.shifts[j].escalation_levels;
+					if (levels &amp;&amp; levels.length &gt; 0 &amp;&amp; levels[levels.length - 1].level_end_time &amp;&amp; levels[levels.length - 1].level_end_time.value)
+						escalationData.totalElapsedTime = this.getDuration(currentEscalation.start_time.value, levels[levels.length - 1].level_end_time.value, false);	
+					else
+						escalationData.totalElapsedTime = this.getDuration(currentEscalation.start_time.value, currentEscalation.end_time.value, false);
+					escalationData.isEscalationActive = false;
+				} else {
+					var wfContextGr = this._getEscalationEndedStatus(escalationGr, shiftDetails[j].sys_id.value);
+					if (wfContextGr.getValue('state') === "finished") {
+						var gdt = new GlideDateTime(wfContextGr.getValue('ended'));
+						escalationData.end_time = this._getDateTimeJS(gdt.getDisplayValue());
+						escalationData.isEscalationActive = false;
+						escalationData.totalElapsedTime = this.getDuration(currentEscalation.start_time.value, escalationData.end_time.value, false);
+					}
+				}
+
+				if ((currentEscalation.status &amp;&amp; currentEscalation.status.value &amp;&amp; currentEscalation.status.value === "cancelled") || (escalationGr.workflow_context.state + "" === "cancelled")) {
+					escalationData.escalationStatus = {
+						value: "cancelled",
+						display_value: gs.getMessage("Cancelled")
+					};
+				}
+
+				//check if escalation is active (overlapping shift)
+
+				var currentShift = shiftDetails[j];
+				escalationData.shiftSysId = currentShift.sys_id.value;
+				var shiftGr = this.getShiftGr(currentShift.sys_id.value);
+				escalationData.shiftName = currentShift.name;
+				if (currentShift.is_custom_escalation)
+					escalationData.escalation_set = currentShift.escalation_set;
+				var escLevelDetails = currentShift.escalation_levels;
+				escalationData.escalationSteps = [];
+
+				var totalEstimatedTime = 0;
+
+				var prevEscEndedTime;
+
+				for (var idx = 0; idx &lt; escLevelDetails.length; idx++) {
+					var esclevelData = {};
+					var currentEscalationLevel = escLevelDetails[idx];
+					esclevelData.status = currentEscalationLevel.status;
+					esclevelData.roster = {};
+
+					/* handle custome escalation */
+					currentEscalationLevel.custom_escalation_step ? esclevelData.custom_escalation_step = currentEscalationLevel.custom_escalation_step.display_value : '';
+
+					currentEscalationLevel.escalation_type ? esclevelData.escalation_type = currentEscalationLevel.escalation_type : '';
+
+					if (!currentEscalationLevel.roster_details.catch_all &amp;&amp; currentEscalationLevel.roster) esclevelData.roster = currentEscalationLevel.roster;
+
+					if (currentEscalationLevel.escalation_set) esclevelData.escalation_type = currentEscalationLevel.escalation_set;
+					var escalationRemainingTime;
+
+					var escAttempts = that.getEscalationContactAttempts(currentEscalationLevel, prevEscEndedTime);
+
+					esclevelData.esc_attempts = escAttempts;
+
+					esclevelData.reject_count = 0;
+
+					var rosterNotifications = currentEscalationLevel.roster_details.notifications;
+
+
+					if (currentEscalationLevel.status === "complete" || (escalationData.end_time &amp;&amp; escalationData.end_time.value &amp;&amp; currentEscalationLevel.status === "active")) {
+						var escalateesData = [];
+						var commResponse;
+						var respAdded;
+						// Override the status for overlapping scenario, when the escalation for a shift ends earlier
+						esclevelData.status = "complete";
+						var communications = currentEscalationLevel.contact_attempts[0].communications;
+						esclevelData.response_type = currentEscalationLevel.response_type;
+						communications.forEach(function (communication) {
+							var escalateeType = (communication.escalatee_type.value).toLowerCase();
+							var escId = (escalateeType === "user" &amp;&amp; communication.user &amp;&amp; communication.user.sys_id) ? communication.user.sys_id : communication.device.sys_id.value;
+							if (esclevelData.esc_attempts[escId]) {
+								commResponse = {};
+
+								var atmpts = esclevelData.esc_attempts[escId];
+
+								respAdded = false;
+
+								for (var atmptIdx = 0; atmptIdx &lt; atmpts.length; atmptIdx++) {
+									var resp = atmpts[atmptIdx];
+									if (resp.channels &amp;&amp; resp.channels.length &gt; 0) {
+										var channels = resp.channels;
+										for (var channelIdx = 0; channelIdx &lt; channels.length; channelIdx++) {
+											if (channels[channelIdx] &amp;&amp; channels[channelIdx].response &amp;&amp; (channels[channelIdx].response.value === "accepted" || channels[channelIdx].response.value === "rejected")) {
+												commResponse = channels[channelIdx];
+												respAdded = true;
+												break;
+											}
+										}
+									}
+									if (respAdded) break;
+								}
+
+								var isEscalateeIncluded = false;
+								if (escalateeType === "user") {
+									escalateesData.forEach(function (esUser) {
+										if (esUser.escalatee_type === "user" &amp;&amp; esUser.user &amp;&amp; esUser.user.sys_id &amp;&amp; esUser.user.sys_id === escId) isEscalateeIncluded = true;
+									});
+									!isEscalateeIncluded ? escalateesData.push(that.formatEscalateeUserDetails(communication, commResponse.response ? commResponse.response : "")) : null;
+								} else {
+									escalateesData.forEach(function (esDevice) {
+										if (esDevice.escalatee_type === "device" &amp;&amp; esDevice.device &amp;&amp; esDevice.device.sys_id &amp;&amp; esDevice.device.sys_id.value &amp;&amp; esDevice.device.sys_id.value === escId) isEscalateeIncluded = true;
+									});
+									!isEscalateeIncluded ? escalateesData.push(that.formatEscalateeDeviceDetails(communication.device, commResponse.response ? commResponse.response : "")) : null;
+								}
+							}
+						});
+						var additionalEscalatees = currentEscalationLevel.additional_escalations;
+						if (additionalEscalatees &amp;&amp; additionalEscalatees.length &gt; 0)
+							additionalEscalatees.forEach(function (additionalEscalatee) {
+								var isGroupIncluded = false;
+								var groupId = (additionalEscalatee.group &amp;&amp; additionalEscalatee.group.sys_id &amp;&amp; additionalEscalatee.group.sys_id.value) ? additionalEscalatee.group.sys_id.value : "";
+								if (groupId) {
+									escalateesData.forEach(function (esGroup) {
+										if (esGroup.escalatee_type === "group" &amp;&amp; esGroup.group &amp;&amp; esGroup.group.sys_id &amp;&amp; esGroup.group.sys_id.value &amp;&amp; esGroup.group.sys_id.value === groupId) {
+											isGroupIncluded = true;
+										}
+									});
+								} !isGroupIncluded ? escalateesData.push(that.formatEscalateeGroupDetails(additionalEscalatee.group, additionalEscalatee.escalation_id)) : null;
+							});
+
+						if (!currentEscalationLevel.total_time &amp;&amp; (escalationData.end_time &amp;&amp; escalationData.end_time.value &amp;&amp; currentEscalationLevel.status === "active")) {
+							if (rosterNotifications &amp;&amp; rosterNotifications.overallTimeSec) {
+								//In case of overlapping shifts, calculate elapsed time for the shift which ended earlier. Parsing of seconds is done on client side
+								var totalTimeDuration = new GlideDuration(rosterNotifications.overallTimeSec * 1000);
+								esclevelData.total_time = totalTimeDuration.getDisplayValue();
+							}
+						} else
+							esclevelData.total_time = currentEscalationLevel.total_time;
+						esclevelData.escalatees = escalateesData;
+						
+						var escAttemptData = that._computeCompletedEscAttempt(escAttempts, escLevelDetails, escalationData.end_time, idx, false);
+
+						esclevelData.esc_attempts = escAttemptData.newAttempts;
+						esclevelData.reject_count = escAttemptData.rejectCount;
+
+						if (currentEscalationLevel.response_type === "accepted") {
+							esclevelData.reject_count = 0;
+							escalationData.isEscalationAccepted = true;
+							escalationData.acceptedEscalation = esclevelData;
+							escalationData.escalationSteps.push(esclevelData);
+							break;
+						}
+					} else if (currentEscalationLevel.status === "pending" &amp;&amp; !(escalationData.end_time &amp;&amp; escalationData.end_time.value)) {
+						if (currentEscalationLevel.escAudiences)
+							esclevelData.escalatees = that.formatEscalationAudienceDetails(currentEscalationLevel);
+						if (!(esclevelData.roster &amp;&amp; esclevelData.roster.display_value) &amp;&amp; currentEscalationLevel.roster_details)
+							esclevelData.roster.display_value = currentEscalationLevel.roster_details.name;
+						if (rosterNotifications.repeats.length &gt; 0 &amp;&amp; (rosterNotifications.repeats[0].contact_eta || currentEscalationLevel.roster_details.notifications.escalated_at))
+							esclevelData.contact_eta = that._getDateTimeJS(rosterNotifications.repeats.length &gt; 0 ? rosterNotifications.repeats[0].contact_eta.display_value : currentEscalationLevel.roster_details.notifications.escalated_at.display_value);
+						else esclevelData.contact_eta = prevEscEndedTime ? that._getDateTimeJS(prevEscEndedTime.display_value) : null;
+					} else if (currentEscalationLevel.status === "active" &amp;&amp; !(escalationData.end_time &amp;&amp; escalationData.end_time.value)) {
+						if (!firstActiveStepStartTimeGdt)
+							firstActiveStepStartTimeGdt = currentEscalationLevel.sys_created_on;
+						escalationData.activeStep = idx + 1;
+						if (currentEscalationLevel.escAudiences)
+							esclevelData.escalatees = that.formatEscalationAudienceDetails(currentEscalationLevel);
+
+						if (currentEscalationLevel.timer) {
+							esclevelData.remainingTime = new GlideDateTime(currentEscalationLevel.timer.value).getNumericValue();
+						} else if (currentEscalationLevel.last_contact_at) {
+							var remainingDiff = that.getDuration(null, currentEscalationLevel.last_contact_at.value, true);
+							var glideDateTime = new GlideDateTime();
+							glideDateTime.addSeconds(remainingDiff);
+							esclevelData.remainingTime = glideDateTime.getNumericValue();
+						}
+
+						var escAttemptData = that._computeCompletedEscAttempt(escAttempts, escLevelDetails, currentEscalation.end_time, idx, true);
+
+						esclevelData.esc_attempts = escAttemptData.newAttempts;
+						esclevelData.reject_count = escAttemptData.rejectCount;
+					}
+
+					if (escalationData.isEscalationAccepted) isAccepted = true;
+
+					if (currentEscalationLevel.catch_all) {
+						escalationData.isCatchAllIncluded = true;
+						var catchAllContactTime;
+
+						if (rosterNotifications.repeats.length &gt; 0) {
+							catchAllContactTime = (currentEscalationLevel.status === "pending") ? rosterNotifications.repeats[rosterNotifications.repeats.length - 1].contact_eta : rosterNotifications.repeats[rosterNotifications.repeats.length - 1].contacted_at;
+						} else catchAllContactTime = currentEscalationLevel.roster_details.notifications.escalated_at;
+
+						var catchAllTime = that._getShiftCatchAllTime(shiftGr);
+						var escalationEndTime = (catchAllContactTime &amp;&amp; catchAllContactTime.value) ? new GlideDateTime(catchAllContactTime.value) : prevEscEndedTime ? new GlideDateTime(prevEscEndedTime.value) : null;
+						escalationEndTime.addSeconds(catchAllTime);
+						esclevelData.roster.display_value = (currentEscalationLevel.roster_details &amp;&amp; currentEscalationLevel.roster_details.name) ? currentEscalationLevel.roster_details.name : "";
+
+						if (!(escalationData.end_time &amp;&amp; escalationData.end_time.value)) {
+							escalationRemainingTime = new GlideDateTime(escalationEndTime.value).getNumericValue();
+							esclevelData.remainingTime = escalationRemainingTime;
+						} else {
+							esclevelData.status = "complete";
+							esclevelData.total_time = that.getDuration(catchAllContactTime.value, escalationEndTime.value, false);
+						}
+
+						escalationData.escalation_estimated_end_time = that._getDateTimeJS(escalationEndTime.getDisplayValue());
+						escalationData.escalation_duration = that.getDuration("", escalationEndTime.value, false);
+					}
+
+					if (esclevelData.remainingTime &amp;&amp; esclevelData.remainingTime &lt; minRemainingTime) minRemainingTime = esclevelData.remainingTime;
+
+					totalEstimatedTime += escLevelDetails[idx].step_time_sec ? escLevelDetails[idx].step_time_sec : 0;
+
+					prevEscEndedTime = currentEscalationLevel.last_contact_at;
+
+					escalationData.escalationSteps.push(esclevelData);
+				}
+
+				/* Handle catch all if not included */
+				if (!gs.nil(shiftGr.getValue('catch_all')) &amp;&amp; !currentShift.is_custom_escalation &amp;&amp; !escalationData.isCatchAllIncluded &amp;&amp; !escalationData.isEscalationAccepted &amp;&amp; !(escalationData.end_time &amp;&amp; escalationData.end_time.value)) {
+					var prevEscalation = escalationData.escalationSteps[escalationData.escalationSteps.length - 1];
+					var lastEscAttempt;
+					var lastNotificationTime;
+					if (prevEscalation &amp;&amp; Object.keys(prevEscalation.esc_attempts).length) {
+						lastEscAttempt = Object.keys(prevEscalation.esc_attempts)[Object.keys(prevEscalation.esc_attempts).length - 1];
+						lastNotificationTime = prevEscalation.esc_attempts[lastEscAttempt][prevEscalation.esc_attempts[lastEscAttempt].length - 1].attempted_at;
+
+						if (shiftGr &amp;&amp; gs.nil(shiftGr.getValue('catch_all'))) {
+							escalationData.escalation_estimated_end_time = that._getDateTimeJS(lastNotificationTime.value);
+							escalationData.escalation_duration = that.getDuration("", lastNotificationTime.value, false);
+						} else {
+							var escCatchAllTime = that._getShiftCatchAllTime(shiftGr);
+							var escalationEndTimeGdt = new GlideDateTime(lastNotificationTime.value);
+							escalationEndTimeGdt.addSeconds(escCatchAllTime);
+							escalationData.escalation_estimated_end_time = that._getDateTimeJS(escalationEndTimeGdt.getDisplayValue());
+							escalationData.escalation_duration = that.getDuration("", escalationEndTimeGdt.value, false);
+
+							var catchAllEscData = {};
+							catchAllEscData.status = "pending";
+							catchAllEscData.roster = {
+								display_value: gs.getMessage("Catch All")
+							}
+							catchAllEscData.escalatees = [];
+							catchAllEscData.esc_attempts = {};
+							catchAllEscData.reject_count = 0;
+							catchAllEscData.escalatees = [];
+							catchAllEscData.contact_eta = that._getDateTimeJS(lastNotificationTime.display_value);
+
+							escalationData.escalationSteps.push(catchAllEscData);
+						}
+					}
+				}
+
+				if (!escalationData.escalation_estimated_end_time) {
+					var escEndTime;
+					if (firstActiveStepStartTimeGdt)
+						escEndTime = new GlideDateTime(firstActiveStepStartTimeGdt.value);
+					else
+						escEndTime = new GlideDateTime(escalationData.start_time.value);
+					escEndTime.addSeconds(totalEstimatedTime);
+					escalationData.escalation_estimated_end_time = that._getDateTimeJS(escEndTime.getDisplayValue());
+					escalationData.escalation_duration = that.getDuration("", escEndTime, false);
+				}
+
+				formattedEscData.push(escalationData);
+
+				if (escalationData.isEscalationActive) isActive = true;
+			}
+		}
+
+		return {
+			formattedEscData: formattedEscData,
+			isActive: isActive,
+			isAccepted: isAccepted,
+			minRemainingTime: minRemainingTime
+		};
+	},
+
+	getShiftGr: function (shiftId) {
+		var shiftGr = new GlideRecord('cmn_rota');
+
+		if (!shiftGr.get(shiftId)) return null;
+
+		return shiftGr;
+	},
+
+	getEscalationContactAttempts: function (escLevel, prevEscEndTime) {
+		var that = this;
+		var rosterDetails = escLevel.roster_details.notifications.repeats;
+		var esclatees = {};
+
+		if (escLevel.contact_attempts) {
+			for (var i = 0; i &lt; escLevel.contact_attempts.length; i++) {
+				var communications = escLevel.contact_attempts[i].communications;
+				for (var j = 0; j &lt; communications.length; j++) {
+					var communication = communications[j];
+					this.getEscalationCommunicationData(communication, esclatees, escLevel.contact_attempts[i].contact_attempt, escLevel.contact_attempts[i].first_contacted_at);
+					var contactAttempt = escLevel.contact_attempts[i].contact_attempt;
+					if (communication.response) {
+						var escalateeType = communication.escalatee_type.value;
+						var communicationId = (escalateeType === "user") ? ((communication.user &amp;&amp; communication.user.sys_id) ? communication.user.sys_id : "") : ((communication.device &amp;&amp; communication.device.sys_id &amp;&amp; communication.device.sys_id.value) ? communication.device.sys_id.value : "");
+
+						if (escLevel.contact_attempts[0].first_contacted_at &amp;&amp; escLevel.contact_attempts[0].first_contacted_at.display_value &amp;&amp; communication.responded_at &amp;&amp; communication.responded_at.display_value &amp;&amp; esclatees &amp;&amp; esclatees[communicationId] &amp;&amp; esclatees[communicationId][parseInt(contactAttempt) - 1]) {
+							esclatees[communicationId][parseInt(contactAttempt) - 1].responseTimeVal = that.getDuration(escLevel.contact_attempts[0].first_contacted_at.display_value, communication.responded_at.display_value, false);
+							esclatees[communicationId][parseInt(contactAttempt) - 1].responded_atVal = that._getDateTimeJS(communication.responded_at.display_value);
+						}
+
+						if (communication.response.value === "accepted" &amp;&amp; esclatees &amp;&amp; esclatees[communicationId] &amp;&amp; esclatees[communicationId][parseInt(contactAttempt) - 1]) {
+							esclatees[communicationId][parseInt(contactAttempt) - 1].responseVal = communication.response;
+						}
+
+						else if (communication.response.value === "rejected" &amp;&amp; esclatees &amp;&amp; esclatees[communicationId] &amp;&amp; esclatees[communicationId][parseInt(contactAttempt) - 1])
+							esclatees[communicationId][parseInt(contactAttempt) - 1].responseVal = communication.response;
+
+						else if (communication.response.value &amp;&amp; esclatees &amp;&amp; esclatees[communicationId] &amp;&amp; esclatees[communicationId][parseInt(contactAttempt) - 1])
+							esclatees[communicationId][parseInt(contactAttempt) - 1].responseVal = communication.response;
+					}
+				}
+			}
+		}
+
+		if (escLevel.pending_preferences) {
+			escLevel.pending_preferences.forEach(function (pref) {
+				var escalateeId = pref.sys_id;
+				var escalateeType = pref['type'];
+				var email = '';
+				var number = '';
+
+				if (escalateeType === 'user') {
+					var users = escLevel.escAudiences.userDetails;
+					for (var i = 0; i &lt; users.length; i++) {
+						var user = users[i].user;
+						if (user &amp;&amp; user.sys_id &amp;&amp; user.sys_id === escalateeId) {
+							email = user.email ? user.email : gs.getMessage('Not available');
+							number = user.contact_number ? user.contact_number : gs.getMessage('Not available');
+							break;
+						}
+					}
+				}
+
+				if (escalateeType === 'device') {
+					var devices = escLevel.escAudiences.deviceDetails;
+					for (var i = 0; i &lt; devices.length; i++) {
+						var device = devices[i];
+						if (device &amp;&amp; device.sys_id &amp;&amp; device.sys_id.value &amp;&amp; device.sys_id.value === escalateeId) {
+							email = (device.email_address &amp;&amp; device.email_address.display_value) ? device.email_address.display_value : gs.getMessage('Not available');
+							number = (device.phone_number &amp;&amp; device.phone_number.display_value) ? device.phone_number.display_value : gs.getMessage('Not available');
+							break;
+						}
+					}
+				}
+
+				var obj = {};
+
+				if (rosterDetails.length &gt; 0 &amp;&amp; (rosterDetails[pref.contact_attempt - 1].contact_eta || rosterDetails[pref.contact_attempt - 1].contacted_at)) {
+					obj.attempted_at = that._getDateTimeJS(rosterDetails[pref.contact_attempt - 1].contact_eta ? rosterDetails[pref.contact_attempt - 1].contact_eta.display_value : rosterDetails[pref.contact_attempt - 1].contacted_at.display_value);
+				} else if (escLevel.roster_details.notifications.escalated_at) obj.attempted_at = that._getDateTimeJS(escLevel.roster_details.notifications.escalated_at.display_value);
+				else obj.attempted_at = prevEscEndTime ? that._getDateTimeJS(prevEscEndTime.display_value) : null;
+
+				obj.contact_attempt = pref.contact_attempt;
+				obj.channels = pref.contact_preferences;
+
+				if (pref.contact_preferences.length) {
+					obj.channels.map(function (channel) {
+						var channelType = channel['type'];
+						switch (channelType) {
+							case 'email':
+								channel.label = gs.getMessage("Email");
+								channel.email = email;
+								break;
+							case 'teams':
+								channel.label = gs.getMessage("Microsoft Teams");
+								channel.email = email;
+								break;
+							case 'slack':
+								channel.label = gs.getMessage("Slack");
+								channel.email = email;
+								break;
+							case 'mobile_notification':
+								channel.label = gs.getMessage("Mobile push");
+								channel.mobile_notification = true;
+								break;
+							case 'sms':
+								channel.label = gs.getMessage("SMS");
+								channel.sms = number;
+								break;
+							case 'voice':
+								channel.label = gs.getMessage("Voice");
+								channel.voice = number;
+								break;
+						}
+					});
+				}
+
+				if (!(escalateeId in esclatees)) esclatees[escalateeId] = [];
+				esclatees[escalateeId].push(obj);
+			});
+		}
+
+		return esclatees;
+	},
+
+	type: 'OnCallEscalationSOWUtilSNC'
+
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-10-11 21:41:51&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;5fd70a2887ee1110a4b9ca29dabb356d&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;311&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;OnCallEscalationSOWUtilSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="On Call Scheduling for Service Operations Workspace" source="sn_sow_on_call"&gt;7e3c2481539260100c54ddeeff7b127b&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="On Call Scheduling for Service Operations Workspace"&gt;7e3c2481539260100c54ddeeff7b127b&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_5fd70a2887ee1110a4b9ca29dabb356d&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-06-14 23:13:02&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:37:42</sys_created_on>
+        <sys_id>a2c6381d83f01210c6695855eeaad33a</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>OnCallEscalationSOWUtilSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_a2c6381d83f01210c6695855eeaad33a</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:37:42</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

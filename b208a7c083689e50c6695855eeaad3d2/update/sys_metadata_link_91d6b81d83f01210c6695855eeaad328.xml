@@ -1,0 +1,248 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>63b21a40c7722010ec17148c95c260d8</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_doc.DocumentTemplateTranslationUtilsSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;DocumentTemplateTranslationUtilsSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var DocumentTemplateTranslationUtilsSNC = Class.create();
+DocumentTemplateTranslationUtilsSNC.prototype = {
+    initialize: function() {},
+
+    getDocumentContent: function(params) {
+        var tableName = params.tableName;
+        var sysId = params.sysId;
+        var language = params.language;
+        var additionalParameters = params.additionalParameters;
+        var sourceId;
+        var targetId;
+        var translationFieldsInfoArray;
+        var escapeDetails;
+        var groupName;
+        var lfDocumentContentBuilder;
+
+        if (additionalParameters &amp;&amp; additionalParameters.sourceID) { //Open translation UI action - The translated record already exists.
+            sourceId = additionalParameters.sourceID;
+            targetId = sysId;
+        } else //Translate UI action - The translated record doesn't exist yet. It'll be created on publishing the translation from Translation UI.
+            sourceId = sysId;
+
+        translationFieldsInfoArray = this._getTranslationFieldsInfo(tableName, sourceId, targetId, language);
+        escapeDetails = this._getEscapeDeailsObject(tableName);
+
+        var gr = new GlideRecord(tableName);
+        if (gr.get(sourceId))
+            groupName = gs.getMessage('Source: {0}', gr.getDisplayValue('name'));
+
+        lfDocumentContentBuilder = new global.LFDocumentContentBuilder("v1", language, sysId, tableName, additionalParameters);
+        translationFieldsInfoArray.forEach(function(fieldInfo) {
+            var additionalParametersForField = {
+                'type': fieldInfo.type == "html_script" ? "translated_html" : "text"
+            };
+            var textType = fieldInfo.type == "html_script" ? global.LFDocumentContentHelper.HTML_TEXT_TYPE : global.LFDocumentContentHelper.PLAIN_TEXT_TYPE;
+            var field = global.LFDocumentContentHelper.createField(fieldInfo.sourceValue, fieldInfo.targetValue).setIsFieldLocked(false).setTextType(textType).setAdditionalParameters(additionalParametersForField);
+            if (fieldInfo.type == "html_script") {
+                field.setEscapeDetails(escapeDetails);
+            }
+            var additionalParametersForElement = {
+                'fieldName': fieldInfo.name
+            };
+
+            var element = global.LFDocumentContentHelper.createElement(groupName, fieldInfo.label).addField(field).setAdditionalParameters(additionalParametersForElement);
+            lfDocumentContentBuilder.processElement(element);
+        });
+
+        return lfDocumentContentBuilder.build();
+    },
+
+    saveTranslation: function(documentContent) {
+        var table = documentContent.getTableName();
+        var artifactSysId = documentContent.getSysId();
+        var targetLanguage = documentContent.getLanguage();
+        var additionalParameters = documentContent.getAdditionalParameters();
+        var sourceId;
+        var targetId;
+        var sourceGr;
+        var targetGr;
+        var translationFieldData = {};
+
+        //Translated field values
+        var elements = documentContent.getElements();
+        documentContent.content.forEach(function(fieldTranslationContent) {
+            translationFieldData[fieldTranslationContent.getAdditionalParameters().fieldName] = fieldTranslationContent.getFields()[0].getTranslatedValue();
+        });
+
+        //Add languague field
+        translationFieldData.language = targetLanguage;
+
+        //Open Translation action - the translation target record already exists. Update it with new translated values.
+        if (additionalParameters &amp;&amp; additionalParameters.sourceID) {
+            sourceId = additionalParameters.sourceID;
+            targetId = artifactSysId;
+
+            targetGr = new GlideRecord(table);
+            if (!targetGr.get(targetId)) {
+                gs.error('Translation target record not found: ' + targetId);
+                return targetId;
+            }
+
+            Object.keys(translationFieldData).forEach(function(field) {
+                targetGr[field] = translationFieldData[field];
+            });
+
+            targetGr.update();
+            return targetId;
+        }
+
+        //Translate action - the translation target record doesn't exist. Create it.
+        sourceId = artifactSysId;
+        targetId = this._createTranslationTarget(table, sourceId, translationFieldData);
+        return targetId;
+    },
+
+    _getTranslationFieldsInfo: function(table, sourceId, targetId, language) {
+        var sourceGr;
+        var targetGr;
+        var translationFieldsInfoArray = [];
+
+        var fieldsToTranslate = this._getFieldsForTranslation(table);
+        if (gs.nil(fieldsToTranslate) || fieldsToTranslate.length == 0)
+            return translationFieldInfoArray;
+
+        sourceGr = new GlideRecord(table);
+        if (!sourceGr.get(sourceId)) {
+            gs.error('Translation source record not found: ' + sourceId);
+            return translationFieldInfoArray;
+        }
+
+        if (!gs.nil(targetId)) {
+            targetGr = new GlideRecord(table);
+            if (!targetGr.get(targetId)) {
+                gs.error('Translation target record not found: ' + targetId);
+                return translationFieldInfoArray;
+            }
+        }
+
+        var tranformFunc = this._transformValue;
+        fieldsToTranslate.forEach(function(field) {
+            translationFieldsInfoArray.push({
+                name: field,
+                label: sourceGr[field].getLabel(),
+                type: sourceGr[field].getED().getInternalType(),
+                sourceValue: tranformFunc(sourceGr, field, language),
+                targetValue: tranformFunc(gs.nil(targetGr) ? sourceGr : targetGr, field, language)
+            });
+        });
+
+        return translationFieldsInfoArray;
+    },
+
+    _getFieldsForTranslation: function(table, sourceId, targetId) {
+        if (table == 'sn_doc_html_template')
+            return ['footnote', 'html_script_body'];
+
+        if (table == 'sn_doc_template_block_content')
+            return ['body'];
+
+        gs.error('Invalid table for translation: ' + table);
+    },
+
+    _transformValue: function(recordGr, field, language) {
+        var fieldValue = recordGr.getValue(field);
+        if (gs.nil(fieldValue))
+            return '';
+
+        if (field == 'html_script_body')
+            fieldValue = new DocumentTemplateBlockUtils().refreshBlockSnippets(fieldValue);
+
+        return fieldValue;
+    },
+
+    _getEscapeDeailsObject: function(table) {
+        var replaceWith = 'ZYZ&lt;IDX&gt;XZY';
+        var escapeDeailsObject = [];
+
+        //Escape all types of tokens
+        escapeDeailsObject.push({
+            "escapeRegex": "\\${([^}]*)}",
+            "replaceWith": replaceWith,
+            "regexFlag": "g"
+        });
+
+        //Escape blocks in template body
+        if (table == 'sn_doc_html_template')
+            escapeDeailsObject.push({
+                "escapeRegex": new DocumentTemplateBlockUtils().getBlockSnippetPattern('', false),
+                "replaceWith": replaceWith,
+                "regexFlag": "gm"
+            });
+
+        return escapeDeailsObject;
+    },
+
+    _createTranslationTarget: function(table, sourceId, fieldData) {
+        var sourceGr = new GlideRecord(table);
+        if (!sourceGr.get(sourceId)) {
+            gs.error('Translation source record not found: ' + sourceId);
+            return;
+        }
+
+        //Add name field
+        fieldData.name = sourceGr.getValue('name') + '_' + this._getLanguageNameById(fieldData.language);
+
+        if (table == "sn_doc_html_template")
+            return new sn_doc.DocumentTemplateUtils().cloneTemplate(sourceGr, fieldData);
+
+        if (table == "sn_doc_template_block_content")
+            return new sn_doc.DocumentTemplateUtils().cloneBlockContent(sourceGr, fieldData);
+    },
+
+    _getLanguageNameById: function(id) {
+        var languageGr = new GlideRecord('sys_language');
+        languageGr.addQuery('id', id);
+        languageGr.setLimit(1);
+        languageGr.query();
+        if (languageGr.next())
+            return languageGr.name;
+
+        return id;
+    },
+
+    type: 'DocumentTemplateTranslationUtilsSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-03-05 06:54:59&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;63b21a40c7722010ec17148c95c260d8&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;258&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;DocumentTemplateTranslationUtilsSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Document Templates" source="sn_doc"&gt;6a9ea833b763330088d9bc78ee11a88q&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Document Templates"&gt;6a9ea833b763330088d9bc78ee11a88q&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_63b21a40c7722010ec17148c95c260d8&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2021-05-17 17:26:26&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:37:54</sys_created_on>
+        <sys_id>91d6b81d83f01210c6695855eeaad328</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>DocumentTemplateTranslationUtilsSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_91d6b81d83f01210c6695855eeaad328</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:37:54</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,155 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>935b08f185321110f877e10cffeb7bbc</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_uibtk_api.UXEvent&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;UXEvent&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[const UXEvent = Class.create();
+UXEvent.prototype = Object.extendsObject(BuilderToolkitAPIBase, {
+    TABLE: 'sys_ux_event',
+    FIELDS: ['label', 'event_name', 'props', 'description', 'schema_version'],
+
+    /**
+     * @param fields {string[]}
+     */
+    initialize: function(fields) {
+        BuilderToolkitAPIBase.prototype.initialize.call(this, this.TABLE, fields || this.FIELDS);
+    },
+
+    /**
+     * Creates any net new event, updates existing ones, deletes removed ones, and updates MCP dispatched/handled event fields
+     * @param events {object[]} an array of sys_ux_event objects
+     * @param macroponent {Macroponent} the macroponent the events relate to
+     */
+    upsertAndDeleteRecords: function(events = [], macroponent = null) {
+        // If we have no macroponent, we shouldn't be here so ABORT
+        if (!macroponent?.sysId) {
+            return {};
+        }
+        const that = this;
+        let updatedDispatchedEvents = (macroponent?.dispatchedEvents?.split(',') ?? []);
+        let updatedHandledEvents = (macroponent?.handledEvents?.split(',') ?? []);
+        let results = events.reduce((acc, fields) =&gt; {
+            // Check if this sysId already exists OR if the event name exists within the same scope
+            const query = `sys_id=${fields?.sysId}^NQevent_name=${fields?.eventName}^sys_scope=${fields?.sysScope?.value}`;
+            const eventGR = that.getRecordsByQuery(query, '', true);
+            // If it doesn't exist, then we just create it and remove from our list
+            if (!eventGR) {
+                acc.push(that.createRecord(fields));
+            } else if (eventGR.next()) {
+                // If we already exist, write if we can, and then make sure our dispatched/handled events are correct
+                if (eventGR.canWrite()) {
+                    const currentFieldValues = eventGR.getElements().reduce(that.getFieldValues.bind(that), {});
+                    // Let's compare our field values to make sure we don't update needlessly
+                    // If we don't match values, update the record and return the result
+                    for (const field in fields) {
+                        if (eventGR.isValidField(field) &amp;&amp; currentFieldValues[field] !== fields[field]) {
+                            const {
+                                sysId,
+                                ...eventFields
+                            } = fields;
+                            that.setFieldValues(eventGR, eventFields);
+                            acc.push(eventGR.update());
+                            break;
+                        }
+                    }
+                }
+
+                const dispatchedIndex = updatedDispatchedEvents.findIndex((sysId) =&gt; sysId === fields?.sysId);
+                dispatchedIndex !== -1 ? updatedDispatchedEvents.splice(dispatchedIndex, 1, eventGR.getUniqueValue()) :
+                    updatedDispatchedEvents;
+
+                const handledIndex = updatedHandledEvents.findIndex((sysId) =&gt; sysId === fields?.sysId);
+                handledIndex !== -1 ? updatedHandledEvents.splice(handledIndex, 1, eventGR.getUniqueValue()) :
+                    updatedHandledEvents;
+            }
+            return acc;
+        }, []);
+
+        // Now if we have any events the macroponent is pointed at that we don't have anymore
+        // we should try to delete them
+        const macroponentGR = new Macroponent().getRecordById(macroponent?.sysId, true);
+        if (macroponentGR) {
+            const previousEventIds = [
+                ...(macroponentGR.getValue('dispatched_events')?.split(',') ?? []),
+                ...(macroponentGR.getValue('handled_events')?.split(',') ?? [])
+            ];
+            const updatedEventIds = [...updatedDispatchedEvents, ...updatedHandledEvents];
+            const eventsIdsToDelete = previousEventIds.filter((eventId) =&gt; !updatedEventIds.includes(eventId));
+            const eventsToDelete = eventsIdsToDelete.reduce((acc, eventId) =&gt; {
+                acc.push({
+                    sysId: eventId
+                });
+                return acc;
+            }, []);
+            results = results.concat(that.deleteRecords(eventsToDelete, macroponent.sysId));
+        }
+
+        return {
+            updatedDispatchedEvents,
+            updatedHandledEvents,
+            eventOperationResults: results
+        };
+    },
+
+    /**
+     * @param records {array} an array of event records
+     * @param macroponentSysId {string} sys_id of the macroponent this event is related to
+     */
+    deleteRecords: function(records, macroponentSysId) {
+        const that = this;
+        return records.reduce((acc, fields) =&gt; {
+            // We have to check if this event is in use anywhere else so we don't delete when used elsewhere
+            const mcpQuery = `handled_eventsLIKE${fields?.sysId}^handled_eventsISNOTEMPTY^sys_id!=${macroponentSysId}^NQdispatched_eventsLIKE${fields?.sysId}^dispatched_eventsISNOTEMPTY^sys_id!=${macroponentSysId}`;
+            const macroponentUsage = new Macroponent().checkIfRecordsExist(mcpQuery, '', true);
+            const addOnEventMappingUsage = new UXAddOnEventMapping().checkIfRecordsExist(`target_event=${fields?.sysId}^target_eventISNOTEMPTY^parent_macroponent!=${macroponentSysId}`, '', true);
+            if (!macroponentUsage &amp;&amp; !addOnEventMappingUsage) {
+                // We also have to check that the event actually exists, it might be something deleted before it was saved
+                const eventGR = that.getRecordById(fields?.sysId, true);
+                if (eventGR) {
+                    acc.push(eventGR.deleteRecord(fields));
+                }
+            }
+            return acc;
+        }, []);
+    },
+
+    type: 'UXEvent'
+});]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;maint&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-10-27 20:05:54&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;935b08f185321110f877e10cffeb7bbc&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;42&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;UXEvent&lt;/sys_name&gt;
+        &lt;sys_package display_value="@devsnc/uibtk-api" source="sn_uibtk_api"&gt;cdfd3bed43321110e70583020cb8f28e&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="@devsnc/uibtk-api"&gt;cdfd3bed43321110e70583020cb8f28e&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_935b08f185321110f877e10cffeb7bbc&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-02-23 16:54:55&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:45:40</sys_created_on>
+        <sys_id>0b98b85183341210c6695855eeaad3cf</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>UXEvent</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_0b98b85183341210c6695855eeaad3cf</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:45:40</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

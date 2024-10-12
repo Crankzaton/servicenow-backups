@@ -1,0 +1,170 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>45d0b14bc3913010a0cd587c1f40dde0</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.FSMConditions&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;For conditions that are too long to fit in the condition field&lt;/description&gt;
+        &lt;name&gt;FSMConditions&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var FSMConditions = Class.create();
+FSMConditions.prototype = {
+    initialize: function() {},
+    shouldValidateAcceptanceDuration: function(current, previous) {
+        //validate accetance duration when
+        //accept reject enabled AND
+        //assignedTo not nil  AND
+		//state == 16
+        //duration not nill  AND  one of the following
+        //assignedTo changes and useScheduledState enabled  OR
+        //duration changes    OR
+        //state changes (to 16)
+        var acceptRejectEnabled = new SMConfigCacheManager().getSMConfig(current.getTableName()).accept_reject == "true";
+        return acceptRejectEnabled &amp;&amp;
+            !current.assigned_to.nil() &amp;&amp;
+            !current.acceptance_duration.nil() &amp;&amp;
+            current.state == 16 &amp;&amp;
+            ((current.assigned_to.changes() &amp;&amp; !new global.ScheduledStateUtil().isUseScheduledStateEnabled(current)) ||
+                current.acceptance_duration.changes() ||
+                current.state.changes());
+    },
+	
+	shouldRaiseAutoRejectEvent: function(current, previous){
+		if (global.FSMUtil.taskIsBundle(current))
+			return false;
+		return this.shouldValidateAcceptanceDuration(current, previous);
+	},
+	
+	shouldRaiseAssignedEvent: function(current, previous){
+		if (global.FSMUtil.taskIsBundle(current))
+			return false;
+
+		if (this.checkScheduleOptimizationCondition(current))
+			return false;
+
+		return current.state == 16 &amp;&amp;(current.state.changes()||current.assigned_to.changes());
+	},
+	
+	shouldShowConfirmAssignmentButton: function(current){
+		if (GlidePluginManager.isActive("com.snc.fsm_task_bundle") &amp;&amp; !gs.nil(current.bundle))
+			return false;
+		return current.state==12
+		&amp;&amp; (new global.StateFlow().validFlow(current, '330008b6c3113010a0cd587c1f40dd49', 'manual'))
+		&amp;&amp; new global.ScheduledStateUtil().isUseScheduledStateEnabled(current);	
+		
+	},
+	shouldShowAutoAssignListAction: function(current){
+		
+		if ( global.FSMUtil.taskInBundle(current)) {
+			return false;
+		}
+		return (current.state != 7) &amp;&amp; (current.state != 12) &amp;&amp; !(global.FSMUtil.isAppRequestDriven(current)) &amp;&amp; global.FSMUtil.checkIfUserCanAutoAssign(current);
+	},
+	
+	shouldRescheduleTask: function(current, previous){	
+		return ((current.assigned_to.changes() &amp;&amp; !current.assigned_to.nil() &amp;&amp; !previous.assigned_to.nil())||(current.expected_start.changes() &amp;&amp; current.state==16 &amp;&amp; !previous.assigned_to.nil() )) &amp;&amp; !(new global.ScheduledStateUtil().shouldTaskBeAssigned(current));
+	},
+	
+	shouldReassignTask: function(current, previous) {
+		return ((current.assigned_to.changes() &amp;&amp; !current.assigned_to.nil() &amp;&amp; !previous.assigned_to.nil()) || (current.expected_start.changes() &amp;&amp; current.state==12)) &amp;&amp;
+			new global.ScheduledStateUtil().shouldTaskBeAssigned(current);
+	},
+
+	shouldSetLockedFlagOnAssigned: function(){
+		var propVal = gs.getProperty('sn_fsm.set_schedule_lock_by_state');
+		return (!gs.nil(propVal) &amp;&amp; !propVal.isNaN() &amp;&amp; (propVal == 16));
+	},
+
+	shouldSetLockedFlagOnAccepted: function(){
+		var propVal = gs.getProperty('sn_fsm.set_schedule_lock_by_state');
+		return (!gs.nil(propVal) &amp;&amp; !propVal.isNaN() &amp;&amp; (propVal == 17));
+	},
+
+	needCheckForMultiDayTask: function(current){
+		var isMultiDayPluginActive = GlidePluginManager.isActive('com.snc.fsm_multiday_tasks');
+		return(isMultiDayPluginActive &amp;&amp; (current.honor_resource_work_hours.changes() || current.expected_start.changes()|| current.assigned_to.changes() || current.estimated_work_duration.changes()));
+
+	},
+
+	checkIfScheduleLockedByState: function(current){
+		var stateFlowLock = false;
+		if (this.shouldSetLockedFlagOnAssigned() &amp;&amp; !((current.scheduling_method == 'dynamic_schedule') || (current.scheduling_method == 'optimization')) &amp;&amp; !current.assigned_to.nil() &amp;&amp; ((current.state == 16) || (current.state == 17) || (current.state == 18) || (current.state == 3) || (current.state == 4) || (current.state == 7)) )
+			stateFlowLock = true;
+		if (this.shouldSetLockedFlagOnAccepted() &amp;&amp; !((current.scheduling_method == 'dynamic_schedule') || (current.scheduling_method == 'optimization')) &amp;&amp; !current.assigned_to.nil() &amp;&amp; ((current.state == 17) || (current.state == 18) || (current.state == 3) || (current.state == 4) || (current.state == 7)))
+             stateFlowLock = true;
+		return stateFlowLock;
+	},
+
+	sourcePartCondition: function(current) {
+		return (this.canCreateAPartRequirement(current.service_order_task) &amp;&amp; this._sourcePartCondition(current));
+	},
+
+	_sourcePartCondition: function(current){
+		var gr = new GlideRecord('alm_transfer_order_line');
+		return !GlidePluginManager.isActive('com.snc.fsm_advanced_parts_sourcing') &amp;&amp; !current.isNewRecord() &amp;&amp;
+			current.sourced == false &amp;&amp; current.required_quantity &gt; current.reserved_quantity &amp;&amp; gr.canCreate();
+	},
+
+	checkScheduleOptimizationCondition: function(current) {
+		var skipCheck = (
+			(current.sys_class_name.getValue() != 'wm_task') ||
+			!GlidePluginManager.isActive('com.snc_schedule_optimization')
+		);
+
+		if (skipCheck)
+			return;
+
+		var isSOUpdate = (
+			(current.assigned_to.changes() || current.scheduling_method.changes() || current.expected_start.changes()) &amp;&amp; 
+			current.scheduling_method == 'optimization'
+		);
+
+		return isSOUpdate;
+	},
+
+	canCreateAPartRequirement: function(parent){
+		if(gs.hasRole('wm_task_initiator') &amp;&amp; !((gs.hasRole('admin') || gs.hasRole('wm_admin') || gs.hasRole('wm_dispatcher') || gs.hasRole('wm_agent') || gs.hasRole('wm_qualifier')))) {
+			if(parent.state != 1)
+				return false;
+			else if(!gs.nil(parent.parent) &amp;&amp; (parent.parent.state != 1 || parent.state!=1))
+				return false;
+		}
+		return true;
+	},
+
+    type: 'FSMConditions'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-07-16 18:55:18&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;45d0b14bc3913010a0cd587c1f40dde0&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;18&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;FSMConditions&lt;/sys_name&gt;
+        &lt;sys_package display_value="Field Service Management" source="com.snc.work_management"&gt;b66bd6bb4722c210cd4e1ce4316d4387&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_45d0b14bc3913010a0cd587c1f40dde0&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-10-09 10:17:39&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:36:28</sys_created_on>
+        <sys_id>588634d983f01210c6695855eeaad3b3</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>FSMConditions</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_588634d983f01210c6695855eeaad3b3</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:36:28</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

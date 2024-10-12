@@ -1,0 +1,361 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>9694c251c3651110abf99bc8a840ddff</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.CAFUnfurlUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;CAFUnfurlUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var CAFUnfurlUtil = Class.create();
+(function() {
+	CAFUnfurlUtil.prototype = {
+		initialize: function(providerChannelIdentityId, channelUserId, urlOrText) {
+			this.isPrecheckSuccessful = this.preCheck(providerChannelIdentityId, channelUserId, urlOrText);
+
+			if(this.isPrecheckSuccessful) {
+				this.providerChannelIdentityId = providerChannelIdentityId;
+				this.channelUserId = channelUserId;
+				this.customAdapterScriptAPI = new sn_cs.CustomAdapterScriptObject();
+				this.allowedHostnameHelper = new global.AllowedHostnameHelper();
+			}
+		},
+
+		isUnfurlingAllowed: function() {
+			return !!this.isPrecheckSuccessful;
+		},
+
+		getUnfurlMetadata: function(unfurlMetadataExtractionOptions) {		
+			if (!this.isUnfurlingAllowed()) {
+				return {};
+			}
+
+			unfurlMetadataExtractionOptions = unfurlMetadataExtractionOptions || {};
+
+			var logger = getLogger();
+			var logContext = null;
+			try {
+				logContext = new sn_log.GlideLogContext({ 'conversation': this.lastConversation.conversation_id });
+
+				var unfurlMetadata = callUnfurlMetadataAPI.call(this, {
+					url: this.urlToUnfurl,
+					provider_channel_identity_id: this.providerChannelIdentityId,
+					channel_user_id: this.channelUserId,
+					conversation_id: this.lastConversation.conversation_id,
+					device_type: this.lastConversation.device_type
+				});
+				
+				if(!unfurlMetadata) {
+					return {};
+				}
+
+				return unfurlMetadata;
+
+			} finally {
+				if(logContext) {
+					logContext.clear();
+				}
+			}
+		},
+
+		getHtmlTitle: function(titleExtractionOptions) {
+			if (!this.isUnfurlingAllowed()) {
+				return '';
+			}
+
+			titleExtractionOptions = titleExtractionOptions || {};
+			titleExtractionOptions.save_to_cache = (titleExtractionOptions.save_to_cache !== false) ? true : false;
+
+			var logger = getLogger();
+			var logContext = null;
+			try {
+				logContext = new sn_log.GlideLogContext({ 'conversation': this.lastConversation.conversation_id });
+
+				var htmlTitle = callHtmlTitleAPI.call(this, {
+					url: this.urlToUnfurl,
+					provider_channel_identity_id: this.providerChannelIdentityId,
+					channel_user_id: this.channelUserId,
+					conversation_id: this.lastConversation.conversation_id,
+					device_type: this.lastConversation.device_type
+				});
+
+				if(!!htmlTitle &amp;&amp; titleExtractionOptions.save_to_cache) {
+					updateCacheWithFields.call(this, this.urlToUnfurl, this.lastConversation.device_type, { title : htmlTitle });
+				}
+
+				return htmlTitle;
+
+			} catch(e) {
+				logger.error("[CAFUnfurlUtil] Error in fetching html title for url {0} =&gt; {1}", this.urlToUnfurl, e.message);
+			} finally {
+				if(logContext) {
+					logContext.clear();
+				}
+			}
+		},
+
+		preCheck: function(providerChannelIdentityId, channelUserId, urlOrText) {
+			var logger = getLogger();
+
+			if(!providerChannelIdentityId) {
+				logger.error("[CAFUnfurlUtil] empty_provider_channel_identity: ignoring unfurling. provider channel identity id should not be empty");
+				return false;
+			}
+
+			if(!channelUserId) {
+				logger.error("[CAFUnfurlUtil] empty_channel_user_id: ignoring unfurling. channel user id should not be empty");
+				return false;
+			}
+
+			var logContext;
+			try {
+				logContext = new sn_log.GlideLogContext({ providerUserId : channelUserId });
+
+				if(!urlOrText) {
+					logger.warn("[CAFUnfurlUtil] empty_text: ignoring unfurling, url or text passed is empty.");
+					return false;
+				}
+				
+				if(!isGlobalUnfurlingEnabled()) {
+					logger.info("[CAFUnfurlUtil] global_unfurling_disabled: ignoring unfurling. global unfurling property is not enabled.", providerChannelIdentityId, channelUserId);
+					return false;
+				}
+
+				if(!isChannelLevelUnfurlingEnabled(providerChannelIdentityId, logger)) {
+					logger.info("[CAFUnfurlUtil] channel_unfurling_disabled: ignoring unfurling. unfurling is disabled for the provider channel identity: {0}", providerChannelIdentityId);
+					return false;
+				}
+
+				var urlsInText = getUrlsFromText(urlOrText);
+				if(!Array.isArray(urlsInText) || !urlsInText.length) {
+					logger.debug("[CAFUnfurlUtil] no_url_in_text: ignoring unfurling. no urls in the passed in text \"{0}\"", urlOrText);
+					return false;
+				}
+
+				var urlToUnfurl = getUrlForUnfurlingFromUrls(urlsInText, logger);
+				if(!urlToUnfurl) {
+					logger.debug("[CAFUnfurlUtil] no_allowed_url_to_unfurl: no url is allowed for unfurling in the passed in text \"{0}\"", urlOrText);
+					return false;
+				}
+
+				// store url to unfurl in the object. This is used when the actual api's are called.
+				this.urlToUnfurl = urlToUnfurl;
+
+				var lastConversationDetails = getLastConversationDetails(providerChannelIdentityId, channelUserId, logger);
+				if(!lastConversationDetails.conversation_id) {
+					logger.debug("[CAFUnfurlUtil] no_conversation_exists: ignoring unfurling. No conversation exists for the channel user id: {0}", channelUserId);
+					return false;
+				}
+
+				// store last conversation in the object. This is used when the actual api's are called.
+				this.lastConversation = lastConversationDetails;
+
+				return true;
+			} finally {
+				if(logContext) {
+					logContext.clear();
+				}
+			}
+		},
+
+
+		type: 'CAFUnfurlUtil'
+	};
+
+	function isGlobalUnfurlingEnabled(logger) {
+		var isGlobalUnfurlingEnabled = gs.getProperty("com.glide.cs.enable_link_unfurling", true);
+		return parseBoolean(isGlobalUnfurlingEnabled);	
+	}
+
+	function isChannelLevelUnfurlingEnabled(providerChannelIdentityId, logger) {
+		var isChannelLevelUnfurlingEnabled = getCustomAdapterProperty("enable_link_unfurling", providerChannelIdentityId, logger);
+		return parseBoolean(isChannelLevelUnfurlingEnabled);
+	}
+	
+	function parseBoolean(val) {
+		return val == '1' || val =='true' || val == true; 
+	}
+
+	function getCustomAdapterProperty(name, providerChannelIdentityId, logger) {
+		try {
+			var property = sn_cs.VASystemObject.getCustomAdapterPropertyWithHierarchy(name, providerChannelIdentityId);
+			if(!property || (property == "null")) {
+				return '';
+			}
+			return property;
+		} catch(e) {
+			logger.error("[CAFUnfurlUtil] error_in_fetching_caf_property: error in fetching custom adapter property \"{0}\" for provider channel identity: \"{1}\" =&gt; {2}", name, providerChannelIdentityId, e.message);
+			return '';
+		}
+	}
+
+	function getLastConversationDetails(providerChannelIdentityId, channelUserId, logger) {
+		try {
+			var conversationDetailsJson = new sn_cs.CustomAdapterScriptObject().getLastConversationDetails(providerChannelIdentityId, channelUserId);
+			var conversationDetails = safeParse(conversationDetailsJson, {});
+			return conversationDetails;
+		} catch(e) {
+			logger.error("[CAFUnfurlUtil] error_in_fetching_last_conversation: Error in fetching last conversation for channel user \"{0}\" and provider channel identity \"{1}\" =&gt; {2}", channelUserId, providerChannelIdentityId, e.message);
+			return {};
+		}
+	}
+
+	function getUrlsFromText(urlOrText) {
+		var urlListJson = new sn_cs.CustomAdapterScriptObject().getUrlsFromText(urlOrText);
+		var urls = safeParse(urlListJson);
+		return urls;
+	}
+
+	function getUrlForUnfurlingFromUrls(urls, logger) {
+		var allowedHostnameHelper = new global.AllowedHostnameHelper();
+
+		var urlToUnfurl = '';
+		for(var i = 0; i &lt; urls.length; i++) {
+			var url = urls[i];
+			url = getTargetUrlFromClickMetricsUrl.call(this, url);
+
+			if(allowedHostnameHelper.isURLAllowedForUnfurling(url)) {
+				urlToUnfurl = url;
+				break;
+			} else {
+				logger.debug("[CAFUnfurlUtil] host_not_allowed: hostname is not allowed for unfurling for url =&gt; {0}", url);
+			}
+		}
+
+		return urlToUnfurl;
+	}
+
+
+	function getTargetUrlFromClickMetricsUrl(link) {
+		var TARGET_URL_PARAM = "target_url=";
+		var VA_LINK = "va_link.do?token=";
+
+		if (link.indexOf(VA_LINK) &lt; 0) {
+			// if the url is not click metrics url, then return the original url
+			return link;
+		}
+
+		var targetUrl = link.substring(link.indexOf(TARGET_URL_PARAM) + TARGET_URL_PARAM.length);
+		targetUrl = decodeURIComponent(targetUrl);
+
+		return targetUrl;
+	}
+
+	function getLogger() {
+		return new sn_log.GlideLogger("com.glide.cs.link_unfurling.CAFUnfurlUtil", {
+			app: 'CI',
+			track: 'CCCIF Link Unfurling',
+			layer: 'Script'
+		}, ['app', 'track', 'layer', 'providerUserId', 'conversation']);
+	}
+
+	function callUnfurlMetadataAPI(unfurlAPIInputs) {
+		if(!unfurlAPIInputs) {
+			return {};
+		}
+
+		var unfurlAPIInputsJson = JSON.stringify(unfurlAPIInputs);
+		var unfurlMetadataJson = new sn_cs.CustomAdapterScriptObject().getUnfurlMetadata(unfurlAPIInputsJson);
+		var unfurlMetadata = safeParse(unfurlMetadataJson);
+		return unfurlMetadata;
+	}
+
+	function callHtmlTitleAPI(unfurlAPIInputs) {
+		if(!unfurlAPIInputs) {
+			return '';
+		}
+
+		var unfurlAPIInputsJson = JSON.stringify(unfurlAPIInputs);
+		var htmlTitle = new sn_cs.CustomAdapterScriptObject().getHtmlTitle(unfurlAPIInputsJson);
+
+		return isEmptyString(htmlTitle) ? '' : htmlTitle;
+	}
+
+	function updateCacheWithFields(url, deviceType, fieldsToUpdate) {
+		var unfurlingCacheUtils = new global.UrlUnfurlingCacheUtils();
+
+		var cachedDataJson = unfurlingCacheUtils.getDataFromCache(this.urlToUnfurl, this.lastConversation.device_type);
+
+		var cachedData = safeParse(cachedDataJson, {});
+		var cachedUnfurledData = safeParse(cachedData.url_unfurl_data, {});
+
+		Object.keys(fieldsToUpdate).forEach(function(key, index) {
+			if(fieldsToUpdate.hasOwnProperty(key)) {
+				cachedUnfurledData[key] = fieldsToUpdate[key];
+			}
+		});
+		
+		var cachedUnfurledDataJson = JSON.stringify(cachedUnfurledData);
+		
+		unfurlingCacheUtils.saveToCacheIfEnabled(this.urlToUnfurl, cachedUnfurledDataJson, this.lastConversation.device_type);
+	}
+
+	function isEmptyString(val) {
+		return !val || (val == 'null') || (val == 'undefined');
+	}
+
+	function safeParse(text, defaultValue) {
+		defaultValue = defaultValue || {};
+
+		if(!text) {
+			return defaultValue;
+		}
+
+		if (isObject(text)) {
+			return text;
+		}
+
+		if (isString(text)) {
+			try {
+				return JSON.parse(text);
+			} catch (e) {
+				return defaultValue;
+			}
+		} else {
+			return defaultValue;
+		}
+	}
+
+	function isString(str) {
+		return (Object.prototype.toString.call(str) === '[object String]');
+	}
+
+	function isObject(obj) {
+		return ((typeof obj) === 'object');
+	}
+
+})();]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-08-25 12:20:09&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;9694c251c3651110abf99bc8a840ddff&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;1&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;CAFUnfurlUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Conversational Custom Chat Integration" source="com.glide.cs.custom.adapter"&gt;4e8d78203c75311068bcf327dfe37fd0&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_9694c251c3651110abf99bc8a840ddff&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-09-08 16:29:22&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:45:51</sys_created_on>
+        <sys_id>7da83c5183341210c6695855eeaad3bd</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>CAFUnfurlUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_7da83c5183341210c6695855eeaad3bd</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:45:51</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

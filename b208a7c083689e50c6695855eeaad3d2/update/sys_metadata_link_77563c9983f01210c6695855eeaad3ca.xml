@@ -1,0 +1,210 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>38997204898691d0c377442b9a194a05</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.DCCalendarRestEndPoint&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;DCCalendarRestEndPoint&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var DCCalendarRestEndPoint = Class.create();
+DCCalendarRestEndPoint.BLACKOUT = 'BLACKOUT';
+DCCalendarRestEndPoint.ALREADY_SCHEDULED_OPERATIONS = 'ALREADY_SCHEDULED_OPERATIONS';
+DCCalendarRestEndPoint.prototype = {
+    // DataCenter Variables 
+    _datacenterUrl: null,
+    _inputCiListString: null,
+    _maintenanceStartDateTimeStringInUTC: null,
+    _maintenanceEndDateTimeStringInUTC: null,
+    _responseObj: {
+        stcdResult: {
+            status: '',
+            errorMessage: '',
+            responseStatus: ''
+        }
+    },
+
+    initialize: function() {
+        this.className = 'DCCalendarRestEndPoint';
+        this._datacenterUrl = gs.getProperty('glide.db.clone.instance_clone_server');
+    },
+
+    /**
+     * 
+     * @get Internal method to Invoke DC Rest API to get Conflicts.
+     * @returns {&lt;conflicts from Datacenter&gt;} 
+     */
+    _requestToGetConflictsRest: function() {
+
+        try {
+            var getConflictResult = {
+                stcdResult: {}
+            };
+            var objectForPayload = {};
+            objectForPayload.inputCiListString = this._inputCiListString;
+            objectForPayload.maintenanceStartDateTimeStringInUTC = this._maintenanceStartDateTimeStringInUTC;
+            objectForPayload.maintenanceEndDateTimeStringInUTC = this._maintenanceEndDateTimeStringInUTC;
+
+            var restMessage = new sn_ws.RESTMessageV2();
+            var serverUrl = this._datacenterUrl.substring(0, this._datacenterUrl.lastIndexOf('/') + 1);
+            var user = gs.getProperty('instance_id');
+            var password = '';
+            if (!gs.nil(gs.getProperty('glide.customurl.datacenter.instance.password', null)))
+                password = GlideStringUtil.base64Encode(gs.getProperty('glide.customurl.datacenter.instance.password', null));
+            else 
+				throw new Error('ConflictCalendarApi cannot be invoked since no credentials were found.');
+
+			restMessage.setEndpoint(serverUrl + '/api/snc/conflictcalendarapi/getCloneConflicts');
+            restMessage.setHttpMethod("post");
+            restMessage.setRequestHeader("Accept", "application/json");
+            restMessage.setRequestHeader("Content-Type", "application/json");
+            restMessage.setRequestHeader('user', user);
+            restMessage.setRequestHeader('password', password);
+            restMessage.setRequestBody(JSON.stringify(objectForPayload));
+            var stopWatch = new GlideStopWatch();
+            var response = restMessage.execute();
+            var duration = stopWatch.getTime();
+            getConflictResult.stcdResult.responseStatus = response.getStatusCode();
+            var responseBody = response.getBody();
+            var responseObj = JSON.parse(responseBody);
+            var reslen = responseObj.result.output.length;
+
+            var errorMessage = "";
+            var blackoutConflictsArray = [];
+            var maintenanceConflictsArray = [];
+
+            if (getConflictResult.stcdResult.responseStatus == 200 &amp;&amp; responseObj.result.status == 'success') {
+                for (var i = 0; i &lt; reslen; i++) {
+                    var responseResult = responseObj.result.output[i];
+
+                    if (responseResult.conflictReason == DCCalendarRestEndPoint.BLACKOUT) {
+                        var blackoutSchedule = {};
+                        blackoutSchedule.start_date = responseResult.scheduledOperationStartDateTime;
+                        blackoutSchedule.end_date = responseResult.scheduledOperationEndDateTime;
+                        blackoutSchedule.changeNumber = responseResult.scheduledChangeRequest;
+						blackoutSchedule.operationId = gs.generateGUID();
+                        blackoutConflictsArray.push(blackoutSchedule);
+                    } else if (responseResult.conflictReason == DCCalendarRestEndPoint.ALREADY_SCHEDULED_OPERATIONS) {
+                        var conflicts = {};
+                        conflicts.start_date = responseResult.scheduledOperationStartDateTime;
+                        conflicts.end_date = responseResult.scheduledOperationEndDateTime;
+                        conflicts.changeNumber = responseResult.scheduledChangeRequest;
+						conflicts.operationId = gs.generateGUID();
+                        maintenanceConflictsArray.push(conflicts);
+                    }
+                }
+            } else
+				getConflictResult.stcdResult.errorMessage = responseObj.result.message;
+
+            getConflictResult.stcdResult.status = responseObj.result.status;
+            getConflictResult.stcdResult.duration = duration;
+            getConflictResult.stcdResult.maintenanceConflicts = maintenanceConflictsArray;
+            getConflictResult.stcdResult.blackoutConflicts = blackoutConflictsArray;
+            return getConflictResult;
+
+        } catch (ex) {
+            gs.logError("_requestToGetConflictsRest: " + ex, this.className);
+            return {
+                stcdResult: {
+                    responseStatus: '400',
+                    status: 'error',
+                    errorMessage: 'Exception occured : ' + ex
+                }
+            };
+        }
+    },
+
+    /**
+     * @generate inputcistring for STCD DC API call
+     * @param {&lt;string&gt;} &lt;type&gt; - &lt;instance or node&gt;
+     * @param {&lt;string&gt;} &lt;id&gt; - &lt;CI Id&gt;
+     * @returns {&lt;string&gt;} &lt;inputCiString&gt; - &lt;inputcistring for STCD DC API call&gt;
+     */
+    getInputCiString: function(type, id) {
+        if (type == "instance")
+            ciString = "InstanceIDs:" + id;
+        else if (type == "node")
+            ciString = "NodeIDs:" + id;
+
+        return ciString;
+    },
+
+    /**
+     * 
+     * @Global Wrapper method to get Datacenter conflicts
+     * @param {&lt;string&gt;} &lt;startDateTimeInUTC&gt; - &lt;Start Time in UTC to check for the conflicts&gt;
+     * @param {&lt;string&gt;} &lt;endDateTimeInUTC&gt; - &lt;End Time in UTC to check for the conflicts&gt;
+     * @param {&lt;string&gt;} &lt;dcInstanceID&gt; - &lt;Instance ID &gt;
+     * @returns {&lt;Object&gt;} &lt;an object with Details about the Conflicts&gt;
+     * @example 
+     * @see 
+     */
+    requestToGetConflictsRest: function(startDateTimeInUTC, endDateTimeInUTC, dcInstanceID) {
+        var funcName = "requestToGetConflictsRest";
+        if (dcInstanceID)
+            this.dcInstanceID = dcInstanceID;
+        else {
+            gs.debug(funcName + 'instanceID is missing for the CI');
+            this._responseObj.stcdResult.status = 'error';
+            this._responseObj.stcdResult.errorMessage = 'instanceID is missing for the CI';
+            return this._responseObj;
+        }
+
+        var inputCiString = this.getInputCiString("instance", dcInstanceID);
+        this._inputCiListString = inputCiString + '';
+        this._maintenanceStartDateTimeStringInUTC = startDateTimeInUTC + '';
+        this._maintenanceEndDateTimeStringInUTC = endDateTimeInUTC + '';
+
+        // Retry for 3 times if status is not 200      
+
+        for (var i = 0; i &lt; 3; ++i) {
+            this._responseObj = this._requestToGetConflictsRest();
+
+            if (this._responseObj.stcdResult.responseStatus == 0) // Socket Timeout
+                break;
+            if ((this._responseObj.stcdResult.responseStatus &lt; 200) || (this._responseObj.stcdResult.responseStatus &gt; 299)) {
+                gs.debug("requestToGetConflictsRest failed : " + this._responseObj.stcdResult.errorMessage);
+                continue;
+            } else
+                break;
+        }
+        gs.debug("requestToGetConflictsRest return obj is : " + JSON.stringify(this._responseObj, 4, ''));
+        return this._responseObj;
+    },
+
+    type: 'DCCalendarRestEndPoint'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;maint&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-09-15 15:48:48&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;38997204898691d0c377442b9a194a05&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;62&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;DCCalendarRestEndPoint&lt;/sys_name&gt;
+        &lt;sys_package display_value="High Availability Cloning" source="com.snc.ha"&gt;ba533ca03c31311068bcf327dfe37f7a&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_38997204898691d0c377442b9a194a05&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-10-21 13:34:40&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:35:53</sys_created_on>
+        <sys_id>77563c9983f01210c6695855eeaad3ca</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>DCCalendarRestEndPoint</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_77563c9983f01210c6695855eeaad3ca</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:35:53</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

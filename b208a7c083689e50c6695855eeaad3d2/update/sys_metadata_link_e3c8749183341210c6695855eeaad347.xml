@@ -1,0 +1,421 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>a3b705904322211090d86d95cab8f295</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.CodeSigningSignatureMigrationAPI&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;APIs to migrate the old signatures that can not be verified using certificate chain to the new signatures that meets the new Certificate Validation requirements before user can turn on Code Signing .&lt;/description&gt;
+        &lt;name&gt;CodeSigningSignatureMigrationAPI&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var CodeSigningSignatureMigrationAPI = Class.create();
+CodeSigningSignatureMigrationAPI.prototype = {
+    initialize: function() {
+		this.LOG_SOURCE = "Code Signing";
+		this.ERROR_MSG = "CodeSigningSignatureMigrationAPI - Error: ";
+		this.INFO_MSG = "CodeSigningSignatureMigrationAPI - Info: ";
+		this.SIGNATURE_TABLENAME = "sn_kmf_record_signature";
+		this.CERTIFICATE_ALIAS_FIELD = "certificate_alias";
+		this.KMF_KEY_TABLE_NAME = "sys_kmf_module_key";
+		this.CRYPTO_MODULE_FIELD = "crypto_module";
+		this.CERTIFICATE_FIELD = "certificate";
+		this.FIELD_OPERATIONS = "operations";
+		this.TABLE_NAME_FIELD = "table_name";
+		this.DOCUMENT_ID_FIELD = "document_id";
+		this.IS_ATTACHMENT_FIELD = "is_attachment";
+		this.PURPOSE_FIELD = "purpose";
+		this.SYS_CREATE_ON_FIELD = "sys_created_on";
+		this.SYS_UPDATED_ON_FIELD = "sys_updated_on";
+		this.COMMA_DELIMITER = ",";
+		this.IN = "IN";
+		this.NOT_IN = "NOT IN";
+		this.CM_CODE_ATTEST_CM_SYSID = "75bdd8c2c70111109d59fa49f4c26031";
+		this.VANCOUVER_PKI_CERT_SYSID = "ce7ad863b702211090d89d2bee11a95f";
+		this.WASHINGTON_PKI_CERT_SYS_ID = "5936923db4e57190f87716af5f9a673e";
+		this.SIGNATURE_VERIFICATION = "signature_verification";
+		this.KEY_LIFECYCLE_STATE_FIELD = "key_lifecycle_state";
+		this.KEY_ACTIVE_STATES = "active,renewed";
+		this.NON_ATTEST_SIGNED_PURPOSES = "4a01db43c30320101109046f5e40dd8d,5c29caa6c33230101109046f5e40ddb8"; // Circle of Trust, Secure Map
+		this.excludedCertList = null; // excluded from signature migration
+		this.specifiedTableList = null;
+		this.excludedPurposeList = null;
+    },
+
+	migrateSignatures: function() {
+		var pass = this.allowTurnOnJob();
+		if (pass) {
+			this.logInfo("This instance is ready to turn on code signing, no pending action.");
+		} else {
+			this.logInfo("Need to run the migration job before turning on code signing.");
+		}
+	},
+
+	isValidSignature: function() {
+		// Validate the signature of the global.ProcessOOBSignatures() script to ensure it has not been changed.
+		// sys_id = 8f03d975a320021037a5a0d3041e618b
+		var codeSigningAPI = new sn_cs_ns.CodeSigningAPI();
+		if (!codeSigningAPI.isRecordTrusted("sys_script_include","8f03d975a320021037a5a0d3041e618b","*")) {
+			gs.error("Untrusted script include: global.ProcessOOBSignatures");
+			return false;
+		}
+		return true;
+	},
+
+	allowTurnOnJob: function() {
+		if (!this.isValidSignature()) {
+			return false;
+		}
+
+		this.logInfo("Cleaning up unmigratable signatures....");
+		new ProcessOOBSignatures('true','oob_unwanted_signatures').process();
+		this.logInfo("Cleaning up unmigratable signatures....Completed");
+		
+		this.logInfo("Scanning all signatures.....");
+		var invalidSigOutput = this.withExcludedPurposes(this.NON_ATTEST_SIGNED_PURPOSES).getInvalidSignatures();
+		this.logInfo("Scanning all signatures.....Completed");
+		if (Object.keys(invalidSigOutput.record).length == 0 &amp;&amp; Object.keys(invalidSigOutput.attachment).length == 0) {
+			this.logInfo("No need to migrate signatures.....");
+			return true;
+		}
+		this.logInfo("Found invalid signatures...creating Mass Signing Job.....");
+		this.createSigningJobs(invalidSigOutput);
+		this.logInfo("Found invalid signatures...creating Mass Signing Job.....Completed");
+		return false;
+	},
+
+	createSigningJobs: function(invalidSigOutput) {
+		if (Object.keys(invalidSigOutput.record).length == 0) {
+			this.logInfo("Created no job because of no invalid signature for table record.");
+		} else {
+			this.createSignSpecificRecordsJobs(invalidSigOutput.record);
+			this.logInfo("Finished creating signing job for table record.");
+		}
+
+		if (Object.keys(invalidSigOutput.attachment).length == 0) {
+			this.logInfo("Created no job because of no invalid signature for table attachment.");
+		} else {
+			this.createSignSpecificAttachmentsJob(invalidSigOutput.attachment);
+			this.logInfo("Finished creating signing job creation for table attachment.");
+		}
+	},
+
+	getInvalidSignatures: function() {
+		// for all table record signatures,
+		// We know a few certificates (like Vancouver cert and customer provided cm_code_attest certificate)
+		// can be verified on MID, while any other cert could possibly not be verified.
+		// We will query signatures that are associated with certificates that are possibly not verified on MID
+		// and suggest user to run the system created jobs to migrate the signatures.
+		//
+		// record: {
+		// 	table1 : ["record sys id1", "record sysid2",...]
+		// 	table2 : ["record sys id1", "record sysid2",...]
+		// },
+		// attachment: {
+		// 	table1 : ["record sys id1", "record sysid2",...]
+		// 	table2 : ["record sys id1", "record sysid2",...]
+		// }
+		var output = {
+			record: {},
+			attachment: {}
+			};
+
+		var verifiableCertSysIds = this.getVerifiableCertSysIds();
+
+		var gr = new GlideRecord(this.SIGNATURE_TABLENAME);
+		var op = gr.addQuery(this.CERTIFICATE_ALIAS_FIELD, this.NOT_IN, verifiableCertSysIds);
+		op.addOrCondition(this.CERTIFICATE_ALIAS_FIELD, ""); //signatures with empty value in certificate 
+		if (!gs.nil(this.specifiedTableList)) {
+			gr.addQuery(this.TABLE_NAME_FIELD, this.IN, this.specifiedTableList);
+		}
+		if (!gs.nil(this.excludedPurposeList)) {
+			gr.addQuery(this.PURPOSE_FIELD, this.NOT_IN, this.excludedPurposeList);
+		}
+		gr.query();
+
+		while (gr.next()) {
+			var isAttachment = gr.getValue(this.IS_ATTACHMENT_FIELD); // 0 no, 1 yes
+			var tableName = gr.getValue(this.TABLE_NAME_FIELD);
+			var docId = gr.getValue(this.DOCUMENT_ID_FIELD);
+			var entry = null;
+			if (isAttachment == 1) {
+				entry = output.attachment;
+				if (!this.existTableRecord("sys_attachment", docId)) //the sn_kmf_record_signature table stores attachment sys id in Document ID field for the given table name
+						continue;
+			} else {
+				entry = output.record;
+				if (!this.existTableRecord(tableName, docId))
+					continue;
+			}
+			var purpose = gr.getValue(this.PURPOSE_FIELD);
+			var certId = gr.getValue(this.CERTIFICATE_ALIAS_FIELD);
+			if (!this.existSigWithAllowedCerts(tableName, docId, purpose, certId, verifiableCertSysIds, isAttachment)) {
+				if (!entry.hasOwnProperty(tableName)) {
+					entry[tableName] = [];
+				}
+				if (entry[tableName].indexOf(docId) == -1) {
+					entry[tableName].push(docId);
+				}
+			}
+		}
+		return output;
+	},
+
+	existSigWithAllowedCerts: function(tableName, docId, purpose, certId, allowedCertIds, isAttachment) {
+		var gr = new GlideRecord(this.SIGNATURE_TABLENAME);
+		gr.addQuery(this.TABLE_NAME_FIELD, tableName);
+		gr.addQuery(this.DOCUMENT_ID_FIELD, docId);
+		gr.addQuery(this.PURPOSE_FIELD, purpose);
+		gr.addQuery(this.IS_ATTACHMENT_FIELD, isAttachment);
+		gr.addQuery(this.CERTIFICATE_ALIAS_FIELD, this.IN,
+					certId + this.COMMA_DELIMITER + allowedCertIds);
+		gr.orderByDesc(this.SYS_UPDATED_ON_FIELD);
+		gr.setLimit(1);
+		gr.query();
+		if (!gr.next()) {
+			return false;
+		}
+		var certIdToCheck = gr.getValue(this.CERTIFICATE_ALIAS_FIELD);
+		return allowedCertIds.includes(certIdToCheck);
+	},
+
+	existTableRecord: function(tableName, docId) {
+		var gr = new GlideRecord(tableName);
+		if (!gr.isValid()){
+			this.logError("Table, "+tableName+", is not valid.");
+			return false;
+		}
+		if (!gr.get(docId)) {
+			this.logError("Table Record, "+tableName+":"+docId+", does not exist.");
+			return false;
+		}
+		return true;
+	},
+
+	createSignSpecificRecordsJobs: function(invalidRecordSysIds) {
+		// input: {
+		// 	table1 : ["record sys id1", "record sysid2",...]
+		// 	table2 : ["record sys id1", "record sysid2",...]
+		// }
+		var parser = new JSONParser();
+		var parsedData = parser.parse(JSON.stringify(invalidRecordSysIds));
+		if (gs.nil(parsedData))
+			return;
+		var createdJobRecordCount = 0;
+		var failedJobRecordCount = 0;
+		var totalJobRecordCount = 0;
+		var failedJobTableNameArray = [];
+		var isJobCompleted = false;
+		for (var key in parsedData) {
+			if (gs.nil(parsedData[key]))
+				continue;
+
+			var job = new GlideRecord("sys_signing_job");
+			job.setValue("name", "Migrate Specific Records " + new GlideDateTime(gs.nowDateTime()));
+			job.setValue("type", "sign_specific_records");
+			job.setValue("table", "sign_specific_records,"+ key); // set to jobtype,tablename
+			job.setValue("selected_table", key);
+			var sysIds = parsedData[key].join(",");
+			job.setValue("select_records_for_signing", sysIds);
+			job.setValue("conditions", "sys_idIN"+sysIds);
+			job.setValue("read_conditions", "sys_idIN"+sysIds);
+			job.setValue("window_start", "1970-01-01 08:00:00"); // equivalent to 0:00 in instance time zone
+			job.setValue("window_end", "1970-01-02 07:00:00"); // equivalent to 23:00 in instance time zone
+			job.setValue("state", "new");
+			var jobSysId = job.insert();
+			if (!gs.nil(jobSysId)) {
+				isJobCompleted = true;
+				createdJobRecordCount++;
+			} else {
+				failedJobTableNameArray.push(key);
+				failedJobRecordCount++;
+				isJobCompleted = false;
+			}
+			totalJobRecordCount++;
+		}
+		//create a json with job details
+		var createdJobRecordInfo = {};
+		createdJobRecordInfo.createdJobRecordTotalCount = createdJobRecordCount;
+		createdJobRecordInfo.expectedJobRecordTotalCount = totalJobRecordCount;
+		createdJobRecordInfo.failedJobRecordTotalCount = failedJobRecordCount;
+		createdJobRecordInfo.completed = isJobCompleted;
+		createdJobRecordInfo.failedJobTableNames = JSON.stringify(failedJobTableNameArray);
+		if (!createdJobRecordInfo.completed) {
+			this.logError("Actual created job record total count: " + createdJobRecordInfo.createdJobRecordTotalCount);
+			this.logError("Failed to create record job total count: " + createdJobRecordInfo.failedJobRecordTotalCount);
+			this.logError("The expected total record of jobs : " + createdJobRecordInfo.expectedJobRecordTotalCount);
+			this.logError("Migration of signed records failed on following tables:"+ createdJobRecordInfo.failedJobTableNames);
+		} else
+			this.logInfo("Created signing job records successfully, total number: " + createdJobRecordInfo.createdJobRecordTotalCount + "/ Expected total number: " + createdJobRecordInfo.expectedJobRecordTotalCount);
+	},
+
+	createSignSpecificAttachmentsJob: function(invalidAttachmentSysIds) {
+		// input: {
+		// 	table1 : ["attachment sys id1", "attachment sysid2",...]
+		// 	table2 : ["attachment sys id1", "attachment sysid2",...]
+		// }
+		var parser = new JSONParser();
+		var parsedData = parser.parse(JSON.stringify(invalidAttachmentSysIds));
+		if (gs.nil(parsedData))
+			return;
+		var createdAttachmentJobRecordCount = 0;
+		var failedAttachmentJobRecordCount = 0;
+		var failedAttachmentJobTableNameArray = [];
+		var isAttachmentJobCompleted = false;
+		var totalAttachmentJobRecordCount = 0;
+		for (var key in parsedData) {
+			var sysIds = this.getTableSysIdForAttachment(parsedData[key]).join(",");
+			if (gs.nil(sysIds))
+				continue;
+
+			var job = new GlideRecord("sys_signing_job");
+			job.setValue("name",  "Migrate Specific Attachments " + new GlideDateTime(gs.nowDateTime()));
+			job.setValue("type", "sign_specific_attachments");
+			job.setValue("table", "sign_specific_attachments,"+ key); // set to jobtype,tablename
+			job.setValue("selected_table", key);
+			job.setValue("select_records_for_signing", sysIds);
+			job.setValue("conditions", "sys_idIN"+sysIds);
+			job.setValue("read_conditions", "sys_idIN"+sysIds);
+			job.setValue("window_start", "1970-01-01 08:00:00"); // equivalent to 0:00 in instance time zone
+			job.setValue("window_end", "1970-01-02 07:00:00"); // equivalent to 23:00 in instance time zone
+			job.setValue("state", "new");
+			var jobSysId = job.insert();
+			if (!gs.nil(jobSysId)) {
+				createdAttachmentJobRecordCount++;
+				isAttachmentJobCompleted = true;
+			} else {
+				failedAttachmentJobTableNameArray.push(key);
+				failedAttachmentJobRecordCount++;
+				isAttachmentJobCompleted = false;
+			}
+			totalAttachmentJobRecordCount++;
+		}
+		//create a json with job details
+		var createdAttachmentJobInfo = {};
+		createdAttachmentJobInfo.createdAttachmentJobRecordTotalCount = createdAttachmentJobRecordCount;
+		createdAttachmentJobInfo.expectedAttachmentJobRecordTotalCount = totalAttachmentJobRecordCount;
+		createdAttachmentJobInfo.failedAttachmentJobRecordTotalCount = failedAttachmentJobRecordCount;
+		createdAttachmentJobInfo.completed = isAttachmentJobCompleted;
+		createdAttachmentJobInfo.failedAttachmentJobTableNames = JSON.stringify(failedAttachmentJobTableNameArray);
+		if (!createdAttachmentJobInfo.completed) {
+			this.logError("Actual created attachment job total count: " + createdAttachmentJobInfo.createdAttachmentJobRecordTotalCount);
+			this.logError("Failed to create attachment job total count: " + createdAttachmentJobInfo.failedAttachmentJobRecordTotalCount);
+			this.logError("The expected total attachment job count: " + createdAttachmentJobInfo.expectedAttachmentJobRecordTotalCount);
+			this.logError("Migration of signed attachments failed on following tables:"+ createdAttachmentJobInfo.failedAttachmentJobTableNames);
+		} else
+			this.logInfo("created attachment signing jobs successfully, total number: " + createdAttachmentJobInfo.createdAttachmentJobRecordTotalCount + "/ Expected total number: " + createdAttachmentJobInfo.expectedAttachmentJobRecordTotalCount);
+	},
+
+	getTableSysIdForAttachment: function(attachmentSysIdsArr) {
+		var attachmentTableSysIdArr = [];
+		var attachmentGr = new GlideRecord("sys_attachment");
+		for (i = 0; i &lt; attachmentSysIdsArr.length; i++) {
+			if (attachmentGr.get(attachmentSysIdsArr[i])) {
+				var tableSysId = attachmentGr.getValue("table_sys_id");
+				if (!gs.nil(tableSysId))
+					attachmentTableSysIdArr.push(attachmentGr.getValue("table_sys_id"));
+			}
+		}
+		return attachmentTableSysIdArr;
+	},
+
+	getVerifiableCertSysIds: function() {
+		// return the list of certificate sys ids that are known to have cert chain
+		// e.g. "vancouver build cert sys id, washington build cert sys id, cm_code_attest cert sys id"
+		var certSysIds = [this.VANCOUVER_PKI_CERT_SYSID, this.WASHINGTON_PKI_CERT_SYS_ID];
+		// add the certificate that is uploaded with cm_code_attest keypair
+		var activeAttestCertSysId = this.getActiveKMFVerifyCertSysId(this.CM_CODE_ATTEST_CM_SYSID);
+		if (!gs.nil(activeAttestCertSysId))
+			certSysIds.push(activeAttestCertSysId);
+		// add certificates that are excluded by the caller
+		if (this.excludedCertList != null) {
+			var excludedCertSysIds = this.excludedCertList.split(this.COMMA_DELIMITER);
+			certSysIds = certSysIds.concat(excludedCertSysIds);
+		}
+
+		return certSysIds.join(this.COMMA_DELIMITER);
+	},
+
+	getActiveKMFVerifyCertSysId: function(cryptoModuleId) {
+		var grKMF = new GlideRecord(this.KMF_KEY_TABLE_NAME);
+		grKMF.addQuery(this.CRYPTO_MODULE_FIELD, cryptoModuleId);
+		grKMF.addQuery(this.FIELD_OPERATIONS, this.SIGNATURE_VERIFICATION);
+		grKMF.addQuery(this.KEY_LIFECYCLE_STATE_FIELD, this.IN, this.KEY_ACTIVE_STATES);
+		grKMF.query();
+
+		if (!grKMF.next()) {
+			this.logError("found no verification key for crypto module " + cryptoModuleId);
+			return null;
+		}
+		return grKMF.getValue(this.CERTIFICATE_FIELD);
+	},
+
+	withExcludedCerts: function(certs) {
+		var certIds = new String(certs);
+		if (!gs.nil(this.excludedCertList))
+			this.excludedCertList += "," + certIds;
+		else
+			this.excludedCertList = certIds;
+		return this;
+	},
+
+	withSpecifiedTables: function(tables) {
+		var tableIds = new String(tables);
+		if (!gs.nil(this.specifiedTableList))
+			this.specifiedTableList += "," + tableIds;
+		else
+			this.specifiedTableList = tableIds;
+		return this;
+	},
+
+	withExcludedPurposes: function(purposes) {
+		var purposeSysIds = new String(purposes);
+		if (!gs.nil(this.excludedPurposeList))
+			this.excludedPurposeList += "," + purposeSysIds;
+		else
+			this.excludedPurposeList = purposeSysIds;
+		return this;
+	},
+
+    logInfo: function(text) {
+		gs.log(this.INFO_MSG + text, this.LOG_SOURCE);
+    },
+
+    logError: function(text) {
+		gs.log(this.ERROR_MSG + text, this.LOG_SOURCE);
+    },
+
+    type: 'CodeSigningSignatureMigrationAPI'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-04-27 19:05:08&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;a3b705904322211090d86d95cab8f295&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;8&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;CodeSigningSignatureMigrationAPI&lt;/sys_name&gt;
+        &lt;sys_package display_value="Code Signing framework" source="com.glide.code_signing"&gt;9cab7c643c35311068bcf327dfe37f23&lt;/sys_package&gt;
+        &lt;sys_policy&gt;protected&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_a3b705904322211090d86d95cab8f295&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-02-26 03:21:53&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:46:31</sys_created_on>
+        <sys_id>e3c8749183341210c6695855eeaad347</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>CodeSigningSignatureMigrationAPI</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_e3c8749183341210c6695855eeaad347</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:46:31</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

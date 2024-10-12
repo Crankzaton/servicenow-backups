@@ -1,0 +1,227 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>61276b490724301028ef0a701ad3002f</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_nlu_workbench.NLUBatchTestExportUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Utility to export Batch Test Results and get status&lt;/description&gt;
+        &lt;name&gt;NLUBatchTestExportUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var NLUBatchTestExportUtil = Class.create();
+
+(function() {
+
+    var tables = NLUWorkbenchConstants.tables;
+    var table = tables.NLU_BATCH_TEST_RESULT;
+    var execTable = tables.NLU_BATCH_TEST_RUN_EXECUTION;
+    var exportUtil = sn_nlu_workbench.NLUWorkbenchExportUtil;
+
+    var modelIdToNameCache = {};
+    var splitFieldSeperator = ',';
+
+    NLUBatchTestExportUtil.getPredictedData = function(gr, type) {
+        var result;
+        var predictions = gr.predictions;
+        var expIntents = NLUBatchTestExportUtil._getAllExpetedIntents(gr, true);
+        if (predictions) {
+            try {
+                var predictionJson = JSON.parse(predictions);
+                predictionJson.forEach(function(eachPrediction) {
+                    if (type === 'predicted_intent') {
+                        var intent = eachPrediction.intentName;
+                        result = result ? (result + ', ' + intent) : intent;
+                    } else if (type === 'confidence') {
+                        var confidence = NLUCoreUtils.getPercentage(eachPrediction.score, 0) + '%';
+                        result = result ? (result + ', ' + confidence) : confidence;
+                    } else if (type === 'correct_incorrect') {
+                        var predIntent = eachPrediction.intentName ? eachPrediction.intentName.toLowerCase().trim() : '';
+                        var outcome = expIntents.indexOf(predIntent) !== -1 ? 'Correct' : 'Incorrect';
+                        result = result ? (result + ', ' + outcome) : outcome;
+                    } else if (type === 'prediction_model') {
+                        var modelDisplayName;
+                        if (modelIdToNameCache.hasOwnProperty(eachPrediction.modelId))
+                            modelDisplayName = modelIdToNameCache[eachPrediction.modelId];
+                        else {
+                            var modelGr = global.NLUModel.getGRById(eachPrediction.modelId);
+                            if (modelGr) {
+                                modelDisplayName = modelGr.display_name;
+                                modelIdToNameCache[eachPrediction.modelId] = modelDisplayName;
+                            }
+                        }
+                        if (modelDisplayName)
+                            result = result ? (result + ', ' + modelDisplayName) : modelDisplayName;
+                    }
+                });
+            } catch (ex) {
+                gs.error('Error while getting predicted ' + type + ' - ' + gr.getUniqueValue() + '[' + ex.message + ']');
+            }
+        }
+        return result || '--';
+    };
+
+    NLUBatchTestExportUtil.getExpectedIntent = function(gr, field) {
+        var i = field.substr('expected_intent_'.length);
+        var expIntents = NLUBatchTestExportUtil._getAllExpetedIntents(gr);
+        return (i &lt;= expIntents.length) ? expIntents[i - 1] : '--';
+    };
+
+    NLUBatchTestExportUtil._getAllExpetedIntents = function(gr, lowerCase) {
+        if (gr.expected_intent) {
+            var intentsStr = gr.expected_intent.toString().trim();
+            return intentsStr.split(',').map(function(intent) {
+                return lowerCase ? intent.trim().toLowerCase() : intent.trim();
+            });
+        }
+        return [];
+    };
+
+    NLUBatchTestExportUtil.prototype = {
+
+        initialize: function(jobId) {
+            this.jobId = jobId;
+        },
+
+        writeToStream: function(executionId, filters, writeStream, fileName) {
+            this.prepare(executionId, fileName, true);
+            exportUtil.streamFromTable(table, this.addExecIdFilter(filters, executionId), this.fieldDef, writeStream);
+        },
+
+        exportResults: function(executionId, filters, fileName) {
+            this.prepare(executionId, fileName);
+            this.jobId = exportUtil.exportInBackground(table, this.addExecIdFilter(filters, executionId), this.fieldDef, execTable, executionId, this.fileName);
+            return this.jobId;
+        },
+
+        addExecIdFilter: function(filters, executionId) {
+            var execIdFilter = 'test_run_execution=' + executionId;
+            if (filters) {
+                return filters + '^' + execIdFilter;
+            }
+            return execIdFilter;
+        },
+
+        prepare: function(executionId, fileName, sync) {
+            this.fileName = fileName;
+            this.fieldDef = {
+                utterance: {
+                    label: gs.getMessage('Utterance')
+                },
+                outcome: {
+                    label: gs.getMessage('Prediction Outcome')
+                },
+            };
+
+            var i = 1;
+            var maxIntentCnt = 1;
+            var executionGr = new GlideRecord(tables.NLU_BATCH_TEST_RUN_EXECUTION);
+            if (executionGr.get(executionId)) {
+                var testSnapshot = JSON.parse(executionGr.test_set_snapshot);
+                if (testSnapshot &amp;&amp; testSnapshot.max_intents_count) {
+                    maxIntentCnt = testSnapshot.max_intents_count;
+                } else {
+                    maxIntentCnt = new NLUBatchTestSet(executionGr.test_run_definition.test_set).getMaxIntentsCount();
+                    testSnapshot.max_intents_count = maxIntentCnt;
+                    executionGr.setValue('test_set_snapshot', JSON.stringify(testSnapshot));
+                    executionGr.update();
+                }
+            }
+
+            if (maxIntentCnt === 1) {
+                this.fieldDef.expected_intent = {
+                    label: gs.getMessage('Expected Intent')
+                };
+            } else {
+                for (i = 1; i &lt;= maxIntentCnt; i++) {
+                    this.fieldDef['expected_intent_' + i] = {
+                        label: gs.getMessage('Expected Intent-{0}', i.toString())
+                    };
+                }
+            }
+
+            global.NLUHelper.extend(this.fieldDef, {
+                predicted_intent: {
+                    label: gs.getMessage('Predicted Intent'),
+                    splitField: true
+                },
+                confidence: {
+                    label: gs.getMessage('Confidence'),
+                    splitField: true
+                },
+                correct_incorrect: {
+                    label: gs.getMessage('Correct/Incorrect'),
+                    splitField: true
+                },
+                prediction_model: {
+                    label: gs.getMessage('Predicted Model'),
+                    splitField: true
+                }
+            });
+
+            if (sync) {
+                this.fieldDef.utterance.valueCb = function(gr) {
+                    return gr.test_utterance;
+                };
+                if (maxIntentCnt === 1) {
+                    this.fieldDef.expected_intent.valueCb = function(gr) {
+                        return gr.expected_intent;
+                    };
+                } else {
+                    for (i = 1; i &lt;= maxIntentCnt; i++)
+                        this.fieldDef['expected_intent_' + i].valueCb = sn_nlu_workbench.NLUBatchTestExportUtil.getExpectedIntent;
+                }
+                this.fieldDef.predicted_intent.valueCb = sn_nlu_workbench.NLUBatchTestExportUtil.getPredictedData;
+                this.fieldDef.confidence.valueCb = sn_nlu_workbench.NLUBatchTestExportUtil.getPredictedData;
+                this.fieldDef.correct_incorrect.valueCb = sn_nlu_workbench.NLUBatchTestExportUtil.getPredictedData;
+                this.fieldDef.prediction_model.valueCb = sn_nlu_workbench.NLUBatchTestExportUtil.getPredictedData;
+            } else {
+                this.fieldDef.utterance.value = 'gr.test_utterance';
+                if (maxIntentCnt === 1) {
+                    this.fieldDef.expected_intent.value = 'gr.expected_intent';
+                } else {
+                    for (i = 1; i &lt;= maxIntentCnt; i++)
+                        this.fieldDef['expected_intent_' + i].value = 'sn_nlu_workbench.NLUBatchTestExportUtil.getExpectedIntent(gr, field)';
+                }
+                this.fieldDef.predicted_intent.value = 'sn_nlu_workbench.NLUBatchTestExportUtil.getPredictedData(gr, field)';
+                this.fieldDef.confidence.value = 'sn_nlu_workbench.NLUBatchTestExportUtil.getPredictedData(gr, field)';
+                this.fieldDef.correct_incorrect.value = 'sn_nlu_workbench.NLUBatchTestExportUtil.getPredictedData(gr, field)';
+                this.fieldDef.prediction_model.value = 'sn_nlu_workbench.NLUBatchTestExportUtil.getPredictedData(gr, field)';
+            }
+        },
+
+        type: 'NLUBatchTestExportUtil'
+    };
+})();]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-06-03 15:37:19&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;61276b490724301028ef0a701ad3002f&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;54&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;NLUBatchTestExportUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="NLU Workbench - Advanced Features" source="sn_nlu_workbench"&gt;31f5f491c3a710100bf407720f40ddf4&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="NLU Workbench - Advanced Features"&gt;31f5f491c3a710100bf407720f40ddf4&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_61276b490724301028ef0a701ad3002f&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-10-17 10:12:21&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:37:46</sys_created_on>
+        <sys_id>13c6381d83f01210c6695855eeaad3ce</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>NLUBatchTestExportUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_13c6381d83f01210c6695855eeaad3ce</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:37:46</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

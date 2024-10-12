@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>8a9d94fd43232110f3063fea8eb8f28f</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_entitlement.GlobalCustomTableRecommendationService&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;GlobalCustomTableRecommendationService&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var GlobalCustomTableRecommendationService = Class.create();
+GlobalCustomTableRecommendationService.prototype = {
+    initialize: function() {
+        this._logger = new LoggingUtil();
+        this._customTableInventoryDAO = new CustomTableInventoryDAO();
+        this._tablesSchemaHelper = new TablesSchemaHelper();
+        this._globalCustomTablesRecommendationDAO = new GlobalCustomTablesRecommendationDAO();
+        this._grandfatherLicenseHelper = new GrandfatherLicenseHelper();
+        this._subscriptionHasFamilyDAO = new SubscriptionHasFamilyDAO();
+        this._licenseCustTableAllotmentDAO = new LicenseCustTableAllotmentDAO();
+        this._table_to_subscription_map = {};
+        this.MAX_RECOMMENDATIONS = gs.getProperty('sn_entitlement.max_recommendations_for_unallocated_global_custom_tables', 1);
+        this.GRAND_FATHER_SUBSCRIPTION = this._grandfatherLicenseHelper.getGrandfatherLicenseDetails();
+        this.APP_ENGINE_SUBSCRIPTIONS = this._licenseCustTableAllotmentDAO.getActiveSubscriptionsByAllotmentType(LicensingEngineDBConstants.ALLOTMENT_TYPE_APP_ENGINE);
+        this.TABLE_BUNDLE_SUBSCRIPTIONS = this._licenseCustTableAllotmentDAO.getActiveSubscriptionsByAllotmentType(LicensingEngineDBConstants.ALLOTMENT_TYPE_TABLE_BUNDLE);
+    },
+    /**
+     *  Recommend Subscriptions to Global Custom Tables
+     */
+    recommendSubscriptions: function() {
+        const unmappedGlobalCustomTables = this._customTableInventoryDAO.getUnmappedGlobalCustomTables();
+        if (global.JSUtil.nil(unmappedGlobalCustomTables)) {
+            this._logger.logInfo(this.type, arguments.callee.name, 'Can not find any unmapped global custom tables');
+            return;
+        }
+        this._logger.logInfo(this.type, arguments.callee.name, 'Total unmapped custom tables count:: ' + unmappedGlobalCustomTables.length);
+        unmappedGlobalCustomTables.forEach(tableObject =&gt; {
+            const recommendations = this.recommendSubscriptionByTableName(tableObject.table_name);
+            const subscription_counts = recommendations.subscription_counts;
+            const subscription_counts_sorted = this._getTopRecommendations(subscription_counts);
+            const related_tables_qualifying_data = recommendations.related_tables_qualifying_data;
+
+            //if additional recommendations allowed, add grand father subscripption if available
+            if (this.MAX_RECOMMENDATIONS &gt; subscription_counts_sorted.length) {
+                this._recommendGrandfatherSubscription(subscription_counts, subscription_counts_sorted, related_tables_qualifying_data);
+            }
+
+            //if additional recommendations allowed, add app engine subscriptions if available
+            if (this.MAX_RECOMMENDATIONS &gt; subscription_counts_sorted.length) {
+                this._mapAdditionalSubscriptions(this.APP_ENGINE_SUBSCRIPTIONS, subscription_counts_sorted, related_tables_qualifying_data, "App engine");
+            }
+
+            //if additional recommendations allowed, map table bundle subscriptions
+            if (this.MAX_RECOMMENDATIONS &gt; subscription_counts_sorted.length) {
+                this._mapAdditionalSubscriptions(this.TABLE_BUNDLE_SUBSCRIPTIONS, subscription_counts_sorted, related_tables_qualifying_data, "Table Bundle");
+            }
+
+            this._saveRecommendations(subscription_counts_sorted, related_tables_qualifying_data, tableObject);
+
+        });
+
+
+    },
+    /**
+     * Recommend Subscriptions by table name
+     */
+    recommendSubscriptionByTableName: function(table_name) {
+        try {
+            const relatedTables = this._tablesSchemaHelper.getRelatedTables(table_name);
+            const subscription_counts = {};
+            const related_tables_qualifying_data = {};
+            relatedTables.forEach(tableName =&gt; {
+                const subscription_id = this._getTableSubscription(tableName);
+                if (global.JSUtil.notNil(subscription_id)) {
+                    this._updateSubscriptionCount(subscription_counts, subscription_id);
+                    this._addRelatedTableQualifyingData(related_tables_qualifying_data, subscription_id, tableName);
+                }
+            });
+            return {
+                subscription_counts: subscription_counts,
+                related_tables_qualifying_data: related_tables_qualifying_data
+            };
+        } catch (error) {
+            this._logger.logError(this.type, arguments.callee.name, `Unexpected error ${error} encountered in recommendation logic for table:: ${table_name}`);
+        }
+    },
+
+    _getTableSubscription: function(tableName) {
+        if (this._table_to_subscription_map[tableName]) {
+            return this._table_to_subscription_map[tableName];
+        }
+        const subscription_id = this._customTableInventoryDAO.getSubscriptionIdByTableName(tableName);
+        if (global.JSUtil.notNil(subscription_id)) {
+            this._table_to_subscription_map[tableName] = subscription_id;
+            return subscription_id;
+        }
+    },
+
+    _getTopRecommendations: function(subscription_counts) {
+        return Object.entries(subscription_counts)
+            .sort((subscription1, subscription2) =&gt; subscription2[1] - subscription1[1])
+            .slice(0, this.MAX_RECOMMENDATIONS);
+    },
+
+    _mapAdditionalSubscriptions: function(subscriptions, subscription_counts_sorted, related_tables_qualifying_data, related_table) {
+        subscriptions.forEach(subscription =&gt; {
+            const subscription_id = subscription.subscriptionEntitlementId;
+            if (this.MAX_RECOMMENDATIONS &gt; subscription_counts_sorted.length &amp;&amp;
+                !related_tables_qualifying_data.hasOwnProperty(subscription_id) &amp;&amp;
+                this._isLicenseAvailableToMapTables(subscription_id, subscription.numTables)) {
+                subscription_counts_sorted.push([subscription_id, 0]);
+                this._addRelatedTableQualifyingData(related_tables_qualifying_data, subscription_id, related_table);
+            }
+        });
+    },
+
+    _recommendGrandfatherSubscription: function(subscription_counts, subscription_counts_sorted, related_tables_qualifying_data) {
+        if (global.JSUtil.notNil(this.GRAND_FATHER_SUBSCRIPTION) &amp;&amp; //subscription is not nil
+            global.JSUtil.notNil(this.GRAND_FATHER_SUBSCRIPTION.licenseSysId) &amp;&amp; //subscription sys_id is not nil
+            !subscription_counts[this.GRAND_FATHER_SUBSCRIPTION.licenseSysId]) { //existing recommendations do not contain grand father subscription 
+            subscription_counts_sorted.push([this.GRAND_FATHER_SUBSCRIPTION.licenseSysId, 0]);
+            this._addRelatedTableQualifyingData(related_tables_qualifying_data, this.GRAND_FATHER_SUBSCRIPTION.licenseSysId, 'Grandfather license');
+        }
+    },
+
+    _saveRecommendations: function(subscription_counts_sorted, related_tables_qualifying_data, tableObject) {
+        subscription_counts_sorted.forEach(subscription_match_count =&gt; {
+            const subscription = subscription_match_count[0];
+            const qualifying_data = {};
+            qualifying_data.related_tables = related_tables_qualifying_data[subscription];
+            this._globalCustomTablesRecommendationDAO.insert(tableObject.custom_table_inventory_sys_id, subscription, subscription_match_count[1], qualifying_data);
+        });
+    },
+
+    _addRelatedTableQualifyingData: function(qualifying_data, subscription, table) {
+        if (!qualifying_data.hasOwnProperty(subscription)) {
+            qualifying_data[subscription] = [];
+        }
+        qualifying_data[subscription].push(table);
+    },
+
+    _updateSubscriptionCount: function(subscription_counts, subscription_id) {
+        subscription_counts[subscription_id] = isNaN(subscription_counts[subscription_id]) ? 1 : subscription_counts[subscription_id] + 1;
+    },
+
+    _isLicenseAvailableToMapTables: function(LICENSE_SYS_ID, AVAILABLE_COUNT) {
+        const allocatedCount = this._customTableInventoryDAO.getAllocatedTableCount(LICENSE_SYS_ID);
+        return (AVAILABLE_COUNT - allocatedCount) &gt; 0;
+    },
+
+    type: 'GlobalCustomTableRecommendationService'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-06-21 00:24:15&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;8a9d94fd43232110f3063fea8eb8f28f&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;68&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;GlobalCustomTableRecommendationService&lt;/sys_name&gt;
+        &lt;sys_package display_value="Licensing Engine" source="sn_entitlement"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Licensing Engine"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_8a9d94fd43232110f3063fea8eb8f28f&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-10-04 12:35:10&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:45:03</sys_created_on>
+        <sys_id>c678fc1183341210c6695855eeaad303</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>GlobalCustomTableRecommendationService</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_c678fc1183341210c6695855eeaad303</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:45:03</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

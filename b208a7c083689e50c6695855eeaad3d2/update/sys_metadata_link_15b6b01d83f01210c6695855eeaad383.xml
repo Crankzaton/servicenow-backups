@@ -1,0 +1,217 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>57adaf0187996d50fa0d64e60cbb358f</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.WF_IncidentCatalogUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;true&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;WF_IncidentCatalogUtils&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var WF_IncidentCatalogUtils = Class.create();
+WF_IncidentCatalogUtils.prototype = {
+    initialize: function() {},
+    updateClosedIncident: function(incidentSysId, catalogRequestNumber, justification, fieldValuesMap) {
+        //LGWH-21194: Script Creation: Update closed major incidents via catalog task
+
+        fieldValuesMap = fieldValuesMap || {};
+        var result = {
+            "status": "",
+            "message": ""
+        };
+
+        try {
+            /* Validation-01: Check if passed sys_id is a valid closed major incident */
+            var grInc = new GlideRecord('incident');
+            grInc.addQuery('sys_id', incidentSysId);
+            grInc.addQuery('state', '7');
+            grInc.addQuery('major_incident_state', 'accepted');
+            grInc.query();
+            if (!grInc.next()) {
+                throw "Error: Incident to be updated must be a Major Incident in a Closed state.";
+            }
+
+            /* Validation-02: Check if Catalog Request Number and Justification is not empty */
+            if (global.JSUtil.nil(catalogRequestNumber)) {
+                throw "Error: Request number is required.";
+            }
+            if (global.JSUtil.nil(justification)) {
+                throw "Error: Justification is required.";
+            }
+
+            /* Validation-03: Business Impact and Cause cannot be empty */
+            if (global.JSUtil.nil(fieldValuesMap.business_impact)) {
+                throw "Error: Business Impact is required.";
+            }
+            if (global.JSUtil.nil(fieldValuesMap.cause)) {
+                throw "Error: Probable Cause is required.";
+            }
+
+            /* Number field value checks - NUM */
+            var NUM_FIELDS = [
+                'x_g_wfb_inc_mgmt_customers_impacted',
+                'x_g_wfb_inc_mgmt_customer_calls',
+                'x_g_wfb_inc_mgmt_customer_financial_impact',
+                'x_g_wfb_inc_mgmt_customer_transactions',
+                'x_g_wfb_inc_mgmt_clients_impacted',
+                'x_g_wfb_inc_mgmt_client_calls',
+                'x_g_wfb_inc_mgmt_client_financial_impact',
+                'x_g_wfb_inc_mgmt_client_transactions'
+            ];
+            var numFieldLength = NUM_FIELDS.length;
+
+            if (grInc.getValue('x_g_wfb_inc_mgmt_external_customer_client_impacting') === 'yes') {
+
+                /*
+                Validation-04 (NUM): Value should be an integer and non-negative
+                Validation-05 (NUM): Any one of the value should be at least greater than 0
+                */
+                var isNumPositive = false;
+                for (var numIterator = 0; numIterator &lt; numFieldLength; numIterator++) {
+                    var numField = NUM_FIELDS[numIterator];
+                    var numFieldValue = fieldValuesMap[numField];
+
+                    if (numFieldValue === "" || isNaN(+numFieldValue)) {
+                        throw "Error: " + grInc[numField].getLabel() + " should be a number.";
+                    }
+                    if (+numFieldValue &lt; 0) {
+                        throw "Error: No negative values are allowed.";
+                    }
+                    if (+numFieldValue &gt; 0) {
+                        isNumPositive = true;
+                    }
+                }
+
+                if (!isNumPositive) {
+                    throw "Error: At least one Customer or Client field must have a value greater than zero.";
+                }
+            }
+
+            /* Validation Passed. Update the Incident */
+            var UPDATABLE_FIELDS = [
+                'x_g_wfb_inc_mgmt_customers_impacted',
+                'x_g_wfb_inc_mgmt_customer_calls',
+                'x_g_wfb_inc_mgmt_customer_financial_impact',
+                'x_g_wfb_inc_mgmt_customer_transactions',
+                'x_g_wfb_inc_mgmt_clients_impacted',
+                'x_g_wfb_inc_mgmt_client_calls',
+                'x_g_wfb_inc_mgmt_client_financial_impact',
+                'x_g_wfb_inc_mgmt_client_transactions',
+                'business_impact',
+                'cause'
+            ];
+            var updatableFieldsLength = UPDATABLE_FIELDS.length;
+
+            var oldValues = this._getFieldAsObj(grInc, UPDATABLE_FIELDS);
+
+            for (var updIterator = 0; updIterator &lt; updatableFieldsLength; updIterator++) {
+                var updField = UPDATABLE_FIELDS[updIterator];
+                grInc[updField] = fieldValuesMap[updField];
+            }
+            grInc.setWorkflow(false);
+            grInc.setUseEngines(false);
+            if (!grInc.update()) {
+                throw "Error: Failed to update the incident.";
+            }
+
+            var newValues = this._getFieldAsObj(grInc, UPDATABLE_FIELDS);
+
+            /* Construct the update worknote */
+            var changedFields = this._getChangedFields(newValues, oldValues);
+            var changedFieldsLength = changedFields.length;
+            var changedMsgs = [];
+
+            for (var chIterator = 0; chIterator &lt; changedFieldsLength; chIterator++) {
+                var chField = changedFields[chIterator];
+
+                var msg = msg = newValues[chField].label + '    ' + newValues[chField].displayValue + '    was    ';
+                if (JSUtil.nil(oldValues[chField].value)) {
+                    msg += 'empty';
+                } else {
+                    msg += oldValues[chField].displayValue;
+                }
+                changedMsgs.push(msg);
+            }
+
+            var workNotes =
+                'Post close updates per ' + catalogRequestNumber + '\n' +
+                'Justification: ' + justification + '\n' +
+                'Changes:' + '\n' + changedMsgs.sort().join('\n');
+
+            grInc.setWorkflow(true);
+            grInc.work_notes = workNotes;
+            grInc.update();
+
+            result.status = "success";
+            result.message = grInc.getValue('number') + " updated";
+        } catch (e) {
+            result.status = "failure";
+            result.message = e;
+        }
+
+        return result;
+    },
+
+
+    /* Workaround to include change of values in Currency Fields */
+    _getFieldAsObj: function(gr, fieldList) {
+        var obj = {};
+
+        var fieldListLength = fieldList.length;
+        for (var i = 0; i &lt; fieldListLength; i++) {
+            var field = fieldList[i];
+            obj[field] = {
+                name: field,
+                label: gr[field].getLabel(),
+                value: gr.getValue(field),
+                displayValue: gr.getDisplayValue(field)
+            };
+        }
+
+        return obj;
+    },
+    _getChangedFields: function(newObj, oldObj) {
+        var changedFields = [];
+        for (var o in newObj) {
+            if (newObj[o].value !== oldObj[o].value) {
+                changedFields.push(o);
+            }
+        }
+        return changedFields;
+    },
+
+    type: 'WF_IncidentCatalogUtils'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;U863956&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-02-27 11:17:53&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;57adaf0187996d50fa0d64e60cbb358f&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;15&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;WF_IncidentCatalogUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Global" source="global"&gt;global&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_57adaf0187996d50fa0d64e60cbb358f&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-02-04 17:24:33&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:37:21</sys_created_on>
+        <sys_id>15b6b01d83f01210c6695855eeaad383</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>WF_IncidentCatalogUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_15b6b01d83f01210c6695855eeaad383</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:37:21</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

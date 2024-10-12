@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>52eb01f7772131103b00d86bba5a9936</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.PurgeOrphanAttachments&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;purge attachments with a valid parent record from sys_attachment&lt;/description&gt;
+        &lt;name&gt;PurgeOrphanAttachments&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var PurgeOrphanAttachments = Class.create();
+var ONE_HOUR_WINDOW_SECONDS = 60 * 60;
+var DELETION_COUNT_LIMIT = gs.getProperty('glide.attachment.orphan.deletion_count_limit', 800);
+var ORPHAN_CLEANUP_ENABLE = gs.getProperty('glide.attachment.orphan.enable_cleanup', false);
+var ORPHAN_AGE_LIMIT_TIME_MIN = gs.getProperty('glide.attachment.orphan.age_limit_minutes', 1440);
+// If true, this property will soft delete all old orphan attachments
+var PURGE_ALL = gs.getProperty('glide.attachment.orphan.clean_old_orphan_records', false);
+var GRACE_PERIOD_SECONDS = 60 * ORPHAN_AGE_LIMIT_TIME_MIN;
+var ATTACHMENT_TABLE = "sys_attachment";
+var SOFT_DELETED_ATTACHMENT_TABLE = 'sys_attachment_soft_deleted';
+var CHECKPOINT_COL = "last_execution_time";
+var SIZE_GB = 1000000000;
+
+PurgeOrphanAttachments.prototype = {
+    purgeAttachments: function () {
+        if (ORPHAN_CLEANUP_ENABLE === 'false')
+            return;
+
+        var newCheckpoint;
+        var attachmentGR = new GlideRecord(ATTACHMENT_TABLE);
+
+        if (PURGE_ALL == 'false') {
+            var queryStartTime = this.getCheckpointTime();
+            newCheckpoint = queryStartTime;
+            attachmentGR.addQuery("sys_created_on", "&gt;=", queryStartTime);
+        } else {
+            gs.setProperty('glide.attachment.orphan.clean_old_orphan_records', false, "remove old orphan attachment records");
+            gs.log("PurgeOrphanAttachments: Purging all old orphan attachments.", "PurgeOrphanAttachments");
+        }
+
+        // Exclude system files
+        attachmentGR.addQuery('table_name', 'DOES NOT CONTAIN', 'ZZ_YY');
+        attachmentGR.addQuery('table_name', 'DOES NOT CONTAIN', 'invisible.');
+        attachmentGR.orderBy('sys_created_on');
+        attachmentGR.query();
+
+        // get the soft deleted attachments count
+        var softDeletedAttachmentSysIds = [];
+        var failedAttachmentSysIds = [];
+        var failedIndex = 0;
+        var index = 0;
+        var totalSize = 0;
+
+        while (attachmentGR.next() &amp;&amp; softDeletedAttachmentSysIds.length &lt; DELETION_COUNT_LIMIT) {
+            var tableSysID = attachmentGR.getValue("table_sys_id");
+            var attachmentSysID = attachmentGR.getValue("sys_id");
+            var tableName = attachmentGR.getValue("table_name");
+            var attachmentCreatedOn = new GlideDateTime(attachmentGR.getValue('sys_created_on'));
+            var ageLimit = gs.nowGlideDateTime();
+            // Ignore recent orphan attachments
+            ageLimit.addSeconds(-1 * GRACE_PERIOD_SECONDS);
+
+            try {
+                if (attachmentCreatedOn.compareTo(ageLimit) &gt;= 0)
+                    continue;
+
+                if (this.isTablenameInvalid(tableName) || this.isParentSysIdInvalid(tableName, tableSysID)) {
+                    // Soft delete the orphan
+                    this.softDelete(attachmentGR);
+                    softDeletedAttachmentSysIds[index++] = attachmentSysID;
+                    try {
+                        totalSize += (attachmentGR.getValue('size_bytes') / SIZE_GB);
+                    } catch (error) {
+                        totalSize = 0;
+                    }
+                }
+            } catch (error) {
+                gs.error(error);
+                failedAttachmentSysIds[failedIndex++] = attachmentSysID;
+            }
+
+            // last attachment processed time is the new checkpoint
+            newCheckpoint = attachmentCreatedOn;
+        }
+
+        // capture the most recent checkpoint
+        this.setLatestCheckpoint(newCheckpoint);
+
+        gs.log("PurgeOrphanAttachments: Job Completed:" + gs.nowGlideDateTime() + "; Attachment expiration time (mins) :" +
+            ORPHAN_AGE_LIMIT_TIME_MIN + ",  purge all old records :" + PURGE_ALL + ", softDeletedAttachmentSysIds: [" +
+            softDeletedAttachmentSysIds + "], failedAttachmentSysIds: [" + failedAttachmentSysIds + "], total size(Gb): " + totalSize, "PurgeOrphanAttachments");
+    },
+
+    isParentSysIdInvalid: function (tableName, tableSysID) {
+        var parentGA = new GlideAggregate(tableName);
+        parentGA.addAggregate('COUNT');
+        parentGA.addQuery('sys_id', tableSysID);
+        parentGA.query();
+
+        if (parentGA.next() &amp;&amp; parentGA.getAggregate('COUNT') == 0)
+            return true;
+
+        return false;
+    },
+
+    isTablenameInvalid: function (tableName) {
+        return !GlideTableDescriptor.isValid(tableName);
+    },
+
+    getCheckpointTime: function () {
+        var checkpointTime = gs.nowGlideDateTime();
+        var softDeletedGR = new GlideRecord(SOFT_DELETED_ATTACHMENT_TABLE);
+        softDeletedGR.orderByDesc(CHECKPOINT_COL);
+        softDeletedGR.setLimit(1);
+        softDeletedGR.query();
+
+        if (softDeletedGR.next())
+            // Soft delete orphans since last run of this script.
+            checkpointTime = new GlideDateTime(softDeletedGR.getValue(CHECKPOINT_COL));
+        else
+            // defaults to one hour ago (typically for the first run)
+            checkpointTime.addSeconds(-1 * ONE_HOUR_WINDOW_SECONDS);
+
+        return checkpointTime;
+    },
+
+    softDelete: function (attachmentGR) {
+        var softDeletedGR = new GlideRecord(SOFT_DELETED_ATTACHMENT_TABLE);
+        softDeletedGR.newRecord();
+
+        softDeletedGR.setValue('table_name', attachmentGR.getValue("table_name"));
+        softDeletedGR.setValue('table_sys_id', attachmentGR.getValue("table_sys_id"));
+        softDeletedGR.setValue(CHECKPOINT_COL, new GlideDateTime(attachmentGR.getValue('sys_created_on')));
+        softDeletedGR.setValue('attachment', attachmentGR.getValue('sys_id'));
+        softDeletedGR.insertWithReferences();
+
+        // remove parent record reference from sys_attachment
+        attachmentGR.setValue("table_name", '');
+        attachmentGR.setValue("table_sys_id", '');
+        attachmentGR.update();
+    },
+
+    setLatestCheckpoint: function (newCheckpoint) {
+        var softDeletedGR = new GlideRecord(SOFT_DELETED_ATTACHMENT_TABLE);
+        softDeletedGR.newRecord();
+        // only record the checkpoint timestamp
+        softDeletedGR.setValue(CHECKPOINT_COL, newCheckpoint);
+        softDeletedGR.insert();
+    },
+
+    type: 'PurgeOrphanAttachments'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-10-04 19:01:18&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;52eb01f7772131103b00d86bba5a9936&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;12&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;PurgeOrphanAttachments&lt;/sys_name&gt;
+        &lt;sys_package display_value="Orphan Attachment Handling" source="com.glide.attachment.orphan"&gt;e2a89f5b47220210cd4e1ce4316d4370&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_52eb01f7772131103b00d86bba5a9936&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-10-11 21:17:09&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:37:06</sys_created_on>
+        <sys_id>65a6301d83f01210c6695855eeaad322</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>PurgeOrphanAttachments</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_65a6301d83f01210c6695855eeaad322</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:37:06</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

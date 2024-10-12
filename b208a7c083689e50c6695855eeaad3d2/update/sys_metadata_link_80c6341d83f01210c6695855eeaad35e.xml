@@ -1,0 +1,800 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>5c32233a0b011110c85e8a8db777b2eb</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_sow_chg.SOWChgConflictCalendarSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;SOWChgConflictCalendarSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var SOWChgConflictCalendarSNC = Class.create();
+
+SOWChgConflictCalendarSNC.LOG_PROP = "sn_sow_chg.change_conflict_calendar.log";
+SOWChgConflictCalendarSNC.CALENDAR_RELATED_CHANGE_LIMIT = "sn_sow_chg.change_conflict_calendar.related.limit";
+
+SOWChgConflictCalendarSNC.I18N = {
+	"APPLIES_TO": gs.getMessage("Applies to"),
+	"BLACKOUT_WINDOWS": gs.getMessage("Blackout windows"),
+	"END_DATE": gs.getMessage("End date"),
+	"MAINTENANCE_WINDOWS": gs.getMessage("Maintenance windows"),
+	"START_DATE": gs.getMessage("Start date"),
+	"TIME_ZONE": gs.getMessage("Time zone"),
+	"DAY": gs.getMessage("Day"),
+	"WEEK": gs.getMessage("Week"),
+	"FOUR_WEEKS": gs.getMessage("{0} Weeks", [4]),
+},
+
+SOWChgConflictCalendarSNC.prototype = {
+
+	PLUGIN_CONFLICT_DETECTION: 'com.snc.change.collision',
+
+	initialize: function(tableName, sysId) {
+		this.tableName = tableName || "change_request";
+		this.sysId = sysId;
+		this.changeGR = new GlideRecordSecure(this.tableName);
+		this.validTable = this.changeGR.isValid();
+		this.validChange = this.validTable ? this.changeGR.get(this.sysId) : false;
+		this.validChangePlannedDates = !this.changeGR.start_date.nil() &amp;&amp; !this.changeGR.end_date.nil();
+		this._ciDataCache = {};
+		this._log = new global.GSLog(SOWChgConflictCalendarSNC.LOG_PROP, this.type).setLog4J();
+	},
+
+	buildChangeConflictCalendar: function(dateRange) {
+		var changeConflictCalendar = {};
+
+		if (!this.validChange) {
+			changeConflictCalendar.error = {
+				message: gs.getMessage("Record not found, cannot display schedule")
+			};
+			return changeConflictCalendar;
+		}
+
+		changeConflictCalendar.timeProperties = {
+			firstDayWeek: new GlideDateTime(gs.beginningOfThisWeek()).getDayOfWeekLocalTime(),
+			locale: gs.getSession().getLanguage(),
+			timezone: gs.getSession().getTimeZoneName()
+		};
+
+		changeConflictCalendar.timelineViewSettings = this._defineTimelineViewProperties();
+
+		this.setRangeDates(dateRange);
+
+		changeConflictCalendar.change = this._changeToEvent(this.changeGR, "change", "rgb(var(--now-color_grouped--green-2, 147, 170, 125))");
+		changeConflictCalendar.changeState = this._defineConflictStatus();
+
+		changeConflictCalendar.flat = [];
+		changeConflictCalendar.flat.push(changeConflictCalendar.change);
+
+		changeConflictCalendar.timelineSections = this._defineTimelineSections(changeConflictCalendar);
+
+		// No need to process
+		if (!this.validChangePlannedDates || !this._hasAffectedCIs())
+			return changeConflictCalendar;
+
+		var changeConflictData = this._calculateConflictData();
+		
+		changeConflictCalendar.related_change = this.processRelatedInfo(changeConflictData);
+		changeConflictCalendar.flat = changeConflictCalendar.flat.concat(changeConflictCalendar.related_change);
+
+		changeConflictCalendar.timelineSections = this._defineTimelineSections(changeConflictCalendar);
+
+		changeConflictCalendar.schedule = this.processScheduleInfo(changeConflictData);
+		changeConflictCalendar.schedule.maintenance.forEach(function(maintenanceSchedule) {
+			changeConflictCalendar.flat = changeConflictCalendar.flat.concat(maintenanceSchedule.windows);
+		}, this);
+		changeConflictCalendar.schedule.blackout.forEach(function(blackoutSchedule) {
+			changeConflictCalendar.flat = changeConflictCalendar.flat.concat(blackoutSchedule.windows);
+		}, this);
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug("[getEvents] changeConflictCalendar.flat: " + JSON.stringify(changeConflictCalendar, 3,3,3));
+
+		return changeConflictCalendar;
+	},
+	
+	_defineConflictStatus: function() {
+		var changeConflictState = "not_run";
+
+		switch (this.changeGR.getValue("conflict_status")) {
+			case "Conflict":
+				changeConflictState = "conflict";
+				break;
+			case "No Conflict":
+				changeConflictState = "no_conflict";
+				break;
+			case "Not Run":
+				changeConflictState = "not_run";
+				break;
+			default:
+				changeConflictState = "not_run";
+				break;
+		}
+		return changeConflictState;
+	},
+	
+	_calculateConflictData: function() {
+		var changeConflictConfig = {
+			date_range: [this.rangeStart, this.rangeEnd],
+			dry_run: true,
+			collect_window_data: true,
+			allow_partially_overlapping_windows: true,
+			show_timing_info: false,
+			include_current_ci: this.relatedCi,
+			include_assigned_to: this.relatedAssigned
+		};
+
+		if (!this.maintenance)
+			changeConflictConfig.maintenance = ["maintenance"];
+		if (!this.blackout)
+			changeConflictConfig.blackout = ["blackout"];
+
+		if (!GlidePluginManager.isActive(this.PLUGIN_CONFLICT_DETECTION))
+			return {
+				maintenance: [],
+				blackout: [],
+				is_invalid_conflict_checker_si: true
+			};
+
+		var conflictChecker = new global.ChangeCheckConflicts(this.changeGR, changeConflictConfig);
+		if (!conflictChecker.getWindowData) {
+			this._log.error("ChangeCheckConflicts does not have \"getWindowData\" defined. Please ensure the latest version of ChangeCheckConflicts provided by ServiceNow is in use.");
+			return {
+				maintenance: [],
+				blackout: [],
+				is_invalid_conflict_checker_si: true
+			};
+		}
+		conflictChecker.check();
+		return conflictChecker.getWindowData();
+	},
+
+	_defineTimelineViewProperties: function() {
+		return {
+			"TIMELINE_DAY": {
+				"eventHeight": 40,
+				"xStep": 60,
+				"xSize": 24,
+				"xStart": 0,
+				"xUnitName": "minutes",
+				"titleWidth": 240,
+				"viewName": "TIMELINE_DAY",
+				"groupBy": "group",
+				"scrollDebounceTime": 100,
+				"noScrolling": false,
+				"eventMinWidthMS": 1000,
+				"animation": false,
+				"enableColumnNavigation": false,
+				"hideAgendaView": true,
+				"hideSidebarOnLoad": false,
+				"snapGranularity": 15,
+				"splitRow": 2,
+				"timeRowSpan": 60,
+				"numberOfDays": 1,
+				"viewLabel": SOWChgConflictCalendarSNC.I18N.DAY,
+				"isReadonly": true,
+				"rowHeightBottomPaddingInLines": 1,
+				"sectionHeaderHeight": 40,
+				"templates": {
+					"rowTitle": {
+						"type": "macroponent",
+						"value": "be243d9c0bd21110c85e8a8db777b28a"
+					},
+					"mainGrid": {
+						"type": "",
+						"value": ""
+					},
+					"timeScaleGrid": {
+						"type": "",
+						"value": ""
+					},
+					"sectionHeadTitle": {
+						"type": "",
+						"value": ""
+					},
+					"sectionHeadBody": {
+						"type": "",
+						"value": ""
+					},
+					"rowBody": {
+						"type": "",
+						"value": ""
+					},
+					"eventBody": {
+						"type": "",
+						"value": ""
+					},
+					"timestampBody": {
+						"type": "component",
+						"value": "sn-now-calendar-timestamp-view"
+					}
+				},
+				"trackConfig": {
+					"normal": {
+						"style": {},
+						"paddingTop": 1,
+						"paddingBottom": 1,
+						"eventHeight": 40
+					},
+					"priority": {
+						"style": {},
+						"paddingTop": 1,
+						"paddingBottom": 1,
+						"eventHeight": 40
+					}
+				}
+			},
+			"TIMELINE_WEEK": {
+				"eventHeight": 40,
+				"xStep": 1,
+				"xSize": 7,
+				"xStart": 0,
+				"xUnitName": "days",
+				"titleWidth": 240,
+				"viewName": "TIMELINE_WEEK",
+				"groupBy": "group",
+				"scrollDebounceTime": 100,
+				"noScrolling": false,
+				"eventMinWidthMS": 1000,
+				"animation": false,
+				"enableColumnNavigation": false,
+				"hideAgendaView": true,
+				"hideSidebarOnLoad": false,
+				"snapGranularity": 480,
+				"splitRow": 4,
+				"numberOfDays": 7,
+				"isReadonly": true,
+				"rowHeightBottomPaddingInLines": 1,
+				"sectionHeaderHeight": 40,
+				"viewLabel": SOWChgConflictCalendarSNC.I18N.WEEK,
+				"templates": {
+					"rowTitle": {
+						"type": "macroponent",
+						"value": "be243d9c0bd21110c85e8a8db777b28a"
+					},
+					"mainGrid": {
+						"type": "",
+						"value": ""
+					},
+					"timeScaleGrid": {
+						"type": "",
+						"value": ""
+					},
+					"sectionHeadTitle": {
+						"type": "",
+						"value": ""
+					},
+					"sectionHeadBody": {
+						"type": "",
+						"value": ""
+					},
+					"rowBody": {
+						"type": "",
+						"value": ""
+					},
+					"eventBody": {
+						"type": "",
+						"value": ""
+					},
+					"timestampBody": {
+						"type": "component",
+						"value": "sn-now-calendar-timestamp-view"
+					}
+				},
+				"trackConfig": {
+					"normal": {
+						"style": {},
+						"paddingTop": 1,
+						"paddingBottom": 1,
+						"eventHeight": 40
+					},
+					"priority": {
+						"style": {},
+						"paddingTop": 1,
+						"paddingBottom": 1,
+						"eventHeight": 40
+					}
+				},
+			}
+		};
+	},
+
+	_defineTimelineSections: function(changeConflictCalendar) {
+		var timelineSections = [
+			{
+				"id": "change",
+				"title": changeConflictCalendar.change._title,
+				"isCollapsed": false,
+				"showHeader": false,
+				"textColor": ""
+			},
+			{
+				"id": "blackout",
+				"title": SOWChgConflictCalendarSNC.I18N.BLACKOUT_WINDOWS,
+				"isCollapsed": false,
+				"showHeader": false,
+				"textColor": ""
+			},
+			{
+				"id": "maintenance",
+				"title": SOWChgConflictCalendarSNC.I18N.MAINTENANCE_WINDOWS,
+				"isCollapsed": false,
+				"showHeader": false,
+				"textColor": ""
+			},
+			{
+				"id": "conflict",
+				"title": "",
+				"isCollapsed": false,
+				"showHeader": true,
+				"textColor": "",
+				"children": [
+					{
+						"id": "config_item_section",
+						"title": "",
+						"isCollapsed": false,
+						"showHeader": true,
+						"textColor": "",
+						"children": [
+						]
+					},
+					{
+						"id": "resource_section",
+						"title": "",
+						"isCollapsed": false,
+						"showHeader": true,
+						"textColor": "",
+						"children": [
+						]
+					}
+				]
+			}
+		];
+		
+		var resourceCount = 0;
+		var configCount = 0;
+		if (changeConflictCalendar.related_change)
+			changeConflictCalendar.related_change.forEach(function(changeObj) {
+				if (changeObj._group === "resource") {
+					resourceCount++;
+					timelineSections[3].children[1].children.push({
+						"id": changeObj.id,
+						"title": changeObj._title,
+					});
+				} else {
+					configCount++;
+					timelineSections[3].children[0].children.push({
+						"id": changeObj.id,
+						"title": changeObj._title,
+					});
+				}
+			});
+
+		timelineSections[3].children[0].title = gs.getMessage("Configuration item ({0})", "" + configCount);
+		if (!configCount)
+			timelineSections[3].children[0].isCollapsed = true;
+
+		timelineSections[3].children[1].title = gs.getMessage("Assigned to ({0})", "" + resourceCount);
+		if (!resourceCount)
+			timelineSections[3].children[1].isCollapsed = true;
+
+		timelineSections[3].title = gs.getMessage("Related changes ({0})", (resourceCount + configCount) + "");
+		if (!(resourceCount + configCount))
+			timelineSections[3].isCollapsed = true;
+
+		return timelineSections;
+	},
+
+	processRelatedInfo: function(windowData) {
+		var relatedChangeRequests = [];
+		var foundRelatedChgRequestsObj = {};
+
+		// Derived from Conflict Detection
+		var changeIdArr = Object.keys(windowData.scheduled);
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug("[processRelatedInfo] changeIdArr: " + changeIdArr);
+		
+		if (changeIdArr &amp;&amp; changeIdArr.length) {
+			var changesGR = new GlideRecordSecure(this.tableName);
+			changesGR.addActiveQuery();
+			changesGR.addQuery("sys_id", changeIdArr);
+			this._addDateRangeQuery(changesGR, this.rangeStart, this.rangeEnd);
+			var relatedChangeLimit = parseInt(gs.getProperty(SOWChgConflictCalendarSNC.CALENDAR_RELATED_CHANGE_LIMIT, 200));
+			changesGR.setLimit(isNaN(relatedChangeLimit) ? 200 : relatedChangeLimit);
+
+			relatedChangeRequests = relatedChangeRequests.concat(this.getChangesInformation(changesGR, foundRelatedChgRequestsObj));
+		}
+
+		return relatedChangeRequests;
+	},
+
+	processScheduleInfo: function(windowData) {
+		return {
+			maintenance: this.getScheduleInformation(windowData.maintenance, "maintenance", "rgb(var(--now-color_grouped--blue-2, 120, 176, 204))"),
+			blackout: this.getScheduleInformation(windowData.blackout, "blackout", "rgb(var(--now-color_grouped--gray-5, 77, 80, 83))"),
+			warn_invalid_conflict_checker: windowData.is_invalid_conflict_checker_si
+		};
+	},
+
+	getChangesInformation: function(changesGR, foundRelatedChgRequestsObj) {
+		var changes = [];
+		if (changesGR) {
+			changesGR.query();
+			while (changesGR.next()) {
+				if (foundRelatedChgRequestsObj[changesGR.getUniqueValue()])
+					continue;
+				var grouping = "related";
+				if (!changesGR.assigned_to.nil() &amp;&amp; changesGR.getValue("assigned_to") === this.changeGR.getValue("assigned_to"))
+					grouping = "resource";
+				else
+					grouping = "config_item";
+				var changeObj = this._changeToEvent(changesGR, grouping, "rgb(var(--now-color_grouped--green-yellow-2, 154, 173, 94))");
+				changes.push(changeObj);
+				foundRelatedChgRequestsObj[changesGR.getUniqueValue()] = true;
+			}
+		}
+		return changes;
+	},
+
+	getScheduleInformation: function(windowArr, group, bgColor) {
+		var schedules = {};
+
+		for (var configItemId in windowArr) {
+			var windowsByCI = windowArr[configItemId];
+
+			for (var i = 0; i &lt; windowsByCI.length; i++) {
+				var window = windowsByCI[i];
+
+				var scheduleObj = schedules[window.scheduleId];
+				if (scheduleObj) {
+					this._addCiToRelated(scheduleObj.related_cis, configItemId, window);
+					continue;
+				}
+
+				scheduleObj = {
+					sys_id: window.scheduleId,
+					windows: [],
+					related_cis: []
+				};
+
+				this._addCiToRelated(scheduleObj.related_cis, configItemId, window);
+
+				var schedule = new GlideSchedule(window.scheduleId);
+				scheduleObj.title = schedule.getName();
+				scheduleObj.time_zone = schedule.getTimeZone();
+				var scheduleTimeMap = schedule.getTimeMap(this.rangeStart, this.rangeEnd, scheduleObj.time_zone);
+				while (scheduleTimeMap.hasNext()) {
+					var scheduleDateTimeSpan = scheduleTimeMap.next();
+
+					var startSDT = scheduleDateTimeSpan.getStart();
+					var endSDT = scheduleDateTimeSpan.getEnd();
+					if (!startSDT || !endSDT)
+						continue;
+					var startGDT = startSDT.getGlideDateTime();
+					var endGDT = endSDT.getGlideDateTime();
+
+					var scheduleName = schedule.getName();
+					scheduleName = global.JSUtil.nil(scheduleName.trim()) ? gs.getMessage("(empty)") : scheduleName;
+
+					var ariaStart = startGDT ? startGDT.getDisplayValue() : "";
+					var ariaEnd = endGDT ? endGDT.getDisplayValue() : "";
+
+					var scheduleWindowObj = {
+						id: window.scheduleId,
+						start: startGDT.getNumericValue(),
+						start_value: startGDT.getValue(),
+						end: endGDT.getNumericValue(),
+						end_value: endGDT.getValue(),
+						title: "",
+						_title: scheduleName,
+						description: "",
+						group: group,
+						bgColor: bgColor,
+						textColor: "",
+						borderColor: bgColor,
+						gradientColor1: "",
+						gradientColor2: "",
+						readOnly: true,
+						allowMove: "",
+						allowResize: "",
+						childEvents: "",
+						ariaLabel: this._getAriaLabel(group, ariaStart, ariaEnd),
+						order: "",
+						contextMenuOptions: "",
+						_table: group === "blackout" ? "cmn_schedule_blackout" : "cmn_schedule_maintenance",
+						_sys_id: window.scheduleId
+					};
+
+					scheduleWindowObj.popoverDetails = [
+						{
+							"label": SOWChgConflictCalendarSNC.I18N.TIME_ZONE,
+							"value": scheduleObj.time_zone
+						},
+						{
+							"label": SOWChgConflictCalendarSNC.I18N.APPLIES_TO,
+							"value": {
+								"type": "text-link",
+								"label": !configItemId || configItemId === "null" ? this.changeGR.getDisplayValue() : this._ciDataCache[configItemId].name,
+								"href": "javascript:void(0)",
+								"underlined": true,
+								"variant": "primary",
+								"opensWindow": false,
+								"_table": !configItemId || configItemId === "null" ? this.changeGR.getRecordClassName() : this._ciDataCache[configItemId].class_name.value,
+								"_sys_id": !configItemId || configItemId === "null" ? this.changeGR.getUniqueValue() : configItemId
+							}
+						},
+						{
+							"label": SOWChgConflictCalendarSNC.I18N.START_DATE,
+							"value": startGDT.getDisplayValue()
+						},
+						{
+							"label": SOWChgConflictCalendarSNC.I18N.END_DATE,
+							"value": endGDT.getDisplayValue()
+						}
+					];
+
+					scheduleObj.windows.push(scheduleWindowObj);
+				}
+				schedules[window.scheduleId] = scheduleObj;
+			}
+		}
+
+		var result = [];
+		for (var scheduleId in schedules)
+			result.push(schedules[scheduleId]);
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug("[getScheduleInformation] result: " + JSON.stringify(result, 3,3,3));
+
+		return result;
+	},
+
+	_getAriaLabel: function (eventType, startDisplayValue, endDisplayValue) {
+		if (!eventType || !startDisplayValue || !endDisplayValue)
+			return "";
+
+		if (eventType === "blackout")
+			return gs.getMessage("Blackout scheduled from {0} to {1}", [startDisplayValue, endDisplayValue]);
+		if (eventType === "maintenance")
+			return gs.getMessage("Maintenance scheduled from {0} to {1}", [startDisplayValue, endDisplayValue]);
+		if (eventType === "change")
+			return gs.getMessage("Change scheduled from {0} to {1}", [startDisplayValue, endDisplayValue]);
+		if (eventType === "related")
+			return gs.getMessage("Related Change scheduled from {0} to {1}", [startDisplayValue, endDisplayValue]);
+
+		return "";
+	},
+
+	_addCiToRelated: function(arr, configItemId, window) {
+		// For maintenance/blackout schedules that apply to a Change Request the configItem value will be null.
+		if (!configItemId || "null" === configItemId)
+			return;
+
+		if (window &amp;&amp; window.relatedCiId)
+			this._addCiToRelated(arr, window.relatedCiId);
+		else if (arr.every(function(ciData) {
+				return ciData.sys_id !== configItemId;
+			})) {
+			var ciData = this._ciDataCache[configItemId];
+			if (!ciData) {
+				ciData = {};
+				var configItemGR = new GlideRecord("cmdb_ci");
+				if (configItemGR.get(configItemId)) {
+					ciData.name = configItemGR.getDisplayValue("name");
+					ciData.class_name = {
+						"display": configItemGR.getDisplayValue("sys_class_name"),
+						"value": configItemGR.getRecordClassName()
+					};
+				}
+				this._ciDataCache[configItemId] = ciData;
+			}
+			arr.push({
+				sys_id: configItemId,
+				name: ciData.name,
+				ci_class: ciData.ci_class
+			});
+		}
+	},
+
+	getChangesWithSameAssignmentGroup: function(startDate, endDate, foundRelatedChgRequestsObj) {
+		if (!this.changeGR.getValue("assignment_group"))
+			return null;
+
+		var changesGR = new GlideRecordSecure(this.tableName);
+		changesGR.addActiveQuery();
+		var ignoreChangeSysIds = Object.keys(foundRelatedChgRequestsObj);
+		ignoreChangeSysIds.push(this.changeGR.getUniqueValue());
+		changesGR.addQuery("sys_id", "!=", ignoreChangeSysIds);
+		changesGR.addQuery("assignment_group", this.changeGR.getValue("assignment_group"));
+		this._addDateRangeQuery(changesGR, startDate, endDate);
+		return changesGR;
+	},
+
+	includeMaintenance: function(include) {
+		this.maintenance = this._getBooleanValue(include);
+	},
+
+	includeBlackout: function(include) {
+		this.blackout = this._getBooleanValue(include);
+	},
+
+	includeRelated: function(include) {
+		this.related = this._getBooleanValue(include);
+	},
+
+	includeRelatedByCI: function(include) {
+		this.relatedCi = this._getBooleanValue(include);
+	},
+
+	includeRelatedByAssignedTo: function(include) {
+		this.relatedAssigned = this._getBooleanValue(include);
+	},
+
+	includeRelatedByAssignmentGroup: function(include) {
+		this.relatedGroup = this._getBooleanValue(include);
+	},
+	
+	setRangeDates: function(dateRange) {
+		dateRange = dateRange.split("_");
+		
+		var startGDT = new GlideDateTime();
+		if (dateRange[0] &amp;&amp; dateRange[0] !== "null") {
+			// Because setNumericValue is not exposed in Scoped apps
+			startGDT.subtract(startGDT.getNumericValue());
+			startGDT.add(dateRange[0]);
+		}
+
+		this.rangeStart = this._isDateTimeValid(startGDT) ? startGDT : new GlideDateTime();
+		
+		var endGDT = null;
+		if (dateRange[1] &amp;&amp; dateRange[1] !== "null") {
+			endGDT = new GlideDateTime();
+			endGDT.subtract(endGDT.getNumericValue());
+			endGDT.add(dateRange[1]);
+		}
+
+		if (this._isDateTimeValid(endGDT))
+			this.rangeEnd = endGDT;
+		else {
+			endGDT = new GlideDateTime(this.rangeStart);
+			endGDT.addDaysUTC(1);
+			this.rangeEnd = endGDT;
+		}
+		
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug("[setRangeDates] Date range set from " + this.rangeStart + " to " + this.rangeEnd);
+	},
+	
+	_changeToEvent: function(changeGR, group, bgColor) {
+		var popoverDetails = [
+			this._getFieldLabelValue(changeGR, "assigned_to"),
+			this._getFieldLabelValue(changeGR, "assignment_group"),
+			this._getFieldLabelValue(changeGR, "short_description"),
+			this._getFieldLabelValue(changeGR, "start_date"),
+			this._getFieldLabelValue(changeGR, "end_date")
+		];
+		
+		var startGDT;
+		var endGDT;
+		if (this.validChangePlannedDates) {
+			startGDT = new GlideDateTime(changeGR.getValue("start_date"));
+			endGDT = new GlideDateTime(changeGR.getValue("end_date"));
+		}
+
+		var ariaStart = startGDT ? startGDT.getDisplayValue() : "";
+		var ariaEnd = endGDT ? endGDT.getDisplayValue() : "";
+
+		return {
+			id: changeGR.getUniqueValue(),
+			start: startGDT ? startGDT.getNumericValue() : 0,
+			start_value: startGDT ? changeGR.getValue("start_date") : "",
+			end: endGDT ? endGDT.getNumericValue() : 0,
+			end_value: endGDT ? changeGR.getValue("end_date") : "",
+			title: "",
+			description: changeGR.getDisplayValue("short_description"),
+			group: group === "change" ? group : changeGR.getUniqueValue(),
+			_group: group,
+			bgColor: bgColor,
+			textColor: "",
+			borderColor: bgColor,
+			gradientColor1: "",
+			gradientColor2: "",
+			readOnly: true,
+			allowMove: "",
+			allowResize: "",
+			childEvents: "",
+			ariaLabel: this._getAriaLabel(group, ariaStart, ariaEnd),
+			order: "",
+			contextMenuOptions: "",
+			popoverDetails: popoverDetails,
+			_assigned_to: changeGR.getDisplayValue("assigned_to"),
+			_cmdb_ci: changeGR.getDisplayValue("cmdb_ci"),
+			_title: changeGR.getDisplayValue(),
+			_table: changeGR.getRecordClassName(),
+			_sys_id: changeGR.getUniqueValue()
+		};
+	},
+	
+	_getFieldLabelValue: function(gr, field) {
+		return {
+			"label": gr[field].getLabel(),
+			"value": gr.getDisplayValue(field)
+		};
+	},
+
+	_toJSON: function(gr, fields) {
+		var values = {};
+		for (var i = 0; i &lt; fields.length; i++) {
+			values[fields[i]] = {
+				value: gr.getValue(fields[i]),
+				display_value: gr.getDisplayValue(fields[i])
+			};
+			if ((fields[i] === "start_date" || fields[i] === "end_date") &amp;&amp; values[fields[i]].value)
+				values[fields[i]].millis = new GlideDateTime(values[fields[i]].value).getNumericValue();
+		}
+		return values;
+	},
+
+	_isDateTimeValid: function(glideDateTime) {
+		return glideDateTime &amp;&amp; typeof glideDateTime.isValid === "function" &amp;&amp; glideDateTime.isValid();
+	},
+
+	_addDateRangeQuery: function(changesGR, startDate, endDate) {
+		if (startDate)
+			changesGR.addQuery("end_date", "&gt;", startDate);
+		if (endDate)
+			changesGR.addQuery("start_date", "&lt;", endDate);
+	},
+
+	_getBooleanValue: function(value) {
+		if (typeof value === "boolean")
+			return value;
+		else
+			return value === "true";
+	},
+	
+	_hasAffectedCIs: function() {
+		var gr = new GlideRecord("task_ci");
+		gr.addQuery("task", this.changeGR.getUniqueValue());
+		gr.addNotNullQuery("ci_item");
+		gr.setLimit(1);
+		gr.query();
+		return gr.hasNext();
+	},
+
+	type: "SOWChgConflictCalendarSNC"
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-08-05 14:28:33&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;5c32233a0b011110c85e8a8db777b2eb&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;192&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;SOWChgConflictCalendarSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Change Management for Service Operations Workspace" source="sn_sow_chg"&gt;bccbdbb023213010785ddc1756bf6579&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Change Management for Service Operations Workspace"&gt;bccbdbb023213010785ddc1756bf6579&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_5c32233a0b011110c85e8a8db777b2eb&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-05 12:38:22&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:37:32</sys_created_on>
+        <sys_id>80c6341d83f01210c6695855eeaad35e</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>SOWChgConflictCalendarSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_80c6341d83f01210c6695855eeaad35e</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:37:32</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

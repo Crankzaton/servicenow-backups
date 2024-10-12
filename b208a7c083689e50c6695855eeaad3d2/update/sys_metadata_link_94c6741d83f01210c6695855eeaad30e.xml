@@ -1,0 +1,168 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>5d37e6c2433121105f919cd82ab8f222</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_entitlement.CustomTableInventoryProcessor&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Populates Custom Table related information in plat_lic_exemption&lt;/description&gt;
+        &lt;name&gt;CustomTableInventoryProcessor&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var CustomTableInventoryProcessor = Class.create();
+CustomTableInventoryProcessor.prototype = {
+    initialize: function(entitlementIdToCustAllotmentObj) {
+        this.logger = new LoggingUtil();
+        this.entitlementIdToCustAllotmentMap = entitlementIdToCustAllotmentObj;
+    },
+
+    /**
+     * Input: 'validSubscriptionFamilies' (Format: key = subscription entitlement ID, value = list of family IDs)
+     *
+     * Invoke the Central endpoint (getExemptedTablesAndScopes) and populates the plat_lic_exemption table
+     */
+    downloadAndProcessExemptedEntities: function(validSubscriptionFamilies) {
+        const familyIdsSet = new Set();
+        if (global.JSUtil.notNil(validSubscriptionFamilies)) {
+            for (entitlementNo in validSubscriptionFamilies) {
+                const familyIds = validSubscriptionFamilies[entitlementNo];
+                familyIdsSet.add(familyIds);
+            }
+        } else
+			this.logger.logInfo(this.type, "downloadAndProcessExemptedEntities", "SubscriptionFamilies is null/empty");
+
+        // Convert to Array and flatten it
+        const familyIdsArr = [];
+        familyIdsSet.forEach(v =&gt; familyIdsArr.push(v));
+        const familyIdsList = [].concat.apply([], familyIdsArr);
+
+        const payload = this._downloadExemptedEntities(familyIdsList);
+        this.logger.logInfo(this.type, "downloadAndProcessExemptedEntities", "Tables and Scopes: " + JSON.stringify(payload));
+
+        if (global.JSUtil.nil(payload)) {
+            this.logger.logError(this.type, "downloadAndProcessExemptedEntities", "Payload from central is empty");
+            return;
+        }
+
+        const exemptedScopes = payload.exemptedScopes;
+        // add additional exempted scopes for AppStore
+        if (global.JSUtil.notNil(payload.families.data)) {
+            this.logger.logInfo(this.type, "downloadAndProcessExemptedEntities", "Check if the EntitlementId for the remaining Families is a Paid AppStore, then exempt it");
+            const subscriptionHasFamilyDAO = new SubscriptionHasFamilyDAO();
+            const paidStoreAppFamilies = subscriptionHasFamilyDAO.getPaidStoreAppSubscriptionsByFamilies(payload.families.data);
+            exemptedScopes.push.apply(exemptedScopes, paidStoreAppFamilies);
+        }
+
+        const platLicExemptionDAO = new PlatLicExemptionDAO();
+        platLicExemptionDAO.insertExemptedEntities(payload.exemptedBaseTables, LicensingEngineConstants.BASE_TABLE);
+        platLicExemptionDAO.insertExemptedEntities(exemptedScopes, LicensingEngineConstants.SCOPE);
+    },
+
+    _downloadExemptedEntities: function(familyIds) {
+        const endPointURL = LicensingEngineConstants.V1_EXEMPTED_TABLES_AND_SCOPES_SERVICE_URL;
+        const restMethod = "POST"; // We are using post to pass the FamilyIds List as the length will be more to accomodate in a path param, although the API does only GET operation
+
+        const authorization = new sn_lef.EntitlementEngineUtils().getAuthHeader();
+        const headers = {
+            'Authorization': authorization,
+            'Accept': "application/json",
+            'Content-Type': 'application/json'
+        };
+
+        const restObject = {
+            'end_point': endPointURL,
+            'rest_method': restMethod,
+            'headers': headers,
+            'request_body': this._buildJSON(familyIds)
+        };
+
+        const licDownloaderUtils = new LicensingDownloaderUtils();
+        const resp = licDownloaderUtils.executeRESTAPI(restObject);
+        const httpStatus = resp.getStatusCode();
+
+        if (httpStatus == 200) {
+            return JSON.parse(resp.getBody()).result;
+        } else {
+            this.logger.logInfo(this.type, "_downloadExemptedEntities", "Failed with status code (" + resp.getStatusCode() + ") due to : " + resp.getErrorCode() + " - " + resp.getErrorMessage());
+        }
+        return null;
+    },
+
+    _buildJSON: function(data) {
+        var json = "";
+        try {
+            json = new global.JSON().encode(data);
+        } catch (ex) {
+            this.logger.logInfo(this.type, "_buildJSON", "Error forming JSON Object");
+            json = null;
+        }
+
+        return json;
+    },
+
+    // Populates license_cust_table_allotment and ua_cust_tbl_entitlement
+    populateCTAllotmentAndEntitlement: function() {
+        const supportedAllotmentTypes = [];
+        var licenseCustTableAllotmentDAO = new LicenseCustTableAllotmentDAO();
+        for (entitlementNo in this.entitlementIdToCustAllotmentMap) {
+            const entitlementNoToCustAllotment = this.entitlementIdToCustAllotmentMap[entitlementNo];
+            const allotmentType = this._getAllotmentTypeByName(entitlementNoToCustAllotment.allotmentType);
+            if (supportedAllotmentTypes.indexOf(allotmentType) &lt; 0)
+                supportedAllotmentTypes.push(allotmentType);
+            licenseCustTableAllotmentDAO.insertOrUpdate(entitlementNoToCustAllotment.sysId, entitlementNoToCustAllotment.numberOfTables, allotmentType);
+        }
+        this.logger.logInfo(this.type, "populateCTAllotmentAndEntitlement", "SupportedAllotmentTypes: " + supportedAllotmentTypes);
+        const uaInstanceStateDAO = new UAInstanceStateDAO();
+        if (uaInstanceStateDAO.isProductionInstance()) {
+            const uaCustTblEntitlementDAO = new UACustTblEntitlementDAO();
+            uaCustTblEntitlementDAO.insert(supportedAllotmentTypes);
+        }
+    },
+
+    _getAllotmentTypeByName: function(allotmentTypeName) {
+        switch (allotmentTypeName) {
+            case LicensingEngineConstants.ALLOTMENT_TYPES.APP_ENGINE:
+                return LicensingEngineDBConstants.ALLOTMENT_TYPE_APP_ENGINE;
+            case LicensingEngineConstants.ALLOTMENT_TYPES.GRANDFATHER:
+                return LicensingEngineDBConstants.ALLOTMENT_TYPE_GRANDFATHER;
+            case LicensingEngineConstants.ALLOTMENT_TYPES.TABLE_BUNDLE:
+                return LicensingEngineDBConstants.ALLOTMENT_TYPE_TABLE_BUNDLE;
+            default:
+                return null;
+        }
+    },
+
+    type: 'CustomTableInventoryProcessor'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-03-27 05:15:00&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;5d37e6c2433121105f919cd82ab8f222&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;1&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;CustomTableInventoryProcessor&lt;/sys_name&gt;
+        &lt;sys_package display_value="Licensing Engine" source="sn_entitlement"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Licensing Engine"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_5d37e6c2433121105f919cd82ab8f222&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;maint&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-03-27 08:13:01&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:37:33</sys_created_on>
+        <sys_id>94c6741d83f01210c6695855eeaad30e</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>CustomTableInventoryProcessor</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_94c6741d83f01210c6695855eeaad30e</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:37:33</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

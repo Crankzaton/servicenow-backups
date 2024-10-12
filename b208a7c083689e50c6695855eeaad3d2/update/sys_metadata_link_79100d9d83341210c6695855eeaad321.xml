@@ -1,0 +1,358 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>b412fceab7262110b87e80408e11a911</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_cmdb_ws.CMDBWsPerfInsightsUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;CMDBWsPerfInsightsUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var CMDBWsPerfInsightsUtil = Class.create();
+CMDBWsPerfInsightsUtil.prototype = Object.extendsObject(CMDBWorkspaceUtil, {
+    initialize: function() {},
+
+    INTEGRATIONS_OUTLIER_LOOKBACK_DAYS: 30,
+    INTEGRATION_EXECUTION_TERMINAL_STATE_ENC_QUERY: "stateINcomplete,error",
+
+    populatePerfInsightsAggregates: function() {
+        this._populateCMDBRelatedEntryAggregates();
+        this._populateRelationshipMissingParentOrChild();
+        this._deleteAndInsertDeltaPartialPayloadItems();
+        this._populatePartialPayloadItemAggregates();
+        this._populateTotalPartialPayload();
+        this._populateDuplicateAndStaleAggregates();
+        this._processIntegrationOutliers();
+    },
+
+    _populatePartialPayloadItemAggregates: function() {
+        this.updateBaseAggDataState(this.STATES.DRAFT, this.STATES.RETIRED, this.SUB_CATEGORY.PARTIAL_PAYLOAD_ITEM);
+
+        var itemGa = new GlideAggregate(this.TABLES.SN_CMDB_WS_PARTIAL_PAYLOAD_ITEM);
+        itemGa.addAggregate(this.COUNT_AGGREGATE);
+        itemGa.groupBy(this.COLS.DISCOVERY_SOURCE);
+        itemGa.query();
+        while (itemGa.next()) {
+            var count = itemGa.getAggregate(this.COUNT_AGGREGATE);
+            var source = itemGa.getValue(this.COLS.DISCOVERY_SOURCE);
+            this.populateBaseAggData(this.SUB_CATEGORY.PARTIAL_PAYLOAD_ITEM, null, count, this.STATES.DRAFT, '', source);
+        }
+
+        // Update the existing records in "Ready" state to "Retired"
+        this.updateBaseAggDataState(this.STATES.READY, this.STATES.RETIRED, this.SUB_CATEGORY.PARTIAL_PAYLOAD_ITEM);
+        // Update the existing records in "Draft" state to "Ready"
+        this.updateBaseAggDataState(this.STATES.DRAFT, this.STATES.READY, this.SUB_CATEGORY.PARTIAL_PAYLOAD_ITEM);
+    },
+
+    _populateTotalPartialPayload: function() {
+        this.updateBaseAggDataState(this.STATES.DRAFT, this.STATES.RETIRED, this.SUB_CATEGORY.TOTAL_PARTIAL_PAYLOADS);
+
+        var totalPartialPayloads = this.getRowCount(this.TABLES.CMDB_IRE_PARTIAL_PAYLOADS, '', {
+            active: true
+        });
+        this.populateBaseAggData(this.SUB_CATEGORY.TOTAL_PARTIAL_PAYLOADS, null, totalPartialPayloads, this.STATES.DRAFT, '', '');
+        this.updateBaseAggDataState(this.STATES.READY, this.STATES.RETIRED, this.SUB_CATEGORY.TOTAL_PARTIAL_PAYLOADS);
+        this.updateBaseAggDataState(this.STATES.DRAFT, this.STATES.READY, this.SUB_CATEGORY.TOTAL_PARTIAL_PAYLOADS);
+    },
+
+    _deleteAndInsertDeltaPartialPayloadItems: function() {
+        var tableNameToIdMap = {};
+        this._deleteInactiveAndEmptyPartialPayloadItems();
+
+        var payloadIds = {};
+        var qualifiedPayloadIds = [];
+        var irePartialPayloadGr = new GlideRecord(this.TABLES.CMDB_IRE_PARTIAL_PAYLOADS);
+        irePartialPayloadGr.addActiveQuery();
+        irePartialPayloadGr.query();
+        while (irePartialPayloadGr.next()) {
+            var payloadId = irePartialPayloadGr.getUniqueValue();
+            payloadIds[payloadId] = true;
+            if (Object.keys(payloadIds).length &gt;= this.BATCH_DEFAULT_SIZE) {
+                qualifiedPayloadIds = this._getUncalculatedPayloads(payloadIds);
+                if (qualifiedPayloadIds.length &gt; 0) {
+                    this._processPartialPayloadItems(qualifiedPayloadIds, tableNameToIdMap);
+                }
+                payloadIds = {};
+            }
+        }
+        qualifiedPayloadIds = this._getUncalculatedPayloads(payloadIds);
+        if (qualifiedPayloadIds.length &gt; 0) {
+            this._processPartialPayloadItems(qualifiedPayloadIds, tableNameToIdMap);
+        }
+    },
+
+    _deleteInactiveAndEmptyPartialPayloadItems: function() {
+        var payloadItemGr = new GlideRecord(this.TABLES.SN_CMDB_WS_PARTIAL_PAYLOAD_ITEM);
+        payloadItemGr.addEncodedQuery(this.COLS.PARTIAL_PAYLOAD + this.COLS.DOT + this.COLS.ACTIVE + this.OPERATORS.EQUAL + this.BOOLEAN.FALSE + this.OPERATORS.OR + this.COLS.PARTIAL_PAYLOAD + this.OPERATORS.ISEMPTY);
+        payloadItemGr.query();
+        payloadItemGr.deleteMultiple();
+    },
+
+    _processPartialPayloadItems: function(qualifiedPayloadIds, tableNameToIdMap) {
+        var itemList = [];
+        var irePartialPayloadGr = new GlideRecord(this.TABLES.CMDB_IRE_PARTIAL_PAYLOADS);
+        irePartialPayloadGr.addQuery(this.COLS.SYS_ID, qualifiedPayloadIds);
+        irePartialPayloadGr.query();
+        while (irePartialPayloadGr.next()) {
+            var payload = irePartialPayloadGr.getValue(this.COLS.PAYLOAD_ITEM);
+            var payloadId = irePartialPayloadGr.getUniqueValue();
+            if (global.JSUtil.nil(payload)) {
+                continue;
+            }
+            var json = '';
+            try {
+                json = JSON.parse(payload);
+            } catch (e) {
+                continue;
+            }
+            if (global.JSUtil.nil(json)) {
+                continue;
+            }
+            var items = json.items;
+            if (global.JSUtil.nil(items)) {
+                continue;
+            }
+            for (var i = 0; i &lt; items.length; i++) {
+                var item = items[i];
+                if (global.JSUtil.nil(item) || global.JSUtil.nil(item.sys_object_source_info)) {
+                    continue;
+                }
+                var sourceObject = item.sys_object_source_info;
+                var source = sourceObject.source_name;
+                var tableId = '';
+                if (global.JSUtil.notNil(tableNameToIdMap[item.className])) {
+                    tableId = tableNameToIdMap[item.className];
+                } else {
+                    tableId = this.getTableSysId(item.className);
+                    tableNameToIdMap[item.className] = tableId;
+                }
+                var error = '';
+                if (global.JSUtil.notNil(item.reason)) {
+                    error = this.transformUnderscoreStrToFirstLetterUpperCase(item.reason);
+                }
+                var itemObj = {
+                    source: source,
+                    tableId: tableId,
+                    error: error,
+                    payloadId: payloadId
+                };
+                itemList.push(itemObj);
+                if (itemList.length &gt;= this.BATCH_DEFAULT_SIZE) {
+                    this._insertPartialPayloadItems(itemList);
+                    itemList = [];
+                }
+            }
+            this._insertPartialPayloadItems(itemList);
+            itemList = [];
+        }
+    },
+
+    _getUncalculatedPayloads: function(payloadIds) {
+        var qualifiedPayloadIds = [];
+        var payloadIdList = Object.keys(payloadIds);
+        var itemGr = new GlideRecord(this.TABLES.SN_CMDB_WS_PARTIAL_PAYLOAD_ITEM);
+        itemGr.addQuery(this.COLS.PARTIAL_PAYLOAD, payloadIdList);
+        itemGr.query();
+        while (itemGr.next()) {
+            var payloadId = itemGr.getValue(this.COLS.PARTIAL_PAYLOAD);
+            payloadIds[payloadId] = false;
+        }
+
+        for (var i = 0; i &lt; payloadIdList.length; i++) {
+            if (payloadIds[payloadIdList[i]]) {
+                qualifiedPayloadIds.push(payloadIdList[i]);
+            }
+        }
+        return qualifiedPayloadIds;
+    },
+
+    _insertPartialPayloadItems: function(itemList) {
+        var itemGr = new GlideRecord(this.TABLES.SN_CMDB_WS_PARTIAL_PAYLOAD_ITEM);
+        for (var i = 0; i &lt; itemList.length; i++) {
+            var obj = itemList[i];
+            itemGr.initialize();
+            itemGr.setValue(this.COLS.DISCOVERY_SOURCE, obj.source);
+            itemGr.setValue(this.COLS.PARTIAL_PAYLOAD, obj.payloadId);
+            itemGr.setValue(this.COLS.ERROR_TYPE, obj.error);
+            itemGr.setValue(this.COLS.CLASS_NAME, obj.tableId);
+            itemGr.insert();
+        }
+    },
+
+    _populateCMDBRelatedEntryAggregates: function() {
+        //if there are any agg records in "draft" state, for this chart, mark them as "retired"
+        this.updateBaseAggDataState(this.STATES.DRAFT, this.STATES.RETIRED, this.SUB_CATEGORY.RELATED_RECORDS);
+
+        var resultObj = this._getCMDBRelatedEntryMissingRefCount();
+        for (var tableSysId in resultObj) {
+            this.populateBaseAggData(this.SUB_CATEGORY.RELATED_RECORDS, null, resultObj[tableSysId], this.STATES.DRAFT, tableSysId);
+        }
+
+        // Update the existing records in "Ready" state to "Retired"
+        this.updateBaseAggDataState(this.STATES.READY, this.STATES.RETIRED, this.SUB_CATEGORY.RELATED_RECORDS);
+        // Update the existing records in "Draft" state to "Ready"
+        this.updateBaseAggDataState(this.STATES.DRAFT, this.STATES.READY, this.SUB_CATEGORY.RELATED_RECORDS);
+    },
+
+    _getCMDBRelatedEntryMissingRefCount: function() {
+        var resultObj = {};
+
+        var relEntryObj = this.getCMDBRelatedEntryRefFields();
+        if (relEntryObj &amp;&amp; Object.keys(relEntryObj).length &gt; 0) {
+            for (var tableName in relEntryObj) {
+                var tableSysId = this.getTableSysId(tableName);
+                var encodedQuery = this.buildCustomEncodedQuery(relEntryObj[tableName], this.OPERATORS.ISEMPTY, null, this.OPERATORS.OR);
+                var rowCount = this.getRowCount(tableName, encodedQuery);
+                if (rowCount &gt; 0) {
+                    resultObj[tableSysId] = rowCount;
+                }
+            }
+        }
+
+        return resultObj;
+    },
+
+    _populateDuplicateAndStaleAggregates: function() {
+        // Retire any agg records that may be in draft state
+        this.updateBaseAggDataState(this.STATES.DRAFT, this.STATES.RETIRED, this.SUB_CATEGORY.STALE_RECORDS);
+        this.updateBaseAggDataState(this.STATES.DRAFT, this.STATES.RETIRED, this.SUB_CATEGORY.DUPLICATE_RECORDS);
+
+        var staleGroupCountGa = this.getRowCountByGroup(this.TABLES.CMDB_HEALTH_RESULT, this.STALENESS_METRIC_QUERY, '', this.COLS.CLASS_NAME);
+        this.populateAggregatesByTable(staleGroupCountGa, this.COLS.CLASS_NAME, this.SUB_CATEGORY.STALE_RECORDS);
+
+        var duplicateGroupCountGa = this.getRowCountByGroup(this.TABLES.CMDB_DUPLICATE_AUDIT_RESULT, '', '', this.COLS.CI_SYS_CLASS_NAME);
+        this.populateAggregatesByTable(duplicateGroupCountGa, this.COLS.CI_SYS_CLASS_NAME, this.SUB_CATEGORY.DUPLICATE_RECORDS);
+    },
+
+    _populateRelationshipMissingParentOrChild: function() {
+        this.updateBaseAggDataState(this.STATES.DRAFT, this.STATES.RETIRED, this.SUB_CATEGORY.RELATIONSHIP_MISSING_PARENT_OR_CHILD);
+        var parentOrChildEmptyQuery = this.COLS.PARENT + this.OPERATORS.ISEMPTY + this.OPERATORS.OR + this.COLS.CHILD + this.OPERATORS.ISEMPTY;
+        var relMissingParentOrChild = this.getRowCount(this.TABLES.CMDB_REL_CI, parentOrChildEmptyQuery);
+        this.populateBaseAggData(this.SUB_CATEGORY.RELATIONSHIP_MISSING_PARENT_OR_CHILD, null, relMissingParentOrChild, this.STATES.DRAFT, '', '');
+        this.updateBaseAggDataState(this.STATES.READY, this.STATES.RETIRED, this.SUB_CATEGORY.RELATIONSHIP_MISSING_PARENT_OR_CHILD);
+        this.updateBaseAggDataState(this.STATES.DRAFT, this.STATES.READY, this.SUB_CATEGORY.RELATIONSHIP_MISSING_PARENT_OR_CHILD);
+    },
+
+    _processIntegrationOutliers: function() {
+        var applications = this._getIntegrationApplications(this.INTEGRATION_EXECUTION_TERMINAL_STATE_ENC_QUERY);
+        var result = [];
+        this._calculateAndInsertOutlierData(
+            this.SUB_CATEGORY.INTEGRATION_PROCESSING_RATE_OUTLIER,
+            this.PA_INDICATORS.INTEGRATION_PROCESSING_RATE.ID,
+            this.PA_INDICATORS.INTEGRATION_PROCESSING_RATE.BREAKDOWN.CMDB_INST_APPLICATION.ID,
+            applications
+        );
+
+        this._calculateAndInsertOutlierData(
+            this.SUB_CATEGORY.INTEGRATION_ROWS_OUTLIER,
+            this.PA_INDICATORS.INTEGRATION_ROWS.ID,
+            this.PA_INDICATORS.INTEGRATION_ROWS.BREAKDOWN.CMDB_INST_APPLICATION.ID,
+            applications
+        );
+    },
+
+    _calculateAndInsertOutlierData: function(featureId, indicatorId, breakdownId, applications) {
+        //if there are any agg records in "draft" state, for this chart, mark them as "retired"
+        this.updateBaseAggDataState(this.STATES.DRAFT, this.STATES.RETIRED, featureId);
+
+        for (var i = 0; i &lt; applications.length; i++) {
+            var outlierCount = this._getOutliersCount(indicatorId, breakdownId, applications[i]);
+            this._populateIntegrationAggData(featureId, applications[i], outlierCount, this.STATES.DRAFT);
+        }
+
+        // Update the existing records in "Ready" state to "Retired"
+        this.updateBaseAggDataState(this.STATES.READY, this.STATES.RETIRED, featureId);
+        // Update the existing records in "Draft" state to "Ready"
+        this.updateBaseAggDataState(this.STATES.DRAFT, this.STATES.READY, featureId);
+    },
+
+    _getIntegrationApplications: function(encodedQuery) {
+        var applications = [];
+        if (gs.tableExists(this.TABLES.SN_CMDB_INT_UTIL_CMDB_INTEGRATION_EXECUTION)) {
+            var ga = new GlideAggregate(this.TABLES.SN_CMDB_INT_UTIL_CMDB_INTEGRATION_EXECUTION);
+            ga.groupBy(this.COLS.APPLICATION);
+            ga.addNotNullQuery(this.COLS.APPLICATION);
+            if (!global.JSUtil.nil(encodedQuery)) {
+                ga.addEncodedQuery(encodedQuery);
+            }
+            ga.query();
+            while (ga.next()) {
+                applications.push(ga.getValue(this.COLS.APPLICATION));
+            }
+
+        }
+        return applications;
+    },
+
+    _getOutliersCount: function(indicatorId, breakdownId, breakdownElementId) {
+        var indicatorDetails = this.getIndicatorDetails(indicatorId, breakdownId, breakdownElementId, this.INTEGRATIONS_OUTLIER_LOOKBACK_DAYS, {
+            includeBand: true
+        });
+
+        var count = 0;
+        if (!global.JSUtil.nil(indicatorDetails) &amp;&amp; !global.JSUtil.nil(indicatorDetails.dataObjArr)) {
+            var data = indicatorDetails.dataObjArr;
+            for (var i = 0; i &lt; data.length; i++) {
+                var currData = data[i];
+                // a given data point is an outlier if it falls outside of prediction band range
+                if (currData.value &lt; currData.predictionBandRangeLower || currData.value &gt; currData.predictionBandRangeUpper) {
+                    count++;
+                }
+            }
+        }
+        return count;
+    },
+
+    _populateIntegrationAggData: function(chart, applicationId, count, state) {
+        var gr = new GlideRecord(this.TABLES.SN_CMDB_WS_INTEGRATION_AGGREGATE_DATA);
+        gr.initialize();
+        gr.setValue(this.COLS.CHART, chart);
+        gr.setValue(this.COLS.APPLICATION, applicationId);
+        gr.setValue(this.COLS.COUNT, count);
+        gr.setValue(this.COLS.STATE, state);
+        gr.insert();
+    },
+
+    getIntegrationAggDataGr: function() {
+        var gr = new GlideRecord(this.TABLES.SN_CMDB_WS_INTEGRATION_AGGREGATE_DATA);
+        gr.addQuery(this.COLS.STATE, this.STATES.READY);
+        gr.addQuery(this.COLS.CHART, [this.SUB_CATEGORY.INTEGRATION_PROCESSING_RATE_OUTLIER, this.SUB_CATEGORY.INTEGRATION_ROWS_OUTLIER]);
+        gr.query();
+        return gr;
+    },
+
+    type: 'CMDBWsPerfInsightsUtil'
+});]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-05-18 16:46:54&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;b412fceab7262110b87e80408e11a911&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;39&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;CMDBWsPerfInsightsUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="CMDB Workspace" source="sn_cmdb_ws"&gt;c8ab76825371201032b7ddeeff7b1280&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="CMDB Workspace"&gt;c8ab76825371201032b7ddeeff7b1280&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_b412fceab7262110b87e80408e11a911&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;maint&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-06-15 20:53:16&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 09:18:20</sys_created_on>
+        <sys_id>79100d9d83341210c6695855eeaad321</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>CMDBWsPerfInsightsUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_79100d9d83341210c6695855eeaad321</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 09:18:20</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

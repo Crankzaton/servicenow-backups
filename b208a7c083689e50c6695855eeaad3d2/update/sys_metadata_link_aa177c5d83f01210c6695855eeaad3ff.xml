@@ -1,0 +1,336 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>79432601437a31101ed803295bb8f244</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.GenAILargeInputPreprocessor&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Implements extension point global.GenAILargeInputPreprocessor&lt;/description&gt;
+        &lt;name&gt;GenAILargeInputPreprocessor&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var GenAILargeInputPreprocessor = Class.create();
+GenAILargeInputPreprocessor.prototype = {
+    initialize: function() {
+    },
+
+	/**
+     * Converts a GenAI request from large input to parts with chunks.
+     *
+     * @param {String} input - GenAI input request, JSON, stringified.
+     * @param {Number} remainingTokens - Remaining tokens in the request.
+	 * @param {Number} maxTokens - Maximum response tokens for a request.
+     * @param {String} provider - Name of the LLM service provider.
+     *
+     * @return {Object}
+     * {
+     *  parentFilter: {Object} - Filters for the combine prompt,
+     *  parts: {Array} - Part objects containing input attributes, chunked attribute and filter
+     * }
+     */
+    process: function(input, remainingTokens, maxTokens, provider) {
+		// Query for attributes
+		input = input ? JSON.parse(input) : {};
+		var chunkableAttributes = [];
+		var attributeGR = new GlideRecord('sys_one_extend_definition_attribute');
+		attributeGR.addQuery("capability", input["_meta"]["capability"]);
+		attributeGR.query();
+
+		var totalRequestTokens = 0;
+		var nonSummarizeLengthTotal = 0;
+		var tokenCalculator = new sn_generative_ai.TokenCalculator();
+		while(attributeGR.next()) {
+			if (attributeGR.contains_large_input == true) {
+				var attributeValueStr = input[attributeGR.getValue("name")] || "";
+				if (attributeGR.getValue("data_type") === "json_array" || attributeGR.getValue("data_type") === "simple_array" || attributeGR.getValue("data_type") === "json_object") {
+					attributeValueStr = JSON.stringify(attributeValueStr);
+				}
+				var nonSummarizeLength = Math.min(tokenCalculator.getTokenCount(attributeValueStr, provider, 0), maxTokens);
+				chunkableAttributes.push({
+					attributeName: attributeGR.getValue("name"),
+					attributeValue: input[attributeGR.getValue("name")],
+					attributeDataType: attributeGR.getValue("data_type"),
+					nonSummarizeLength: nonSummarizeLength
+				});
+
+				nonSummarizeLengthTotal += nonSummarizeLength;
+			}
+
+			var attributeValue = input[attributeGR.getValue("name")] || "";
+			var attributeDataType = attributeGR.getValue("data_type");
+
+			// If JSON, stringify
+			if (attributeDataType === "json_array" || attributeDataType === "simple_array" || attributeDataType === "json_object") {
+				try {
+					attributeValue = (typeof attributeValue != "string") ? JSON.stringify(attributeValue) : attributeValue;
+				} catch(e) {
+					attributeValue = "";
+				}
+			} else {
+				attributeValue = attributeValue.toString();
+			}
+
+			// Clean residual string
+			var spaceProcessed = attributeValue.replace(/[^a-zA-z0-9]/g, " ");
+			spaceProcessed = spaceProcessed.replace(/\s+/g, " ");
+
+			// Total attribute tokens
+			var totalAttributeTokens = tokenCalculator.getTokenCount(spaceProcessed, provider, 0);
+			totalRequestTokens += totalAttributeTokens;
+		}
+
+		if (totalRequestTokens &lt; remainingTokens || chunkableAttributes.length == 0) {
+			return {
+				parts: [input]
+			};
+		}
+
+		var chunkingParams = {};
+		try {
+			chunkingParams = JSON.parse(gs.getProperty("com.glide.one_extend.chunking_params") || "{}");
+		} catch (e) {
+			chunkingParams = {};
+		}
+		var maxChunks = chunkingParams.chunkLimit || 6;
+		if (gs.getProperty("com.glide.one.extend.retain_last_chunk") == "true") {
+			maxChunks = Math.floor((remainingTokens - nonSummarizeLengthTotal) / maxTokens);
+			maxChunks = Math.min(maxChunks, chunkingParams.chunkLimit || 6);
+		}
+
+		var allParts = [];
+		for (var i = 0; i &lt; chunkableAttributes.length; i++) {
+			allParts.push(this._chunkAttribute(
+				chunkableAttributes[i].attributeName,
+				chunkableAttributes[i].attributeValue || "",
+				chunkableAttributes[i].attributeDataType,
+				chunkableAttributes[i].nonSummarizeLength,
+				remainingTokens,
+				provider,
+				chunkingParams
+			));
+		}
+
+		var parts = this._limitChunks(allParts, maxChunks);
+
+		var parentFilter = {};
+		if (parts.length &gt; 0) {
+			// For combination request
+			parentFilter = input["_meta"].configFilters || {};
+		} else {
+			parts.push(input);
+		}
+
+		var result = {
+			parentFilter: parentFilter || {},
+			parts: parts
+		};
+
+		return JSON.stringify(result);
+    },
+
+	/**
+     * Checks if the current instance is appropriate for a given
+	 * capabilityId and definitionId
+     *
+     * @param {String} capabilityId - The sys_id for the capability.
+	 * @param {String} definitionId - The sys_id for the capability definition.
+     *
+     * @return {Boolean} true/false - is the handler instance valid or not.
+     */
+	validateHandler: function (capabilityId, definitionId) {
+		return true;
+	},
+
+	/**
+     * Invokes TokenCalculator to count remaining
+	 * number of tokens in the request prompt
+     *
+     * @param {String} prompt - Prompt template.
+	 * @param {Number} requestTokens - Request token limit.
+	 * @param {String} provider - Name of the LLM service provider.
+     *
+     * @return {Number} - Number of remaining tokens in the prompt.
+     */
+	countRemainingTokens: function (prompt, requestTokens, provider) {
+		prompt = prompt || "";
+		var promptTokenCount = new sn_generative_ai.TokenCalculator().getTokenCount(prompt, provider, 0);
+		var remainingTokensBuffer = 50;
+		return Math.floor(requestTokens - promptTokenCount - remainingTokensBuffer);
+	},
+
+	/**
+     * Checks if recursive execution is required by checking
+	 * for large text
+     *
+     * @param {String} payload - Input payload.
+	 * @param {Number} remainingTokens - Token limit remaining.
+	 * @param {String} provider - Name of the LLM service provider.
+     *
+     * @return {Boolean} - Whether given input payload contains large text.
+     */
+	isLargeText: function (payload, remainingTokens, provider) {
+		payload = payload || "";
+		var payloadTokenCount = new sn_generative_ai.TokenCalculator().getTokenCount(payload, provider, 0);
+		if (payloadTokenCount &gt;= remainingTokens) {
+			return true;
+		}
+		return false;
+	},
+
+	_limitChunks: function (allParts, chunkLimit) {
+		var parts = [];
+		var zeroProcessChunks = true;
+		for (var attrIdx = 0; attrIdx &lt; allParts.length; attrIdx++) {
+			for (var chunkIdx = 0; chunkIdx &lt; allParts[attrIdx].length; chunkIdx++) {
+				if (!allParts[attrIdx][chunkIdx].chunk || !allParts[attrIdx][chunkIdx].chunkedAttributeName || allParts[attrIdx][chunkIdx].chunk.length &lt; 10) {
+					continue;
+				}
+				if (!allParts[attrIdx][chunkIdx].action || allParts[attrIdx][chunkIdx].action == "PROCESS") {
+					if (chunkLimit &lt;= 0) {
+						if (zeroProcessChunks) {
+							zeroProcessChunks = false;
+						} else {
+							continue;
+						}
+					} else {
+						zeroProcessChunks = false;
+					}
+					chunkLimit--;
+				}
+				parts.push(allParts[attrIdx][chunkIdx]);
+			}
+		}
+
+		return parts;
+	},
+
+	_chunkAttribute: function (attributeName, attributeValue, attributeDataType, retainLength, remainingTokens, provider, chunkingParams) {
+		// If JSON, stringify
+		if (attributeDataType === "json_array" || attributeDataType === "simple_array" || attributeDataType === "json_object") {
+			attributeValue = JSON.stringify(attributeValue);
+		}
+
+		// Clean residual string
+		var spaceProcessed = attributeValue.replace(/[^a-zA-z0-9]/g, " ");
+		spaceProcessed = spaceProcessed.replace(/\\n+/g, " ");
+		spaceProcessed = spaceProcessed.replace(/\\r+/g, " ");
+		spaceProcessed = spaceProcessed.replace(/\\+/g, " ");
+		spaceProcessed = spaceProcessed.replace(/\s+/g, " ");
+
+		// Perform the chunking
+		var chunkTokenBufferPercent = chunkingParams.bufferPercent || 0.02;
+		var chunkOverlapFactor = chunkingParams.overlapFactor || 6;
+		var chunkTokenLength = remainingTokens - (remainingTokens * chunkTokenBufferPercent);
+		var chunkOverlapLength = chunkTokenLength / chunkOverlapFactor;
+		var chunks = [];
+		if (provider === "Now LLM") {
+			chunks = this._getChunksNowLLM(spaceProcessed, chunkTokenLength, chunkOverlapLength, retainLength);
+		} else {
+			chunks = this._getChunksOpenAI(spaceProcessed, chunkTokenLength, chunkOverlapLength, retainLength);
+		}
+
+		// Get parts in specified format
+		var minChunkLength = 10;
+		for (var i = 0; i &lt; chunks.length; i++) {
+			if (chunks[i].chunk.length &lt; minChunkLength) continue;
+			chunks[i].chunkedAttributeName = attributeName;
+		}
+
+		return chunks;
+	},
+
+	_getChunksNowLLM: function (spaceProcessed, chunkTokenLength, chunkOverlapLength, retainLength) {
+		var words = spaceProcessed.split(" ").reverse();
+		var chunks = [];
+		if (gs.getProperty("com.glide.one.extend.retain_last_chunk") == "true") {
+			var retainChunk = words.slice(0, retainLength).reverse().join(" ");
+			chunks.push({
+				chunk: retainChunk,
+				action: "RETAIN"
+			});
+			words = words.slice(retainLength);
+		}
+		var wordOverlapLength = Math.floor(chunkOverlapLength * 0.8);
+		var wordLimit = Math.floor(chunkTokenLength * 0.8);
+		var currentPosition = 0;
+		while (currentPosition &lt; words.length) {
+			var end = currentPosition + wordLimit - 1;
+			end = (end &gt; words.length) ? words.length : end;
+			var rawTokens = words.slice(currentPosition, end);
+			var chunk = rawTokens.reverse().join(" ");
+			chunks.push({
+				chunk: chunk,
+				action: "PROCESS"
+			});
+			currentPosition += wordLimit;
+			currentPosition -= wordOverlapLength;
+		}
+
+		return chunks;
+	},
+
+	_getChunksOpenAI: function (spaceProcessed, chunkTokenLength, chunkOverlapLength, retainLength) {
+		var currentPosition = 0;
+		var chunks = [];
+		spaceProcessed = spaceProcessed.split("").reverse().join("");
+		if (gs.getProperty("com.glide.one.extend.retain_last_chunk") == "true") {
+			var retainChunk = spaceProcessed.split("").slice(0, retainLength * 4).reverse().join("");
+			chunks.push({
+				chunk: retainChunk,
+				action: "RETAIN"
+			});
+			spaceProcessed = spaceProcessed.substring(retainLength * 4);
+		}
+
+		while (currentPosition &lt; spaceProcessed.length) {
+			var end = currentPosition + (chunkTokenLength * 4) - 1;
+			end = (end &gt; spaceProcessed.length) ? spaceProcessed.length : end;
+			var rawSubstring = spaceProcessed.substring(currentPosition, end);
+			var rawTokens = rawSubstring.split(" ");
+			rawTokens = rawTokens.slice(1, rawTokens.length - 1);
+			var chunkText = rawTokens.join(" ").split("").reverse().join("");
+			chunks.push({
+				chunk: chunkText,
+				action: "PROCESS"
+			});
+			currentPosition += (chunkTokenLength * 4);
+			currentPosition -= (chunkOverlapLength * 4);
+		}
+
+		return chunks;
+	},
+
+    type: 'GenAILargeInputPreprocessor'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-11-27 15:36:30&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;79432601437a31101ed803295bb8f244&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;71&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;GenAILargeInputPreprocessor&lt;/sys_name&gt;
+        &lt;sys_package display_value="Glide OneExtend" source="com.glide.one_extend"&gt;dc98175b47220210cd4e1ce4316d4324&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_79432601437a31101ed803295bb8f244&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-01-12 05:38:13&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:39:04</sys_created_on>
+        <sys_id>aa177c5d83f01210c6695855eeaad3ff</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>GenAILargeInputPreprocessor</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_aa177c5d83f01210c6695855eeaad3ff</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:39:04</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

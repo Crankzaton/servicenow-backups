@@ -1,0 +1,391 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>44ee99055301211054f0ddeeff7b12b5</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.AvailabilityOutageProcessor&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;AvailabilityOutageProcessor&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var AvailabilityOutageProcessor = Class.create();
+AvailabilityOutageProcessor.prototype = {
+	initialize: function() {
+		this.OUTAGE_TYPES = (new global.AvailabilityConstants()).OUTAGE_TYPES;
+	},
+
+	/**
+	 * Trims outages to specified calculation boundaries
+	 * @param {Object} outage Outage object to process
+	 * @param {Number} beginBoundary Begin cutoff time to check
+	 * @param {Number} endBoundary End cutoff time to check
+	 * @returns {Object|null} Returns object if duration of outage &gt; 0 else returns null
+	 */
+	_modifyOutageBoundaries: function(outage, beginBoundary, endBoundary) {
+		// Null checks
+		if (beginBoundary == null || endBoundary == null || !outage)
+			return null;
+
+		// Trim outage if outage begin is less than begin boundary
+		if (outage.begin &lt; beginBoundary)
+			outage.begin = beginBoundary;
+
+		// If outage end is set then it is not an outgoing outage
+		// Trim outage end if outage end  is bigger than end boundary
+		if (outage.end &gt; endBoundary)
+			outage.end = endBoundary;
+
+		// Check for outage duration
+		// Duration will be 0 in the following case:
+		// Outage begin is the same as begin boundary since we've adjusted boundaries already
+		// Since outages are ordered by begin date we can safely assume that ALL
+		// of the remaining outages in the array are not to be considered in the calculation
+		// bceause they do not meet the period cutoff (begin and end boundaries)
+		if (outage.end - outage.begin === 0)
+			return null;
+
+		// Return outage with modified boundaries
+		return outage;
+	},
+
+	/**
+	 * Inserts outage at given position
+	 * @param {Array} outages
+	 * @param {Number} position
+	 * @param {Object} newOutage
+	 */
+	_insertOutage: function(outages, position, newOutage) {
+		if (!outages || position === null || position === undefined || !newOutage)
+			return;
+		outages.splice(position, 0, newOutage);
+	},
+
+	/**
+	 * Deletes outage at given position
+	 * @param {Array} outages Outages array (reference)
+	 * @param {Number} position
+	 */
+	_deleteOutage: function(outages, position) {
+		if (!outages || position === null || position === undefined)
+			return;
+		outages.splice(position, 1);
+	},
+
+	/**
+	 * Finds and merges outages within the range of the first outages
+	 * @param {Array} outages
+	 * @param {Number} currentPositionInArray
+	 */
+	_mergeLongestPossiblePlannedOutage: function(outages, currentPositionInArray) {
+		var currentOutage = outages[currentPositionInArray];
+		// Build longest possible planned outage within current plannedOutage range
+		for (var j = currentPositionInArray + 1; j &lt; outages.length; j++) {
+			var nextOutage = outages[j];
+			if (!nextOutage)
+				break;
+			// Merge planned outage if it is in range
+			else if (nextOutage.type == this.OUTAGE_TYPES.PLANNED &amp;&amp; nextOutage.begin &lt;= currentOutage.end) {
+				outages[currentPositionInArray].begin = Math.min(currentOutage.begin, nextOutage.begin);
+				outages[currentPositionInArray].end = Math.max(currentOutage.end, nextOutage.end);
+				this._deleteOutage(outages, j);
+				// Since we deleted an outage, array shifts to the right by 1
+				// Make sure we check the outage that shifted to the right
+				j--;
+			} else if (nextOutage.begin &gt; currentOutage.end)
+				break;
+		}
+	},
+
+	/**
+	 * Function that finds the index in the outage array where the given outage would be in order
+	 * @param {Array} outages
+	 * @param {Object} newOutage outage to insert
+	 * @param {Number} startingPosition current position in array
+	 * @returns {Number} position where element should be inserted
+	 */
+	_seekNewIndexInArray: function(outages, newOutage, startingPosition) {
+		var currentPosition = startingPosition;
+		var currentOutage = outages[currentPosition];
+		while (currentOutage != null &amp;&amp; newOutage.begin &gt; outages[currentPosition].begin) {
+			currentPosition++;
+			currentOutage = outages[currentPosition];
+		}
+		return currentPosition;
+	},
+
+	/**
+	 * Determines index adjustment for re-check depending on if we're scanning
+	 * the array to the left or right
+	 * @param {String} direction either 'left' or 'right'
+	 * @param {Number} currentIndex current position in the array
+	 * @returns {Number} containing the index offset
+	 */
+	_determineIndexAdjustment: function(direction, currentIndex) {
+		if (direction === 'left')
+			return currentIndex + 1;
+		else if (direction === 'right')
+			return currentIndex - 1;
+	},
+
+	/**
+	 * Checks if two different types of outages (one planned and one outage) overlap with each other
+	 * If they do, then it trims/splits/deletes outageOutage accordingly
+	 * @param {Array} outages
+	 * @param {Object} indexes object with the following properties:
+	 * {currentIndex, plannedOutageIndex, outageOutageIndex}
+	 * @param {String} direction direction in the array we're checking
+	 * @returns {Number}
+	 */
+	_checkPlannedOutageOverlap: function(outages, indexes, direction) {
+		// Outages array is in order. Current possible cases are:
+		// - CASE 1: The plannedOutage is in the middle of an outageOutage. Split outage
+		//   (outageOutage.begin &lt; plannedOutage.begin &amp;&amp; outageOutage.end &gt; plannedOutage.end)
+		// - CASE 2: The outageOutage is completely within the planned outage. Delete outage
+		//   (outageOutage.begin &gt;= plannedOutage.begin &amp;&amp; outageOutage.end &lt;= plannedOutage.end)
+		// - CASE 3: The outageOutage end goes past plannedOutage end date. We need to modify begin of outageOutage
+		// - CASE 4: The outageOutage begin is before plannedOutage begin date. We need to modify end of outageOutage
+
+		if (!indexes || indexes.currentIndex == null || indexes.plannedOutageIndex == null || indexes.outageOutageIndex == null)
+			return;
+		var currentIndex = indexes.currentIndex;
+		var previousOrNextIndex = direction === 'left' ? currentIndex - 1 : currentIndex + 1;
+		var plannedOutageIndex = indexes.plannedOutageIndex;
+		var outageOutageIndex = indexes.outageOutageIndex;
+		var plannedOutage = outages[plannedOutageIndex];
+		var outageOutage = outages[outageOutageIndex];
+		if (!plannedOutage || !outageOutage)
+			return currentIndex;
+
+		// - CASE 1: The plannedOutage is in the middle of an outageOutage. Split outage
+		if (outageOutage.begin &lt; plannedOutage.begin &amp;&amp; outageOutage.end &gt; plannedOutage.end) {
+			// Planned outage is in the middle, split outageOutage
+			// Create new upper outage and insert it after planned outage
+			var upperOutage = {begin: plannedOutage.end, end: outageOutage.end, type: this.OUTAGE_TYPES.OUTAGE};
+
+			// Modify outageOutage to be the lower outage
+			outages[outageOutageIndex].end = plannedOutage.begin;
+			var newIndexInOutageArray = this._seekNewIndexInArray(outages, upperOutage, previousOrNextIndex);
+			this._insertOutage(outages, newIndexInOutageArray, upperOutage);
+			// No need to adjust index since no deletion happened
+
+		// - CASE 2: The outageOutage is completely within the planned outage. Delete outage
+		} else if ((outageOutage.begin &gt;= plannedOutage.begin &amp;&amp; outageOutage.end &lt;= plannedOutage.end)) {
+			this._deleteOutage(outages, currentIndex);
+			return this._determineIndexAdjustment(direction, currentIndex);
+
+		// - CASE 3: The outageOutage end goes past plannedOutage end date. We need to modify begin of outageOutage
+		} else if (outageOutage.begin &gt;= plannedOutage.begin &amp;&amp; outageOutage.end &gt; plannedOutage.end) {
+			// Adjust begin date
+			outages[outageOutageIndex].begin = plannedOutage.end;
+			// At this point array is not in order since there can be outages within our planned outage
+			// that have not been processed yet. Look for new position in array and then insert there
+			var newPositionInArray = this._seekNewIndexInArray(outages, outageOutage, previousOrNextIndex);
+			this._insertOutage(outages, newPositionInArray, outages[currentIndex]);
+			// Delete outage after insertion
+			this._deleteOutage(outages, currentIndex);
+			return this._determineIndexAdjustment(direction, currentIndex);
+
+		// - CASE 4: The outageOutage begin is before plannedOutage begin date. We need to modify end of outageOutage
+		} else if (outageOutage.begin &lt; plannedOutage.begin &amp;&amp; outageOutage.end &lt;= plannedOutage.end)
+			// Adjust end date
+			outages[outageOutageIndex].end = plannedOutage.begin;
+
+		return currentIndex;
+	},
+
+	/**
+	 * Processes outages and finds overlaps among outage objects
+	 * If outages are of the same type and there is an overlap, the function merges them
+	 * If outages are of different type and there is an overap, the function trims/splits/deletes outageOutage accordingly
+	 * @param {Array} outages contains outages to process
+	 * @param {Number} beginBoundary UNIX Timestamp in millis containing the lower boundary for outages to process
+	 * @param {Number} endBoundary UNIX Timestamp in millis containing the higher boundary for outages to process
+	 * @returns {Array} of processed outages that contains no overlaps
+	 */
+	processOutages: function(outages, beginBoundary, endBoundary) {
+		// If outages is empty
+		if (outages.length === 0)
+			return outages;
+		// If outages has only one outage, return dataset as is with modified boundaries
+		else if (outages.length === 1) {
+			// If outage is planned then return empty array since we don't need planned outages
+			if (outages[0].type == this.OUTAGE_TYPES.PLANNED)
+				return [];
+			var modifiedOutage = this._modifyOutageBoundaries(outages[0], beginBoundary, endBoundary);
+			// If modified outage is not within boundaries return empty dataset
+			if (!modifiedOutage)
+				return [];
+			// Return outage with modified boundaries
+			return [modifiedOutage];
+		}
+
+		for (var i = 0; i &lt; outages.length; i++) {
+			var currentOutage = this._modifyOutageBoundaries(outages[i], beginBoundary, endBoundary);
+			// Check currentOutage is within boundaries
+			if (!currentOutage) {
+				this._deleteOutage(outages, i);
+				// We have reached end of the boundary for current calculation period
+				return;
+			}
+
+			if (currentOutage.type == this.OUTAGE_TYPES.PLANNED) {
+				this._mergeLongestPossiblePlannedOutage(outages, i);
+
+				var nextOutageIndex = i + 1;
+				var nextOutage;
+				// Check we're not at the end of the array for next Outage
+				if (nextOutageIndex &gt; outages.length) {
+					// Delete outage if last is planned outage
+					this._deleteOutage(outages, i);
+					i--;
+					break;
+				}
+				// Since we checked for overlapping planned outages already, next outage in range can only be of type outage
+				nextOutage = outages[nextOutageIndex];
+
+				// Check for potential outages that need to be trimmed to the left of our planned outage
+				// At this point there shouldn't be any planned outages to the left of the array
+				for (var j = i - 1; j &gt;= 0; j--) {
+					var previousOutage = outages[j];
+					var previousOutageIndex = j;
+					// Ignore other types
+					// CANT HAPPEN SINCE WE ALWAYS MAKE SURE THERE ARE NO PLANNED OUTAGES TO THE LEFT OF THE ARRAY
+					// WHEN PROCESSING
+					if (!previousOutage.type == this.OUTAGE_TYPES.OUTAGE)
+						continue;
+
+					var isPreviousOutageInRange = (previousOutage.end &gt; currentOutage.begin);
+					if (isPreviousOutageInRange) {
+						var indexes = {currentIndex: i, plannedOutageIndex: i, outageOutageIndex: previousOutageIndex};
+						var indexOffset = this._checkPlannedOutageOverlap(outages, indexes, 'left');
+						j = indexOffset;
+					}
+					if (previousOutage.end &lt;= currentOutage.begin)
+						break;
+				}
+
+				// NOTE: At this point, planned outage cannot be in the middle since planned outage is currentOutage
+				// outageOutages can be:
+				// FIRST CASE
+				// - Fully contained within, which means delete:
+				//	(outageOutage.begin &gt;= plannedOutage.begin &amp;&amp; outageOutage.end &lt;= plannedOutage.end)
+				// SECOND CASE
+				// - Contained partially, which means trim (trim begin to planned outage end)
+				//  (outageOutage.begin &gt;= plannedOutage.begin &amp;&amp; outageOutage.end &gt; plannedOutage.end)
+
+				// First check ensure we only process outages within the planned outage range
+				// Second check ensures we do not go out of array boundary
+				if (nextOutage.type != this.OUTAGE_TYPES.OUTAGE) {
+					// We can safely delete planned outage since we checked for planned outages in range and merged them
+					// At this point nextOutage should be a planned outage not in range
+					this._deleteOutage(outages, i);
+					i--;
+					continue;
+				}
+				var indexes = {currentIndex: i, plannedOutageIndex: i, outageOutageIndex: nextOutageIndex};
+				while ((nextOutage.begin &lt; currentOutage.end) &amp;&amp; (nextOutageIndex &lt; outages.length)) {
+					// Check for delete (FIRST CASE)
+					if (nextOutage.begin &gt;= currentOutage.begin &amp;&amp; nextOutage.end &lt;= currentOutage.end)
+						// No need to adjust array pointer i since currentOutage in next iteration will be
+						// whatever next outage there is to process
+						this._deleteOutage(outages, nextOutageIndex);
+
+						// Check for trim (SECOND CASE)
+					else if (nextOutage.begin &gt;= currentOutage.begin &amp;&amp; nextOutage.end &gt; currentOutage.end) {
+						outages[nextOutageIndex].begin = currentOutage.end;
+						// Check array is still in order
+						var outageAfterNextIndex = nextOutageIndex + 1;
+						if (outageAfterNextIndex &lt; outages.length) {
+							var newIndex = this._seekNewIndexInArray(outages, outages[nextOutageIndex], nextOutageIndex + 1);
+							// If new index is bigger than current index, we need to move outage
+							if (newIndex &gt; nextOutageIndex + 1) {
+								this._insertOutage(outages, newIndex, outages[nextOutageIndex]);
+								// Delete shifts outage. Next iteration will be in desired position
+								this._deleteOutage(outages, nextOutageIndex);
+							} else
+								// Update nextOutageIndex manually
+								nextOutageIndex++;
+						}
+					}
+					// Update local reference to nextOutage
+					nextOutage = outages[nextOutageIndex];
+				}
+
+				// We have processed all the planned outages that needed to be merged with our planned outage
+				// and all the outage outages that were in range of the current planned outage that were either
+				// to the left or right of the array, we can safely remove planned outage from the array
+				this._deleteOutage(outages, i);
+				// Since we deleted currentOutage, elements in array shifted position by 1 to the left
+				// Adjust current array pointer to check for next currentOutage
+				i--;
+
+			// Else currentOutage is outage of type outage
+			} else {
+				var nextOutageIndex = i + 1;
+				var nextOutage, nextOutageType, nextOutageBeginDateIsInRange;
+				// Check we're not at the end of the array for next Outage
+				if (nextOutageIndex &gt; outages.length)
+					break;
+
+				nextOutage = outages[nextOutageIndex];
+				nextOutageType = nextOutage.type;
+				nextOutageBeginDateIsInRange = (nextOutage.begin &gt;= currentOutage.begin &amp;&amp; nextOutage.begin &lt;= currentOutage.end);
+
+				// Check next outage type
+				if (nextOutageType == this.OUTAGE_TYPES.OUTAGE) {
+					// Check if there is an overlap
+					if (nextOutageBeginDateIsInRange) {
+						// Modify end date to have the later date
+						outages[i].end = Math.max(currentOutage.end, nextOutage.end);
+						// Delete nextOutage since we've combined outages
+						this._deleteOutage(outages, nextOutageIndex);
+						i--;
+					}
+				// nextOutage is a planned outage
+				} else if (nextOutageType == this.OUTAGE_TYPES.PLANNED) {
+					// Check if there is an overlap
+					if (nextOutageBeginDateIsInRange) {
+						var indexes = {currentIndex: i, plannedOutageIndex: nextOutageIndex, outageOutageIndex: i};
+						var indexOffset = this._checkPlannedOutageOverlap(outages, indexes, 'right');
+						i = indexOffset;
+					}
+				}
+			}
+		}
+		return outages;
+	},
+	type: 'AvailabilityOutageProcessor'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-02-14 14:37:22&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;44ee99055301211054f0ddeeff7b12b5&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;32&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AvailabilityOutageProcessor&lt;/sys_name&gt;
+        &lt;sys_package display_value="Availability" source="com.snc.availability"&gt;cfe7f4ac3cb1311068bcf327dfe37ffb&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_44ee99055301211054f0ddeeff7b12b5&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-02-04 17:24:06&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:36:25</sys_created_on>
+        <sys_id>e77634d983f01210c6695855eeaad35c</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AvailabilityOutageProcessor</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_e77634d983f01210c6695855eeaad35c</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:36:25</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

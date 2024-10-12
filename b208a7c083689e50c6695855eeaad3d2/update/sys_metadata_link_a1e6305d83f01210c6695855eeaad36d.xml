@@ -1,0 +1,251 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>696a3829530111106883ddeeff7b122f</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_appclient.AppInfoService&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;AppInfoService&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var AppInfoService = Class.create();
+AppInfoService.prototype = {
+    initialize: function() {
+        this.appsData = new AppsData();
+    },
+    getInstanceAppInfo: function(args) {
+        if (!args.pathParams.appID)
+            throw "AppInfoService:getInstanceAppInfo Path Param appId is missing";
+        var appDetails = {};
+        this.startTime = new GlideDateTime().getNumericValue();
+        appDetails.app_info_on_instance = this.appsData.getAppInfoFromInstance(args.pathParams.appID);
+        appDetails.time_taken = new GlideDateTime().getNumericValue() - this.startTime;
+        return appDetails;
+    },
+    getAppInfoFromStore: function(args) {
+        if (!args.pathParams.sourceAppId || !args.pathParams.version)
+            throw "AppInfoService.getAppInfoFromStore():  Missing mandatory path params";
+
+        if (this.appsData.isInstanceOffline()) {
+            return this.getOOBAppInfo(args);
+        }
+        var apiRequestArgs = {
+            apiName: "instance_api",
+            params: {
+                "sub_type": "get_app_details_from_store",
+                "app_id": args.pathParams.sourceAppId,
+                "version": args.pathParams.version
+            },
+            method: "Get"
+        };
+
+        var appInfo = AppManagerIntegrationAPI.makeAPIRequest(apiRequestArgs);
+        return appInfo;
+    },
+    getOOBAppInfo: function(args) {
+        return {}
+    },
+
+	getAppsCountForBadges: function(args, tableName, addOptionalAppsFlag){
+		if(addOptionalAppsFlag){
+			args.encodedQuery += "^optional_apps_available=true";
+		}
+		var count = AppsDAO.getApps(args,tableName, []).count;
+		return count;
+	},
+
+    getApps: function(appManagerAPIUtil) {
+        var bodyObj = appManagerAPIUtil.getRequestBody();
+        var args = appManagerAPIUtil.getPaginationParams() || {};
+        args.requirePagination = Object.keys(args).length &gt; 0;
+        var tabContext = appManagerAPIUtil.params.queryParams[Constants.TAB_CONTEXT];
+        var sortBy = appManagerAPIUtil.params.queryParams[Constants.SORT_BY_PARAM];
+        if (!tabContext)
+            throw "AppInfoService.getApps(): Missing mandatory query parameter " + Constants.TAB_CONTEXT;
+        args[Constants.TAB_CONTEXT] = tabContext;
+        args[Constants.SORT_BY_PARAM] = sortBy;
+        args.searchTerm = appManagerAPIUtil.getSearchTerm();
+        args.filterParams = bodyObj;
+        args.encodedQuery = this._getEncodedQueryBySearchContext(args);
+        var rowMapper = AppsDAO.appMapper;
+        var response = {};
+        switch (tabContext) {
+            case "available_for_you":
+                gs.eventQueue("sn_appclient.update_last_installed_from"); // update last installed from on sys_store_app table to decide source of installation of the app and keep it ready for installed tab
+                response = AppsDAO.getApps(args, Constants.TABLE_SYS_REMOTE_APP, rowMapper);
+                args.encodedQuery += "^optional_apps_available=true^active=true";
+                var partialInstallAppsResponse = AppsDAO.getApps(args, Constants.TABLE_SYS_STORE_APP, rowMapper);
+                var mergedApps = response.apps.concat(partialInstallAppsResponse.apps);
+                response.apps = mergedApps;
+                response.count += partialInstallAppsResponse.count;
+                if (!args.searchTerm)
+                    break;
+
+                response.avl_for_you_badge_count = response.count;
+                args[Constants.TAB_CONTEXT] = "installed";
+                args.encodedQuery = this._getEncodedQueryBySearchContext(args);
+                response.installed_badge_count = this.getAppsCountForBadges(args, Constants.TABLE_SYS_STORE_APP, false);
+                args[Constants.TAB_CONTEXT] = "updates";
+                args.encodedQuery = this._getEncodedQueryBySearchContext(args);
+                response.updates_badge_count = this.getAppsCountForBadges(args, Constants.TABLE_SYS_STORE_APP, false);
+                break;
+            case "installed":
+                response = AppsDAO.getApps(args, Constants.TABLE_SYS_STORE_APP, rowMapper);
+                this.addCustomizationInfo(response.apps);
+                if (!args.searchTerm)
+                    break;
+
+                response.installed_badge_count = response.count;
+                args[Constants.TAB_CONTEXT] = "available_for_you";
+                args.encodedQuery = this._getEncodedQueryBySearchContext(args);
+                response.avl_for_you_badge_count = this.getAppsCountForBadges(args, Constants.TABLE_SYS_REMOTE_APP, false);
+                response.avl_for_you_badge_count += this.getAppsCountForBadges(args, Constants.TABLE_SYS_STORE_APP, true);
+                args[Constants.TAB_CONTEXT] = "updates";
+                args.encodedQuery = this._getEncodedQueryBySearchContext(args);
+                response.updates_badge_count = this.getAppsCountForBadges(args, Constants.TABLE_SYS_STORE_APP, false);
+                break;
+            case "updates":
+                response = AppsDAO.getApps(args, Constants.TABLE_SYS_STORE_APP, rowMapper);
+                this.addCustomizationInfo(response.apps);
+                if (!args.searchTerm)
+                    break;
+
+                response.updates_badge_count = response.count;
+                args[Constants.TAB_CONTEXT] = "available_for_you";
+                args.encodedQuery = this._getEncodedQueryBySearchContext(args);
+                response.avl_for_you_badge_count = this.getAppsCountForBadges(args, Constants.TABLE_SYS_REMOTE_APP, false);
+                response.avl_for_you_badge_count += this.getAppsCountForBadges(args, Constants.TABLE_SYS_STORE_APP, true);
+
+                args[Constants.TAB_CONTEXT] = "installed";
+                args.encodedQuery = this._getEncodedQueryBySearchContext(args);
+                response.installed_badge_count = this.getAppsCountForBadges(args, Constants.TABLE_SYS_STORE_APP, false);
+                break;
+        }
+        appManagerAPIUtil.addTotalCountHeader(response.count);
+        appManagerAPIUtil.setHeader("avl_for_you_badge_count", response.avl_for_you_badge_count);
+        appManagerAPIUtil.setHeader("installed_badge_count", response.installed_badge_count);
+        appManagerAPIUtil.setHeader("updates_badge_count", response.updates_badge_count);
+        delete response.count;
+        delete response.avl_for_you_badge_count;
+        delete response.installed_badge_count;
+        delete response.updates_badge_count;
+        return response;
+    },
+    _getEncodedQueryBySearchContext: function(args) {
+        var encodedQuery = "shared_internally=" + !!args.sharedInternally;
+        if (args[Constants.TAB_CONTEXT] == 'updates' || args[Constants.TAB_CONTEXT] == 'installed')
+            encodedQuery += "^ORshared_internallyISEMPTY^active=true^last_installed_fromINstore,out_of_band,offline";
+        if (args[Constants.TAB_CONTEXT] == 'updates')
+            encodedQuery += "^update_available=true";
+        if (args.searchTerm)
+            encodedQuery += "^GOTO123TEXTQUERY321=" + args.searchTerm;
+        if (args.filterParams &amp;&amp; Object.keys(args.filterParams).length &gt; 0)
+            encodedQuery = this._appendEncodedQueryByFilterParams(encodedQuery, args.filterParams);
+        if (!gs.getUser().hasRole("maint"))
+            encodedQuery += "^hide_on_ui=false";
+        return encodedQuery;
+    },
+    _appendEncodedQueryByFilterParams: function(encodedQuery, filterParams) {
+        var processedFilters = [];
+        var i;
+
+        var LOBs = [];
+        var productFamily = [];
+        var adoptionBluePrint = [];
+        var offeredBy = [];
+        var listings = [];
+        if (filterParams.hasOwnProperty('productFamily'))
+            LOBs = filterParams['productFamily'];
+        if (filterParams.hasOwnProperty('productFamily'))
+            productFamily = filterParams['productFamily'];
+        if (filterParams.hasOwnProperty('offeredBy'))
+            offeredBy = filterParams['offeredBy'];
+        if (filterParams.hasOwnProperty('adoptionBlueprint'))
+            adoptionBluePrint = filterParams['adoptionBlueprint'];
+        if (filterParams.hasOwnProperty('listings'))
+            listings = filterParams['listings'];
+
+        var isfreeToTryPresent = listings.indexOf('free_to_try') != -1;
+        if (isfreeToTryPresent) {
+            encodedQuery += "^indicatorsLIKEfree_to_try";
+        }
+        if (offeredBy != null &amp;&amp; offeredBy.length == 1)
+            if (offeredBy[0] === 'partners')
+                encodedQuery += "^vendor!=" + 'servicenow';
+            else
+                encodedQuery += "^vendor=" + offeredBy[0];
+
+        if (LOBs != null &amp;&amp; LOBs.length &gt; 0)
+            for (i = 0; i &lt; LOBs.length; i++) {
+                if (i &gt; 0) encodedQuery += "^OR";
+                else encodedQuery += "^";
+                encodedQuery += "lobLIKE" + LOBs[i];
+            }
+        if (productFamily != null &amp;&amp; productFamily.length &gt; 0)
+            for (i = 0; i &lt; productFamily.length; i++) {
+                if (i &gt; 0 || (LOBs &amp;&amp; LOBs.length &gt; 0)) encodedQuery += "^OR";
+                else encodedQuery += "^";
+                encodedQuery += "productsLIKE" + productFamily[i];
+            }
+        if (adoptionBluePrint != null &amp;&amp; adoptionBluePrint.length &gt; 0) {
+            adoptionBluePrintQuery = this.getEncodedQueryByAdoptionBluePrint(adoptionBluePrint);
+            appNames = new AppManagerFiltersUtil().getFilteredIdsWithAdoptionBluePrint(adoptionBluePrintQuery);
+            if (appNames != null &amp;&amp; appNames.length &gt; 0)
+                for (i = 0; i &lt; appNames.length; i++) {
+                    if (i &gt; 0) encodedQuery += "^OR";
+                    else encodedQuery += "^";
+                    encodedQuery += "name=" + appNames[i];
+                }
+        }
+        return encodedQuery;
+    },
+    getEncodedQueryByAdoptionBluePrint: function(adoptionBluePrint) {
+        var adoptionBluePrintQuery = "";
+        for (var i = 0; i &lt; adoptionBluePrint.length; i++) {
+            if (i &gt; 0) adoptionBluePrintQuery += "^OR";
+            adoptionBluePrintQuery += "objective.sys_id=" + adoptionBluePrint[i];
+        }
+        return adoptionBluePrintQuery;
+    },
+    addCustomizationInfo: function(apps) {
+        for (var appIndex in apps) {
+            if (apps[appIndex].customization)
+                apps[appIndex].customized_version_info = sn_app_customization.AppCustomizationAPI.getCustomizationVersionInfo(apps[appIndex].sys_id);
+        }
+    },
+
+    type: 'AppInfoService'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-08-01 05:03:37&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;696a3829530111106883ddeeff7b122f&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;70&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AppInfoService&lt;/sys_name&gt;
+        &lt;sys_package display_value="Scoped App Client" source="sn_appclient"&gt;781f36a96fef21005be8883e6b3ee43d&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Scoped App Client"&gt;781f36a96fef21005be8883e6b3ee43d&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_696a3829530111106883ddeeff7b122f&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-10-06 08:12:36&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:38:12</sys_created_on>
+        <sys_id>a1e6305d83f01210c6695855eeaad36d</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AppInfoService</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_a1e6305d83f01210c6695855eeaad36d</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:38:12</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

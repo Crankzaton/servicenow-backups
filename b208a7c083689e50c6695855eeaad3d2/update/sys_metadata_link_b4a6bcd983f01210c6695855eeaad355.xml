@@ -1,0 +1,470 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>515d50640f832010af170c3635767e5d</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_hr_core.hr_BulkCaseUserSegmentUtils&lt;/api_name&gt;
+        &lt;caller_access&gt;2&lt;/caller_access&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;hr_BulkCaseUserSegmentUtils&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var hr_BulkCaseUserSegmentUtils = Class.create();
+hr_BulkCaseUserSegmentUtils.prototype = {
+
+    initialize: function() {
+        this.bulkCaseRequestUtils = new sn_hr_core.hr_BulkCaseRequestUtils();
+    },
+
+    /**
+     * Method to create user-segment records for user-selection 
+     *
+     * @param {GlideRecord} userSegmentGroupGR - sn_hr_core_bulk_case_user_segment_group record
+     *
+     * throws exceptions
+     */
+    createUserSegments: function(userSegmentGroupGR) {
+
+        try {
+            //update bulk-request status to draft while processing users for the request
+            var bulkCaseRequestGR = userSegmentGroupGR.bulk_case_request.getRefRecord();
+            if (gs.nil(bulkCaseRequestGR))
+                throw this.getError("'createUserSegments' - No bulk-case-request record found.");
+            this.bulkCaseRequestUtils.updateGlideRecord(bulkCaseRequestGR, {
+                'status': 'draft'
+            });
+
+            //Get user selection data
+            var userSelection = JSON.parse(userSegmentGroupGR.user_selection);
+            if (!userSelection)
+                throw this.getError("'createUserSegments' - No user selection data.");
+
+            //Get selected user record
+            var selectedUserGR = this.getSelectedUserRecord(userSelection);
+            if (!selectedUserGR.hasNext())
+                throw this.getError("'createUserSegments' - No user records to create user segment.");
+
+            //Create user segments for selected users
+            var includedUsers = [];
+            var userGroupID = userSegmentGroupGR.getUniqueValue();
+            var userGroupRevision = userSegmentGroupGR.getValue('revision');
+            var userGroupHRCriteria = userSegmentGroupGR.bulk_case_request.hr_service.hr_criteria;
+
+            while (selectedUserGR.next()) {
+                var selectedUserID = selectedUserGR.getUniqueValue();
+                var includedUserSegmentID = this.createUserSegmentRecord(
+                    selectedUserID,
+                    userGroupID,
+                    userGroupRevision,
+                    userGroupHRCriteria
+                );
+
+                //if user-segments record marked 'included' is inserted, store it for validation-query
+                if (!gs.nil(includedUserSegmentID))
+                    includedUsers.push(selectedUserID);
+            }
+
+            //Validate user-records for duplicate entries in other user-groups for the bulk-case-request
+            var bulkCaseRequestID = bulkCaseRequestGR.getUniqueValue();
+            this.validateIncludedUsers(includedUsers, bulkCaseRequestID, userSegmentGroupGR);
+
+            //Update bulk_case_user_segment_group status and count
+            userSegmentGroupGR.setValue('status', 'processed');
+            this.setUserGroupCount(userSegmentGroupGR);
+            if (!userSegmentGroupGR.update(gs.getMessage('User segment records processed for the group.')))
+                this.getError("'createUserSegments' - Failed to update user-segment-group status.");
+
+            //update bulk-request status to 'ready' if atleast one user included and update included-user count
+            var includedUserCount = this.bulkCaseRequestUtils.getIncludedUserCount(bulkCaseRequestID);
+            if (includedUserCount &gt; 0)
+                this.bulkCaseRequestUtils.updateGlideRecord(bulkCaseRequestGR, {
+                    'status': 'ready',
+                    'selected_user_count': includedUserCount
+                });
+
+            //Clean up lists whose revision was dropped following an update
+            this.removeUserSegmentsStaleRevisions(userSegmentGroupGR);
+
+        } catch (error) {
+            this.bulkCaseRequestUtils.updateGlideRecord(userSegmentGroupGR, {
+                'status': 'error'
+            });
+            this.getError("'createUserSegments' - " + error);
+        }
+    },
+
+    /**
+     * Method to include users marked as Duplicate by deleted segment group GR
+     *
+     * @param {GlideRecord} userSegmentGroupGR - sn_hr_core_bulk_case_user_segment_group record
+     *
+     */
+    validateDuplicateUsers: function(userSegmentGroupGR) {
+        try {
+            var bulkCaseRequestGR = userSegmentGroupGR.bulk_case_request.getRefRecord();
+            var bulkCaseRequestID = bulkCaseRequestGR.getUniqueValue();
+            var userSegmentGR = new GlideRecord('sn_hr_core_bulk_case_user_segment');
+            userSegmentGR.addQuery('user_segment_group_revision.bulk_case_request', bulkCaseRequestID);
+            userSegmentGR.addQuery('status', 'duplicate');
+            userSegmentGR.query();
+
+            while (userSegmentGR.next()) {
+                var dupUser = userSegmentGR.user;
+                var duplicateSegmentsGR = new GlideRecord('sn_hr_core_bulk_case_user_segment');
+                duplicateSegmentsGR.addQuery('user', dupUser);
+                duplicateSegmentsGR.addQuery('status', '!=', 'duplicate');
+                duplicateSegmentsGR.addQuery('user_segment_group_revision.bulk_case_request', bulkCaseRequestID);
+                duplicateSegmentsGR.query();
+
+                // If All the records of a user are in duplicate status. Mark one as not duplicate.
+                if (duplicateSegmentsGR.getRowCount() === 0) {
+                    userSegmentGR.setValue('status', 'included');
+                    userSegmentGR.update();
+                }
+            }
+        } catch (error) {
+            this.bulkCaseRequestUtils.updateGlideRecord(userSegmentGroupGR, {
+                'status': 'error'
+            });
+            this.getError("'validateDuplicateUsers' - " + error);
+        }
+        this.setUserGroupCount(userSegmentGroupGR);
+
+    },
+
+
+    /**
+     * Method to create user-segment record
+     *
+     * @params
+     *  {string} userID - sys_user.sys_id
+     *  {string} userSegmentGroupID - sn_hr_core_bulk_case_user_segment_group.sys_id
+     *  {string} userSegmentGroupRevision - sn_hr_core_bulk_case_user_segment_group.revision
+     *  {string} hrCriteria - sn_hr_core_criteria.sys_id
+	 
+	 * @returns record unique ID for included user
+     *
+     * throws exceptions
+     */
+    createUserSegmentRecord: function(userID, userSegmentGroupID, userSegmentGroupRevision, hrCriteria) {
+        //Create user-segment-record
+        var userSegmentGR = new GlideRecord('sn_hr_core_bulk_case_user_segment');
+        userSegmentGR.initialize();
+        userSegmentGR.setValue('user', userID);
+        userSegmentGR.setValue('user_segment_group_revision', userSegmentGroupRevision);
+        userSegmentGR.setValue('user_segment_group', userSegmentGroupID);
+
+        //Check if user satisfies hr_service.hr_criteria
+        var included = false;
+        if (!gs.nil(hrCriteria)) {
+            var hrCriteriaList = hrCriteria.split(',');
+            var hrCriteriaUtils = new sn_hr_core.hr_Criteria();
+
+            //Set default status
+            this.setUserSegmentStatus(userSegmentGR, 'excluded', gs.getMessage('User do not satisfy hr_service.hr_criteria.'));
+
+            //Include user that satisfy hr_service.hr_criteria
+            for (var i = 0; i &lt; hrCriteriaList.length; i++)
+                if (hrCriteriaUtils.evaluateById(hrCriteriaList[i], userID)) {
+                    this.setUserSegmentStatus(userSegmentGR, 'included', gs.getMessage('User satisfies hr_service.hr_criteria.'));
+                    included = true;
+                    break;
+                }
+        } else {
+            included = true;
+            this.setUserSegmentStatus(userSegmentGR, 'included', gs.getMessage('No hr_service.hr_criteria specified.'));
+        }
+        //Return unique ID only for included user-segment record
+        var userSegmentID = userSegmentGR.insert();
+        if (gs.nil(userSegmentID))
+            this.getError("'createUserSegmentRecord' - Failed to create user-segment record. Insert failed.");
+        else if (included)
+            return userSegmentID;
+    },
+
+    /**
+     * Validate  user-record status by comparing user-segment-group.updated-on date
+     * Set user-segment record 'duplicate' if same user is 'included' from current user-segment-group
+     *
+     * @params
+     *  includedUsers {Array}: sys_user sys_id's
+     *  bulkCaseRequestID {string}: sys_id of sn_hr_core_bulk_case_request table
+     *  currentGroupGR {GlideRecord}: sn_hr_core_bulk_case_user_segment_group record
+     *
+     * TO-DO: splice array at fixed size IF 'IN' GlideRecord query fails for 'sys_id' look-ups
+     */
+    validateIncludedUsers: function(includedUsers, bulkCaseRequestID, currentGroupGR) {
+        var userSegmentGR = new GlideRecord('sn_hr_core_bulk_case_user_segment');
+
+        //list of user also marked included as that of 'excludeUserGroupRevision'
+        userSegmentGR.addQuery('status', 'included');
+        userSegmentGR.addNotNullQuery('user_segment_group_revision.sys_id');
+        userSegmentGR.addQuery('user_segment_group_revision.status', 'processed').addOrCondition('user_segment_group_revision', currentGroupGR.revision);
+        userSegmentGR.addQuery('user_segment_group_revision.bulk_case_request', bulkCaseRequestID);
+        userSegmentGR.addQuery('user_segment_group_revision.updated_time', '&lt;', currentGroupGR.updated_time);
+        userSegmentGR.addQuery('user.sys_id', 'IN', includedUsers.join());
+        userSegmentGR.query();
+        var userSegmentCount = userSegmentGR.getRowCount();
+        //mark user-records with older group-updated-on value 'duplicate'
+        while (userSegmentGR.next()) {
+            this.setUserSegmentStatus(userSegmentGR, 'duplicate', gs.getMessage("The user is included from another user-segment-group with label '{0}'.", currentGroupGR.user_segment_group_label));
+            userSegmentGR.update();
+        }
+
+        //recalculate user count
+        if (userSegmentCount &gt; 0)
+            this.reCalculateUserCount(bulkCaseRequestID);
+    },
+
+    /**
+     * Update user-record status count for user-group
+     *
+     * @params
+     *  bulkCaseRequestID {string}: sys_id of sn_hr_core_bulk_case_request table
+     */
+    reCalculateUserCount: function(bulkCaseRequestID) {
+        if (gs.nil(bulkCaseRequestID))
+            throw this.getError("'reCalculateUserCount' - No bulk-case-request ID.");
+
+        var userGroupGR = new GlideRecord('sn_hr_core_bulk_case_user_segment_group');
+        userGroupGR.addQuery('bulk_case_request', bulkCaseRequestID);
+        userGroupGR.addQuery('status', 'processed');
+        userGroupGR.query();
+
+        while (userGroupGR.next())
+            this.updateUserCount(userGroupGR.sys_id);
+    },
+
+    updateUserCount: function(userGroupID) {
+        if (gs.nil(userGroupID))
+            throw this.getError("'updateUserCount' - No user-group ID.");
+
+        var userGroupGR = new GlideRecord('sn_hr_core_bulk_case_user_segment_group');
+        if (!userGroupGR.get(userGroupID))
+            throw this.getError("'updateUserCount' - No user-group record found.");
+        else {
+            this.setUserGroupCount(userGroupGR);
+            if (!userGroupGR.update(gs.getMessage('User count updated.')))
+                this.getError("'updateUserCount' - Failed to update user-segment-group count.");
+        }
+    },
+
+    setUserGroupCount: function(userGroupGR) {
+        if (gs.nil(userGroupGR))
+            throw this.getError("'setUserGroupCount' - Invalid user-segment-group record. Cannot set count.");
+
+        var userCount = this.getUserSegmentStatusCount(userGroupGR.revision);
+
+        userGroupGR.setValue('included_user_count', userCount.included ? userCount.included : 0);
+        userGroupGR.setValue('excluded_user_count', userCount.excluded ? userCount.excluded : 0);
+        userGroupGR.setValue('duplicate_user_count', userCount.duplicate ? userCount.duplicate : 0);
+    },
+
+    /**
+     * Method counts user-segment records in different statuses 
+     *
+     * @param: userGroupRevisionID {string} sn_hr_core_bulk_case_user_segment_group 'revision'
+     *
+     * @returns: {object} containing count for different sn_hr_core_bulk_case_user_segment statuses
+     **/
+    getUserSegmentStatusCount: function(userGroupRevisionID) {
+        if (gs.nil(userGroupRevisionID))
+            throw this.getError("'getUserSegmentStatusCount' - No user-segment-group ID.");
+
+        var userSegmentGA = new GlideAggregate('sn_hr_core_bulk_case_user_segment');
+        userSegmentGA.addNotNullQuery('user_segment_group_revision.sys_id');
+        userSegmentGA.addQuery('user_segment_group_revision', userGroupRevisionID);
+        userSegmentGA.addAggregate('COUNT', 'status');
+        userSegmentGA.setGroup(true);
+        userSegmentGA.groupBy('status');
+        userSegmentGA.query();
+        var userSegmentStatusCount = {};
+        while (userSegmentGA.next())
+            userSegmentStatusCount[userSegmentGA.status] = userSegmentGA.getAggregate('COUNT', 'status');
+
+        return userSegmentStatusCount;
+    },
+
+    setUserSegmentStatus: function(userSegmentGR, status, reason) {
+        if (gs.nil(userSegmentGR))
+            throw this.getError("'setUserSegmentStatus' - Invalid user-segment record. Cannot set status.");
+
+        userSegmentGR.setValue('status', status);
+        userSegmentGR.setValue('note', reason);
+    },
+
+    /**
+     * Drops user segments whose parent (by revision) no longer exists
+     *
+     * @params
+     *  {GlideRecord} userSegmentGroup - sn_hr_core_bulk_case_user_segment_group instance
+     */
+    removeUserSegmentsStaleRevisions: function(userSegmentGroup) {
+        var userSegmentRemoveGR = new GlideRecord('sn_hr_core_bulk_case_user_segment');
+        userSegmentRemoveGR.addQuery('user_segment_group', userSegmentGroup.sys_id);
+        userSegmentRemoveGR.addNullQuery('user_segment_group_revision.sys_id');
+        userSegmentRemoveGR.query();
+        userSegmentRemoveGR.deleteMultiple();
+    },
+
+    /**
+     * Method to get sys_user GlideRecord for user-selection on sn_hr_core_bulk_case_user_segment_group record
+     *
+     * @params {Object} userSelectionData - sn_hr_core_bulk_case_user_segment_group.user_selection.value (as provided by UI page to create user-segment)
+     *                                      contains `selectedOption` and `query` properties
+     *
+     * @return {GlideRecord} - sys_user record
+     * 
+     * throws exceptions
+     */
+    getSelectedUserRecord: function(userSelectionData) {
+        try {
+            //Validate data for user selection
+            if (!userSelectionData.hasOwnProperty('selectedOption') || !userSelectionData.hasOwnProperty('query'))
+                throw this.getError("'getSelectedUserRecord' - Invalid user selection data.");
+
+            //Get encoded-query to select sys_user record
+            var userEncodedQuery = this.getSelectUserEncodedQuery(userSelectionData.selectedOption, userSelectionData.query);
+            if (gs.nil(userEncodedQuery))
+                throw this.getError("'getSelectedUserRecord' - No encoded-query to fetch user record.");
+
+            //Create sys_user GlideRecord for selected users
+            var userGR = new GlideRecord('sys_user');
+            userGR.addActiveQuery();
+            userGR.addEncodedQuery(userEncodedQuery);
+            userGR.query();
+
+            //throw error if no user record found
+            var userRecordCount = userGR.getRowCount();
+            if (userRecordCount &lt; 1)
+                throw this.getError("'getSelectedUserRecord' - " + userRecordCount + " user records found.");
+
+            return userGR;
+
+        } catch (error) {
+            this.getError("'getSelectedUserRecord' - " + error);
+        }
+    },
+
+    /**
+     * Method to get string encodedQuery for querying sys_user GlideRecord
+     *
+     * @params {string} userSelectionType - as provided by UI page to create user-segment
+     * @params {string} userSelectionQuery - as provided by UI page to create user-segment
+     *
+     * @return {String} encodedQuery
+     * 
+     * throws exceptions
+     */
+    getSelectUserEncodedQuery: function(userSelectionType, userSelectionQuery) {
+        try {
+            switch (userSelectionType) {
+
+                //Retrieves encoded query 
+                case 'user_criteria':
+                case 'hr_criteria':
+                case 'filter_users':
+                    var encodedQuery = new sn_hr_core.hr_BulkCaseCreation().getUserSelectionEncodedQuery(userSelectionQuery, userSelectionType);
+                    if (encodedQuery === 'sys_idISEMPTY')
+                        throw this.getError("'getSelectUserEncodedQuery' - Invalid user query.");
+                    return encodedQuery;
+
+                    //Retrieves user sys_ids
+                case 'hr_profile':
+                case 'upload_file':
+                    return this.getEncodedQueryForUserIDs(userSelectionType, userSelectionQuery);
+
+                    //No encoded-query to select user
+                default:
+                    throw this.getError("'getSelectUserEncodedQuery' - Invalid user selection type.");
+            }
+        } catch (error) {
+            this.getError("'getSelectUserEncodedQuery' - " + error);
+        }
+    },
+
+    /**
+     * Method to get string encodedQuery for selecting sys_user by sys_id
+     *
+     * @params {string} userSelectionType - as provided by UI page to create user-segment
+     * @params {string} userSelectionQuery - as provided by UI page to create user-segment
+     *
+     * @return {String} encodedQuery
+     * 
+     * throws exceptions
+     */
+    getEncodedQueryForUserIDs: function(userSelectionType, userSelectionQuery) {
+        var bulkCaseUtils = new sn_hr_core.hr_BulkCaseCreation();
+        var userIDs = [];
+
+        //Retrieves selected user sys_id's
+        switch (userSelectionType) {
+            case 'hr_profile':
+                userIDs = bulkCaseUtils.getUsersSysidsFromCriteriaCondition('sn_hr_core_profile', userSelectionQuery, 'user');
+                break;
+
+            case 'upload_file':
+                var userQueryForUploadedFile = 'bulk_case_creation_run.sys_id=' + userSelectionQuery + '^query_result=Found^userISNOTEMPTY';
+                userIDs = bulkCaseUtils.getUsersSysidsFromCriteriaCondition('sn_hr_core_bulk_case_creation_data', userQueryForUploadedFile, 'user');
+                break;
+
+            default:
+                throw this.getError("'getEncodedQueryForUserIDs' - Invalid user selection type.");
+        }
+
+        if (userIDs.length &lt; 1)
+            throw this.getError("'getEncodedQueryForUserIDs' - No user ID found");
+
+        //Return encoded-query for sys_user record
+        return 'sys_idIN' + userIDs.join();
+    },
+
+    /**
+     * Method to be used  when throwing an exception. To get an error object from the message. This method logs the
+     * message and returns an Error object.
+     *
+     * @param {string} message - The error message.
+     *
+     * @return {Error} - The error object.
+     */
+    getError: function(message) {
+        var errorMessage = 'Script include: hr_BulkCaseUserSegmentUtils - ' + message;
+        gs.error(errorMessage);
+
+        return new Error(errorMessage);
+    },
+
+    type: 'hr_BulkCaseUserSegmentUtils'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-03-18 21:57:57&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;515d50640f832010af170c3635767e5d&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;169&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;hr_BulkCaseUserSegmentUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Human Resources: Core" source="sn_hr_core"&gt;d4ac3fff5b311200a4656ede91f91af2&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Human Resources: Core"&gt;d4ac3fff5b311200a4656ede91f91af2&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_515d50640f832010af170c3635767e5d&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-04-17 09:10:49&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:37:03</sys_created_on>
+        <sys_id>b4a6bcd983f01210c6695855eeaad355</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>hr_BulkCaseUserSegmentUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_b4a6bcd983f01210c6695855eeaad355</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:37:03</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

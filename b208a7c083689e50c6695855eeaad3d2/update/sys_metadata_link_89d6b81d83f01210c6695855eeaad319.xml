@@ -1,0 +1,472 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>634988945b1230101b488d769e81c7aa</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_aisearch_global.AISConverter&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Converts Zing application configurations to AI Search creating any missing indexed sources, adding search sources with the appropriate filters and linking them to new search profiles.&lt;/description&gt;
+        &lt;name&gt;AISConverter&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var AISConverter = Class.create();
+AISConverter.prototype = {
+
+    initialize: function(migrationSysID) {
+        this.migrationSysID = migrationSysID;
+        this.logger = new AisMigrationLogger(migrationSysID, 'Converter');
+        this.conflictResolver = new AisMigrationConflictResolver(this.migrationSysID);
+        this.facetGenerator = new AisMigrationFacetGenerator(this.migrationSysID);
+        this.titleTextHandler = new AisMigrationTitleTextHandler(this.migrationSysID);
+        this.tableConfigHandler = new AisMigrationTableConfigHandler(this.migrationSysID);
+        this.arrayUtils = new global.ArrayUtil();
+        this.utils = new AISMigrationUtils();
+    },
+
+    convertAll: function() {
+        var uxSearchConfigIds = new AISMigrationUtils().getSearchConfigurationsToMigrate();
+
+        if (!Array.isArray(uxSearchConfigIds) || uxSearchConfigIds.length === 0) {
+            this.logger.error('There is no eligible search config for global search, aborting converting zing search config to AI Search config.');
+            return;
+        }
+
+        this.logger.info('Attempting to convert configs: ' + uxSearchConfigIds);
+        for (var searchContextID in uxSearchConfigIds)
+            this._convertZingSearchContext(uxSearchConfigIds[searchContextID]);
+
+        this._associateSearchConfigsWithMigrationJob(uxSearchConfigIds);
+
+    },
+
+    convertContexts: function(contextArr, searchAppName) {
+        if (!Array.isArray(contextArr) || contextArr.length === 0) {
+            this.logger.error('There is no eligible search config for global search, aborting converting zing search config to AI Search config.');
+            return;
+        }
+
+        this.logger.info('Attempting to convert zing search application configs: ' + searchAppName + ' ' + contextArr);
+        for (var searchContextID in contextArr)
+            this._convertZingSearchContext(contextArr[searchContextID]);
+    },
+
+    _convertZingSearchContext: function(zingSearchContextID) {
+        this.logger.info('Start conversion for search context sys_id: ' + zingSearchContextID);
+
+        var searchContextGr = new GlideRecord('sys_search_context_config');
+        searchContextGr.get(zingSearchContextID);
+
+        // Ensure we are converting a zing config
+        if (searchContextGr.getValue('search_engine') !== 'zing') {
+            this.logger.warn('Search engine is set to ' + searchContextGr.getValue('search_engine') + '. Skipping this context');
+            return;
+        }
+
+        var aisContextID = this._getMigratedSearchContextID(zingSearchContextID);
+        var aisSearchProfileID;
+
+        if (!aisContextID) {
+            // Create an AI Search search profile if it does not exist
+            aisSearchProfileID = this._createSearchProfile(searchContextGr.getValue('name'));
+
+            if (!aisSearchProfileID) {
+                this.logger.warn('Unable to get or create AI Search Profile. Skipping this context: ' + zingSearchContextID);
+                return;
+            }
+            // Create a search context config for AI Search
+            aisContextID = this._createNewConfig(searchContextGr, aisSearchProfileID);
+            if (!aisContextID) {
+                this.logger.warn('Unable to get or create sys_search_context_config. Skipping this context: ' + zingSearchContextID);
+                return;
+            }
+        } else {
+            aisSearchProfileID = this._getExistingProfile(aisContextID);
+            if (aisSearchProfileID == null) {
+
+                this.logger.warn('Unable to find search profile for migrated sys_search_context_config. Skipping this context: ' + zingSearchContextID);
+                return;
+            }
+        }
+
+        // Find the search sources to convert
+        var zingSources = [];
+        var linkGR = new GlideRecord('m2m_search_context_config_search_source');
+        linkGR.addQuery('search_context_config', zingSearchContextID);
+        linkGR.query();
+        var util = new sn_ais.AisUtil();
+        while (linkGR.next()) {
+            //Ensure that source is indexable by ais
+            if (!util.isTableIndexable(linkGR.source.source_table)) {
+                this.logger.warn('Search source: ' + linkGR.source.source_table + ' cannot be indexed by AI Search, skipping converting zing search source.');
+                continue;
+            }
+            zingSources.push(linkGR.getValue('source'));
+        }
+
+        if (zingSources.length === 0) {
+            this.logger.warn('No Zing search sources found to migrate. Skipping this context ' + zingSearchContextID);
+            return;
+        }
+
+        // Convert Zing search sources to AIS Indexed sources and Search Sources (get the search source ids so we can link it to a profile)
+        var aisSearchSources = [];
+        for (var z in zingSources)
+            aisSearchSources.push(this._convertSearchSource(zingSources[z]));
+
+        if (aisSearchSources.length === 0) {
+            this.logger.warn('No Zing search sources were converted. Skipping this context');
+            return;
+        }
+
+        // Link all our search sources to this profile (This will create navigation tabs via sys_script:cc882ca3c35314109e777d127840dda6)
+        for (var j in aisSearchSources)
+            this._linkSearchSourceToProfile(aisSearchProfileID, aisSearchSources[j]);
+
+        this._addDefaultSortOptions(aisContextID);
+        this.facetGenerator.generate(aisContextID, aisSearchSources);
+    },
+
+    /**
+    A Zing search source converts potentially to an AI Search Indexed Source AND an AI Search Search Source
+	 **/
+    _convertSearchSource: function(zingSearchSourceSysID) {
+        var zingSearchSourceGR = new GlideRecord('sys_search_source');
+        if (!zingSearchSourceGR.get(zingSearchSourceSysID)) {
+            this.logger.warn('Could not find search source with sys_id: ' + zingSearchSourceSysID);
+            return;
+        }
+
+        var searchSourceName = zingSearchSourceGR.getValue('sys_name');
+        var searchSourceSysID = zingSearchSourceGR.getUniqueValue();
+        var searchSourceTable = zingSearchSourceGR.getValue('source_table');
+
+        var migratedSearchSourceObj = this._getMigratedSearchSource(searchSourceSysID);
+        if (migratedSearchSourceObj) {
+            this.logger.info('Search source: ' + searchSourceName + ' has already been migrated to: ' + migratedSearchSourceObj.name);
+            return migratedSearchSourceObj;
+        } else {
+            var existingSearchSourceObj = this._getExistingSearchSource(zingSearchSourceGR);
+            if (existingSearchSourceObj) {
+                this.logger.info('Found an existing AI Search source matching the Zing search source: ' + searchSourceName);
+                return existingSearchSourceObj;
+            }
+        }
+
+        this.logger.info('Converting Zing search source name: ' + searchSourceName);
+        var indexedSource = this._findIndexedSourceForZingSource(zingSearchSourceGR);
+        var aisSearchSourceObj = this._createAisSearchSource(zingSearchSourceGR, indexedSource);
+        this._markSearchSourceMigrated(searchSourceSysID, aisSearchSourceObj.sys_id);
+
+        return aisSearchSourceObj;
+    },
+
+    /**
+    AI Search does not support more than one indexed source per table. Hence the need to check for existing indexed sources.
+	 **/
+    _findIndexedSourceForZingSource: function(zingSourceGR) {
+        var table = zingSourceGR.getValue('source_table');
+
+        // check child table
+        var aisChildGR = new GlideRecord('ais_child_table');
+        aisChildGR.addQuery('table', table);
+        aisChildGR.query();
+        if (aisChildGR.next()) {
+            var datasource = aisChildGR.getValue('datasource');
+
+            var indexedSourceGR = new GlideRecord('ais_datasource');
+            indexedSourceGR.get(datasource);
+
+            this.logger.info("Indexed source for table: " + table + " already exists as child table of parent indexed source: " + indexedSourceGR.source);
+            return indexedSourceGR.source + "-" + indexedSourceGR.sys_id;
+        }
+
+        var aisSourceGR = new GlideRecord('ais_datasource');
+        aisSourceGR.addQuery('source', table);
+        aisSourceGR.query();
+        if (aisSourceGR.next()) {
+            var source = aisSourceGR.getValue('source');
+            this.logger.info("Indexed source for table: " + table + " already exists");
+            return source + "-" + aisSourceGR.sys_id;
+        }
+
+
+        if (this.arrayUtils.contains(this.utils.PLUGIN_INDEXED_SOURCES, table)) {
+            throw new Error('Table: ' + table + ' is expected to create an Indexed Source only through the "AI Search Index Sources" plugin. Please activate this plugin before running the migration job');
+        }
+
+        // If we are here, we need to create a new indexed source
+        var aisIndexedSourceGr = new AisMigrationRecord(this.migrationSysID, "ais_datasource");
+
+        var rootTable = new GlideTableHierarchy(table).getRoot();
+        //task table requires retention_policy to be set
+        if (rootTable === 'task')
+            aisIndexedSourceGr.setValue('retention_policy', '04f129e57792f010be280d892c5a99d9');
+
+        aisIndexedSourceGr.setValue("name", '[Migrated] ' + zingSourceGR.getValue('sys_name'));
+        aisIndexedSourceGr.setValue("source", table);
+        aisIndexedSourceGr.setNeedsReview(true);
+        var indexedSourceSysID = aisIndexedSourceGr.insert();
+
+        // If we created an indexed source, we need to set its attributes
+        this.titleTextHandler.createTitleTextMappings(table, indexedSourceSysID);
+        this.tableConfigHandler.migrateAttributes(table, indexedSourceSysID);
+        this.tableConfigHandler.addChildTables(table, indexedSourceSysID);
+        return table + "-" + indexedSourceSysID;
+    },
+
+    _createAisSearchSource: function(zingSourceGR, indexedSource) {
+        var indexedSourceTable = indexedSource.split("-")[0];
+        var indexedSourceSysID = indexedSource.split("-")[1];
+
+        var aisSearchSourceStagingGr = new AisMigrationRecord(this.migrationSysID, 'ais_search_source');
+        var name = zingSourceGR.getValue('sys_name');
+        var zingTable = zingSourceGR.getValue('source_table');
+
+        aisSearchSourceStagingGr.setValue('name', name);
+        aisSearchSourceStagingGr.setValue('datasource', indexedSourceTable);
+
+        var glideRecord = new GlideRecord(indexedSourceTable);
+
+        var condition = zingSourceGR.getValue('condition');
+
+        // If the indexed source is on a parent table, then add a filter for the child table. This is not fool proof, but its the best we can do without requiring manual intervention
+        if (zingTable != indexedSourceTable &amp;&amp; glideRecord.isValidField('sys_class_name')) {
+            if (condition != null)
+                condition = 'sys_class_name=' + zingTable + '^' + condition;
+            else
+                condition = 'sys_class_name=' + zingTable;
+        }
+
+        //Handle conditions with dot-walked fields
+        if (condition != '' &amp;&amp; condition != null) {
+            var result = new sn_ais.AisUtil().canConvertToSearchFilter(indexedSourceTable, condition);
+            if (result) {
+                this.titleTextHandler.createDotWalkMapping(indexedSourceTable, indexedSourceSysID, condition);
+            }
+        }
+
+        aisSearchSourceStagingGr.setValue('condition', condition);
+
+        return {
+            'sys_id': aisSearchSourceStagingGr.insert(),
+            'table': indexedSourceTable,
+            'name': name
+        };
+    },
+
+    _createSearchProfile: function(zingContextName) {
+        var name = this._getSearchProfileName(zingContextName);
+        var profileStagingGR = new AisMigrationRecord(this.migrationSysID, 'ais_search_profile');
+        profileStagingGR.setValue('name', name);
+        profileStagingGR.setValue('label', '[Migrated] ' + zingContextName);
+
+        var profileID = profileStagingGR.insert();
+        this.logger.info('Created a new AI Search profile: ' + profileID);
+        return profileID;
+    },
+
+    _linkSearchSourceToProfile: function(profileID, sourceObj) {
+        // Check that the link does not exist yet
+        var m2mGr = new GlideRecord('ais_search_profile_ais_search_source_m2m');
+        m2mGr.addQuery('profile', profileID);
+        m2mGr.addQuery('search_source', sourceObj['sys_id']);
+        m2mGr.query();
+
+        if (m2mGr.hasNext()) {
+            this.logger.info('Link between profile: ' + profileID + ' and search source: ' + sourceObj['sys_id'] + ' already exists');
+            return;
+        }
+
+        var linkGR = new AisMigrationRecord(this.migrationSysID, 'ais_search_profile_ais_search_source_m2m');
+        linkGR.setValue('search_source', sourceObj['sys_id']);
+        linkGR.setValue('profile', profileID);
+        linkGR.insert();
+    },
+
+    _createNewConfig: function(confGR, aisSearchProfileID) {
+        var newConfigGR = new AisMigrationRecord(this.migrationSysID, 'sys_search_context_config');
+        newConfigGR.setValue('name', '[Migrated] ' + confGR.getValue('name'));
+        newConfigGR.setValue('genius_results_limit', confGR.getValue('genius_results_limit') ? confGR.getValue('genius_results_limit') : 1);
+        newConfigGR.setValue('hit_highlighting', confGR.getValue('hit_highlighting'));
+        newConfigGR.setValue('search_results_limit', confGR.getValue('search_results_limit'));
+        newConfigGR.setValue('spell_check', confGR.getValue('spell_check'));
+        newConfigGR.setValue('suggestions_to_show_limit', confGR.getValue('suggestions_to_show_limit'));
+        newConfigGR.setValue('search_engine', 'ai_search');
+        newConfigGR.setValue('search_profile', aisSearchProfileID);
+        newConfigGR.setValue('spell_check', 'true');
+        newConfigGR.setValue('evam_definition', 'f78b729b53d801109fa9ddeeff7b1201');
+        this.logger.info('Created AI Search application for ' + confGR.getValue('name'));
+
+        var aisContextID = newConfigGR.insert();
+        this._markSearchContextMigrated(confGR.getUniqueValue(), aisContextID);
+        return aisContextID;
+    },
+
+    /**
+    Util functions below
+	 **/
+
+    _getSearchProfileName: function(label) {
+        // convert all capital letters to lower case
+        var lowercase = label.toLowerCase();
+        // replace all whitespace characters with '_'
+        return '_migrated_' + lowercase.replaceAll(' ', '_');
+    },
+
+    _getMigratedSearchSource: function(sysSearchSourceSysID) {
+        var migratedRecords = new GlideRecord('sn_aisearch_global_job_completion');
+        migratedRecords.addQuery('table_name', 'sys_search_source');
+        migratedRecords.addQuery('source_sys_id', sysSearchSourceSysID);
+        migratedRecords.query();
+
+        if (!migratedRecords.next())
+            return;
+
+        var migratedSearchSourceSysID = migratedRecords.getValue('destination_sys_id');
+        var gr = new GlideRecord('ais_search_source');
+        if (!gr.get(migratedSearchSourceSysID))
+            return;
+
+        return {
+            'sys_id': migratedSearchSourceSysID,
+            'table': gr.getValue('datasource'),
+            'name': gr.getValue('name')
+        };
+
+    },
+
+    /**
+    Marks a Zing search source as migrated so that we do not re-migrate sources
+	 **/
+    _markSearchSourceMigrated: function(sysSearchSourceSysID, aisSearchSourceID) {
+        var migratedRecords = new GlideRecord('sn_aisearch_global_job_completion');
+        migratedRecords.initialize();
+        migratedRecords.setValue('table_name', 'sys_search_source');
+        migratedRecords.setValue('source_sys_id', sysSearchSourceSysID);
+        migratedRecords.setValue('destination_sys_id', aisSearchSourceID);
+        migratedRecords.insert();
+    },
+
+    /**
+    Marks a Zing search source as migrated so that we do not re-migrate sources
+	 **/
+    _markSearchContextMigrated: function(zingContextID, aisContextID) {
+        var migratedRecords = new GlideRecord('sn_aisearch_global_job_completion');
+        migratedRecords.initialize();
+        migratedRecords.setValue('table_name', 'sys_search_context_config');
+        migratedRecords.setValue('source_sys_id', zingContextID);
+        migratedRecords.setValue('destination_sys_id', aisContextID);
+        migratedRecords.insert();
+    },
+
+    // Add the converted configs to this migration job record so we know which configs were converted by the job
+    _associateSearchConfigsWithMigrationJob: function(configSysIDs) {
+        var gr = new GlideRecord('sn_aisearch_global_migration_job');
+        gr.get(this.migrationSysID);
+        gr.setValue('migrated_config', configSysIDs);
+        gr.update();
+    },
+
+    _getMigratedSearchContextID: function(zingContextID) {
+        var completedMigrationRecords = new GlideRecord('sn_aisearch_global_job_completion');
+        completedMigrationRecords.addQuery('table_name', 'sys_search_context_config');
+        completedMigrationRecords.addQuery('source_sys_id', zingContextID);
+        completedMigrationRecords.query();
+
+        if (!completedMigrationRecords.next())
+            return;
+
+        return completedMigrationRecords.getValue('destination_sys_id');
+    },
+
+    _getExistingProfile: function(aisSearchContextID) {
+        var searchContextGr = new GlideRecord('sys_search_context_config');
+        searchContextGr.get(aisSearchContextID);
+        if (searchContextGr.getValue('search_engine') == 'ai_search' &amp;&amp; searchContextGr.getValue('search_profile') != null)
+            return searchContextGr.getValue('search_profile');
+
+        return;
+    },
+
+    _getExistingSearchSource: function(zingSearchSourceGR) {
+        var sourceGR = this.utils.searchSourceExists(zingSearchSourceGR);
+        if (sourceGR) {
+            return {
+                'sys_id': sourceGR.sys_id,
+                'table': sourceGR.datasource.source,
+                'name': sourceGR.name
+            };
+        }
+        return false;
+    },
+
+    _addDefaultSortOptions: function(aisContextID) {
+        var default_sort_options = [{
+                'name': 'Updated (oldest)',
+                'field': 'sort_by_date',
+                'ascending': true
+            },
+            {
+                'name': 'Updated (newest)',
+                'field': 'sort_by_date',
+                'ascending': false
+            },
+        ];
+        for (var i in default_sort_options) {
+            var sort_option = default_sort_options[i];
+            this._createSortOption(sort_option.name, sort_option.field, sort_option.ascending, aisContextID);
+        }
+    },
+
+    _createSortOption: function(label, ais_field, ascending, aisContextID) {
+        var sortExists = new GlideRecord('sys_search_sort_option');
+        sortExists.addQuery('search_context_config', aisContextID);
+        sortExists.addQuery('ais_field_name', ais_field);
+        sortExists.addQuery('ascending', ascending);
+        sortExists.query();
+        if (sortExists.getRowCount() &gt; 0)
+            return;
+
+        var sortOption = new AisMigrationRecord(this.migrationSysID, 'sys_search_sort_option');
+        sortOption.setValue('ais_field_name', ais_field);
+        sortOption.setValue('gui_label', label);
+        sortOption.setValue('ascending', ascending);
+        sortOption.setValue('search_context_config', aisContextID);
+        sortOption.setValue('active', true);
+        sortOption.insert();
+    },
+
+    type: 'AISConverter'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-08-26 15:28:55&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;634988945b1230101b488d769e81c7aa&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;187&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AISConverter&lt;/sys_name&gt;
+        &lt;sys_package display_value="AI Search For Next Experience" source="sn_aisearch_global"&gt;3c467b5f0bf130109e0fa4e6e9c4c946&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="AI Search For Next Experience"&gt;3c467b5f0bf130109e0fa4e6e9c4c946&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_634988945b1230101b488d769e81c7aa&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-07-26 20:51:48&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:37:53</sys_created_on>
+        <sys_id>89d6b81d83f01210c6695855eeaad319</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AISConverter</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_89d6b81d83f01210c6695855eeaad319</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:37:53</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

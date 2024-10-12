@@ -1,0 +1,630 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>6a8a6b13972815108843f73ef053af27</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_pdf_table_bldr.PDFtoTableHelper&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;PDFtoTableHelper&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[
+var PDFtoTableHelper = Class.create();
+
+PDFtoTableHelper.prototype = {
+    initialize: function() {
+
+    },
+
+    /**
+     - Get Attachmnet
+     - Process PDF into chunks and save it in table
+     - Trigger job
+    **/
+
+    processPdf: function(atthmt_helper_sys_id, isRetryForParsing) {
+        var solutionName = this.checkAndReturnConfigSolutionName();
+        var isPDFExist = false;
+        var return_obj = {
+			status:'success'
+		};
+
+
+        if (isRetryForParsing &amp;&amp; this._validateExistingAttachment(atthmt_helper_sys_id)) {
+            this.updateState(atthmt_helper_sys_id, 'assigned', " ");
+            this.submittingPdfToParser(solutionName);
+            return return_obj;
+        }
+
+        if (this._validateExistingAttachment(atthmt_helper_sys_id, "is_atatchment_processed")) {
+            return return_obj;
+        }
+
+        if (!solutionName) {
+            throw {
+                status: 'error',
+                message: "The configuration is not yet ready."
+            };
+        }
+
+        try {
+            isPDFExist = this.processPDFIntoChunks(atthmt_helper_sys_id);
+        } catch (e) {
+            throw e;
+        }
+
+
+
+        if (isPDFExist) {
+            this.submittingPdfToParser(solutionName);
+        } else {
+            throw {
+                status: 'error',
+                message: "The provided sys_id doesn't have any attachments."
+            };
+        }
+        return {
+            status: "Success"
+        };
+    },
+
+    checkAndReturnConfigSolutionName: function() {
+        var pdfSolutionJson,
+            solutionName = "",
+            grSolDef = new GlideRecord(PDFtoTableConstants.ML_CAPABILITY_DEFINITION_TABLE);
+
+        if (!grSolDef.isValid()) {
+            throw {
+                status: 'error',
+                message: "Table doesn't exist , please check configuration- " + PDFtoTableConstants.ML_CAPABILITY_DEFINITION_TABLE
+            };
+        }
+
+        grSolDef.addQuery("solution_label", PDFtoTableConstants.PARSER_CONFIGURATION_RECORD_LABEL);
+        grSolDef.addQuery("active", true);
+        grSolDef.orderByDesc("sys_created_on");
+        grSolDef.query();
+        if (grSolDef.next()) {
+            solutionName = grSolDef.getValue("solution_name");
+        } else {
+            pdfSolutionJson = this.getPdfPreprocessingWorkflow();
+            try {
+                solutionName = sn_ml.WorkflowSolutionStore.add(
+                    sn_ml.WorkflowSolution(pdfSolutionJson)
+                );
+            } catch (e) {
+                return {
+                    status: 'error',
+                    message: "Something went wrong while doing configuration " + e
+                };
+            }
+        }
+
+        return solutionName;
+    },
+
+    processPDFIntoChunks: function(atthmt_helper_sys_id) {
+        var attachment = new GlideSysAttachment();
+        var agr = attachment.getAttachments(
+            PDFtoTableConstants.ATTACHMENT_HELPER,
+            atthmt_helper_sys_id
+        );
+        var isPDFExist = false;
+        var chunks = [];
+
+        while (agr.next()) {
+
+            var contentType = agr.getValue("content_type");
+            var size_mb = parseFloat((agr.getValue('size_bytes') / (1024 * 1024))).toFixed(3);
+
+            if (PDFtoTableConstants.SUPPORT_PDF_FORMAT_TYPES.indexOf(contentType) &lt; 0) {
+                throw {
+                    status: 'error',
+                    message: "The type of file is not supported to parse"
+                };
+            }
+
+            if (size_mb &gt; 5) {
+                throw {
+                    status: 'error',
+                    message: "The PDF size is more than 5MB"
+                };
+            }
+
+            try {
+                chunks = this.chunkString(attachment.getContentBase64(agr));
+                if (chunks.length) {
+                    for (j = 0; j &lt; chunks.length; j++) {
+                        var grPDFInput = new GlideRecord(PDFtoTableConstants.PDF_INPUT_TABLE);
+                        grPDFInput.newRecord();
+                        grPDFInput.setValue("pdf", atthmt_helper_sys_id);
+                        grPDFInput.setValue("data", chunks[j]);
+                        grPDFInput.setValue("chunk_number", j);
+                        grPDFInput.setValue("state", "assigned");
+                        grPDFInput.insert();
+                    }
+                    isPDFExist = true;
+                }
+
+            } catch (e) {
+                throw {
+                    status: 'error',
+                    message: 'Unable to chunk PDF - PDF size may be greater than 5 MB'
+                };
+            }
+        }
+
+        return isPDFExist;
+
+    },
+
+    /**
+    "ERR030: Cannot submit training request job.
+    A solution training is already in progress.
+    **/
+
+    submittingPdfToParser: function(solutionName) {
+        var solution_name = solutionName ? solutionName : this.checkAndReturnConfigSolutionName();
+        var pdfSolutionDef = sn_ml.WorkflowSolutionStore.get(solution_name);
+
+        try {
+            pdfSolutionDef.submitTrainingJob();
+
+        } catch (ex) {
+            if (ex.message.includes("ERR030")) {
+                gs.debug("PDF job already scheduled for: ");
+            } else {
+                throw {
+                    status: 'error',
+                    message: ex
+                };
+            }
+        }
+
+    },
+
+    getPdfPreprocessingWorkflow: function() {
+        var pdfInputData = new sn_ml.DatasetDefinition(PDFtoTableConstants.ML_DATASET_DEFINATION);
+        var schedulingInfo = {
+            useCase: PDFtoTableConstants.PARSER_CONFIGURATION_RECORD_LABEL
+        };
+
+        return {
+            label: (PDFtoTableConstants.PARSER_CONFIGURATION_RECORD_LABEL).toString(),
+            workflowLanguageVersion: PDFtoTableConstants.PIPELINE_WORKFLOW_VERSION,
+            description: "AES PDF preprocessing workflow",
+            tags: ["aes", "pdf", "workflow"],
+            workflowConfiguration: {
+                trainingFrequency: "run_once",
+            },
+            schedulingInfo: schedulingInfo,
+            trainingPipeline: {
+                pipelineInput: {
+                    datasets: {
+                        pdf_input: pdfInputData,
+                    },
+                    config: {
+                        max_pages: PDFtoTableConstants.MAX_NUMBER_OF_PDF_PAGES,
+                        save_format: PDFtoTableConstants.IMAGE_SAVE_FORMAT,
+                        quality: PDFtoTableConstants.IMAGE_SAVE_QUALITY,
+                    },
+                },
+                pipelineName: PDFtoTableConstants.PIPELINE_NAME,
+            }
+        };
+    },
+
+    /**
+     Divide the pdf data into chunks
+    **/
+    chunkString: function(str) {
+        var chunkSize = PDFtoTableConstants.CHUNK_SIZE || 800000;
+        var numberOfChunks = Math.ceil(str.length / chunkSize);
+        var chunks = new Array(numberOfChunks);
+        var offset = 0;
+        for (var i = 0; i &lt; numberOfChunks; i++) {
+            chunks[i] = str.substr(offset, chunkSize);
+            offset += chunkSize;
+        }
+        return chunks;
+    },
+
+    /**
+     - Poll API to get status
+    **/
+    getPollStatus: function(attachmentSysId, isConnectionTimeOut) {
+
+        var grInputRec = new GlideRecord(PDFtoTableConstants.PDF_INPUT_TABLE);
+        var return_obj = {},
+            schedulerStatus = {},
+            parserOutputSysId;
+        grInputRec.addQuery('pdf', attachmentSysId);
+        grInputRec.addQuery('chunk_number', 0);
+        grInputRec.query();
+
+        if (grInputRec.next()) {
+
+            return_obj.state = grInputRec.getValue('state');
+            return_obj.message = grInputRec.getValue('message');
+
+            if (isConnectionTimeOut) {
+                this.updateState(attachmentSysId, 'error', 'CONNECTION_TIME_OUT_ISSUE');
+                return {
+                    state: 'error',
+                    message: 'CONNECTION_TIME_OUT_ISSUE'
+                };
+            }
+
+            if (return_obj.state === 'error') {
+                return {
+                    state: 'error',
+                    message: return_obj.message || 'Failed to parse pdf.'
+                };
+            }
+
+
+            if (return_obj.state === 'complete') {
+                schedulerStatus = {
+                    'state': 'complete'
+                };
+
+            } else {
+                schedulerStatus = this.getCurrentJobStatus();
+                if (['error', 'timed_out', 'retry'].indexOf(schedulerStatus['state']) &gt; -1) {
+                    this.updateState(attachmentSysId, 'error', "FAILED_FROM_SERVER_END-PLEASE_RETRY");
+                }
+            }
+        } else {
+            return_obj = {
+                status: 'error',
+                message: 'Something went wrong while polling'
+            };
+        }
+
+        return_obj['job_status'] = schedulerStatus;
+
+        return return_obj;
+
+    },
+
+    /**
+      Need to revist below function
+    **/
+    getCurrentJobStatus: function() {
+
+        var gr = new GlideRecord('ml_solution');
+        gr.addEncodedQuery('solution_nameLIKE'+PDFtoTableConstants.PARSER_CONFIGURATION_RECORD_LABEL);
+        gr.orderByDesc("sys_updated_on");
+        gr.query();
+        if (gr.next()) {
+            return {
+                state: PDFtoTableConstants.ERROR_NOTATION[gr.getValue('state')] || gr.getDisplayValue('state'),
+                progress: gr.getValue('progress')
+            };
+        }
+
+        return null;
+    },
+
+
+    /**
+	** - This function being called from BR
+        Extracting the PDF and updating the result in appropriate record.
+    **/
+    getPdfResult: function(currentSolution) {
+
+        var modelArtifactRec = new GlideRecord("ml_model_artifact");
+        var result = {};
+        modelArtifactRec.addQuery(
+            "solution",
+            "=",
+            currentSolution.getUniqueValue()
+        );
+        modelArtifactRec.query();
+        var status = 'complete';
+
+
+        while (modelArtifactRec.next()) {
+            var attachment = new GlideSysAttachment();
+            var agr = attachment.getAttachments(
+                "ml_model_artifact",
+                modelArtifactRec.getUniqueValue()
+            );
+            var model_id = modelArtifactRec.getValue("model_id");
+
+            if (model_id === "output_metadata") {
+                if (agr.next()) {
+                    var meta_data = attachment.getContent(agr);
+
+                    result.metaData = JSON.parse(meta_data);
+                }
+
+            } else if (model_id === "output") {
+                if (agr.next()) {
+                    var stream = attachment.getContentStream(agr.sys_id);
+                    result.output = {};
+                    var reader = new GlideTextReader(stream);
+                    var ln = '',
+                        data;
+                    while ((ln = reader.readLine()) != null) {
+                        try {
+                            data = JSON.parse(ln);
+                            if (data['file_name'] &amp;&amp; !result.output[data['file_name']]) {
+                                result.output[data['file_name']] = [];
+                            }
+                            data['file_name'] &amp;&amp; result.output[data['file_name']].push(data);
+
+                        } catch (e) {
+                            status = 'error';
+                            gs.error("Error occured while getting pdf results " + e);
+                        }
+
+                    }
+                } else {
+                    status = 'error';
+                    return status;
+                }
+
+            }
+        }
+        // Need handle for only images issue
+
+        for (key in result['output']) {
+            var metaData = result.metaData[key];
+            var isPDFHasMorePageIssue = false;
+
+            //  To check whether only images in PDF
+
+            if (metaData['total_pages'] &gt; PDFtoTableConstants.MAX_NUMBER_OF_PDF_PAGES) {
+                status = 'error';
+                isPDFHasMorePageIssue = true;
+                this.updateState(key, status, "PAGE_LIMIT_ERROR");
+
+            }
+
+            if (result.output[key] &amp;&amp;
+                result.output[key][0] &amp;&amp;
+                result.output[key][0]['content'] &amp;&amp;
+                result.output[key][0]['content'].length === 0) {
+                status = 'error';
+                this.updateState(key, status, "PAGE_HAS_ONLY_IMAGES");
+            }
+
+            if (metaData &amp;&amp; (metaData['parse_completed'] !== true)) {
+                status = 'error';
+                this.updateState(key, status, "PDF parser failed due to unknown issue");
+            }
+
+            try {
+
+                !isPDFHasMorePageIssue &amp;&amp; this.writeAttachmentAndupdate(key, JSON.stringify({
+                    "metaData": metaData,
+                    "output": result.output[key]
+                }), status);
+
+            } catch (e) {
+                status = "error";
+                this.updateState(key, status, "Unable to upload data into record - " + e);
+            }
+
+
+        }
+
+        return status;
+
+    },
+
+    /**
+     - Update output json into table
+     - Update status to complete / error
+     - Pending Error part need to update
+    **/
+
+    writeAttachmentAndupdate: function(attachment_sys_id, content, status) {
+        var gr = new GlideRecord(PDFtoTableConstants.PDF_INPUT_TABLE);
+        var new_attachment_sys_id = null;
+        gr.addQuery('pdf', attachment_sys_id);
+        gr.addNullQuery("parser_output");
+        gr.orderByDesc('sys_created_on');
+        gr.query();
+        var sa = new GlideSysAttachment();
+        while (gr.next()) {
+
+            if (parseInt(gr.getValue('chunk_number')) === 0) {
+                new_attachment_sys_id = sa.write(gr, "pdf_" + attachment_sys_id + ".json", "application/json", content);
+                gr.setValue('parser_output', new_attachment_sys_id);
+            }
+
+            if (status === 'error' || gr.getValue('state') === 'error') {
+                gr.setValue("state", status);
+            } else {
+                gr.setValue("state", "complete");
+            }
+
+
+            gr.update();
+
+        }
+
+        new_attachment_sys_id &amp;&amp; this.checkPendingTasks(); // Checking is there any queued jobs for waiting for scheduler
+
+        return new_attachment_sys_id;
+
+    },
+
+    checkPendingTasks: function() {
+        var gr = new GlideRecord(PDFtoTableConstants.PDF_INPUT_TABLE);
+        gr.addQuery("state", "assigned");
+        gr.query();
+        if (gr.getRowCount() &gt; 0) {
+            this.submittingPdfToParser();
+        }
+    },
+
+    updateState: function(attachment_sys_id, state, message) {
+        var gr = new GlideRecord(PDFtoTableConstants.PDF_INPUT_TABLE);
+
+        if (!attachment_sys_id) {
+            return;
+        }
+
+        gr.addQuery('pdf', attachment_sys_id);
+        gr.query();
+        while (gr.next()) {
+            gr.setValue('state', state);
+            message &amp;&amp; gr.setValue('message', message.trim());
+            gr.update();
+        }
+
+    },
+
+    addTablesToList: function(attachmentSysID, tableSysIDs) {
+        var return_obj = {},
+            tempArray = [],
+            grInput = new GlideRecord(PDFtoTableConstants.PDF_INPUT_TABLE);
+
+        grInput.addQuery('pdf', attachmentSysID);
+        grInput.addQuery('chunk_number', 0);
+        grInput.query();
+
+        if (grInput.next()) {
+            var tables = String(grInput.getValue('tables_created') || "").split(",");
+            for (var i = 0; i &lt; tableSysIDs.length; i++) {
+                if (tables.indexOf(tableSysIDs[i]) === -1) {
+                    tables.push(tableSysIDs[i]);
+                }
+            }
+            grInput.setValue('tables_created', tables.join(","));
+            if (grInput.update()) {
+                return_obj.message = "Successfully added table to the list";
+                return_obj.status = "success";
+            } else {
+                return_obj.message = "Failed to update the list.";
+                return_obj.status = "error";
+            }
+        } else {
+            return_obj.message = "Record not found. Failed to add table to the list";
+            return_obj.status = "error";
+        }
+        return return_obj;
+    },
+
+    deletePDFDetails: function(attachmentSysID) {
+        var grInput = new GlideRecord(PDFtoTableConstants.PDF_INPUT_TABLE),
+            grAttchmt = new GlideRecord(PDFtoTableConstants.ATTACHMENT_HELPER),
+            isPDFInutExist,
+            isAttchmtExist,
+            obj = {
+                status: "success"
+            };
+
+        grInput.addQuery("pdf", attachmentSysID);
+        grInput.query();
+        isPDFInutExist = grInput.next();
+        isAttchmtExist = grAttchmt.get(attachmentSysID);
+
+        if (isPDFInutExist || isAttchmtExist) {
+            obj.message = "";
+            if (isPDFInutExist) {
+                grInput.deleteMultiple();
+                obj.message += " PDF Input deleted successfully.";
+            } else {
+                obj.message += " PDF Input not available.";
+            }
+
+            if (isAttchmtExist) {
+                grAttchmt.deleteRecord();
+                obj.message += " Attachment deleted successfully.";
+            } else {
+                obj.message += " Attachment not available.";
+            }
+        } else {
+            obj.message = "Records not found, failed to delete data.";
+        }
+        return obj;
+    },
+
+     _validateExistingAttachment: function(atthmt_helper_sys_id, operation) {
+        var grInput = new GlideRecord(PDFtoTableConstants.PDF_INPUT_TABLE);
+        grInput.addQuery("pdf", atthmt_helper_sys_id);
+        if (operation === "is_atatchment_processed") {
+            grInput.addQuery('state', 'complete');
+        }
+
+        grInput.query();
+
+        if (grInput.next()) {
+            return true;
+        }
+
+        return false;
+
+    },
+    getTableExtensions: function (table_name) {
+		var res = this.isValidTableRecord(table_name);
+
+        if (res.isValid) {
+            var result = {
+                isExtended: false
+            };
+            var gr = new GlideTableHierarchy(table_name);
+            var isExtended = gr.hasExtensions();
+            if (isExtended) {
+                var extendingTables = gr.getTableExtensions();
+                result.isExtended = true;
+                result.tables = extendingTables;
+            }
+            return result;
+        }
+	},
+	isValidTableRecord: function(table_name) {
+    var res = {
+        isValid: false
+    };
+
+    var gr = new GlideRecord('sys_db_object');
+    gr.addQuery('name', table_name);
+    gr.query();
+
+    if (gr.next()) {
+        res.isValid = true;
+    }
+    return res;
+	},
+
+    type: 'PDFtoTableHelper'
+};
+]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-07-13 07:51:18&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;6a8a6b13972815108843f73ef053af27&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;2&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;PDFtoTableHelper&lt;/sys_name&gt;
+        &lt;sys_package display_value="PDF Extractor" source="sn_pdf_table_bldr"&gt;8e417ee064982b70a7bd187e6edb95f1&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="PDF Extractor"&gt;8e417ee064982b70a7bd187e6edb95f1&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_6a8a6b13972815108843f73ef053af27&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-07-13 07:54:40&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:38:15</sys_created_on>
+        <sys_id>dae6305d83f01210c6695855eeaad3eb</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>PDFtoTableHelper</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_dae6305d83f01210c6695855eeaad3eb</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:38:15</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

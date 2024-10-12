@@ -1,0 +1,366 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>3067ea3c43202110a878634a1bb8f284</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_fsm_map_integr.FSMMapProviderAPI&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Main API used from GraphQL and JavaScript to retrieve Travel Time Estimates&lt;/description&gt;
+        &lt;name&gt;FSMMapProviderAPI&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var FSMMapProviderAPI = Class.create();
+FSMMapProviderAPI.prototype = {
+    initialize: function() {
+        this.decisionTableAPI = new sn_dt.DecisionTableAPI();
+        this.helper = new FSMMapProviderHelper();
+        this.loggerUtil = new FSMMapProviderLoggerUtil();
+        this.adapter = new FSMMapProviderAdapter();
+        this.util = new FSMMapProviderCommonUtil();
+        this.isRevertedToCrow = false;
+    },
+	getRevertedToCrowValidation: function(mapProvider){
+		if(mapProvider != FSMMapProviderConstants.GOOGLE.GOOGLE_REAL_TIME &amp;&amp; mapProvider != FSMMapProviderConstants.GOOGLE.GOOGLE_API){
+			return false;
+		}
+		return this.isRevertedToCrow;
+	},
+    //return map format
+    getTravelTimeDistanceMapEstimates: function(requestPayload) {
+        requestPayload.matrixType = 'map';
+        return this.getTravelTimeDistanceEstimates(requestPayload);
+    },
+
+    //retuen array format
+    getTravelTimeDistanceArrayEstimates: function(requestPayload) {
+        requestPayload.matrixType = 'array';
+        return this.getTravelTimeDistanceEstimates(requestPayload);
+    },
+
+    //no metadata in response, work managemnet request
+    getTravelTimeDistanceEstimates: function(requestPayload) {
+        requestPayload.includeResponseMetaData = false;
+        this.util.populateLocationId(requestPayload);
+        requestPayload.matrixField = FSMMapProviderConstants.MATRIX_FIELD.DURATION_DISTANCE;
+
+        if (requestPayload.vendor == FSMMapProviderConstants.MAP_VENDOR.STRAIGHT_LINE) {
+            return this.util.straightlineMatrix(requestPayload);
+        }
+        var response = this._getTravelEstimates(requestPayload);
+        //if error fallback to stright line
+        if (!gs.nil(response.hasError) &amp;&amp; response.hasError == true) {
+            return this.util.straightlineMatrix(requestPayload);
+        }
+        return response;
+    },
+
+    //concats src and dest -- for Dynamic scheduling, return map format
+    getTravelTimeDistanceConcatedEstimates: function(requestPayload) {
+        let vendor = requestPayload['vendor'];
+        requestPayload.includeResponseMetaData = false;
+        requestPayload.matrixType = 'map';
+        this.util.populateLocationId(requestPayload);
+
+        requestPayload.matrixField = FSMMapProviderConstants.MATRIX_FIELD.DURATION_DISTANCE;
+        requestPayload.concatedRequest = true;
+        var response = null;
+        if (vendor == FSMMapProviderConstants.GOOGLE.GOOGLE_REAL_TIME || vendor == FSMMapProviderConstants.GOOGLE.GOOGLE_API) {
+            response = this._getTravelEstimates(requestPayload);
+            if (gs.nil(response.hasError) || response.hasError == false) {
+                return response;
+            }
+            //if error, fallback to SL
+            requestPayload.vendor = FSMMapProviderConstants.MAP_VENDOR.STRAIGHT_LINE;
+        }
+
+        //DS need to retrun pairs of:
+        //task to agent =&gt;(y*X)
+        //task to task and agent to task =&gt;(x+y)*y
+
+        //y*X
+        var reqYX = JSON.parse(JSON.stringify(requestPayload));
+        reqYX.origins = JSON.parse(JSON.stringify(requestPayload.destinations)); //y
+        reqYX.destinations = JSON.parse(JSON.stringify(requestPayload.origins)); //x
+        response = this.getTravelMatrix(reqYX);
+
+        var reqXYY = JSON.parse(JSON.stringify(requestPayload));
+        reqXYY.origins = JSON.parse(JSON.stringify(requestPayload.origins)); //x
+        requestPayload.destinations.forEach(function(y) { //x+y
+            reqXYY.origins.push(y);
+        });
+
+        reqXYY.destinations = JSON.parse(JSON.stringify(requestPayload.destinations));
+        var responseXYY = this.getTravelMatrix(reqXYY);
+        this.util.mergeResponseMap(response, responseXYY);
+        return response;
+    },
+
+    getTravelMatrix: function(requestPayload) {
+		var response;
+        if (requestPayload.vendor == FSMMapProviderConstants.MAP_VENDOR.STRAIGHT_LINE) {
+            response =  this.util.straightlineMatrix(requestPayload);
+        }else{ 
+			response = this._getTravelEstimates(requestPayload);
+			if (!gs.nil(response.hasError) &amp;&amp; response.hasError == true) {
+				response = this.util.straightlineMatrix(requestPayload);
+			}
+        }
+		for(var s in response){
+			for (var d in response[s]){
+				response[s][d]['duration_in_traffic'] = response[s][d]['duration'];
+			}
+
+		}
+        return response;
+    },
+    /**
+     * API to get travel estimates for a map vendor
+     * @param {*} vendor  - Map vendor value to request travel estimates
+     * @param {*} requestPayload - generic request payload
+     * @returns travel time estimates matrix
+     */
+    //original SO API, SL not supported
+    getTravelTimeEstimates: function(requestPayload) {
+        requestPayload.matrixField = FSMMapProviderConstants.MATRIX_FIELD.DURATION;
+        /*if (requestPayload.vendor == FSMMapProviderConstants.MAP_VENDOR.STRAIGHT_LINE) {
+            return this.util.straightlineMatrix(requestPayload);
+        }*/
+        requestPayload.includeResponseMetaData = true;
+        var response = this._getTravelEstimates(requestPayload);
+        //no fallbak to SL if error
+        return response;
+    },
+
+    getTravelDistanceArrayEstimates: function(requestPayload) {
+        requestPayload.matrixType = 'array';
+        return this.getTravelDistanceEstimates(requestPayload);
+    },
+
+    getTravelDistanceMapEstimates: function(requestPayload) {
+        requestPayload.matrixType = 'map';
+        return this.getTravelDistanceEstimates(requestPayload);
+    },
+    getTravelDistanceEstimates: function(requestPayload) {
+        requestPayload.matrixField = FSMMapProviderConstants.MATRIX_FIELD.DISTANCE;
+        requestPayload.includeResponseMetaData = false;
+        if (requestPayload.vendor == FSMMapProviderConstants.MAP_VENDOR.STRAIGHT_LINE) {
+            return this.util.straightlineMatrix(requestPayload);
+        }
+        var response = this._getTravelEstimates(requestPayload);
+        if (!gs.nil(response.hasError) &amp;&amp; response.hasError == true) {
+            return this.util.straightlineMatrix(requestPayload);
+        }
+        return response;
+    },
+
+    _getTravelEstimates: function(requestPayload) {
+        var includeResponseMetaData = requestPayload.includeResponseMetaData;
+        let vendorInReq = requestPayload['vendor'];
+		var vendor = vendorInReq;
+		if(vendorInReq == FSMMapProviderConstants.GOOGLE.GOOGLE_REAL_TIME || vendorInReq == FSMMapProviderConstants.GOOGLE.GOOGLE_API){
+			vendor = FSMMapProviderConstants.MAP_VENDOR.GOOGLE;
+			requestPayload.vendor = vendor;
+		}
+		if(vendorInReq == FSMMapProviderConstants.BEANS_DISP){
+			vendor = FSMMapProviderConstants.MAP_VENDOR.BEANS_AI;
+			requestPayload.vendor = vendor;
+		}
+
+        var matrixType = requestPayload.matrixType;
+
+        if (this.util.validateRequest(requestPayload)) {
+            requestPayload = JSON.stringify(requestPayload);
+            let config = this.util.readMapProviderDecisionRecord(
+                vendor,
+            );
+
+            if (config.hasError) {
+                this.helper.addAdminLog(vendor, JSON.parse(requestPayload), config);
+                return config;
+            }
+			if(vendorInReq == FSMMapProviderConstants.GOOGLE.GOOGLE_REAL_TIME){
+				config.useTraffic = true;
+			}
+            let responseObj = this.adapter.validateCount(
+                config.data,
+                JSON.parse(requestPayload),
+            );
+            if (responseObj.hasError) {
+                let usageData = this.helper.getUsageData(responseObj);
+                let errorResponseObj = this.helper.buildErrorResponse(
+                    FSMMapProviderConstants.ERROR_TYPE.VALIDATE_COUNT_LIMIT,
+                    responseObj.errorMessage,
+                );
+                this.helper.addAdminLog(vendor, JSON.parse(requestPayload), errorResponseObj, usageData);
+                return errorResponseObj;
+            }
+            let request = new FSMMapProviderRequestProcessor().transformRequestBody(
+                requestPayload,
+                vendor,
+            );
+
+            let response = this.helper.processRequest(vendor, request, config.data);
+            let usageData = response.hasError ?
+                this.helper.getUsageData(responseObj) :
+                this.helper.getUsageData(response);
+
+            this.helper.addAdminLog(vendor, JSON.parse(requestPayload), response, usageData);
+            if (!gs.nil(includeResponseMetaData) &amp;&amp; includeResponseMetaData == true) {
+                return response;
+            }
+
+            request.matrixType = matrixType;
+            if(vendor == FSMMapProviderConstants.MAP_VENDOR.GOOGLE){
+				this.isRevertedToCrow = response.logData.isRevertedToCrow;
+			}
+            response = this.util.getMapOrArrayMatrixData(request, response);
+            return response;
+
+        } else {
+            let errorResponse = this.helper.buildErrorResponse(
+                FSMMapProviderConstants.ERROR_TYPE.REQUEST_PAYLOAD_INCORRECT,
+                FSMMapProviderConstants.ERROR_MESSAGE.INCORRECT_REQUEST_PAYLOAD
+            );
+
+            this.helper.addAdminLog(vendor, requestPayload, errorResponse);
+
+            return errorResponse;
+        }
+    },
+
+    /**
+     * API to read all map providers configured in the decision table
+     */
+    getAllMapProviders: function() {
+        var mapVendors = [];
+        var inputs = this.decisionTableAPI.getInputs(
+            FSMMapProviderConstants.TABLE.DECISION_TABLE,
+        ).result[0].choices;
+        for (let choice in inputs) {
+            if (!gs.nil(inputs[choice].value)) {
+                mapVendors.push(inputs[choice].value);
+            }
+        }
+        return mapVendors;
+    },
+
+    /**
+     * API to read Straight-Line Configurations
+     * @param {*} sysIDs - SysIDs to read configuration attributes
+     * @returns Straight Line Config objects
+     */
+    readStraightLineConfiguration: function(sysIDs) {
+        let configObject = [];
+        var config = new GlideRecord(FSMMapProviderConstants.TABLE.STRAIGHT_LINE);
+        config.addEncodedQuery('sys_idIN' + sysIDs.join(','));
+        config.query();
+        while (config.next()) {
+            var id = config.getUniqueValue();
+            var obj = {};
+            obj[id] = {
+                config: {},
+            };
+            if (config.getValue('unit') === 'kmh') {
+                var speedInKmh = config.getValue('speed');
+                config.setValue('speed', this.helper.convertKmhToMph(speedInKmh));
+            }
+            for (let key in config) {
+                if (!key.includes('sys')) {
+                    if (key === 'name') obj[id].name = config.getValue(key);
+                    else if (key === 'description') obj[id].description = config.getValue(key);
+                    else if (key === 'active') obj[id].active = config.getValue(key);
+                    else obj[id].config[key] = config.getValue(key);
+                }
+            }
+            configObject.push(obj);
+        }
+        return configObject;
+    },
+
+    /**
+     * API to read default Straight-Line Configuration
+     * @returns default straight-line attribute values
+     */
+    readDefaultStraightLineConfiguration: function() {
+        var config = {
+            multiplier_60_to_180: 0.8,
+            multiplier_15_to_60: 1.0,
+            multiplier_under_15: 2,
+            speed: 25,
+            multiplier_over_180: 0.5,
+        };
+        return config;
+    },
+
+    /**
+     * API to read all active Straight Line Distance Configurations
+     * @returns active straight line configurations
+     */
+    getAllActiveStraightLineConfigs: function() {
+        let slc = [];
+        let gr = new GlideRecord(FSMMapProviderConstants.TABLE.STRAIGHT_LINE);
+        gr.addQuery('active', 'true');
+        gr.query();
+        while (gr.next()) {
+            slc.push({
+                sysId: gr.getUniqueValue(),
+                name: gr.getValue('name'),
+                description: gr.getValue('description'),
+            });
+        }
+        return slc;
+    },
+
+    /**
+     * API to reset usage counter values - request_count and location_elements_count to 0.
+     */
+    resetUsageCounter: function(current) {
+        var usageRecordGR = new GlideRecord(
+            FSMMapProviderConstants.TABLE.USAGE_COUNT,
+        );
+        usageRecordGR.addQuery('sys_id', current.getUniqueValue());
+        usageRecordGR.query();
+        while (usageRecordGR.next()) {
+            usageRecordGR.setValue('count_start', new GlideDateTime());
+            usageRecordGR.setValue('request_count', 0);
+            usageRecordGR.setValue('location_elements_count', 0);
+            usageRecordGR.update();
+        }
+        this.helper.addUsageLog(current);
+    },
+
+
+    type: 'FSMMapProviderAPI',
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-01-20 04:43:48&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;3067ea3c43202110a878634a1bb8f284&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;27&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;FSMMapProviderAPI&lt;/sys_name&gt;
+        &lt;sys_package display_value="Map Integrations for Field Service" source="sn_fsm_map_integr"&gt;32467aba87d8a910f53c7515dabb3598&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Map Integrations for Field Service"&gt;32467aba87d8a910f53c7515dabb3598&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_3067ea3c43202110a878634a1bb8f284&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-08 22:40:50&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:35:32</sys_created_on>
+        <sys_id>3646789983f01210c6695855eeaad3c9</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>FSMMapProviderAPI</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_3646789983f01210c6695855eeaad3c9</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:35:32</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

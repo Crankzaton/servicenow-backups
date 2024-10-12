@@ -1,0 +1,432 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>2f61f4949789d510b6b13f0e6253afe0</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_appclient.PluginInfoHelper&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;PluginInfoHelper&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var PluginInfoHelper = Class.create();
+PluginInfoHelper.prototype = {
+    initialize: function() {
+        this.indicatorKeyMessageMap = {};
+        this.indicatorKeyMessageMap[Constants.UNSUPPORTED_ENVIRONMENT_KEY] = gs.getMessage('{0}',Constants.UNSUPPORTED_ENVIRONMENT_LABEL);
+        this.pluginData = new global.PluginsData();
+        this.appCustomizationAPI = sn_app_customization.AppCustomizationAPI;
+    },
+
+    /**
+     * Get list of plugins
+     * @param apiUtil
+     * @returns JSON containing the list of plugins
+     */
+    getPlugins: function(apiUtil) {
+        try {
+            var params = apiUtil.getRequestParams();
+            var searchExpression = params.queryParams[Constants.SEARCH_EXPRESSION];
+            var filterParams = apiUtil.getRequestBody();
+            var tabContext = params.queryParams[Constants.TAB_CONTEXT];
+
+            var plugins = this._getAllMatchedPlugins(searchExpression, filterParams, tabContext, apiUtil);
+            var response = CommonUtils.getResultByParams(plugins, params.queryParams);
+            apiUtil.addTotalCountHeader(plugins.length);
+            return response;
+        } catch (err) {
+            throw err;
+        }
+    },
+
+    /**
+     * Get plugin by Id
+     * @param params
+     * @returns JSON object containing plugin as the result
+     */
+    getPlugin: function(params) {
+        try {
+            var pluginId = params.pathParams[Constants.PLUGIN_ID];
+            var plugin = pluginId ? this._getPluginById(pluginId) : {};
+            var response = {};
+            response[Constants.PLUGIN] = plugin;
+            return response;
+        } catch (err) {
+            throw err;
+        }
+    },
+
+    _getPluginById: function(pluginId) {
+        var allPlugins = this._getAllPluginInfo();
+        for (var i = 0; i &lt; allPlugins.length; i++) {
+            var plugin = allPlugins[i];
+            if (plugin.app_id === pluginId) {
+                this._decoratePlugin(plugin);
+                return plugin;
+            }
+        }
+        return {};
+    },
+
+   _getAllMatchedPlugins: function(searchExpression, filterParams, tabContext, apiUtil) {
+       var allPlugins = this._getAllPluginInfo();
+       var plugins = searchExpression ? this._filterPlugins(allPlugins, searchExpression) : allPlugins;
+       if (filterParams &amp;&amp; Object.keys(filterParams).length &gt; 0)
+           plugins = this._filterPluginsByFilterParams(plugins, filterParams);
+
+       plugins = this._filterAppResults(plugins, apiUtil);
+       var avlPlugins = [];
+       var installedPlugins = [];
+       var updatePlugins = [];
+       var installedOrUpdateScopeArray = [];
+       plugins = plugins.forEach(function(plugin) {
+           if (plugin.active == "0" || plugin.active == 0)
+               avlPlugins.push(plugin);
+           else {
+               if (plugin.scope !== 'global') installedOrUpdateScopeArray.push(plugin.scope);
+               installedPlugins.push(plugin);
+           }
+       }, this);
+       var isUpdatePluginObject = {};
+       var gr = new GlideRecord('sys_app_customization');
+       gr.addEncodedQuery('vendor_app.scopeIN' + installedOrUpdateScopeArray);
+       gr.query();
+
+       while (gr.next()) {
+           if (gr.version != gr.latest_version)
+               isUpdatePluginObject[gr.vendor_app.scope] = true;
+       }
+
+       installedPlugins.forEach(function(plugin) {
+           if (isUpdatePluginObject[plugin.scope]) {
+	       plugin.update_available = true;
+               updatePlugins.push(plugin);
+           }
+       }, this);
+
+       if (searchExpression) {
+           apiUtil.setHeader(Constants.UPDATES_BADGE_COUNT, updatePlugins.length);
+           apiUtil.setHeader(Constants.INSTALLED_BADGE_COUNT, installedPlugins.length);
+           apiUtil.setHeader(Constants.AVAILABLE_FOR_YOU_BADGE_COUNT, avlPlugins.length);
+       }
+       if (tabContext == 'available_for_you') return avlPlugins;
+       if (tabContext == 'installed') return installedPlugins;
+       if (tabContext == 'updates') return updatePlugins;
+       return plugins;
+   },
+
+    /**
+     * Get list of plugins by their product name
+     * @param searchExpression
+     * @returns [*]
+     */
+    getAllMatchedPluginsByProductName: function(searchExpression, filterParams) {
+        var allPlugins = this._getAllPluginInfo();
+        allPlugins = searchExpression ? this._filterPlugins(allPlugins, searchExpression, this._filterPluginsByProductName) : allPlugins;
+        allPlugins = (filterParams &amp;&amp; Object.keys(filterParams).length &gt; 0) ? this._filterPluginsByFilterParams(allPlugins, filterParams) : allPlugins;
+        return allPlugins;
+    },
+
+    getAllPluginsByProductId: function(productId) {
+        var allPlugins = this._getAllPluginInfo();
+        return allPlugins.filter(function(plugin) {
+            if (plugin.lineage_id === productId) {
+                plugin.customized_version_info = sn_app_customization.AppCustomizationAPI.getInactivePluginCustomizationVersionInfo(plugin.app_id);
+                return plugin;
+            }
+        }, this);
+    },
+
+    _getAllPluginInfo: function() {
+        try {
+            var allPlugins = JSON.parse(this.pluginData.getAllPluginInfo());
+            return allPlugins.filter(this._filterScopedPlugins, this);
+        } catch (err) {
+            var errorString = "Failed to load plugins";
+            var error = {};
+            error.errorCode = 500;
+            error.errorDescription = errorString;
+            gs.error(err, errorString);
+            throw error;
+        }
+    },
+
+	_filterAppResults: function(plugins, apiUtil) {
+		var appInfoService = new AppInfoService();
+		var appsResultData = appInfoService.getApps(apiUtil);
+		return plugins.filter(function(plugin) {
+			return appsResultData.apps.filter(function(app) {
+				return app.scope == plugin.scope || app.sys_code == plugin.app_id;
+			}).length == 0;
+		}, this);
+	},
+
+    _filterPluginsByInstallation: function(plugins, isActive) {
+        var filteredPlugins = plugins;
+        switch (isActive) {
+            case true:
+            case 'true':
+                filteredPlugins = plugins.filter(function(plugin) {
+                    return plugin.active == 1;
+                });
+                break;
+            case false:
+            case 'false':
+                filteredPlugins = plugins.filter(function(plugin) {
+                    return plugin.active == 0;
+                });
+                break;
+            default:
+                break;
+        }
+        return filteredPlugins;
+    },
+
+    _filterScopedPlugins: function(plugin) {
+        return !plugin.scope.toLowerCase().startsWith(Constants.SCOPED_PLUGIN_PREFIX);
+    },
+
+    _filterPluginsByMultipleParameters: function(plugin) {
+        var regex = this;
+        var name = plugin.app_name;
+        var id = plugin.app_id;
+        var description = plugin.description;
+        var scope = plugin.scope;
+        var lineageName = plugin.lineage_name;
+
+        return regex.test(name) || regex.test(id) || regex.test(scope) || regex.test(lineageName) || regex.test(description);
+    },
+
+    _filterPluginsByProductName: function(plugin) {
+        var regex = this;
+        var lineageName = plugin.lineage_name;
+        return regex.test(lineageName);
+    },
+
+    _filterPlugins: function(plugins, searchExpression, customFilter) {
+        var searchType = CommonUtils.getSearchType(searchExpression);
+        var keyword = CommonUtils.getSearchKeyword(searchExpression);
+        var regexEscapedKeyword = CommonUtils.getEscapedRegExp(keyword);
+        var regex = (searchType == Constants.SEARCH_FOR_EXACT_MATCH) ? new RegExp('^' + regexEscapedKeyword + '$', 'i') : new RegExp(regexEscapedKeyword, 'i');
+
+        var filteredPlugins = customFilter ? plugins.filter(customFilter, regex) : plugins.filter(this._filterPluginsByMultipleParameters, regex);
+
+        return filteredPlugins;
+    },
+
+    _filterPluginsByFilterParams: function(plugins, filterParams) {
+        var LOBs = [];
+        var productFamily = [];
+        var adoptionBluePrint = [];
+        var offeredBy = [];
+        var listings = [];
+
+        if (filterParams.hasOwnProperty('productFamily'))
+            LOBs = filterParams['productFamily'];
+        if (filterParams.hasOwnProperty('productFamily'))
+            productFamily = filterParams['productFamily'];
+        if (filterParams.hasOwnProperty('offeredBy'))
+            offeredBy = filterParams['offeredBy'];
+        if (filterParams.hasOwnProperty('adoptionBlueprint'))
+            adoptionBluePrint = filterParams['adoptionBlueprint'];
+        if (filterParams.hasOwnProperty('listings'))
+            listings = filterParams['listings'];
+
+        if (offeredBy.indexOf('partners') != -1 &amp;&amp; offeredBy.indexOf('servicenow') == -1)
+            return [];
+        var isfreeToTryPresent = listings.indexOf('free_to_try') != -1;
+        var pluginsAfterListings = [];
+        if (isfreeToTryPresent)
+            for (var i = 0; i &lt; plugins.length; i++) {
+                if (plugins[i].for_fee == 0)
+                    pluginsAfterListings.push(plugins[i]);
+            }
+        if (isfreeToTryPresent)
+            plugins = pluginsAfterListings;
+
+        var pluginsAfterProductFamily = [];
+        if (LOBs.length &gt; 0 || productFamily.length &gt; 0)
+            for (i = 0; i &lt; plugins.length; i++) {
+                for (var j = 0; j &lt; LOBs.length; j++) {
+                    alreadyAdded = false;
+                    if (plugins[i].lob_name === LOBs[j]) {
+                        pluginsAfterProductFamily.push(plugins[i]);
+                        alreadyAdded = true;
+                    }
+                }
+                for (j = 0; j &lt; productFamily.length; j++) {
+                    if (plugins[i].lineage_name === productFamily[j] &amp;&amp; !alreadyAdded)
+                        pluginsAfterProductFamily.push(plugins[i]);
+                }
+            }
+        if (LOBs.length &gt; 0 || productFamily.length &gt; 0)
+            plugins = pluginsAfterProductFamily;
+        var pluginsAfterABP = [];
+        if (adoptionBluePrint != null &amp;&amp; adoptionBluePrint.length &gt; 0) {
+            adoptionBluePrintQuery = this.getEncodedQueryByAdoptionBluePrint(adoptionBluePrint);
+            pluginIDs = new AppManagerFiltersUtil().getFilteredPluginIdsWithAdoptionBluePrint(adoptionBluePrintQuery);
+            var hashmap = {};
+            if (pluginIDs != null &amp;&amp; pluginIDs.length &gt; 0)
+                for (i = 0; i &lt; pluginIDs.length; i++) {
+                    var id = pluginIDs[i];
+                    hashmap[id] = true;
+                }
+            for (i = 0; i &lt; plugins.length; i++) {
+                if (hashmap.hasOwnProperty(plugins[i].app_id))
+                    pluginsAfterABP.push(plugins[i]);
+            }
+            plugins = pluginsAfterABP;
+        }
+        return plugins;
+    },
+    
+    getEncodedQueryByAdoptionBluePrint: function(adoptionBluePrint) {
+        var adoptionBluePrintQuery = "";
+        for (var i = 0; i &lt; adoptionBluePrint.length; i++) {
+            if (i &gt; 0) adoptionBluePrintQuery += "^OR";
+            adoptionBluePrintQuery += "objective.sys_id=" + adoptionBluePrint[i];
+        }
+        return adoptionBluePrintQuery;
+    },
+
+    _decoratePlugin: function(plugin) {
+        plugin.isPlugin = true;
+        plugin.name = plugin.app_name;
+        plugin.id = plugin.app_id;
+        plugin.isInstalled = plugin.active == 0 ? false : true;
+        if (plugin.isInstalled) {
+        	var gr = new GlideRecord("v_plugin");
+        	gr.get(plugin.sys_id);
+        	plugin.has_demo_data = gr.getValue("has_demo_data");
+        	plugin.version = gr.getValue("version");
+        	var appsData = new AppsData();
+        	plugin.upgradeHistoryId = new AppUpgrader().getLatestUpgradeHistory(plugin.id);
+        	plugin.installedFilesQuery = appsData.getInstalledFilesQuery(plugin.id);
+        	plugin.pluginFilesInfo = this.getPluginFilesInfo(plugin);
+        	plugin.upgradeDetailsInfo = appsData.getUpgradeInfo(plugin.upgradeHistoryId);
+        	var installationInfo = {};
+        	installationInfo.installation_log = appsData.getInstallationInfo(plugin.sys_id, plugin.scope);
+        	installationInfo.installed_files = this.getPluginFilesInfo(plugin);
+        	installationInfo.customized_files = appsData.getCustomizedFiles(plugin.packageID);
+        	plugin.installationInfo = installationInfo;
+        	plugin.new_guided_setup_id = new AppsData().getNewGuidedSetupId(plugin.packageID);
+            plugin.can_rollback = this.pluginData.canRollbackPlugin(plugin.id);
+        }
+        var adminCenterGr = new GlideRecord("sn_admin_center_application");
+        adminCenterGr.addQuery('plugin_id', plugin.app_id);
+        adminCenterGr.query();
+        if(adminCenterGr.next()){
+        	plugin.pluginDoc  = gs.xmlToJSON(adminCenterGr.documentation.toString());
+        	plugin.key_features  = adminCenterGr.getValue("key_features");
+        }
+
+        plugin.free = plugin.for_fee == 0;
+        plugin.paid = plugin.for_fee == 1;
+        plugin[Constants.ALL_LOBS] = [plugin.lob_id];
+        plugin.isOutOfBandApp = (plugin.scope.toLowerCase().startsWith(Constants.SERVICE_NOW_PREFIX) &amp;&amp; plugin.id.toLowerCase() == plugin.scope.toLowerCase()) ? true : false;
+
+        plugin.is_customized_app = this.appCustomizationAPI.isInactivePluginCustomizedApp(plugin.id);
+        if (plugin.is_customized_app)
+            plugin.can_install_or_upgrade_customization = true;
+
+        plugin.can_edit_in_studio = false;
+        plugin.can_open_in_studio = false;
+        if (plugin.active === "1" &amp;&amp; plugin.scope !== Constants.GLOBAL) {
+            var isCustomizationSupported = this.appCustomizationAPI.isAppCustomizationCapableByScopeName(plugin.scope);
+            var canEditInStudio = this.appCustomizationAPI.isEditableInStudio(plugin.scope);
+            plugin.can_edit_in_studio = canEditInStudio &amp;&amp; isCustomizationSupported;
+            plugin.can_open_in_studio = !canEditInStudio &amp;&amp; isCustomizationSupported;
+            if (plugin.is_customized_app)
+                plugin.can_install_or_upgrade_customization = this.appCustomizationAPI.canInstallOrRepairCustomization(plugin.scope);
+        }
+        plugin.customized_version_info = this.appCustomizationAPI.getInactivePluginCustomizationVersionInfo(plugin.id);
+        plugin.indicators = this._generateIndicatorList(plugin.indicators);
+        plugin.plugin_schedule_details = new ScheduledInstallService().fetchActiveSchedulesForEntity({source_app_id: plugin.id.toString()});
+        var tracker = new ProgressTracker().getInProgressInstallationByAppId(plugin.app_id);
+        plugin.install_tracker_id = tracker.id;
+        if(tracker.id)
+	        plugin.tracker = tracker;
+    },
+
+	getPluginFilesInfo: function(plugin) {
+
+	    var pluginFiles = new GlideRecord("sys_metadata");
+	    var packageID = "-1";
+	    var scopeName = plugin.scope;
+	    var scope = new GlideRecord("sys_scope");
+	    if (scopeName !== "global" &amp;&amp; scope.get("scope", scopeName)) {
+	        packageID = scope.getUniqueValue();
+	        var files = new GlideRecord("sys_metadata");
+	        files.addQuery("sys_package", packageID);
+	        files.query();
+	        var customerFileIds = new global.UpdateVersionAPI().getCustomerFileIds(files);
+	        if (customerFileIds.length &gt; 0)
+	            pluginFiles.addQuery("sys_id", "NOT IN", customerFileIds);
+	    } else {
+	        var pluginsGR = new GlideRecord("sys_plugins");
+	        if (pluginsGR.get("source", plugin.id)) packageID = pluginsGR.getUniqueValue();
+	    }
+	    pluginFiles.addQuery("sys_package", packageID);
+	    plugin.packageID = packageID;
+	    pluginFiles.query();
+	    return {
+	        query: pluginFiles.getEncodedQuery(),
+	        count: pluginFiles.getRowCount()
+	    };
+	},
+
+    _generateIndicatorList: function(indicators) {
+        var list = [];
+        var keys = JSON.parse(indicators || '[]');
+        keys.forEach(function(key) {
+            list.push(this._getIndicator(key));
+        }, this);
+        return list;
+    },
+
+    _getIndicator: function(key) {
+        var indicator = {};
+        indicator.id = key;
+        var message = this.indicatorKeyMessageMap[key];
+        if (!message) {
+            message = key.split('_').join(' ');
+            message = message.charAt(0).toUpperCase() + message.slice(1);
+        }
+        indicator.message = message;
+        return indicator;
+    },
+
+    type: 'PluginInfoHelper'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-07-28 07:33:11&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;2f61f4949789d510b6b13f0e6253afe0&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;59&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;PluginInfoHelper&lt;/sys_name&gt;
+        &lt;sys_package display_value="Scoped App Client" source="sn_appclient"&gt;781f36a96fef21005be8883e6b3ee43d&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Scoped App Client"&gt;781f36a96fef21005be8883e6b3ee43d&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_2f61f4949789d510b6b13f0e6253afe0&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-07-05 11:35:33&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:35:29</sys_created_on>
+        <sys_id>0246389983f01210c6695855eeaad3ac</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>PluginInfoHelper</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_0246389983f01210c6695855eeaad3ac</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:35:29</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,255 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>61b8e4eb77755110cd1b756f1b5a993a</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.TopicCategoryContentSurfacingUtilSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;TopicCategoryContentSurfacingUtilSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var TopicCategoryContentSurfacingUtilSNC = Class.create();
+TopicCategoryContentSurfacingUtilSNC.prototype = {
+    initialize: function() {
+        this.JOB_LAST_EXECUTION_PROPERTY = "taxonomy.category.new_content_job_last_run";
+        this.CATALOG_CONTENT_TYPE = "98f9a16553622010069addeeff7b1248";
+        this.KNOWLEDGE_CONTENT_TYPE = "4c32a92153622010069addeeff7b12a3";
+    },
+
+    /**
+     * Return filtered GlideRecord based on table name and encoded query
+     */
+    _getFilteredGlideRecord: function(tableName, encodedQuery, disableWorkflow) {
+        var gr = new GlideRecord(tableName);
+        if (disableWorkflow)
+            gr.setWorkflow(false);
+        if (encodedQuery)
+            gr.addEncodedQuery(encodedQuery);
+        gr.query();
+        return gr;
+    },
+
+    /**
+     * Insert records in unconnected_category_content based on a list of values
+     */
+    _createUnconnectedContentRecords: function(records) {
+        records.forEach(function(record) {
+            var gr = new GlideRecord("unconnected_category_content");
+            for (key in record)
+                gr[key] = record[key];
+            gr.insert();
+        });
+    },
+
+    /**
+     * Returns a object where the key is the category id and the value is an empty object
+     */
+    _buildCategoryContentMap: function(contentType, categoryRefField) {
+        var categoryContentMap = {};
+
+        var connectedCategoryGr = new GlideAggregate("m2m_connected_category");
+        connectedCategoryGr.addQuery("content_type", contentType);
+        connectedCategoryGr.addNotNullQuery(categoryRefField);
+        connectedCategoryGr.groupBy(categoryRefField);
+        connectedCategoryGr.query();
+
+        while (connectedCategoryGr.next())
+            categoryContentMap[connectedCategoryGr.getValue(categoryRefField)] = {};
+        return categoryContentMap;
+    },
+
+    /**
+     * Returns a object for linking category and content
+     * Structure of the object is {&lt;categoryId&gt;: {contentId: {contentId: &lt;content id&gt;, published: &lt;published date&gt;}}}
+     */
+    _identifyNewContentInCategories: function(categoryContentMap, categoryField, tableName, encodedQuery) {
+        var last_run_date = gs.getProperty(this.JOB_LAST_EXECUTION_PROPERTY);
+
+        var query = categoryField + "IN" + Object.keys(categoryContentMap).join(",");
+        if (last_run_date)
+            query += "^sys_created_on&gt;=" + last_run_date;
+        if (encodedQuery)
+            query += "^" + encodedQuery;
+        var contentGr = this._getFilteredGlideRecord(tableName, query);
+
+        while (contentGr.next()) {
+            var categoryId = contentGr.getValue(categoryField);
+            categoryContentMap[categoryId][contentGr.sys_id.toString()] = {
+                contentId: contentGr.sys_id.toString(),
+                content_creation_date: contentGr.getValue("sys_created_on")
+            };
+        }
+    },
+
+    /**
+     * Identifies new catalog items that have been added in the connected categories
+     */
+    _identifyNewContentInCategoriesForCatalog: function(categoryContentMap) {
+        var last_run_date = gs.getProperty(this.JOB_LAST_EXECUTION_PROPERTY);
+
+        var query = "sc_categoryIN" + Object.keys(categoryContentMap).join(",");
+        if (last_run_date)
+            query += "^sc_cat_item.sys_created_on&gt;=" + last_run_date;
+        var contentGr = this._getFilteredGlideRecord("sc_cat_item_category", query);
+
+        while (contentGr.next()) {
+            var categoryId = contentGr.sc_category.toString();
+            var contentId = contentGr.sc_cat_item.toString();
+            var content_creation_date = contentGr.sc_cat_item.sys_created_on.toString();
+            categoryContentMap[categoryId][contentId] = {
+                contentId: contentId,
+                content_creation_date: content_creation_date
+            };
+        }
+    },
+
+    /**
+     * Returns the list of content ids that should not be suggested
+     * These content includes the ones that have been already dismissed or are already connected via m2m_connected_content table
+     */
+    _getExclusionContentForTopic: function(topicId, contentType, contentRefField) {
+        var excludedContentIds = {};
+        var existingUnconnectedContentGr = this._getFilteredGlideRecord("unconnected_category_content", "topic=" + topicId + "^content_type=" + contentType, true);
+        while (existingUnconnectedContentGr.next())
+            excludedContentIds[existingUnconnectedContentGr[contentRefField]] = existingUnconnectedContentGr[contentRefField];
+
+        var existingConnectedContentGr = this._getFilteredGlideRecord("m2m_connected_content", "topic=" + topicId + "^content_type=" + contentType);
+        while (existingConnectedContentGr.next())
+            excludedContentIds[existingConnectedContentGr[contentRefField]] = existingUnconnectedContentGr[contentRefField];
+        return Object.keys(excludedContentIds);
+    },
+
+    /**
+     * Returns the list of KB article sys ids that should not be suggested
+     * New translations of KB articles are not suggested if any existing language for the same KB articles has been dismissed
+     * New versions of KB articles are not suggested if any existing version has been dismissed
+     */
+    _getExcludedKBArticlesForTopic: function(topicId) {
+        var excludedKBIds = {};
+
+        var KBTranslationUtil = new sn_ex_sp.KBContentTranslationUtil();
+        query = "dismissed=true^content_type=" + this.KNOWLEDGE_CONTENT_TYPE + "^topic=" + topicId;
+        var unconnectedContentGr = this._getFilteredGlideRecord("unconnected_category_content", query, true);
+
+        while (unconnectedContentGr.next()) {
+            // New versions should not be suggested for dismissed KB articles
+            var kbVersionsGr = this._getFilteredGlideRecord("kb_knowledge", "number=" + unconnectedContentGr.getValue("knowledge"));
+            while (kbVersionsGr.next())
+                excludedKBIds[kbVersionsGr.getValue("sys_id")] = 1;
+
+            // New translations should not be suggested for dismissed KB articles
+            if (GlidePluginManager.isActive("com.glideapp.knowledge.i18n2")) {
+                var translatedVersionsGr = KBTranslationUtil.getTranslatedVersionsFromSysId(unconnectedContentGr.getValue('knowledge'));
+                while (translatedVersionsGr.next())
+                    excludedKBIds[translatedVersionsGr.getValue("sys_id")] = 1;
+            }
+        }
+
+        return Object.keys(excludedKBIds);
+
+    },
+
+    surfaceNewContent: function() {
+        var contentConfigGr = this._getFilteredGlideRecord(
+            "taxonomy_content_configuration",
+            "category_reference_fieldISNOTEMPTY^content_table_category_fieldISNOTEMPTY^category_tableISNOTEMPTY^active=true"
+        );
+        var recordDataList = [];
+
+        while (contentConfigGr.next()) {
+            var contentType = contentConfigGr.getValue("sys_id");
+            // connected content fields
+            var contentRefField = contentConfigGr.content_reference_field.toString();
+            // connected category fields
+            var connectedCategoryTable = contentConfigGr.connected_category_table.toString();
+            var categoryRefField = contentConfigGr.category_reference_field.toString();
+            var contentTable = contentConfigGr.content_table.toString();
+            var contentTableCategoryField = contentConfigGr.content_table_category_field.toString();
+
+            var categoryContentMap = this._buildCategoryContentMap(contentType, categoryRefField);
+
+            if (contentType == this.CATALOG_CONTENT_TYPE)
+                this._identifyNewContentInCategoriesForCatalog(categoryContentMap);
+            else if (contentType == this.KNOWLEDGE_CONTENT_TYPE &amp;&amp; GlidePluginManager.isActive("com.snc.knowledge_advanced"))
+                this._identifyNewContentInCategories(categoryContentMap, contentTableCategoryField, contentTable, "latest=true");
+            else
+                this._identifyNewContentInCategories(categoryContentMap, contentTableCategoryField, contentTable);
+
+            var topicGr = this._getFilteredGlideRecord("topic");
+
+            while (topicGr.next()) {
+                recordDataList = [];
+                connectedCategoryGr = new GlideRecord(connectedCategoryTable);
+                connectedCategoryGr.addQuery("topic", topicGr.sys_id.toString());
+                connectedCategoryGr.addQuery("content_type", contentType);
+                connectedCategoryGr.query();
+
+                var excludedContentIds = this._getExclusionContentForTopic(topicGr.sys_id.toString(), contentType, contentRefField);
+                if (contentType == this.KNOWLEDGE_CONTENT_TYPE)
+                    excludedContentIds = excludedContentIds.concat(this._getExcludedKBArticlesForTopic(topicGr.getValue("sys_id")));
+
+                connectedCategoryGr = this._getFilteredGlideRecord(connectedCategoryTable, "topic=" + topicGr.sys_id.toString() + "^content_type=" + contentType);
+                while (connectedCategoryGr.next()) {
+                    newContents = categoryContentMap[connectedCategoryGr[categoryRefField]];
+                    if (!newContents)
+                        continue;
+
+                    for (contentId in newContents) {
+                        if (excludedContentIds.indexOf(contentId) &gt; -1)
+                            continue;
+                        var record = {
+                            content_type: contentType,
+                            topic: topicGr.sys_id.toString(),
+                            content_creation_date: newContents[contentId]["content_creation_date"]
+                        };
+                        record[contentRefField] = contentId;
+                        record[categoryRefField] = connectedCategoryGr[categoryRefField].toString();
+                        recordDataList.push(record);
+                    }
+                }
+                if (recordDataList)
+                    this._createUnconnectedContentRecords(recordDataList);
+            }
+        }
+
+        gs.setProperty(this.JOB_LAST_EXECUTION_PROPERTY, (new GlideDateTime()).getDate());
+
+        if (gs.getProperty("taxonomy.category.new_feature_alert") === "true")
+            gs.setProperty("taxonomy.category.new_feature_alert", false);
+    },
+
+    type: 'TopicCategoryContentSurfacingUtilSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-09-13 16:49:35&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;61b8e4eb77755110cd1b756f1b5a993a&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;29&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;TopicCategoryContentSurfacingUtilSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Content Taxonomy" source="com.snc.taxonomy"&gt;0dbb74a43c35311068bcf327dfe37ffd&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_61b8e4eb77755110cd1b756f1b5a993a&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-10-13 13:38:07&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:37:48</sys_created_on>
+        <sys_id>f3c6381d83f01210c6695855eeaad3ff</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>TopicCategoryContentSurfacingUtilSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_f3c6381d83f01210c6695855eeaad3ff</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:37:48</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

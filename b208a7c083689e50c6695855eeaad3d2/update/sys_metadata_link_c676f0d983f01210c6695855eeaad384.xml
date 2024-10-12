@@ -1,0 +1,913 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>42a0a290772230108f64b2487b5a9940</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_employee.ep_UtilsSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;[WARNING: Customers should NOT modify this script]&amp;#13;
+&amp;#13;
+The purpose of this script include is to provide default behaviours for the ep_Utils script include.&amp;#13;
+To change the behaviour of these methods (or add new methods), Customers should override/add new methods to the ep_Utils script include.&lt;/description&gt;
+        &lt;name&gt;ep_UtilsSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ep_UtilsSNC = Class.create();
+ep_UtilsSNC.prototype = {
+    initialize: function() {
+        this.currentDomainId = gs.getSession().getCurrentDomainID() || 'global';
+        this.DOMAIN_PLUGIN_ID = "com.glide.domain.msp_extensions";
+        this.isDomainSeparationActive = GlidePluginManager.isActive(this.DOMAIN_PLUGIN_ID);
+        this.notAvailableForCriterias = {};
+        this.availableForCriterias = {};
+        this.isWidgetCriteriaPopulated = false;
+        this.NOT_AVAILABLE_M2M_TABLE = "sn_employee_widget_mapping_user_criteria_no_mtom";
+        this.AVAILABLE_M2M_TABLE = "sn_employee_widget_mapping_user_criteria_mtom";
+    },
+
+    /**
+     * Returns true if user is a subordinate of manager
+     * @param {String} userId - sys_id of sys_user record
+     * @param {String} managerId - sys_id of direct manager of current user
+     * @param {Array} managers - List of sys_ids of managers of current user (Collected during the recursive calls)
+     * returns {Boolean}
+     */
+    userReportsTo: function(userId, managerId, managers) {
+        var user = new GlideRecord('sys_user');
+        if (!user.get(userId) || !user.canRead() || user.manager == '')
+            return false;
+
+        if (!managers)
+            managers = '';
+        if (managers.indexOf(userId) &gt; -1)
+            return false;
+
+        if (user.manager == managerId)
+            return true;
+        else
+            return this.userReportsTo(user.manager.sys_id, managerId, managers + ',' + userId);
+    },
+
+    /**
+     * Returns the sys_id of Employee Profile record 
+     * @param {String} userId - sys_id of sys_user record
+     * returns {String} 
+     */
+    getEmployeeProfileSysId: function(userId) {
+        var profileRecord = this.getEmployeeProfileRecord(userId);
+        if (profileRecord != null)
+            return profileRecord.sys_id;
+        return null;
+    },
+
+    /**
+     * Returns the Employee Profile record of sys_user with userId as sys_id 
+     * @param {String} userId - sys_id of sys_user record
+     * returns {GlideRecord} 
+     */
+    getEmployeeProfileRecord: function(userId) {
+        userId = userId || gs.getUserID();
+        var profileGr = new GlideRecord('sn_employee_profile');
+        profileGr.addQuery('user', userId);
+        profileGr.setLimit(1);
+        profileGr.query();
+        if (profileGr.next())
+            return profileGr;
+        return null;
+    },
+
+    /**
+     * Returns the User record with userId as sys_id
+     * @param {String} userId - sys_id of sys_user record
+     * returns {GlideRecord}
+     */
+    getSysUserRecord: function(userId) {
+        userId = userId || gs.getUserID();
+        var sysUserGR = new GlideRecord('sys_user');
+        if (sysUserGR.get(userId))
+            return sysUserGR;
+        return null;
+    },
+
+    /**
+     * Returns the HR Profile record with userId as sys_id
+     * @param {String} userId - sys_id of sys_user record
+     * returns {GlideRecord}
+     */
+    getHRProfileRecord: function(userId) {
+        var isHrCoreActive = GlidePluginManager.isActive('com.sn_hr_core');
+        if (!isHrCoreActive) {
+            return null;
+        }
+        var profileGr = new GlideRecord('sn_hr_core_profile');
+        profileGr.addQuery('user', userId);
+        profileGr.setLimit(1);
+        profileGr.query();
+        if (profileGr.next())
+            return profileGr;
+        return null;
+    },
+
+    createEmployeeProfileFromUser: function(userId, skipBr) {
+        var employeeProfileGr = new GlideRecord("sn_employee_profile");
+        employeeProfileGr.initialize();
+        employeeProfileGr.setValue("user", userId);
+        var hrProfileGr = this.getHRProfileRecord(userId);
+        if (hrProfileGr) {
+            var fieldsToSync = ep_Constants.HR_FIELDS;
+            employeeProfileGr.setValue("hr_profile", hrProfileGr.getUniqueValue());
+            fieldsToSync.forEach(function(field) {
+                employeeProfileGr.setValue(field, hrProfileGr.getValue(field));
+            });
+        }
+        if (skipBr)
+            employeeProfileGr.setWorkflow(false);
+        employeeProfileGr.insert();
+        return employeeProfileGr.getUniqueValue();
+    },
+
+    createEmployeeProfileFromHRProfile: function(hrProfileGr, skipBr) {
+        var fieldsToSync = ep_Constants.HR_FIELDS;
+        var employeeProfileGr = new GlideRecord("sn_employee_profile");
+        employeeProfileGr.initialize();
+        employeeProfileGr.user = hrProfileGr.getValue("user") || '';
+        employeeProfileGr.hr_profile = hrProfileGr.getUniqueValue();
+        fieldsToSync.forEach(function(field) {
+            employeeProfileGr.setValue(field, hrProfileGr.getValue(field));
+        });
+        if (skipBr)
+            employeeProfileGr.setWorkflow(false);
+        employeeProfileGr.insert();
+        return employeeProfileGr.getUniqueValue();
+    },
+
+    getCurrentDefinition: function() {
+        var employeeDefinitionGr = new GlideRecord('sn_employee_definition');
+        employeeDefinitionGr.addActiveQuery();
+        employeeDefinitionGr.orderByDesc('sys_updated_on');
+        employeeDefinitionGr.setLimit(1);
+        employeeDefinitionGr.query();
+        if (employeeDefinitionGr.next())
+            return employeeDefinitionGr;
+        return null;
+    },
+
+
+    getCurrentDefinitionInDomain: function(domainId) {
+        var employeeDefinitionGr = new GlideRecord('sn_employee_definition');
+        employeeDefinitionGr.addActiveQuery();
+        employeeDefinitionGr.addQuery("sys_domain", domainId);
+        employeeDefinitionGr.orderByDesc('sys_updated_on');
+        employeeDefinitionGr.setLimit(1);
+        employeeDefinitionGr.query();
+        if (employeeDefinitionGr.next())
+            return employeeDefinitionGr;
+        return null;
+    },
+
+    /**
+     * Returns the value of sys_property {sn_employee.employee_profile_enabled}
+     * returns true/false
+     */
+    isEmployeeProfileEnabled: function() {
+        return GlideApplicationProperty.getValue('sn_employee.employee_profile_enabled') == 'true' ? true : false;
+    },
+
+    /**
+     * Follows the main isValidEmployeeGr() principle, execpt this method can be used with employee profile sys_id instead of user sys_id
+     * returns Employee Profile GlideRecord object
+     */
+    isValidEmployeeByProfileIdGr: function(profileSysId, empDefinitionGr /*Optional*/ ) {
+        var empProfileGr = new GlideRecord("sn_employee_profile");
+        if (!empProfileGr.get(profileSysId)) {
+            return false;
+        }
+        if (this.userSatisfiesEmployeeDefintion(empProfileGr.getValue('user'), empDefinitionGr))
+            return empProfileGr;
+        else return null;
+    },
+
+    /**
+     * Same as isValidEmployee() API, but this method will return a GR instead of true/false
+     * returns Employee Profile GlideRecord object
+     */
+    isValidEmployeeGr: function(userId, empDefinitionGr /*Optional*/ ) {
+        var empProfileGr = new GlideRecord("sn_employee_profile");
+        empProfileGr.addQuery('user', userId);
+        empProfileGr.query();
+        if (!empProfileGr.hasNext()) {
+            return false;
+        }
+        if (this.userSatisfiesEmployeeDefintion(userId, empDefinitionGr))
+            return empProfileGr;
+        else return null;
+    },
+
+    /**
+     * Follows the main isValidEmployee() principle, execpt this method can be used with employee profile sys_id instead of user sys_id
+     */
+    isValidEmployeeByProfileId: function(profileSysId, empDefinitionGr /*Optional*/ ) {
+        var empProfileGr = new GlideRecord("sn_employee_profile");
+        if (!empProfileGr.get(profileSysId)) {
+            return false;
+        }
+        return this.userSatisfiesEmployeeDefintion(empProfileGr.getValue('user'), empDefinitionGr);
+    },
+
+    /**
+     * Validates if the user is a valid employee by checking its presenece in employee profile table and if its passing the latest employee definition filter
+     * returns true/false
+     */
+    isValidEmployee: function(userId, empDefinitionGr /*Optional*/ ) {
+        var empProfileGr = new GlideRecord("sn_employee_profile");
+        empProfileGr.addQuery('user', userId);
+        empProfileGr.query();
+        if (!empProfileGr.hasNext()) {
+            return false;
+        }
+        return this.userSatisfiesEmployeeDefintion(userId, empDefinitionGr);
+    },
+
+    /**
+     * If domain is not present return current definition, if Domain is installed then
+     * Method handles check for employee definition in current domain, if not present return global def
+     */
+    getEmployeeDefForDomain: function() {
+        var empDefinitionGr;
+        if (this.isDomainSeparationActive) {
+            empDefinitionGr = this.getCurrentDefinitionInDomain(this.currentDomainId);
+            if (gs.nil(empDefinitionGr)) {
+                empDefinitionGr = this.getCurrentDefinitionInDomain('global');
+            }
+        } else {
+            empDefinitionGr = this.getCurrentDefinition();
+        }
+        return empDefinitionGr;
+    },
+
+    /**
+     * Validates the user against employee definition, if definition passed in argument otherwise uses the latest employee definition to validate.
+     * return true/false
+     */
+    userSatisfiesEmployeeDefintion: function(userId, empDefinitionGr) {
+        // If empDefinitionGr is passed then use the GR ELSE check if domain separation is active and fetch current definition
+        // If Domain separation is inactive, query the current definition
+        empDefinitionGr = (empDefinitionGr &amp;&amp; empDefinitionGr.getTableName() === 'sn_employee_definition') ? empDefinitionGr : this.getEmployeeDefForDomain();
+
+        if (empDefinitionGr) {
+            var empDefinitionTable = empDefinitionGr.table;
+            var profileGr = new GlideRecord(empDefinitionTable);
+            profileGr.addEncodedQuery(empDefinitionGr.condition);
+            if (empDefinitionTable.toString() === 'sn_hr_core_profile') {
+                profileGr.addQuery('user.sys_id', userId);
+            } else if (empDefinitionTable.toString() === 'sys_user') {
+                profileGr.addQuery('sys_id', userId);
+            }
+            profileGr.setLimit(1);
+            profileGr.query();
+            return profileGr.hasNext();
+        }
+        return false;
+    },
+
+    /**
+     * Method queries for latest employee definition and processes query with appropriate prefix
+     */
+    getCurrentDefWithProcessedCondition: function() {
+        var empDefinitionGr = this.getEmployeeDefForDomain();
+        var processedQuery = null;
+        if (!gs.nil(empDefinitionGr)) {
+            var table = empDefinitionGr.getValue('table');
+            var condition = empDefinitionGr.getValue('condition');
+            if (table == 'sn_hr_core_profile') //append hr_profile dotwalk for core plugin
+                processedQuery = this.encodedQueryForProfiles("hr_profile.", condition);
+            if (table == 'sys_user') //append user dotwalk for sys_user
+                processedQuery = this.encodedQueryForProfiles("user.", condition);
+        }
+        return processedQuery;
+    },
+
+    getHRProfileGr: function(userId) {
+        var isHrCoreActive = GlidePluginManager.isActive('com.sn_hr_core');
+        if (!isHrCoreActive) {
+            return null;
+        }
+        var gr = new GlideRecord("sn_hr_core_profile");
+        if (gr.get("user", userId))
+            return gr;
+        return null;
+    },
+
+    /**
+     * This API is for opting employee profile 
+     * functionality
+     */
+    optIn: function() {
+        this.updateOptInProperty(true);
+        this.enableDisablePageRoutes(true);
+        this.enableOrgChartPageRoute(true);
+        return true;
+    },
+    /**
+     * This API is for opting out employee profile 
+     * functionality
+     */
+    optOut: function() {
+        this.updateOptInProperty(false);
+        this.enableDisablePageRoutes(false);
+        this.enableOrgChartPageRoute(false);
+        return true;
+    },
+
+    /**
+     * This API is for enabling/disabling page routes
+     * these page routes are for user profile to employee profile
+     */
+    enableDisablePageRoutes: function(isActive) {
+        var gr = new GlideRecord("sp_page_route_map");
+        gr.addEncodedQuery("sys_idIN8bec9e56530801104180ddeeff7b1295,e15dde56530801104180ddeeff7b12d4");
+        gr.query();
+        while (gr.next()) {
+            gr.active = isActive;
+            gr.update();
+        }
+    },
+
+    /**
+     * Enable/Disable page route map for my_org_chart to org_chart
+     * based on if employee profile is enabled
+     */
+    enableOrgChartPageRoute: function(isActive) {
+        sn_ex_sp_pro.OrgChartUtil &amp;&amp;
+            new sn_ex_sp_pro.OrgChartUtil().enableOrgChartPageRoute(isActive);
+    },
+
+    /**
+     * This API is for updating employee profile 
+     * enabled property.
+     */
+    updateOptInProperty: function(value) {
+        var gr = new GlideRecord("sys_properties");
+        gr.addQuery('name', 'sn_employee.employee_profile_enabled');
+        gr.query();
+        while (gr.next()) {
+            gr.value = value;
+            gr.update();
+        }
+    },
+    /**
+     * This API is to tell if new org chart page exists
+     * @return boolean
+     * returns true if new page exist else return false
+     **/
+    isNewOrgChartPresent: function() {
+        var spPageGr = new GlideRecord("sp_page");
+        return spPageGr.get('sys_id', '8f8bcd52c3074110069aec4b7d40dd64');
+    },
+
+    //Gets the user criterias associated with the tab-widget mapping mtom tables
+    _getWidgetMappingUserCriterias: function(table) {
+        var criterias = {};
+        var gr = new GlideRecord(table);
+        gr.query();
+        while (gr.next() &amp;&amp; gr.getValue('user_criteria')) {
+            if (criterias[gr.getValue('sn_employee_tab_widget_mapping')]) {
+                criterias[gr.getValue('sn_employee_tab_widget_mapping')].push(gr.getValue('user_criteria'));
+                continue;
+            }
+            criterias[gr.getValue('sn_employee_tab_widget_mapping')] = [gr.getValue('user_criteria')];
+        }
+        return criterias;
+    },
+
+    //Populate notAvailableForCriterias and AvailableForCriterias global objects
+    _populateUserCriterias: function() {
+        this.notAvailableForCriterias = this._getWidgetMappingUserCriterias('sn_employee_widget_mapping_user_criteria_no_mtom');
+        this.availableForCriterias = this._getWidgetMappingUserCriterias('sn_employee_widget_mapping_user_criteria_mtom');
+        this.isWidgetCriteriaPopulated = true;
+    },
+
+    /**
+     * Returns a list of tabs (name and tabId)
+     * @param {String} profileUserId - sys_id of sys_user record whose profile is being visited
+     * @param {String} visitorUserId - sys_id of sys_user record who is visiting the profile
+     * returns {List of objects} tabs
+     */
+    getAccessibleProfileTabs: function(profileUserId, visitorUserId) {
+        if (!this.isValidEmployee(profileUserId)) {
+            return [{
+                "tabId": "non-employee-tab",
+                "name": "Non Employee Tab"
+            }];
+        }
+        var tabs = {};
+        var accessibilityOptions = this._getAccessibilityOptions(profileUserId, visitorUserId);
+        var tabsWithUCWidgets = {};
+
+        if (!this.isWidgetCriteriaPopulated) {
+            this._populateUserCriterias();
+        }
+
+        var userPreference = this.getWidgetVisibilityPreference(profileUserId);
+        var gr = new GlideRecord("sn_employee_tab_widget_mapping");
+        gr.addActiveQuery();
+        gr.addQuery("tab.active", "true");
+        gr.orderBy("accessible_by");
+        gr.orderBy("tab");
+        gr.query();
+
+        while (gr.next()) {
+            // Check if the tab is already present in the tab list
+            if (this._ifTabPresent(gr.getValue("tab"), tabs)) {
+                continue;
+            }
+            // If the tab-widget mapping's accessible_by option is anything but 'user_criteria', directly add it to the final tab's list
+            if (gr.getValue('accessible_by') != 'user_criteria') {
+                var widgetVisibility = this._getWidgetVisibility(gr, userPreference);
+                if (accessibilityOptions.indexOf(widgetVisibility) &gt; -1) {
+                    tabs[gr.getValue("tab")] = true;
+                }
+                continue;
+            }
+            //If accessible_by is user criteria
+            if (tabsWithUCWidgets[gr.getValue("tab")]) {
+                tabsWithUCWidgets[gr.getValue("tab")].push(gr.getUniqueValue());
+                continue;
+            }
+            tabsWithUCWidgets[gr.getValue("tab")] = [gr.getUniqueValue()];
+        }
+        var tabList = Object.keys(tabsWithUCWidgets);
+        for (var i = 0; i &lt; tabList.length; i++) {
+            if (this._ifTabPresent(tabList[i], tabs)) {
+                continue;
+            }
+            var widgetMappings = tabsWithUCWidgets[tabList[i]];
+            for (var j = 0; j &lt; widgetMappings.length; j++) {
+                // If any of the user criteria of user matches with any one of the 'Not Available For' user criteria list, reject it immediately
+                var notAvailableFor = this.notAvailableForCriterias[widgetMappings[j]];
+                if (!gs.nil(notAvailableFor) &amp;&amp; sn_uc.UserCriteriaLoader.userMatches(visitorUserId, notAvailableFor)) {
+                    continue;
+                }
+
+                // If any of the user criteria of user matches with any one of the 'Available For' user criteria list, add it to the final tab's list immediately
+                var availableFor = this.availableForCriterias[widgetMappings[j]];
+                if (gs.nil(availableFor) || sn_uc.UserCriteriaLoader.userMatches(visitorUserId, availableFor)) {
+                    tabs[tabList[i]] = true;
+                    break;
+                }
+            }
+        }
+        var orderedTabs = this._getOrderedTabs(Object.keys(tabs));
+        return orderedTabs;
+    },
+
+    //Get Ordered Tabs
+    _getOrderedTabs: function(unorderedTabs) {
+        var orderedTabs = [];
+        var gr = new GlideRecord("sn_employee_tab");
+        gr.addActiveQuery();
+        gr.addQuery("sys_id", "IN", unorderedTabs);
+        gr.orderBy("order");
+        gr.orderBy("name");
+        gr.query();
+        while (gr.next()) {
+            var tab = {};
+            tab.tabId = gr.getUniqueValue();
+            tab.name = gr.getDisplayValue("name");
+            orderedTabs.push(tab);
+        }
+        return orderedTabs;
+    },
+
+    //Get the accessibility options 
+    _getAccessibilityOptions: function(profileUserId, visitorUserId) {
+        var accessibilityOptions = [];
+        var userGr = new GlideRecord('sys_user');
+        userGr.get(profileUserId);
+        var managerId = userGr.getValue('manager');
+
+        if (visitorUserId === profileUserId) {
+            accessibilityOptions = ["employee_only", "employee_and_manager", "everyone", "user_criteria"];
+        } else if (visitorUserId === managerId) {
+            accessibilityOptions = ["manager_only", "employee_and_manager", "everyone", "user_criteria"];
+        } else {
+            accessibilityOptions = ["everyone", "user_criteria"];
+        }
+
+        return accessibilityOptions;
+    },
+
+    //Checks if the tab is already present in the tabs list
+    _ifTabPresent: function(id, tabs) {
+        return tabs[id] ? true : false;
+    },
+
+    /**
+     * Returns a list of widgets (name, id and widgeOptions)
+     * @param {String} tab - sys_id of sn_employee_tab record
+     * returns {List of objects} widgets
+     */
+    getWidgets: function(tab, profileUserId, visitorUserId) {
+        if (tab === "non-employee-tab") {
+            return this.getNonEmployeeWidgets();
+        }
+        var widgets = [];
+        var accessibilityOptions = this._getAccessibilityOptions(profileUserId, visitorUserId);
+        if (!this.isWidgetCriteriaPopulated) {
+            this._populateUserCriterias();
+        }
+
+        var userPreference = this.getWidgetVisibilityPreference(profileUserId);
+        var gr = new GlideRecord("sn_employee_tab_widget_mapping");
+        gr.addQuery("tab", tab);
+        gr.addActiveQuery();
+        gr.orderBy("order");
+        gr.orderBy("name");
+        gr.query();
+        while (gr.next()) {
+            var widgetVisibility = this._getWidgetVisibility(gr, userPreference);
+            if (accessibilityOptions.indexOf(widgetVisibility) &gt; -1) {
+                if (gr.getValue("accessible_by") == "user_criteria") {
+                    var notAvailableFor = this.notAvailableForCriterias[gr.getUniqueValue()];
+                    if (!gs.nil(notAvailableFor) &amp;&amp; sn_uc.UserCriteriaLoader.userMatches(visitorUserId, notAvailableFor)) {
+                        continue;
+                    }
+
+                    var availableFor = this.availableForCriterias[gr.getUniqueValue()];
+                    if (!gs.nil(availableFor) &amp;&amp; !sn_uc.UserCriteriaLoader.userMatches(visitorUserId, availableFor)) {
+                        continue;
+                    }
+                }
+
+                var widget = {};
+                widget.name = gr.getDisplayValue("name");
+                widget.id = gr.getUniqueValue();
+                widget.tabId = tab;
+                widget.widgetId = gr.getValue('widget');
+                widget.options = this._populateWidgetOptions(gr);
+                widgets.push(widget);
+            }
+        }
+        return widgets;
+    },
+
+    _populateWidgetOptions: function(widgetMappingGr) {
+        var widgetOptions = JSON.parse(widgetMappingGr.getValue("widget_parameters"));
+        var finalWidgetOptions = widgetOptions ? widgetOptions : {};
+        finalWidgetOptions.widgetTitle = widgetMappingGr.getDisplayValue("name");
+        finalWidgetOptions.tabWidgetMappingId = widgetMappingGr.getUniqueValue();
+        finalWidgetOptions.isUserSelectionEnabled = widgetMappingGr.getValue('allow_visibility_control') == true;
+        return JSON.stringify(finalWidgetOptions);
+    },
+
+    /**
+     * Returns whether logged in user can view the widget in a particular tab
+     * @param {String} widgetMappingId - sys_id of tab-widget mapping record
+     * @param {String} visitorId - sys_id of the logged in user
+     * @param {String} profileUserId - userid of profile owner
+     * @returns {boolean} 
+     */
+
+    isWidgetVisibleForUser: function(widgetMappingId, visitorUserId, profileUserId) {
+        var accessibilityOptions = this._getAccessibilityOptions(profileUserId, visitorUserId);
+        var widgetVisibility = this.getWidgetVisibilityOnTabs(widgetMappingId, profileUserId);
+        if (accessibilityOptions.indexOf(widgetVisibility) &gt; -1) {
+            if (widgetVisibility == 'user_criteria') {
+                var userCriterias = this._getUserCriterForWidgetMapping(widgetMappingId);
+                if (userCriterias['notAvailableFor'].length &amp;&amp; sn_uc.UserCriteriaLoader.userMatches(visitorUserId, userCriterias['notAvailableFor'])) {
+                    return false;
+                }
+
+                if (userCriterias['availableFor'].length &amp;&amp; !sn_uc.UserCriteriaLoader.userMatches(visitorUserId, userCriterias['availableFor'])) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return false;
+    },
+
+    /**
+     * Returns an object  containing the list of available for and not avaible for criterias defined for a widget mapping 
+     * @param {String} widgetMappingId - sys_id of tab-widget mapping record
+     * @returns {Object} 
+     */
+
+    _getUserCriterForWidgetMapping: function(widgetMappingId) {
+        var criterias = {};
+        criterias['notAvailableFor'] = this._populateUserCriterForWidgetMapping(this.NOT_AVAILABLE_M2M_TABLE, widgetMappingId);
+        criterias['availableFor'] = this._populateUserCriterForWidgetMapping(this.AVAILABLE_M2M_TABLE, widgetMappingId);
+        return criterias;
+    },
+
+    /**
+     * Populates and returns the array of user criteria for an m2m table defined on a widget mapping
+     * @param {String} table - Name of the m2m table 
+     * @param {String} widgetMappingId - sys_id of tab-widget mapping record
+     * @returns {Array} 
+     */
+
+    _populateUserCriterForWidgetMapping: function(table, widgetMappingId) {
+        var userCriterias = [];
+        var m2mGr = new GlideRecord(table);
+        m2mGr.addQuery("sn_employee_tab_widget_mapping", widgetMappingId);
+        m2mGr.query();
+        while (m2mGr.next()) {
+            userCriterias.push(m2mGr.getValue('user_criteria'));
+        }
+        return userCriterias;
+    },
+
+
+    /**
+     * Returns widget's visibility by honouring user's preference.
+     * @param {String} widgetMappingId - sys_id of tab-widget mapping record
+     * @param {String} profileUserId - user id of profile owner
+     * @returns {String}
+     */
+    getWidgetVisibilityOnTabs: function(widgetMappingId, profileUserId) {
+        var widgetMappingGr = new GlideRecord("sn_employee_tab_widget_mapping");
+        widgetMappingGr.get(widgetMappingId);
+        var userPreference = this.getWidgetVisibilityPreference(profileUserId);
+        return this._getWidgetVisibility(widgetMappingGr, userPreference);
+    },
+
+
+    /**
+     * Returns widget's visibility by honouring user's preference.
+     * @param {GlideRecord} widgetMappingGr - tab-widget mapping record.
+     * @param {Object} userPreference - user preference. 
+     * @returns {String}
+     */
+    _getWidgetVisibility: function(widgetMappingGr, userPreference) {
+        var overridableWidgetVisibility = ep_Constants.OVERRIDABLE_WIDGET_VISIBILITY;
+        var accessibleBy = widgetMappingGr.getValue('accessible_by');
+        if (widgetMappingGr.getValue('allow_visibility_control') == true &amp;&amp; overridableWidgetVisibility.indexOf(accessibleBy) &gt; -1) {
+            var widgetMappingId = widgetMappingGr.getUniqueValue();
+            return userPreference &amp;&amp; userPreference[widgetMappingId] &amp;&amp; overridableWidgetVisibility.indexOf(userPreference[widgetMappingId]) &gt; -1 ?
+                userPreference[widgetMappingId] :
+                accessibleBy;
+        } else {
+            return accessibleBy;
+        }
+    },
+
+    /**
+     * Returns the widget visibility preference of a given user
+     * @param {String} userId - sys_id of sys_user record
+     * returns {Object}
+     */
+    getWidgetVisibilityPreference: function(userId) {
+        var preferenceGr = new GlideRecord("sys_user_preference");
+        preferenceGr.addQuery("name", ep_Constants.WIDGET_VISIBILITY_USER_PREFERENCE);
+        preferenceGr.addQuery("user", userId);
+        preferenceGr.setLimit(1);
+        preferenceGr.query();
+        if (preferenceGr.next()) {
+            return JSON.parse(preferenceGr.getValue("value"));
+        }
+        return null;
+    },
+
+    /**
+     * Sets the visibility of a widget in user preference for the logged in user
+     * @param {String} widgetMappingId - sys_id of tab-widget mapping record
+     * @param {String} visibilityPreference - visibility selected by user 
+     */
+    saveWidgetVisibilityPreference: function(widgetMappingId, visibilityPreference) {
+        var overridableWidgetVisibility = ep_Constants.OVERRIDABLE_WIDGET_VISIBILITY;
+        if (overridableWidgetVisibility.indexOf(visibilityPreference) === -1) {
+            return;
+        }
+        var widgetMapping = new GlideRecord("sn_employee_tab_widget_mapping");
+        widgetMapping.get(widgetMappingId);
+        if (!widgetMapping.isValid()) {
+            return;
+        }
+        var preference = this.getWidgetVisibilityPreference(gs.getUserID());
+        var accessibleBy = this._getWidgetVisibility(widgetMapping, preference);
+        if (accessibleBy === visibilityPreference) {
+            return;
+        }
+        preference = preference ? preference : {};
+        preference[widgetMappingId] = visibilityPreference;
+        gs.getUser().savePreference(ep_Constants.WIDGET_VISIBILITY_USER_PREFERENCE, JSON.stringify(preference));
+    },
+
+    /**
+     * Returns the visibility of the Public Profile Visibility widget to true on the basis of the portal page
+     * @param {String} pageId - id of the portal page
+     * returns {Boolean}
+     */
+    isPublicProfileVisibilityWidgetVisibleOnPage: function(pageId) {
+        var pages = ['employee_profile'];
+        if (this.isEmployeeProfileEnabled()) {
+            pages.push('hri_user_profile');
+            pages.push('user_profile');
+        }
+        return (pageId &amp;&amp; pages.indexOf(pageId) &gt;= 0);
+    },
+
+    /**
+     * Checks whether the logged in user is viewing his/her profile page
+     * @param {String} userId - sys_id of the user viewing the profile page
+     */
+    isLoggedInUsersProfile: function(userId) {
+        return userId ? (gs.getUserID() === userId) : true;
+    },
+    /**
+     * Get a list of the widgets that should be shown for a non-employee profile
+     * Overview Widget
+     * My Teams Widget
+     * My Documents Widget
+     * My Delegates Widget
+     * My Contacts Widget
+     */
+    getNonEmployeeWidgets: function() {
+        var widgets = [];
+        var overviewWidget = {
+            "name": "Overview",
+            "id": "overview",
+            "tabId": "non-employee-tab",
+            "widgetId": "56fc512453333010fedfddeeff7b1273",
+            "options": ""
+        };
+        widgets.push(overviewWidget);
+        var myTeamsWidget = {
+            "name": "My Teams",
+            "id": "my_teams",
+            "tabId": "non-employee-tab",
+            "widgetId": "cfcbbf7c30b3b010f8772514c50e7062",
+            "options": ""
+        };
+        widgets.push(myTeamsWidget);
+        if (GlidePluginManager.isActive('com.sn_employee_document_management')) {
+            var myDocumentsWidget = {
+                "name": "My Documents",
+                "id": "my_documents",
+                "tabId": "non-employee-tab",
+                "widgetId": "6f86d215531013003585c3c606dc3411",
+                "options": ""
+            };
+            widgets.push(myDocumentsWidget);
+        }
+        if (GlidePluginManager.isActive('com.glide.granular_service_delegation')) {
+            var myDelegatesWidget = {
+                "name": "My Delegates",
+                "id": "my_delegates",
+                "tabId": "non-employee-tab",
+                "widgetId": "bc49147bb3321010f5302ddc16a8dc33",
+                "options": ""
+            };
+            widgets.push(myDelegatesWidget);
+        }
+        if (GlidePluginManager.isActive('com.sn_hr_core')) {
+            var myContactsWidget = {
+                "name": "My Contacts",
+                "id": "my_contacts",
+                "tabId": "non-employee-tab",
+                "widgetId": "b9e232209f22120047a2d126c42e70ba",
+                "options": ""
+            };
+            widgets.push(myContactsWidget);
+        }
+        return widgets;
+    },
+
+    /**
+     * Returns the visibility options which user can override
+     * returns {Array}
+     */
+    getVisibilityOptions: function() {
+        return ep_Constants.VISIBILITY_OPTIONS;
+    },
+
+    /**
+     * Returns the accessibility message
+     * @param {String} widgetMappingId - widget mapping id
+     * @param {String} userId - user id
+     * returns {String}
+     */
+    getAccessibilityMsg: function(widgetMappingId, userId) {
+        var accessibilityMsgs = ep_Constants.ACCESSIBILITY_MSGS;
+        var widgetVisibilityOnTabs = this.getWidgetVisibilityOnTabs(widgetMappingId, userId);
+        var accessibilityMsg = accessibilityMsgs[widgetVisibilityOnTabs] || "";
+        return accessibilityMsg;
+    },
+
+    /**
+     * Checks whether the user visibility control has been enabled for the tab widget mapping
+     * @param {String} widgetMappingId - widget mapping id
+     * returns {Boolean}
+     */
+    isUserSelectionEnabled: function(widgetMappingId) {
+        var tabWidgetMappingGr = new GlideRecord("sn_employee_tab_widget_mapping");
+        tabWidgetMappingGr.get(widgetMappingId);
+        return (tabWidgetMappingGr.getValue("allow_visibility_control") == true);
+    },
+
+    /*
+     * Prefixes give keyword to condition string
+     * Sample Input: active=true^company=c9818d2c4a36231201624433851894bb^EQ
+     * Sample Output:user.active=true^user.company=c9818d2c4a36231201624433851894bb^EQ
+     * @parm prefix - String
+     * @parm query - Condition string
+     * @return query - Prefixed conidtion string
+     */
+    encodedQueryForProfiles: function(prefix, query) {
+        query = prefix + query;
+        var pos = 0;
+        for (var i = 0; i &lt; query.length &amp;&amp; pos != -1; i++) {
+            pos = query.indexOf('^', i);
+            if (pos != -1) {
+                i = pos;
+                if (pos + 3 &lt; query.length &amp;&amp; (query.substring(pos + 1, pos + 3) == 'NQ' || query.substring(pos + 1, pos + 3) == 'OR')) {
+                    query = query.substring(0, pos + 3) + prefix + query.substring(pos + 3);
+                } else {
+                    if (query.substring(pos) != '^EQ')
+                        query = query.substring(0, pos + 1) + prefix + query.substring(pos + 1);
+                }
+            }
+        }
+        return query;
+    },
+
+    // method to fetch header config for currentDomain if not present get Global Domain config
+    getHeaderConfigGrDomain: function(current /*Optional*/ ) {
+        var configGr = this.getHeaderConfigGr(current);
+        if (!configGr.hasNext() &amp;&amp; this.isDomainSeparationActive) {
+            configGr = this.getHeaderConfigGr(current, 'global');
+        }
+        return configGr;
+    },
+
+    // method to fetch all available active header configuration
+    getHeaderConfigGr: function(current, domain /*Optional*/ ) {
+        var configGr = new GlideRecord(ep_Constants.TABLES.EP_HEADER_CONFIG);
+        if (current) { //if current object is present exclude from query
+            configGr.addQuery("sys_id", "!=", current.getUniqueValue());
+        }
+        configGr.addActiveQuery();
+        configGr.setLimit(1);
+        if (this.isDomainSeparationActive) {
+            var domainName = domain ? domain : this.currentDomainId;
+            configGr.addQuery("sys_domain", domainName);
+        }
+        configGr.query();
+        return configGr;
+    },
+
+    // Returns the URL to load the config page.
+    getHeaderConfigRecordURL: function() {
+        var tableName = ep_Constants.TABLES.EP_HEADER_CONFIG;
+        var configGr = this.getHeaderConfigGr();
+        if (this.checkForRecordAccess(configGr)) {
+            if (configGr.next())
+                return tableName + '.do?sys_id=' + configGr.getUniqueValue();
+            return tableName + '.do?sys_id=-1';
+        }
+    },
+
+    checkForRecordAccess: function(recordGR, hasDeleteAccess) {
+        if (recordGR) {
+            var hasAccess = recordGR.canRead();
+            if (hasDeleteAccess)
+                hasAccess = hasAccess &amp;&amp; (recordGR.canDelete() || gs.hasRole(ep_Constants.ROLES.EMPLOYEE_ADMIN));
+            return hasAccess;
+        }
+        return gs.hasRole(this.ROLES.ESC_ADMIN) || gs.hasRole(ep_Constants.ROLES.EMPLOYEE_ADMIN);
+    },
+    type: 'ep_UtilsSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-09-08 12:33:44&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;42a0a290772230108f64b2487b5a9940&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;193&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ep_UtilsSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Employee Profile" source="sn_employee"&gt;1e95bac2738f001001b566b90ff6a7cd&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Employee Profile"&gt;1e95bac2738f001001b566b90ff6a7cd&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_42a0a290772230108f64b2487b5a9940&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-11 20:06:56&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:36:19</sys_created_on>
+        <sys_id>c676f0d983f01210c6695855eeaad384</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ep_UtilsSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_c676f0d983f01210c6695855eeaad384</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:36:19</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

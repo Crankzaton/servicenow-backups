@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>35dfe52797e50110ecc47e0e6253af29</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_hr_sp.RelevantForYouUtilSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;[WARNING: Customers should NOT modify this script]&amp;#13;
+  &amp;#13;
+  The purpose of this script include is to provide apis to get relevant articles and catalog items&amp;#13;
+  To change the behaviour of these methods (or add new methods), Customers should override/add new methods to the RelevantForYouUtil script include.&lt;/description&gt;
+        &lt;name&gt;RelevantForYouUtilSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[        var RelevantForYouUtilSNC = Class.create();
+        RelevantForYouUtilSNC.prototype = {
+            initialize: function() {
+                this.isHRCoreActive = GlidePluginManager.isActive('com.sn_hr_core');
+                this.isEmployeeProfileEnabled = GlidePluginManager.isActive('com.sn_employee') &amp;&amp; GlideApplicationProperty.getValue('sn_employee.employee_profile_enabled') == 'true' ? true : false;
+                this.similarUsers = [];
+                this.userRecommendationUtil = new sn_hr_sp.UserRecommendationUtil();
+                this.useSimilarUserQuery = GlideApplicationProperty.getValue('sn_hr_sp.use_similar_user_query') == 'true' ? true : false;
+            },
+            getSimilarUsers: function(userPredictionCount) {
+                // do not use similar users if the sys_property is false for using similar user query
+                if (!this.useSimilarUserQuery) {
+                    return [];
+                }
+                if (GlidePluginManager.isActive('com.glide.platform_ml') &amp;&amp; (this.isHRCoreActive || this.isEmployeeProfileEnabled)) {
+                    /*
+                     * The system property 'apply_employee_profile_ml_model' when enabled allows HR customers to use ML models specified under Employee
+                     * profile AI configurations.
+                     */
+                    var applyEmployeeProfileMlModel = gs.getProperty('sn_employee.apply_employee_profile_ml_model', 'false') == 'true' ? true : false;
+                    if (this.isHRCoreActive &amp;&amp; !applyEmployeeProfileMlModel) {
+                        var ML_PortalUtils = new sn_hr_sp.HR_MLPortalUtils();
+                        this.similarUsers = ML_PortalUtils.getSimilarUsers(gs.getUserID(), userPredictionCount);
+                    } else {
+                        var EP_PortalUtils = new sn_employee.EP_MLPortalUtils();
+                        this.similarUsers = EP_PortalUtils.getSimilarUsers(gs.getUserID(), userPredictionCount);
+                    }
+                }
+                return this.similarUsers;
+            },
+
+            getRelevantArticlesAndCatalogs: function(articlePayload, catalogPayload, displayCount, userPredictionCount, taxonomyId) {
+                var articles = [];
+                var catalogs = [];
+                this.getSimilarUsers(userPredictionCount);
+                if (this.similarUsers &amp;&amp; this.similarUsers.length &gt; 0) {
+
+                    if (!gs.nil(articlePayload)) {
+                        articles = this.getSimilarUserArticles(this.similarUsers, articlePayload.knowledgeBases, articlePayload.articleCount, articlePayload.recentActivityCutoffDate, taxonomyId);
+                        if (articles.length &lt; displayCount) {
+                            var mostViewedArticleCount = displayCount - articles.length;
+                            var articlesToIgnore = articles.map(function(item) {
+                                return item.sys_id;
+                            });
+                            var mostViewedArticles = this.getMostViewedArticles(articlePayload.knowledgeBases, articlePayload.kbRecords, mostViewedArticleCount, articlesToIgnore, taxonomyId);
+                            articles = articles.concat(mostViewedArticles);
+                        }
+                    }
+
+                    if (!gs.nil(catalogPayload)) {
+                        catalogs = this.getCatalogItems(this.similarUsers, catalogPayload.catalogCount, null, catalogPayload.recentActivityCutoffDate, taxonomyId);
+                        if (catalogs.length &lt; displayCount) {
+                            var mostPopulartCatItemCount = displayCount - catalogs.length;
+                            var catalogItemsToIgnore = catalogs.map(function(item) {
+                                return item.sys_id;
+                            });
+                            catalogPayload.ignoredCatalogs = catalogItemsToIgnore;
+                            catalogPayload.users = null;
+                            var popularItems = this.userRecommendationUtil.getCatalogItems(catalogPayload);
+                            catalogs = catalogs.concat(popularItems);
+                        }
+                    }
+                } else {
+                    if (!gs.nil(articlePayload))
+                        articles = this.getMostViewedArticles(articlePayload.knowledgeBases, articlePayload.kbRecords, displayCount, null, taxonomyId);
+                    if (!gs.nil(catalogPayload))
+                        catalogs = this.getCatalogItems(null, catalogPayload.catalogCount, null, catalogPayload.recentActivityCutoffDate, taxonomyId);
+                }
+                var totalData = this.getCombinedData(articles, catalogs, displayCount);
+                return totalData;
+            },
+
+            getMostViewedArticles: function(knowledgeBases, kbRecords, articleCount, ignoreArticles, taxonomyId) {
+                var articlePayload = {
+                    knowledgeBases: knowledgeBases,
+                    kbRecords: kbRecords,
+                    articleCount: articleCount,
+                    ignoreArticles: ignoreArticles,
+                    taxonomyId: taxonomyId
+                };
+                var articles = this.userRecommendationUtil.getMostViewedArticles(articlePayload);
+                return articles;
+            },
+
+            getSimilarUserArticles: function(users, knowledgeBases, displayCount, recentActivityCutoffDate, taxonomyId) {
+                var articlesPayload = {
+                    users: users,
+                    knowledgeBases: knowledgeBases,
+                    articleCount: displayCount,
+                    recentActivityCutoffDate: recentActivityCutoffDate,
+                    taxonomyId: taxonomyId
+                };
+                return this.userRecommendationUtil.getArticlesforSimilarUsers(articlesPayload);
+            },
+
+            getCatalogItems: function(users, catalogCount, ignoredCatalogs, recentActivityCutoffDate, taxonomyId) {
+                var catalogPayload = {
+                    users: users,
+                    catalogCount: catalogCount,
+                    ignoredCatalogs: ignoredCatalogs,
+                    recentActivityCutoffDate: recentActivityCutoffDate,
+                    taxonomyId: taxonomyId
+                };
+                return this.userRecommendationUtil.getCatalogItems(catalogPayload);
+            },
+
+            getCombinedData: function(articleResults, catalogResults, displayCount) {
+                return this.userRecommendationUtil.getNormalizedData({
+                    articleResults: articleResults,
+                    catalogResults: catalogResults
+                }, displayCount, true);
+            },
+
+            type: 'RelevantForYouUtilSNC'
+        };]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-11-15 07:52:33&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;35dfe52797e50110ecc47e0e6253af29&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;2&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;RelevantForYouUtilSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Employee Center Core" source="sn_hr_sp"&gt;3d1da2705b021200a4656ede91f91ab6&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Employee Center Core"&gt;3d1da2705b021200a4656ede91f91ab6&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_35dfe52797e50110ecc47e0e6253af29&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-07-19 14:35:11&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:35:44</sys_created_on>
+        <sys_id>6556f89983f01210c6695855eeaad338</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>RelevantForYouUtilSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_6556f89983f01210c6695855eeaad338</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:35:44</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

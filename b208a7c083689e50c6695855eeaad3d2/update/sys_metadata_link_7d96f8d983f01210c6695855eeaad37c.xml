@@ -1,0 +1,227 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>4c69be88b7e101107f033307fe11a9a4</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_aisearch_global.AisMigrationConflictResolver&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Resolves conflicts between generated configs and existing configs if any&lt;/description&gt;
+        &lt;name&gt;AisMigrationConflictResolver&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var AisMigrationConflictResolver = Class.create();
+AisMigrationConflictResolver.prototype = {
+    initialize: function(migrationSysID) {
+        this.migrationSysID = migrationSysID;
+        this.logger = new AisMigrationLogger(migrationSysID, 'ConflictResolver');
+    },
+
+    /**
+    Child indexed sources cannot have filters in AI Search. These need to be resolved manually by users
+	
+	This method does some simple checks to see if it can be avoided.
+	 **/
+    resolveChildIndexedSource: function(aisChildGR, zingSourceGR) {
+
+        var parentDataSource = aisChildGR.getValue('datasource');
+        var parentDataSourceGr = new GlideRecord('ais_datasource');
+        parentDataSourceGr.get(parentDataSource);
+        var targetTable = parentDataSourceGr.getValue('source');
+
+        var existingCondition = parentDataSourceGr.getValue('filter');
+        var sourceTable = zingSourceGR.getValue('source_table');
+        var incomingCondition = '';
+        if (sourceTable)
+            incomingCondition = new global.TSConfigurationUtil().getTableLevelAttribute(sourceTable, 'text_index_filter_query');
+
+        if (existingCondition == incomingCondition) {
+            this.logger.info('Conditions are the same. Skipping ');
+            return;
+        }
+
+        if (incomingCondition != null &amp;&amp; existingCondition != null) {
+            this.logger.error('Table: ' + aisChildGR.getValue('table') + ' is a child table on Indexed Source: ' + targetTable +
+                '. Please manually resolve the filter conditions for Zing search source: ' + zingSourceGR.name);
+            return;
+        }
+
+    },
+
+    /**
+    Handles the case where the migrated source conflicts with an existing indexed source on the instance.
+
+	 **/
+    resolveIndexedSource: function(datasourceGr, zingSourceGr) {
+        var targetSource = datasourceGr.getValue('source');
+        var existingCondition = datasourceGr.getValue('filter');
+        var sourceTable = zingSourceGr.getValue('source_table');
+        var incomingCondition = '';
+        if (sourceTable)
+            incomingCondition = new global.TSConfigurationUtil().getTableLevelAttribute(sourceTable, 'text_index_filter_query');
+
+        // Legacy records could have a filter defined as an attribute instead of the condition field on the table
+        if (existingCondition == null || existingCondition == '')
+            existingCondition = new sn_ais.AisUtil().getTableLevelAttribute(targetSource, 'filter', '');
+
+        var finalCondition = this._resolveCondition(existingCondition, incomingCondition);
+
+        this.logger.warn("Resolved condition conflicts for table: " + targetSource + " . Result of condition merge: " + finalCondition);
+
+        var stagingGr = new AisMigrationRecord(this.migrationSysID, 'ais_datasource');
+        stagingGr.setNeedsReview(true);
+
+        stagingGr.addQuery('source', '=', targetSource);
+        stagingGr.query();
+        stagingGr.next();
+
+        stagingGr.setValue('source', targetSource);
+        stagingGr.setValue('filter', finalCondition);
+        stagingGr.update();
+
+    },
+
+    /**
+    Handles the case where the record we are about to migrate conflicts with a record we have staged. In this case, the 'previous_value'
+    for the record should come from the staged record, assuming it will be committed first.
+	
+	We will copy all values over from the previously staged record, and only overwrite the values we need to
+	 **/
+    resolveWithStagingRecord: function(targetTableName, existingStagingRecord, values) {
+        var targetSysID = existingStagingRecord.getValue('table_sys_id');
+        if (targetSysID == null || targetSysID == '')
+            targetSysID = 'sn_aisearch_global_job_staging_' + existingStagingRecord.getUniqueValue();
+
+        var stagingGr = new GlideRecord('sn_aisearch_global_job_staging');
+        stagingGr.initialize();
+        stagingGr.setValue('state', 'needs_review');
+
+        stagingGr.setValue('table_name', targetTableName);
+        stagingGr.setValue('table_sys_id', targetSysID);
+        stagingGr.setValue('operation', 'update');
+        stagingGr.setValue('migration_orchestration', this.migrationSysID);
+
+        var stagingRecordSysID = stagingGr.insert();
+        var insertedChanges = 0;
+
+        var existingChangeGr = new GlideRecord('sn_aisearch_global_job_staging_change');
+        existingChangeGr.addQuery('migration_staging_record', existingStagingRecord.getUniqueValue());
+        existingChangeGr.query();
+
+        while (existingChangeGr.next()) {
+            var key = existingChangeGr.getValue('field');
+            var existingValue = existingChangeGr.getValue('new_value');
+            var incomingValue = values[key];
+            var finalValue;
+
+            if (key == 'filter') {
+                finalValue = this._resolveCondition(existingValue, incomingValue);
+                this.logger.warn("Resolved staged condition conflicts for table: " + targetTableName + " . Result of condition merge: " + finalValue);
+            } else if (incomingValue == null)
+                finalValue = existingValue;
+            else
+                finalValue = incomingValue;
+
+            var stagingChangeGr = new GlideRecord('sn_aisearch_global_job_staging_change');
+            stagingChangeGr.initialize();
+            stagingChangeGr.setValue('migration_staging_record', stagingRecordSysID);
+            stagingChangeGr.setValue('field', key);
+            stagingChangeGr.setValue('previous_value', existingValue);
+            stagingChangeGr.setValue('new_value', finalValue);
+            stagingChangeGr.insert();
+
+            insertedChanges = insertedChanges + 1;
+        }
+
+        // In case of no changes, remove the staging record
+        if (insertedChanges == 0) {
+            gs.info('No changes found for the record. Deleting staged record.');
+            stagingGr.get(stagingRecordSysID);
+            stagingGr.deleteRecord();
+        }
+
+        this.setValues = {};
+
+    },
+
+    /**
+    Resolves conditions by joining them with a new query (^NQ) operator, which translates roughly to an OR
+    
+    We are severely limited by the APIs exposed to scoped apps. Hence we can only perform primitive string operations on the conditions we see
+	 **/
+    _resolveCondition: function(existingCondition, incomingCondition) {
+        if (existingCondition != null)
+            existingCondition = existingCondition.trim();
+
+        if (incomingCondition != null)
+            incomingCondition = incomingCondition.trim();
+        this.logger.info('Resolving conditions: existing: ' + existingCondition + ' incoming: ' + incomingCondition);
+
+        // If either of the conditions are empty or null, then there are no filters. Need to index all content.
+        if (existingCondition == null || existingCondition == '')
+            return null;
+
+        if (incomingCondition == null || incomingCondition == '')
+            return null;
+
+        // Check if either condition contains the other
+        if (this._doesFirstConditionContainSecond(existingCondition, incomingCondition))
+            return existingCondition;
+        if (this._doesFirstConditionContainSecond(incomingCondition, existingCondition))
+            return incomingCondition;
+
+        return existingCondition + '^NQ' + incomingCondition;
+    },
+
+    _doesFirstConditionContainSecond: function(firstCondition, secondCondition) {
+        if (firstCondition == secondCondition)
+            return true;
+
+        if (firstCondition == null || !firstCondition.includes('^NQ'))
+            return false;
+
+        var subConditions = firstCondition.split('^NQ');
+        for (var i in subConditions) {
+            var condition = subConditions[i];
+            if (condition.trim() == secondCondition.trim())
+                return true;
+        }
+
+        return false;
+    },
+
+
+
+    type: 'AisMigrationConflictResolver'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-02-03 23:02:57&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;4c69be88b7e101107f033307fe11a9a4&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;43&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AisMigrationConflictResolver&lt;/sys_name&gt;
+        &lt;sys_package display_value="AI Search For Next Experience" source="sn_aisearch_global"&gt;3c467b5f0bf130109e0fa4e6e9c4c946&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="AI Search For Next Experience"&gt;3c467b5f0bf130109e0fa4e6e9c4c946&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_4c69be88b7e101107f033307fe11a9a4&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;maint&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-02-24 05:57:11&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:36:51</sys_created_on>
+        <sys_id>7d96f8d983f01210c6695855eeaad37c</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AisMigrationConflictResolver</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_7d96f8d983f01210c6695855eeaad37c</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:36:51</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

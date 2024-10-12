@@ -1,0 +1,601 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>a5d7615653122010c722ddeeff7b12c2</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_mab_api.ConfigRetrievalService&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;The script include used for mobile configuration retrievals&lt;/description&gt;
+        &lt;name&gt;ConfigRetrievalService&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ConfigRetrievalService = Class.create();
+ConfigRetrievalService.prototype = {
+    initialize: function(copyMode) {
+        this.configKeyFactory = new sn_mab_api.ConfigKeyFactory();
+        this.daoCache = new sn_mab_api.MobileDAOCache();
+        this.configKeyStackCreator = new sn_mab_api.ConfigKeyStackCreator();
+        this.configResponse = new sn_mab_api.ConfigResponse();
+        this.validationHandler = new sn_mab_api.ValidationHandler();
+        this.errorHandler = new sn_mab_api.ErrorHandler();
+        this.alertHandler = new sn_mab_api.AlertHandler();
+        this.configKeyStack = [];
+        this.configTypeMap = new sn_mab_api.A_ConfigTypeMap();
+        this.typeMap = this.configTypeMap.typeMap;
+        this.hideFromContentTreeNodes = this.configTypeMap.hideFromContentTreeNodes;
+        // Duplicate options
+        this.copyMode = copyMode;
+        this.initialCopyNode = null;
+        this.duplicateConfigMap = new sn_mab_api.DuplicateConfigMap();
+        this.descendantsToReuse = this.duplicateConfigMap.descendantsToReuse;
+        // Used to keep track of mobile ui rules with a parent table !== sys_sg_view_config
+        this.nonCardUiRulesToDuplicate = [];
+        // Because the target field on ui rule actions associated to them behave uniquely
+        this.nonCardUiRuleActions = [];
+        this.uiRuleActionTargets = {};
+        // Parameterized condition builders also similarly rely on the name of a record instead of the sysId
+        this.parameterizedConditionBuilders = this.duplicateConfigMap.parameterizedConditionBuilders;
+        this.parameterizedConditions = {};
+        this.itemParameters = [];
+    },
+
+    retrieveConfig: function(tableName, sysId, externalNodes) {
+        if (this.copyMode) {
+            this.initialCopyNode = {
+                tableName: tableName,
+                sysId: sysId
+            };
+            return this.retrieveCopyConfig(tableName, sysId);
+        } else {
+            return this.retrieveStandardConfig(tableName, sysId, externalNodes);
+        }
+    },
+
+    retrieveStandardConfig: function(tableName, sysId, externalNodes) {
+        this.validateInput(tableName, sysId);
+
+        var isFloor = false;
+        if (externalNodes &amp;&amp; externalNodes.length) {
+            this.configResponse = new sn_mab_api.ConfigResponse(externalNodes);
+            this.configKeyStack = this.createStackFromNodes(externalNodes);
+            isFloor = externalNodes[externalNodes.length - 1].isFloor;
+        }
+
+        this.processConfiguration(tableName, sysId, isFloor);
+        this.configResponse.preSerialize(this.copyMode);
+        return this.configResponse;
+    },
+
+    retrieveCopyConfig: function(tableName, sysId) {
+        this.validateInput(tableName, sysId);
+
+        this.processConfiguration(tableName, sysId);
+        this.processUiRuleActions();
+        this.processParameterizedConditions();
+        this.configResponse.preSerialize(this.copyMode);
+        return this.configResponse;
+    },
+
+    validateInput: function(tableName, sysId) {
+        if (!tableName || !this.validationHandler.isValidTable(tableName))
+            this.errorHandler.throwBadRequestError('Table name missing or does not exist: ' + tableName);
+
+        if (!this.validationHandler.isGeneratedOrNormalSysId(sysId))
+            this.errorHandler.throwBadRequestError('SysId missing or does not exist: ' + sysId);
+
+        // TODO: Use cache instead querying DAO directly
+        var dao = new sn_glide_ms_api.MobileAppBuilderDAO(tableName);
+        var record = dao.getRecord(sysId);
+        if (record == null || !record.isValidRecord())
+            this.errorHandler.throwNotFoundError('Record does not exist for table: ' + tableName + ' and id: ' + sysId);
+    },
+
+    createStackFromNodes: function(externalNodes) {
+        return this.configKeyStackCreator.createStackFromNodes(externalNodes);
+    },
+
+    //TODO: extra lookups are being performed because we can't pass in a GR directly to this function
+    //need to consider modifying the java dao so that we can pass it around with a loaded 'curr' object similar to a normal GR
+    processConfiguration: function(tableName, sysId, isFloor) {
+        // handles the case where a we want to get the tableName of a child table
+        tableName = this.getSysClassName(tableName, sysId);
+
+        //Have we already processed this node?
+        var wasProcessed = this.configResponse.nodeExists(tableName, sysId);
+        //Create our output node and add it to response, otherwise return on error
+        var currConfigNode = this.addConfigNodeResponse(tableName, sysId);
+
+        if (isFloor) {
+            this.addConfigFloorNode(tableName, sysId);
+        }
+        this.addConfigNodeLink(tableName, sysId, isFloor);
+        if (!currConfigNode || wasProcessed || isFloor)
+            return;
+
+        //Get our configMetadata
+        var configMetadata = this.getConfigMetadata(tableName, sysId);
+
+        var curNode = new ConfigKeyStackEntry(configMetadata.getConfigKey(), tableName, sysId);
+
+        //Push ourselves onto the configKeyStack
+        this.configKeyStack.push(curNode);
+
+        if (this.copyMode) {
+            this.processCurrentCopyNode(configMetadata, currConfigNode);
+        } else {
+            this.processCurrentNode(configMetadata, currConfigNode);
+        }
+
+        //Pop ourselves off the configKeyStack
+        this.configKeyStack.pop();
+    },
+
+    getSysClassName: function(tableName, sysId) {
+        var record = this.daoCache.getDAO(tableName).getRecord(sysId);
+
+        if (!record || !record.sys_class_name)
+            return tableName;
+
+        return record.sys_class_name.value;
+    },
+
+    processCurrentNode: function(configMetadata, currConfigNode) {
+        //Handle our references first
+        configMetadata.references.forEach(function(currReference) {
+            this.processReferences(currReference, currConfigNode);
+        }, this);
+
+        //Handle our relationships
+        configMetadata.relationships.forEach(function(currRelationship) {
+            this.processRelationships(currRelationship, currConfigNode);
+        }, this);
+    },
+
+    processCurrentCopyNode: function(configMetadata, currConfigNode) {
+        this.prepForDuplicatingUiRules(currConfigNode);
+        this.prepForDuplicatingParameterizedConditions(currConfigNode);
+        // Get a list of descendant tables to look out for
+        var descendantTablesToReuse = this.descendantsToReuse.all.concat(this.descendantsToReuse[this.initialCopyNode.tableName] || []);
+
+        //Handle our references first
+        configMetadata.references.forEach(function(currReference) {
+            this.processReferences(currReference, currConfigNode, descendantTablesToReuse);
+        }, this);
+
+        //Handle our relationships
+        configMetadata.relationships.forEach(function(currRelationship) {
+            this.processRelationships(currRelationship, currConfigNode, descendantTablesToReuse);
+        }, this);
+    },
+
+    // Strictly for duplicating UI rules, which behave differently if they're attached to sys_sg_parameter_screen
+    // or sys_sg_parameter_section instead of sys_sg_view_config
+    prepForDuplicatingUiRules: function(currConfigNode) {
+        var nodeData = currConfigNode.data;
+        var sysClassName = nodeData.sys_class_name.value;
+        var sysId = nodeData.sys_id.value;
+        // If the currConfigNode is an input associated to a form screen or section, track it
+        if (sysClassName === 'sys_sg_input') {
+            if (nodeData.parameter_section || nodeData.parameter_screen) {
+                this.uiRuleActionTargets[nodeData.name.displayValue] = {
+                    sysId: sysId,
+                };
+            }
+            // If the currConfigNode is a ui rule associated to a form screen or section, track it too
+        } else if (sysClassName === 'sys_sg_ui_rule') {
+            if (nodeData.parent_table.value !== 'sys_sg_view_config') {
+                this.nonCardUiRulesToDuplicate.push(sysId);
+            }
+            // Finally also track the ui rule actions associated to non-card ui rules
+        } else if (sysClassName === 'sys_sg_ui_rule_action') {
+            var uiRule = nodeData.ui_rule.value;
+            if (this.nonCardUiRulesToDuplicate.indexOf(uiRule) !== -1) {
+                this.nonCardUiRuleActions.push({
+                    sysId: sysId,
+                    uiRule: uiRule,
+                    target: nodeData.target.value
+                });
+            }
+        }
+    },
+
+    // Strictly for duplicating records that include a parameterized condition, which references the name of an
+    // item parameter
+    prepForDuplicatingParameterizedConditions: function(currConfigNode) {
+        var nodeData = currConfigNode.data;
+        var sysClassName = nodeData.sys_class_name.value;
+        var sysId = nodeData.sys_id.value;
+        var parameterizedCondBuilderFields = this.parameterizedConditionBuilders[sysClassName];
+        // If we know this record has a parameterized condition filled out, track it
+        if (parameterizedCondBuilderFields) {
+            parameterizedCondBuilderFields.forEach(function(condBuilderField) {
+                var conditionString = nodeData[condBuilderField] ? nodeData[condBuilderField].value : null;
+                if (conditionString) {
+                    // A record can have more than one parameterized condition
+                    if (!this.parameterizedConditions[sysId]) {
+                        this.parameterizedConditions[sysId] = [];
+                    }
+                    this.parameterizedConditions[sysId].push({
+                        conditionString: conditionString,
+                        parentSysClassName: sysClassName,
+                        parentSysId: sysId,
+                        field: condBuilderField
+                    });
+                }
+            }, this);
+            // Also track item parameters that has a parent with a parameterized condition
+        } else if (sysClassName === 'sys_sg_item_parameter') {
+            var parent = nodeData.parent.value;
+            if (parent &amp;&amp; this.parameterizedConditions[parent]) {
+                this.itemParameters.push({
+                    sysId: sysId,
+                    name: nodeData.name.value,
+                    parent: parent
+                });
+            }
+        }
+    },
+
+    // Add the ui rule action exceptions to the config response
+    processUiRuleActions: function() {
+        if (!this.nonCardUiRulesToDuplicate.length) return;
+
+        this.nonCardUiRuleActions.forEach(function(uiRuleAction) {
+            var targetName = uiRuleAction.target;
+            var target = this.uiRuleActionTargets[targetName];
+            var uiRuleActionTarget = {
+                name: targetName,
+                sysId: target.sysId
+            };
+            this.configResponse.addUiRuleActionException(uiRuleActionTarget, uiRuleAction.sysId);
+        }, this);
+    },
+
+    // Add item parameter exceptions to the config response
+    processParameterizedConditions: function() {
+        if (!this.itemParameters.length) return;
+
+        this.itemParameters.forEach(function(itemParameter) {
+            var parent = itemParameter.parent;
+            var conditions = this.parameterizedConditions[parent];
+            conditions.forEach(function(condition) {
+                // Only add the exception if the condition string actually includes a reference to that exception
+                if (condition.conditionString.indexOf(itemParameter.name) !== -1) {
+                    var updatedItemParameter = Object.create(itemParameter);
+                    updatedItemParameter.parent = {
+                        sysClassName: condition.parentSysClassName,
+                        sysId: condition.parentSysId,
+                        fields: [condition.field]
+                    };
+                    updatedItemParameter.name = itemParameter.name;
+                    this.configResponse.addItemParameterException(updatedItemParameter, itemParameter.sysId);
+                }
+            }, this);
+        }, this);
+    },
+
+    getConfigMetadata: function(tableName, sysId) {
+        var configMetadata = this.configKeyFactory.getGenerator(tableName).getTreeConfigurationViaSysId(sysId);
+        if (!configMetadata) {
+            gs.warn(gs.getMessage('ConfigRetrievalService was unable to retrieve the config metadata for table: {0}, id: {1}', tableName, sysId));
+            //get empty config metadata
+            configMetadata = new sn_mab_api.TreeConfigurationNode();
+        }
+        return configMetadata;
+    },
+
+    processReferences: function(currReference, configNode, descendantTablesToReuse) {
+        //Verify that the referenced field exists and extract its tableName
+        var refTableName = undefined;
+        var refSysId = undefined;
+        var nodeData = configNode.data;
+
+        if (nodeData &amp;&amp; nodeData[currReference.name]) {
+            refTableName = nodeData[currReference.name].referenceTable;
+            refSysId = nodeData[currReference.name].value;
+        }
+
+        // Nodes that doesn't have to be retrieved, or hidden from the content tree
+        if (refTableName &amp;&amp; this.hideFromContentTreeNodes.indexOf(refTableName) != -1) {
+            return;
+        }
+
+        if (!refTableName || !refSysId) {
+            gs.warn(gs.getMessage('ConfigRetrievalService was unable to retrieve the reference: {0} for table: {1}, id: {2}', currReference.name, configNode.tableName, configNode.sysId));
+            return;
+        }
+
+        // Booleans for floorNode escapes
+        var shouldIgnoreConditional = false;
+        var shouldAlwaysFloor = false;
+
+        // Which are only set if we're copying
+        if (this.copyMode) {
+            // While we're copying, either we're copying a record and all of its children, therefore needing to ignore any potential floorNoding
+            shouldIgnoreConditional = descendantTablesToReuse.indexOf(refTableName) === -1;
+            // ...or we're reusing an existing record and all of its children. Instead of returning any children records, we'll just treat that
+            // reused record as a floorNode
+            shouldAlwaysFloor = !shouldIgnoreConditional;
+        }
+
+        refSysId = refSysId.split(',');
+        refSysId.forEach(function(referenceSysId) {
+            if (!referenceSysId || referenceSysId.length &lt;= 0)
+                return;
+
+            if (shouldAlwaysFloor) {
+                this.processConfiguration(refTableName, referenceSysId, true);
+            } else if (!currReference.conditional || shouldIgnoreConditional) {
+                this.processConfiguration(refTableName, referenceSysId, false);
+            } else {
+                // conditional evaluated to true so process next node
+                if (this.evaluateConditional(currReference.conditional, refTableName, referenceSysId)) {
+                    this.processConfiguration(refTableName, referenceSysId, false);
+                    // conditional evaluated to false but a conditional existed so we process direct children
+                } else {
+                    this.processConfiguration(refTableName, referenceSysId, true);
+                }
+            }
+        }, this);
+    },
+
+    evaluateConditional: function(conditional, tableName, sysId) {
+        var configMetadata = this.getConfigMetadata(tableName, sysId);
+        var evaluation = false;
+
+        //If we find the metadata we can try the conditional evaluation
+        if (configMetadata &amp;&amp; this.evaluateCondition(conditional, this.configKeyStack, configMetadata))
+            evaluation = true;
+
+        return evaluation;
+    },
+
+    evaluateCondition: function(conditional, configKeyStack, configMetadata) {
+        return ConditionalEvaluator.evaluate(conditional, configKeyStack, configMetadata, this.copyMode);
+    },
+
+    getConfigData: function(tableName, sysId) {
+        return this.daoCache.getDAO(tableName).getRecord(sysId);
+    },
+
+    processRelationships: function(currRelationship, configNode, descendantTablesToReuse) {
+        //Verify that the reference fields exist and extract them
+        var refTableName = currRelationship.remoteTableName;
+        var refLocalSysIdField = currRelationship.localRefFieldName;
+        var refRemoteSysIdField = currRelationship.remoteRefFieldName;
+        var isM2MTable = refLocalSysIdField ? true : false;
+
+        if (!refTableName || !refRemoteSysIdField) {
+            gs.warn(gs.getMessage('ConfigRetrievalService was unable to proess the relationship: {0} for table: {1}, id: {2}', currRelationship.name, configNode.tableName, configNode.sysId));
+            return;
+        }
+
+        var encodedQuery = (isM2MTable ? refLocalSysIdField : refRemoteSysIdField) + '=' + configNode.sysId;
+        var relationshipEntries = this.daoCache.getDAO(refTableName).getRecordsByEncodedQuery(encodedQuery);
+        //No records were found that match - we return
+        if (!relationshipEntries)
+            return;
+
+        //Iterate through each M2M or 12M table's entries
+        relationshipEntries.forEach(function(currEntry) {
+            var resolvedTableName = refTableName;
+            var resolvedSysId = currEntry.sys_id.value;
+            var m2mTableName = resolvedTableName;
+            var m2mTableSysId = resolvedSysId;
+
+            if (isM2MTable) {
+                //If we have an M2M table we need to follow the refRemoteSysIdField to get our node
+                if (currEntry[refRemoteSysIdField]) {
+                    resolvedTableName = this.getRefTableName(currEntry, refRemoteSysIdField);
+                    resolvedSysId = currEntry[refRemoteSysIdField].value;
+                } else {
+                    //this else block handles an m2m node without a child so the currEntry(refRemoteSysIdField) check fails because it is undefined
+                    this.addConfigNodeResponse(m2mTableName, m2mTableSysId);
+                    this.addConfigNodeLink(m2mTableName, m2mTableSysId);
+                    this.addEmptyM2MAlert(m2mTableName);
+                    return;
+                }
+            }
+
+            //If we cant figure out the resolved tableName/sysId we break out
+            if (!resolvedTableName || !resolvedSysId)
+                return;
+
+            // Booleans for floorNode escapes
+            var shouldIgnoreConditional = false;
+            var shouldAlwaysFloor = false;
+
+            // Which are only set if we're copying
+            if (this.copyMode) {
+                // While we're copying, either we're copying a record and all of its children, therefore needing to ignore any potential floorNoding
+                shouldIgnoreConditional = descendantTablesToReuse.indexOf(refTableName) === -1;
+                // ...or we're reusing an existing record and all of its children. Instead of returning any children records, we'll just treat that
+                // reused record as a floorNode
+                shouldAlwaysFloor = !shouldIgnoreConditional;
+            }
+
+            var isFloor = false;
+
+            if (currRelationship.conditional &amp;&amp; !shouldIgnoreConditional) {
+                if (shouldAlwaysFloor || !this.evaluateConditional(currRelationship.conditional, resolvedTableName, resolvedSysId)) {
+                    isFloor = true;
+                }
+            }
+
+            //If we have a M2M push the M2M onto the stack and output
+            if (isM2MTable) {
+                this.addConfigNodeResponse(m2mTableName, m2mTableSysId);
+                this.addConfigNodeLink(m2mTableName, m2mTableSysId);
+                //Get our configMetadata
+                var m2mConfigMetadata = this.getConfigMetadata(m2mTableName, m2mTableSysId);
+                //Push ourselves onto the configKeyStack
+                this.configKeyStack.push(new ConfigKeyStackEntry(m2mConfigMetadata.getConfigKey(), m2mTableName, m2mTableSysId));
+            }
+
+            //Process our main node
+            this.processConfiguration(resolvedTableName, resolvedSysId, isFloor);
+
+            //Pop the M2M from the stack if it exists
+            if (isM2MTable)
+                this.configKeyStack.pop();
+
+        }, this);
+    },
+
+    getParentNode: function() {
+        if (this.configKeyStack.length)
+            return this.configKeyStack[this.configKeyStack.length - 1];
+
+    },
+
+    getRefTableName: function(record, refFieldName) {
+        var refField = record[refFieldName];
+        var refTable = null;
+        if (refField.type === 'reference')
+            refTable = refField.referenceTable;
+        else if (refField.type === 'document_id') {
+            var dependentField = this.getDepFieldRefTableName(record.sys_class_name.value, refFieldName);
+            refTable = dependentField ? record[dependentField].value : null;
+        }
+
+        if (!refTable)
+            gs.warn(gs.getMessage('ConfigRetrievalService was unable to get reference table for field {0} on table {1}', refFieldName, record.sys_class_name.value));
+
+        return refTable;
+    },
+
+    getDepFieldRefTableName: function(table, fieldName) {
+        var dependent = null;
+        var dict = new GlideRecordSecure('sys_dictionary');
+        dict.addQuery('name', table);
+        dict.addQuery('element', fieldName);
+        dict.query();
+
+        if (dict.next())
+            dependent = dict.getValue('dependent');
+
+        return dependent;
+    },
+
+    addEmptyM2MAlert: function(m2mTableName) {
+        //logging a warning if m2m table name isn't provided but continue to provide a warning for the FE
+        var childTable = '';
+        if (!m2mTableName)
+            gs.warn(gs.getMessage('Returning addEmptyM2MAlert with incomplete data for alertData.childTable'));
+        else
+            childTable = m2mTableName;
+
+        var parentNode = this.getParentNode();
+        if (parentNode) {
+            var missingM2MChildAlertFlag = this.alertHandler.generateMissingM2MChildAlert(parentNode.tableName, parentNode.sysId, m2mTableName);
+            this.configResponse.addAlert(missingM2MChildAlertFlag);
+        }
+    },
+
+    //Find the node or it is not accessible then return and log it
+    validateConfigData: function(tableName, sysId) {
+        var configData = this.getConfigData(tableName, sysId);
+        if (!configData) {
+            gs.warn(gs.getMessage('ConfigRetrievalService was unable to retrieve the node for table: {0}, id: {1}', tableName, sysId));
+            return false;
+        }
+        return true;
+    },
+
+    addConfigNodeLink: function(tableName, sysId, isFloor) {
+        var configNode = this.configResponse.getConfigNode(tableName, sysId);
+        if (!configNode &amp;&amp; !this.validateConfigData(tableName, sysId)) {
+            return;
+        }
+        //If we are not the root node we add the link
+        var parentNode = this.getParentNode();
+        if (parentNode)
+            this.configResponse.validateAndAddNodeLink(parentNode.tableName, parentNode.sysId, tableName, sysId, isFloor);
+    },
+
+    addConfigFloorNode: function(tableName, sysId) {
+        var configNode = this.configResponse.getConfigNode(tableName, sysId);
+        if (!configNode &amp;&amp; !this.validateConfigData(tableName, sysId)) {
+            return;
+        }
+        //If we are not the root node we add the link
+        var parentNode = this.getParentNode();
+        if (parentNode)
+            this.configResponse.addFloorNode(parentNode.tableName, parentNode.sysId, tableName, sysId);
+    },
+
+    addConfigNodeResponse: function(tableName, sysId) {
+        var configNode = this.configResponse.getConfigNode(tableName, sysId);
+        //Check our response to see if we already have output this node
+        if (!configNode) {
+            var configData = this.getConfigData(tableName, sysId);
+
+            if (!configData) {
+                if (!this.validationHandler.isRecordGloballyScoped(tableName, sysId)) {
+                    this.addUnretrievableNodeAlert(tableName, sysId);
+                    gs.warn(gs.getMessage('ConfigRetrievalService was unable to retrieve the node for table: {0}, id: {1}', tableName, sysId));
+                }
+
+                return;
+            }
+
+            this.configResponse.addConfigNode(tableName, sysId, configData);
+            configNode = {
+                'data': configData,
+                'tableName': tableName,
+                'sysId': sysId
+            };
+        }
+
+        return configNode;
+    },
+
+    addUnretrievableNodeAlert: function(tableName, sysId) {
+        var unretrievableNodeAlert = this.alertHandler.generateUnretrievableNodeAlert(tableName, sysId);
+        this.configResponse.addAlert(unretrievableNodeAlert);
+    },
+
+    type: 'ConfigRetrievalService'
+};
+
+function ConfigKeyStackEntry(configKey, tableName, sysId) {
+    if (!configKey || !tableName || !sysId)
+        new ErrorHandler().throwInternalError('Error - NodeStackEntry not defined correctly');
+
+    this.configKey = configKey;
+    this.tableName = tableName;
+    this.sysId = sysId;
+}
+]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;maint&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-02-15 07:03:07&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;a5d7615653122010c722ddeeff7b12c2&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;8&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ConfigRetrievalService&lt;/sys_name&gt;
+        &lt;sys_package display_value="Mobile App Builder API" source="sn_mab_api"&gt;3c64259bc7812010100f2f3bf4c2609a&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Mobile App Builder API"&gt;3c64259bc7812010100f2f3bf4c2609a&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_a5d7615653122010c722ddeeff7b12c2&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;maint&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-05-20 06:48:34&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:46:39</sys_created_on>
+        <sys_id>25d8789183341210c6695855eeaad37c</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ConfigRetrievalService</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_25d8789183341210c6695855eeaad37c</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:46:39</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

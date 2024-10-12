@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>78f1034fb71101107f033307fe11a9c8</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_aisearch_global.AisMigrationReverter&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Reverse of AisMigrationCommitter&lt;/description&gt;
+        &lt;name&gt;AisMigrationReverter&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var AisMigrationReverter = Class.create();
+AisMigrationReverter.prototype = {
+    initialize: function(migrationSysID) {
+        this.sysIDLookup = {};
+        this.utils = new sn_aisearch_global.AISMigrationUtils(migrationSysID);
+        this.logger = new sn_aisearch_global.AisMigrationLogger(migrationSysID, 'Reverter');
+        this.migrationSysID = migrationSysID;
+    },
+
+    revertAll: function() {
+        this._revertStagedRecords();
+        this._removeIndexHistoryRecords();
+        this._publishProfile();
+    },
+
+    _revertStagedRecords: function(queryField, queryValue) {
+        var migrationStagingGr = new GlideRecord('sn_aisearch_global_job_staging');
+        migrationStagingGr.addQuery('state', 'accept');
+        migrationStagingGr.addQuery('migration_orchestration', this.migrationSysID);
+        if (queryField &amp;&amp; queryValue) {
+            migrationStagingGr.addQuery(queryField, queryValue);
+        }
+        migrationStagingGr.orderByDesc('sequence'); //revert in the reverse order of inserts
+        migrationStagingGr.query();
+
+        while (migrationStagingGr.next()) {
+            var operation = migrationStagingGr.getValue('operation');
+            var destinationTable = migrationStagingGr.getValue('table_name');
+            var destinationSysID = migrationStagingGr.getValue('table_sys_id');
+
+            if (operation == 'insert') {
+                var destinationGr = new GlideRecord(destinationTable);
+                destinationGr.get(destinationSysID);
+                if (destinationGr) {
+                    this.sysIDLookup['sn_aisearch_global_job_staging_' + migrationStagingGr.getUniqueValue()] = destinationGr.getUniqueValue();
+                    destinationGr.deleteRecord();
+                }
+            } else {
+                this.logger.info("Trying to find a record for undo in table: " + destinationTable + " . sys_id: + " + destinationSysID + ". ");
+                var migrationStagingChangeGr = new GlideRecord('sn_aisearch_global_job_staging_change');
+                migrationStagingChangeGr.addQuery('migration_staging_record', migrationStagingGr.getUniqueValue());
+                migrationStagingChangeGr.query();
+                try {
+                    this._undoChanges(migrationStagingChangeGr, destinationTable);
+                } catch (e) {
+                    this.logger.errorWithException("An error occurred while undoing changes for a record in table: " + destinationTable + " . sys_id: + " + destinationSysID + ". ", e);
+                }
+            }
+        }
+    },
+
+    _undoChanges: function(migrationStagingChangeGr, destinationTable) {
+        var destinationGr = new GlideRecord(destinationTable);
+        var changes = "";
+        var previousValues = {};
+
+        if (!migrationStagingChangeGr.hasNext()) {
+            this.logger.warn("No conditions found. Aborting this delete operation");
+            return;
+        }
+
+        while (migrationStagingChangeGr.next()) {
+            var fieldName = migrationStagingChangeGr.getValue('field');
+            var fieldValue = migrationStagingChangeGr.getValue('new_value');
+
+            if (fieldValue != null &amp;&amp; fieldValue.startsWith('sn_aisearch_global_job_staging_')) {
+                fieldValue = this.utils._lookupSysID(fieldValue, this.sysIDLookup, this.logger);
+
+                if (fieldValue == null) {
+                    this.logger.warn("Expected to find a lookup for " + migrationStagingChangeGr.getValue('new_value'));
+                }
+            }
+            previousValues[fieldName] = migrationStagingChangeGr.getValue('previous_value');
+
+            changes = changes + fieldName + ":" + fieldValue + " ";
+            destinationGr.addQuery(fieldName, fieldValue);
+        }
+        destinationGr.setLimit(1);
+        destinationGr.query();
+
+        if (!destinationGr.hasNext()) {
+            this.logger.warn("Unable to find record that matches. Either the record does not exist or has been changed since commit.");
+            return null;
+        }
+        destinationGr.next();
+
+        for (var key in previousValues) {
+            destinationGr.setValue(key, previousValues[key]);
+        }
+
+        this.logger.info("Updating record =&gt; " + changes);
+        destinationGr.update();
+    },
+
+    _removeIndexHistoryRecords: function() {
+        var gr = new GlideRecord('sn_aisearch_global_job_ingest_history');
+        gr.addQuery('sn_aisearch_global_migration_job', this.migrationSysID);
+        gr.query();
+        gr.deleteMultiple();
+    },
+
+    _publishProfile: function() {
+        var jobGr = new GlideRecord('sn_aisearch_global_migration_job');
+        if (jobGr.get(this.migrationSysID)) {
+            var aisAppGr = new AISMigrationUtils().getSearchProfilesToPublish(jobGr.selected_config);
+            if (aisAppGr != null &amp;&amp; aisAppGr.search_profile.state != 'PUBLISHED') {
+                var profile = aisAppGr.search_profile.name;
+                var dictionaries = new AISMigrationUtils().getDictionariesToPublish(aisAppGr.search_profile);
+                for (var i = 0; i &lt; dictionaries.length; i++)
+                    new sn_ais.Synchronizer().publishDictionary(dictionaries[i]);
+
+                new sn_ais.Synchronizer().publishProfile(profile);
+            }
+        }
+    },
+
+    type: 'AisMigrationReverter'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-03-07 21:02:44&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;78f1034fb71101107f033307fe11a9c8&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;46&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AisMigrationReverter&lt;/sys_name&gt;
+        &lt;sys_package display_value="AI Search For Next Experience" source="sn_aisearch_global"&gt;3c467b5f0bf130109e0fa4e6e9c4c946&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="AI Search For Next Experience"&gt;3c467b5f0bf130109e0fa4e6e9c4c946&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_78f1034fb71101107f033307fe11a9c8&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-03-15 23:35:10&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:39:04</sys_created_on>
+        <sys_id>1a177c5d83f01210c6695855eeaad32e</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AisMigrationReverter</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_1a177c5d83f01210c6695855eeaad32e</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:39:04</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

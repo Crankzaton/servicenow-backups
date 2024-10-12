@@ -1,0 +1,139 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>86c6034824912510f8775fc2cb18d66e</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_entitlement.CustomTableEntitlementProcessor&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Processes entitlement requests for custom table artifacts&lt;/description&gt;
+        &lt;name&gt;CustomTableEntitlementProcessor&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var CustomTableEntitlementProcessor = Class.create();
+CustomTableEntitlementProcessor.prototype = {
+    initialize: function() {
+        this.ctiDao = new CustomTableInventoryDAO();
+        this.logger = new LoggingUtil();
+    },
+
+    // returns true if table is present in sys_custom_db_object
+    isCustomTable: function(tableName) {
+        return new SysCustomDBObjectDAO().isCustomTable(tableName);
+    },
+
+    // returns true if table is present in CTI and allotment type is not grandfather
+    isLicensableCustomTable: function(tableName) {
+        return this.ctiDao.isLicensableCustomTable(tableName);
+    },
+
+    // returns sys_id of the active subscription associated with the given custom table
+    getActiveSubscriptionSysId: function(tableName) {
+        return this.ctiDao.getActiveSubscriptionSysId(tableName);
+    },
+
+    // returns user access check type associated with the given custom table
+    getUserAccessCheckType: function(tableName) {
+        try {
+            var subscriptionSysId = this.getActiveSubscriptionSysId(tableName);
+            if (gs.nil(subscriptionSysId)) {
+                this.logger.logCouldNotFind(LicensingEngineConstants.CUSTOM_TABLE_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.GET_USER_ACCESS_CHECK_TYPE,
+                    LicensingEngineConstants.ACTIVE_ASSOCIATED_SUBSCRIPTIONS);
+                return LicensingEngineConstants.CHECK;
+            }
+
+            var subscriptionType = new SubscriptionEntitlementDAO().getSubscriptionTypeBySysId(subscriptionSysId);
+            if (gs.nil(subscriptionType)) {
+                this.this.logger.logCouldNotFind(LicensingEngineConstants.CUSTOM_TABLE_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.GET_USER_ACCESS_CHECK_TYPE,
+                    LicensingEngineConstants.ASSOCIATED_SUBSCRIPTION_TYPE);
+                return LicensingEngineConstants.CHECK;
+            }
+            return new UserAccessManagerUtil().getUserAccessCheckBySubscriptionType(subscriptionType);
+        } catch (error) {
+            this.logger.logErrorInDetermining(LicensingEngineConstants.CUSTOM_TABLE_ENTITLEMENT_PROCESSOR,
+                LicensingEngineConstants.GET_USER_ACCESS_CHECK_TYPE, LicensingEngineConstants.USER_ACCESS_CHECK_TYPE, error);
+            // if we catch any unexpected exception, we return true as we don't want to restrict customers
+            return LicensingEngineConstants.ALLOW;
+        }
+    },
+
+    // returns true if table is present in CTI amd is non-gf table
+    isLicenseCheckRequired: function(tableName) {
+        var licenseCheckRequired = this.isLicensableCustomTable(tableName);
+        if (!licenseCheckRequired)
+            this.logger.logInfo(LicensingEngineConstants.CUSTOM_TABLE_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.IS_LICENSE_CHECK_REQUIRED,
+                LicensingEngineConstants.LICENSE_CHECK_IS_NOT_REQUIRED);
+
+        return licenseCheckRequired;
+    },
+
+    // returns true if user is entitled to perform given role on the table
+    isUserEntitledForRole: function(userId, role, tableName) {
+        try {
+            if (!this.isLicenseCheckRequired(tableName))
+                return true;
+
+            var highPrivilegeRoleList = new LicenseRoleTypeDAO().getRoleTypesWithEqualOrHighPrivileges(role);
+            var subscriptionSysId = this.getActiveSubscriptionSysId(tableName);
+            if (!gs.nil(subscriptionSysId)) {
+                var subscriptionRoleTypeSysIds = new SubscriptionEntitlementDAO().getMeasuredRoleTypesBySysId(subscriptionSysId);
+                var arrayUtil = new global.ArrayUtil();
+                var intersectedArray = arrayUtil.intersect(highPrivilegeRoleList, subscriptionRoleTypeSysIds);
+                if (intersectedArray.length == 0)
+                    return false;
+
+                if (new UserHasSubscriptionDAO().doesUserHasSubscription(userId, subscriptionSysId))
+                    return true;
+
+                var userGroups = new SysUserGrmemberDAO().getUserGroups(userId);
+                if (new GroupHasSubscriptionDAO().doesGroupsHaveSubscription(userGroups, subscriptionSysId))
+                    return true;
+            } else
+                this.logger.logCouldNotFind(LicensingEngineConstants.CUSTOM_TABLE_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.IS_USER_ENTITLED_FOR_ROLE,
+                    LicensingEngineConstants.ACTIVE_ASSOCIATED_SUBSCRIPTIONS);
+
+            var errorMsg = LicensingEngineConstants.LICENSING_ERROR_CODES[LicensingEngineConstants.ENTITLEMENT_API_CODE.NO_USER_ROLE_ENTITLEMENT] + " user Id : " + userId + " tableName : " + tableName + " role : " + role;
+            this.logger.logError(LicensingEngineConstants.CUSTOM_TABLE_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.IS_USER_ENTITLED_FOR_ROLE, errorMsg, LicensingEngineConstants.ENTITLEMENT_API_CODE.NO_USER_ROLE_ENTITLEMENT, LicensingEngineConstants.LICENSING_ERROR_TYPES.ENTITLEMENT_API);
+
+            return false;
+        } catch (error) {
+            errorMsg = LicensingEngineConstants.LICENSING_ERROR_CODES[LicensingEngineConstants.ENTITLEMENT_API_CODE.NO_USER_ROLE_ENTITLEMENT] + " user Id : " + userId + " tableName : " + tableName + " role : " + role + error + " \n " + error.stack;
+            this.logger.logError(LicensingEngineConstants.CUSTOM_TABLE_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.IS_USER_ENTITLED_FOR_ROLE, errorMsg, LicensingEngineConstants.ENTITLEMENT_API_CODE.NO_USER_ROLE_ENTITLEMENT, LicensingEngineConstants.LICENSING_ERROR_TYPES.ENTITLEMENT_API);
+
+            return LicensingEngineConstants.UNABLE_TO_DETERMINE_ENTITLEMENT;
+        }
+    },
+
+    type: 'CustomTableEntitlementProcessor'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;maint&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-02-24 05:52:20&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;86c6034824912510f8775fc2cb18d66e&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;1&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;CustomTableEntitlementProcessor&lt;/sys_name&gt;
+        &lt;sys_package display_value="Licensing Engine" source="sn_entitlement"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Licensing Engine"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_86c6034824912510f8775fc2cb18d66e&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-05-11 11:58:47&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:44:50</sys_created_on>
+        <sys_id>36683c1183341210c6695855eeaad37c</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>CustomTableEntitlementProcessor</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_36683c1183341210c6695855eeaad37c</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:44:50</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

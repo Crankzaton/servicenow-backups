@@ -1,0 +1,546 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>9845c08d73d22010f14a063f34f6a7fa</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.AutoResolutionUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;AutoResolutionUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var AutoResolutionUtil = Class.create();
+AutoResolutionUtil.ML_SOLUTION_DEFINITION_TABLE = "ml_capability_definition_base";
+
+AutoResolutionUtil.getConfigurationForTask = function(taskTableName) {
+	var autoResConfigGr = new GlideRecord(AutoResolutionConstants.CONFIG_TABLE_NAME);
+	autoResConfigGr.addQuery(AutoResolutionConstants.CONFIGURATION_TABLENAME_FIELD_NAME, taskTableName);
+	autoResConfigGr.query();
+		
+	if (autoResConfigGr.next())
+		return autoResConfigGr.getUniqueValue();
+
+	return null;
+};
+
+/**
+ *
+ * @param taskTableName
+ * @param fieldNames an array of IAR config field names
+ * @returns {{}} JSON with multiple key value pairs of {"fieldName" : "fieldValue"} from IAR config table
+ */
+AutoResolutionUtil.getConfigurationFieldValuesForTaskTable = function(taskTableName, fieldNames) {
+	if (gs.nil(fieldNames) &amp;&amp; fieldNames.length &lt;= 0) 
+		return {};
+		
+	var autoResConfigGr = new GlideRecord(AutoResolutionConstants.CONFIG_TABLE_NAME);
+	autoResConfigGr.addQuery(AutoResolutionConstants.CONFIGURATION_TABLENAME_FIELD_NAME, taskTableName);
+	autoResConfigGr.query();
+	
+	var response = {};	
+	if (autoResConfigGr.next()) {
+		for (var i=0; i&lt;fieldNames.length; i++) {
+			var fieldName = fieldNames[i];
+			response[fieldName] = autoResConfigGr.getValue(fieldName);
+		}		
+	}
+	return response;
+};
+
+/**
+* @param taskTableName
+* @returns {result{'assign_to', 'task_assignment_template_name'}}
+* if the assign_to field doesn't exist on the table return Virtual agent user id (for ZDT compatibility)
+*/
+AutoResolutionUtil.getAssignToAndPostTaskAssignmentTemplateFromTaskConfig = function(taskTableName) {	
+	var result = {};
+	var autoResConfigGr = new GlideRecord(AutoResolutionConstants.CONFIG_TABLE_NAME);
+	if (!autoResConfigGr.isValidField(AutoResolutionConstants.CONFIGURATION_ASSIGN_TO_FIELD_NAME)) {
+		result.assign_to = new AutoResolutionContextHelper()._getVAUserID();
+		result.task_assignment_template_name = '';
+		return result;
+	}
+	
+	autoResConfigGr.addQuery(AutoResolutionConstants.CONFIGURATION_TABLENAME_FIELD_NAME, taskTableName);
+	autoResConfigGr.query();		
+	if (autoResConfigGr.next()) {
+		result.assign_to = autoResConfigGr.getValue(AutoResolutionConstants.CONFIGURATION_ASSIGN_TO_FIELD_NAME);
+		result.task_assignment_template_name = autoResConfigGr.task_assignment_template.name;
+	}
+
+	return result;
+};
+
+/** 
+* @param {string} configSysId
+* @returns {boolean} value of the 'active' field from the IAR config table
+*/
+AutoResolutionUtil.isConfigurationActive = function(configSysId) {
+	var activeVal = '';
+	var autoResConfigGr = new GlideRecord(AutoResolutionConstants.CONFIG_TABLE_NAME);
+
+	if (autoResConfigGr.get(configSysId)) 
+		activeVal = autoResConfigGr.active;
+	
+	return activeVal;
+};
+
+/** 
+* @param {string} configSysId, 
+* @param {Object} JSON with key value pairs of {"fieldName" : "fieldValue"} of values to be updated in IAR config table
+*/
+AutoResolutionUtil.updateConfigRecord = function(configSysId, resultObj) {
+	var logger = new AutoResolutionLoggingUtils()
+		.withName('AutoResolutionUtil')
+		.createLogger();
+	var autoResConfigGr = new GlideRecord(AutoResolutionConstants.CONFIG_TABLE_NAME);
+	
+	if (!autoResConfigGr.get(configSysId)) {
+		logger.error("Unable to update IAR configuration record because the configuration record with sys id {0} does not exist", configSysId);
+		return;
+	}
+
+	Object.keys(resultObj).forEach(function(key) {
+		autoResConfigGr.setValue(key, resultObj[key]);
+		autoResConfigGr.update();
+	});
+};
+
+/** 
+* @param {string} sys id of the business rule that will be set as active
+*/
+AutoResolutionUtil.setBRActive = function(brSysId) {
+	var br = new GlideRecord('sys_script');
+	
+	if (br.get(brSysId) &amp;&amp; !br.active) {
+		br.active = true;
+		br.update();
+	}
+};
+
+AutoResolutionUtil.getBotUserId = function(taskTableName) {
+	var result = AutoResolutionUtil.getAssignToAndPostTaskAssignmentTemplateFromTaskConfig(taskTableName);		
+	if (!gs.nil(result) &amp;&amp; JSON.stringify(result) !== '{}') 
+		return result.assign_to;
+};
+
+AutoResolutionUtil.getSessionLanguage = function() {
+	return gs.getSession().getLanguage();
+};
+
+AutoResolutionUtil.checkIARModelExists = function() {
+	var result = {};
+	var modelExists = false;
+	
+	var autoResConfigGr = new GlideRecord(AutoResolutionConstants.CONFIG_TABLE_NAME);
+	autoResConfigGr.addQuery('target_table_name', AutoResolutionConstants.INCIDENT_TABLE_NAME);
+	autoResConfigGr.addNotNullQuery('ml_solution_name');
+	autoResConfigGr.query();
+	
+	if (!autoResConfigGr.next()) {
+		modelExists = false;
+		result.modelExists = modelExists;
+	} else {
+		modelExists = true;
+		var solutionName = autoResConfigGr.getValue('ml_solution_name');
+		var trainingState = autoResConfigGr.getValue('ml_training_state');
+		var lastUpdate = autoResConfigGr.getValue('ml_status_last_updated');
+		var trainingProgress = autoResConfigGr.getValue('ml_training_progress');
+		var configurationActive = autoResConfigGr.getValue('active');
+		var configurationSysId = autoResConfigGr.getUniqueValue();
+		var latestTrainedVersion = AutoResolutionUtil.getLatestTrainedVersionNumber(configurationSysId, solutionName);
+
+		result.modelExists = modelExists;
+		result.solutionName = solutionName;
+		result.trainingState = trainingState;
+		result.trainingProgress = trainingProgress;
+		result.configurationActive = configurationActive;
+		result.lastUpdate = lastUpdate;
+		result.latestTrainedVersion = latestTrainedVersion;
+		result.configurationSysId = configurationSysId;
+	}
+	
+	return result;
+};
+
+AutoResolutionUtil.getLatestTrainedVersionNumber = function(autoResConfigSysId, solutionName) {
+	var mlHelper = new AutoResolutionMLHelper(autoResConfigSysId);
+	return mlHelper.getActiveSolutionVersionNumberForSolutionName(sn_ml.AgentZeroSolutionStore, solutionName);
+};
+
+// This method is called by "Check mandatory values before save BR" on sys_cs_auto_resolution_intent_topic_map table. 
+// This is because, on the AR config form, in the embedded list, even empty fields will be saved without this, even though
+// mandatory fields were filled in
+AutoResolutionUtil.validateMandatoryFieldsOnIntentTopicMap = function(intentToTopicMapGr) {
+	var emptyFields = [];
+	if (gs.nil(intentToTopicMapGr.getValue('ar_intent')))
+		emptyFields.push(intentToTopicMapGr.ar_intent.getLabel());
+	
+	if (gs.nil(intentToTopicMapGr.getValue('matched_topic')))
+		emptyFields.push(intentToTopicMapGr.matched_topic.getLabel());
+
+	if (emptyFields.length &gt; 0)
+		throw gs.getMessage('The following mandatory fields are not filled in: {0}', emptyFields.join(', '));
+};
+
+/*
+Check if there is atleast one active intent topic map record
+ */
+AutoResolutionUtil.isAnyIntentTopicMapRecordActive = function() {
+	var intentTopicMapGr = new GlideRecord(AutoResolutionConstants.INTENT_TOPIC_MAP_TABLE_NAME);
+	intentTopicMapGr.addActiveQuery();
+	intentTopicMapGr.query();
+
+	return intentTopicMapGr.next();
+};
+
+/*
+Check if any records exist in intent topic map table
+ */
+AutoResolutionUtil.intentTopicMapRecordsExist = function() {
+	var intentTopicMapGr = new GlideRecord(AutoResolutionConstants.INTENT_TOPIC_MAP_TABLE_NAME);
+	intentTopicMapGr.query();
+
+	return intentTopicMapGr.next();
+};
+
+AutoResolutionUtil.updateIntentTopicMapRecords = function() {
+	var logger = new AutoResolutionLoggingUtils()
+		.withName('AutoResolutionUtil')
+		.createLogger();
+	var intentTopicMapGr = new GlideRecord(AutoResolutionConstants.INTENT_TOPIC_MAP_TABLE_NAME);
+	intentTopicMapGr.query();
+	while (intentTopicMapGr.next()) {
+		var intent = intentTopicMapGr.getValue("ar_intent");
+		var topicGr = intentTopicMapGr.getElement('matched_topic').getRefRecord();
+		var topicResults = AutoResolutionUtil.getActiveTopicForDomainAndIntent(
+			intentTopicMapGr.getElement("ar_configuration").getRefRecord(), intent);
+		if (Object.keys(topicResults).length === 0) {
+			logger.info('[AutoResolutionUtil] No matching active topics found for intent {0}.', intent);
+		}
+		else {
+			intentTopicMapGr.setValue("matched_topic", topicResults['topicSysId']);
+			intentTopicMapGr.update();
+			logger.info('[AutoResolutionUtil] Successfully updated matched topic for intent {0}, from {1} to {2}.', intent,
+				topicGr.getValue("name"), topicResults['topicName']);
+		}
+	}
+};
+
+/**
+ *
+ * @param domainGr
+ * @returns {topicList[]}
+ */
+AutoResolutionUtil.getActiveTopicsForDomain = function(domainGr) {
+	var topicList = [];
+	var topicGr = new GlideRecord('sys_cs_topic');
+	topicGr.addDomainQuery(domainGr);
+	topicGr.addQuery('active', true);
+	topicGr.addQuery('visible', true); //exclude preview topics (name starting with *_PRVW*)
+	topicGr.query();
+	while (topicGr.next())
+		topicList.push(topicGr.getValue('sys_id'));
+	return topicList;
+};
+
+/**
+ *
+ * @param domainGr
+ * @param intent
+ * @returns {result {topicName, topicSysId}}
+ * When a topic is duplicated and published from the designer, nlu_intent is not populated on the sys_cs_topic table
+ * Get the topic from sys_cs_topic_language record which has the expected intent and check if topic is active and visible
+ */
+AutoResolutionUtil.getActiveTopicForDomainAndIntent = function(domainGr, intent) {
+	var result = {};
+	var topicLanguageGr = new GlideAggregate('sys_cs_topic_language');
+	topicLanguageGr.addDomainQuery(domainGr);
+	topicLanguageGr.addQuery("nlu_intent", intent);
+	//There can be many topic language records for different languages for the same topic
+	topicLanguageGr.groupBy("cs_topic_id");
+	topicLanguageGr.query();
+	while (topicLanguageGr.next()) {
+		var topicId = topicLanguageGr.getValue("cs_topic_id");
+		var topicGr = new GlideRecord('sys_cs_topic');
+		topicGr.addQuery("sys_id", topicId);
+		topicGr.addQuery('active', true);
+		topicGr.addQuery('visible', true); //exclude preview topics (name starting with *_PRVW*)
+		topicGr.query();
+		//There can be only one active Topic record for a particular intent, return the result when its found
+		if (topicGr.next()) {
+			result.topicSysId = topicGr.getUniqueValue();
+			result.topicName = topicGr.getValue("name");
+			return result;
+		}
+	}
+	return result;
+};
+
+/**
+ *
+ * @param predictionFields comma separated string
+ * @param taskGr
+ * @returns {{}} JSON with multiple key value pairs of {"fieldName" : "fieldValue"} from task table
+ */
+AutoResolutionUtil.buildPredictionInputs = function(predictionFields, taskGr) {
+	var predictionInputs = {};
+	if (gs.nil(predictionFields))
+		return {};
+
+	var fieldsArray = predictionFields.split(",");
+	
+	for (var i=0; i&lt;fieldsArray.length; i++) {
+		
+		var val = taskGr.getValue(fieldsArray[i]);
+		
+		if (!gs.nil(val)) 
+			predictionInputs[fieldsArray[i]] = val;
+	}
+	return predictionInputs;
+};
+
+/**
+ *
+ * @param {string} className
+ * @return {string}
+ */
+AutoResolutionUtil.getPortalSuffixForClass = function(className) {
+	var autoResolutionConfigGr = new GlideRecord(AutoResolutionConstants.CONFIG_TABLE_NAME);
+	autoResolutionConfigGr.addQuery('target_table_name', className);
+	autoResolutionConfigGr.query();
+
+	if (autoResolutionConfigGr.next())
+		return autoResolutionConfigGr.portal.url_suffix.toString();
+};
+
+/**
+ * Get the link to the specific task, if calling this then you already expect there to be recommendations
+ * @param {string} taskTable
+ * @param {string} taskId
+ * @returns {string}
+ */
+AutoResolutionUtil.getViewRecommendationsLink = function(taskTable, taskId) {
+	var autoResolutionConfigGr = new GlideRecord(AutoResolutionConstants.CONFIG_TABLE_NAME);
+	autoResolutionConfigGr.addQuery('target_table_name', taskTable);
+	autoResolutionConfigGr.query();
+	
+	var portal = "";
+	if (autoResolutionConfigGr.next() &amp;&amp; autoResolutionConfigGr.ais_enabled)
+		portal = autoResolutionConfigGr.portal.url_suffix.toString();
+	
+	return sn_cs.VASystemObject.applyLinkTemplateCustomPortal(taskId, taskTable, "", portal);
+};
+
+/**
+ * Returns required field names of the passed task table that need to be used for the inputs to LanguageX call
+ * 
+ * @param taskTableName : the table name registered in the config table
+ * @returns {Array} an array of field names that can be found in the passed task table
+ */
+AutoResolutionUtil.getTaskTableFieldNamesForARPredictionInput = function(taskTableName) {
+	
+	var colName = AutoResolutionConstants.IAR_PREDICTION_FIELDS_COLUMN_NAME;
+	
+	var configGr = new GlideRecord(AutoResolutionConstants.CONFIG_TABLE_NAME);
+	configGr.addQuery(AutoResolutionConstants.CONFIGURATION_TABLENAME_FIELD_NAME, taskTableName);
+	configGr.query();
+	
+	var foundVal;	
+	if (configGr.next())
+		foundVal = configGr.getValue(colName);
+			
+	//found value can have comma-separated values.
+	return gs.nil(foundVal)?[] : foundVal.split(',');
+};
+
+AutoResolutionUtil.getCapabilityFromSolutionDefintion = function(solutionName) {
+	var solutionDefGr = new GlideRecord(AutoResolutionUtil.ML_SOLUTION_DEFINITION_TABLE);
+	solutionDefGr.addQuery('solution_name', solutionName);
+	solutionDefGr.query();
+		
+	if (!solutionDefGr.hasNext())
+		return '';
+		
+	solutionDefGr.next();
+	if (!gs.nil(solutionDefGr.capability))
+		return solutionDefGr.capability.label + '';
+		
+	return '';		
+};
+
+AutoResolutionUtil.getSolutionCapabilityToPersistInDB = function(capability) {
+	if (gs.nil(capability))
+		return null;
+	
+	var solutionCapability = '';
+	
+	switch (capability) {
+		case AutoResolutionConstants.AGENT_ZERO_CAPABILITY:
+			solutionCapability = AutoResolutionConstants.ML_CAPBILITIES.AGENT_ZERO;
+			break;
+			
+		case AutoResolutionConstants.LANGUAGEX_CAPABILITY:
+			solutionCapability = AutoResolutionConstants.ML_CAPBILITIES.LANGUAGEX;
+			break;
+			
+		case AutoResolutionConstants.AGENT_ZERO_WORKFLOW_CAPABILITY:
+			solutionCapability = AutoResolutionConstants.ML_CAPBILITIES.AGENT_ZERO_WORKFLOW;
+			break;
+
+		case AutoResolutionConstants.COMPOSITE_CAPABILITY:
+			solutionCapability = AutoResolutionConstants.ML_CAPBILITIES.COMPOSITE;
+			break;
+			
+		default:
+			break;	
+	}	
+	return solutionCapability;
+};
+
+AutoResolutionUtil.checkSolutionWithCapabilityExists = function(arConfigId, capabilityTypeEncodedQuery) {
+	var langConfigGr = new GlideRecord(AutoResolutionConstants.CONFIG_LANGUAGE_TABLE_NAME);
+	langConfigGr.addQuery("configuration", arConfigId);
+	langConfigGr.addEncodedQuery(capabilityTypeEncodedQuery);
+	langConfigGr.query();
+	
+	return langConfigGr.next();
+};
+
+/**
+ * Gets the list of NLU model solution names from the list of NLU models selected in the autoresolution configuration.
+ * @param {string} arConfigId	The sys_id of the auto resolution configuration.
+ * @return {string[]} List of NLU model solution names.
+ */
+AutoResolutionUtil.getNLUModelNameListFromConfig = function(arConfigId) {
+	var logger = new AutoResolutionLoggingUtils()
+		.withName('AutoResolutionUtil')
+		.createLogger();
+	var configGr = new GlideRecord(AutoResolutionConstants.CONFIG_TABLE_NAME);
+	configGr.get(arConfigId);
+
+	var nluModelStatusString = configGr.getValue("nlu_model");
+	var nluModelStatusIdList = gs.nil(nluModelStatusString) ? [] : nluModelStatusString.split(",");
+	var nluModelNameList = [];
+
+	nluModelStatusIdList.forEach(function(nluModelStatusId) {
+		var nluModelStatusGr = new GlideRecord("sys_nlu_model_status");
+		nluModelStatusGr.get(nluModelStatusId);
+		var nluModelGr = nluModelStatusGr.model.getRefRecord();
+
+		if (gs.nil(nluModelGr)) {
+			logger.error("NLU model record does not exist for NLU model status record with ID: " + nluModelStatusGr.getUniqueValue());
+			return;
+		}
+
+		var name = nluModelGr.getValue('name');
+		if (!gs.nil(name)) {
+			nluModelNameList.push(nluModelGr.getValue("name"));
+		}
+	});
+	
+	return nluModelNameList;
+};
+
+/**
+ * Returns a list of sys_ids of configuration records that use the same ML solution name.
+ * @param {string} solutionName	The name of the ML solution in a sys_cs_auto_resolution_configuration_language record.
+ * @return {string[]} List of sys_cs_auto_resolution_configuration record sys_ids.
+ */
+AutoResolutionUtil.getConfigIdsWithSameSolutionName = function(solutionName) {
+	var configLanguageGr = new GlideRecord(AutoResolutionConstants.CONFIG_LANGUAGE_TABLE_NAME);
+	configLanguageGr.addQuery("ml_solution_name", solutionName);
+	configLanguageGr.query();
+
+	var configIdList = [];
+	while (configLanguageGr.next()) {
+		var configId = configLanguageGr.getValue("configuration");
+		configIdList.push(configId);
+	}
+	
+	return configIdList;
+};
+
+/**
+ * Returns the task type ITSM/HR for the given tablename
+ * @param tableName
+ * @returns {string}
+ */
+AutoResolutionUtil.getTaskType = function(tableName) {
+	var logger = new AutoResolutionLoggingUtils()
+		.withName('AutoResolutionUtil')
+		.createLogger();
+	if (gs.nil(tableName)) {
+		logger.warn("Tablename provided is invalid {0}", tableName);
+		return '';
+	}
+
+	if (tableName === AutoResolutionConstants.INCIDENT_TABLE_NAME)
+		return AutoResolutionConstants.ITSM_TASK_TYPE;
+	else if (AutoResolutionAPI.isHRCaseTable(tableName))
+		return AutoResolutionConstants.HR_TASK_TYPE;
+	else
+		logger.warn("Unsupported task type tablename for IAR {0}", tableName);
+
+	return '';
+};
+
+/**
+ * Return the ML use case id for a given task table
+ * @param tableName
+ * @returns {string|*} Ex: MLUC-IARHR-00001 for HR
+ */
+AutoResolutionUtil.getMLUseCaseId = function(tableName) {
+	if (tableName === AutoResolutionConstants.INCIDENT_TABLE_NAME)
+		return AutoResolutionConstants.INCIDENT_USE_CASE_ID;
+	else if (AutoResolutionAPI.isHRCaseTable(tableName)) {
+		var configSysId = AutoResolutionUtil.getConfigurationForTask(tableName);
+		if (gs.nil(configSysId))
+			return '';
+
+		var solutionName = AutoResolutionLanguageHelper.getSolutionNameForLanguage("en", configSysId,
+			AutoResolutionConstants.COMPOSITE_CAPABILITY);
+		if (gs.nil(solutionName))
+			return '';
+
+		var platformUtil = new global.MLPlatformUtils();
+		var result = platformUtil.getSolutionMLUC(solutionName);
+		if (gs.nil(result) || Object.keys(result).length === 0)
+			return AutoResolutionConstants.HR_USE_CASE_ID;
+		else
+			return result.mluc;
+	}
+	return '';
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-02-11 02:39:22&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;9845c08d73d22010f14a063f34f6a7fa&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;220&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AutoResolutionUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Issue Auto-Resolution" source="com.glide.cs.auto_resolution"&gt;81ddf4a03c75311068bcf327dfe37fa6&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_9845c08d73d22010f14a063f34f6a7fa&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-03-17 19:05:04&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:45:58</sys_created_on>
+        <sys_id>efa87c5183341210c6695855eeaad391</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AutoResolutionUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_efa87c5183341210c6695855eeaad391</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:45:58</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

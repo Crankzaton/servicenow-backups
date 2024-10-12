@@ -1,0 +1,783 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>3d98ec365ba53010461b52380a81c731</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.DynamicSchedulingUserImpl&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Implementation of the Resource Entity for User&lt;/description&gt;
+        &lt;name&gt;DynamicSchedulingUserImpl&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var DynamicSchedulingUserImpl = Class.create();
+DynamicSchedulingUserImpl.prototype = Object.extendsObject(DynamicSchedulingResourceEntity, {
+
+    _getResourcesFromGroups: function(groupIDs) {
+        var groupUsers = [];
+
+        var agents = new GlideAggregate("sys_user_grmember");
+        agents.addEncodedQuery("groupIN" + groupIDs.join(","));
+        agents.addQuery("group.active", "true");
+        agents.addQuery("user.active", "true");
+        agents.addAggregate("MAX", "user.sys_id");
+        agents.groupBy("user");
+        agents.orderBy("user");
+        agents.setCategory('field_service');
+        agents.query();
+        while (agents.next()) {
+            var user = agents.getAggregate("MAX", "user.sys_id");
+            groupUsers.push(user);
+        }
+        return groupUsers;
+    },
+
+    _getResponseFromWorkBlocks: function(task, workBlocks, shouldLogResponse) {
+        var resourceWorkBlocks = {};
+
+        var response = {};
+        response.success = true;
+        response.message = "";
+        response.msgType = "info";
+        response.assignmentMode = "schedule";
+        response.resourceType = this.getResourceType();
+        response.resourceField = this.getResourceFieldInTask();
+        response.suggestedResources = [];
+
+        for (var i = 0; i &lt; workBlocks.length; i++) {
+            var workBlock = workBlocks[i];
+
+            if (!resourceWorkBlocks[workBlock.resource]) {
+                var candidateResponse = {};
+                candidateResponse.resourceID = this.resourceInfo[workBlock.resource].resourceID;
+                candidateResponse.agentID = this.resourceInfo[workBlock.resource].resourceID;
+                candidateResponse.groupID = this.resourceInfo[workBlock.resource].groupID;
+                candidateResponse.resourceName = this.resourceInfo[workBlock.resource].resourceName;
+                candidateResponse.agentName = this.resourceInfo[workBlock.resource].resourceName;
+                candidateResponse.workBlock = workBlock;
+                candidateResponse.rating = workBlock.rating;
+                candidateResponse.taskUpdates = {};
+                candidateResponse.taskUpdates.assignment_group = candidateResponse.groupID;
+                candidateResponse.taskUpdates.assigned_to = candidateResponse.resourceID;
+                candidateResponse.taskUpdates.expected_start = workBlock.spanStart.getDisplayValue();
+
+                var expTravelStart = new GlideDateTime(workBlock.spanStart);
+                expTravelStart.addSeconds((-1 * workBlock.beforeTime));
+
+                candidateResponse.taskUpdates.expected_travel_start = expTravelStart.getDisplayValue();
+                candidateResponse.taskUpdates.estimated_travel_duration = (new GlideDuration(workBlock.beforeTime * 1000)).toString();
+
+                candidateResponse.taskUpdates.estimated_end = workBlock.spanEnd.getDisplayValue();
+                response.suggestedResources.push(candidateResponse);
+                resourceWorkBlocks[workBlock.resource] = workBlock;
+
+            }
+        }
+        if (response.suggestedResources.length == 0) {
+            return this._generateErrorResponse(NO_RESOURCE_AVAILABLE, "NO_RESOURCE_AVAILABLE", this.current);
+        }
+
+        if(shouldLogResponse){
+            this.loggerUtil.logResourceResponse(response);
+            response.logs = this.loggerUtil.getLogs();
+        }
+
+        return response;
+    },
+
+    _getResourceGroupResponse: function(groupIDs, config, task) {
+        var maxAgents = config.maxAgents
+        var groupResponse = {};
+        var agents = new GlideAggregate("sys_user_grmember");
+        var encodedQuery = "groupIN" + groupIDs.join(",") + "^group.active=true^user.active=true";
+
+        if(new WMFilters().isTerritoryPlanningActive()){
+            var fieldServiceTerritoryAPI = new sn_fsm_tp.FieldServiceTerritoryPlanning();
+            var adhocAgentsOfTerritory = fieldServiceTerritoryAPI._getAdhocAgentsOfTerritory(task);
+        if(adhocAgentsOfTerritory.length !=0)
+                encodedQuery += "^NQsys_idIN" + adhocAgentsOfTerritory.join(",");
+        }
+        agents.addEncodedQuery(encodedQuery);
+
+        // Get agent count before run agent query   
+        var count = this._getQueryRowCount('sys_user_grmember', agents.getEncodedQuery());
+        if (count == 0) {
+            return this._generateErrorResponse(NO_RESOURCE_AVAILABLE, "NO_RESOURCE_AVAILABLE", this.current);
+        }
+        if (count &gt; maxAgents) {
+            return this._generateErrorResponse(TOO_MANY_AGENTS, "TOO_MANY_AGENTS", this.current);
+        }
+
+        agents.addAggregate("MAX", "group.sys_id");
+        agents.addAggregate("MAX", "user.schedule.sys_id");
+        agents.addAggregate("MAX", "user.location");
+        agents.addAggregate("MAX", "user.name");
+        agents.addAggregate("MAX", "user.location.sys_id");
+        agents.addAggregate("MAX", "user.time_zone");
+        agents.addAggregate("MAX", "user.sys_id");
+        agents.addAggregate("MAX", "user.location.latitude");
+        agents.addAggregate("MAX", "user.location.longitude");
+
+        agents.groupBy("user");
+        agents.orderBy("user");
+
+        agents.setCategory('field_service');
+        agents.query();
+
+        groupResponse.success = true;
+        groupResponse.candidates = agents;
+
+        return groupResponse;
+    },
+
+
+    _getGroupResources: function(groupResponse, task) {
+        var groupUsers = [];
+        while (groupResponse.candidates.next()) {
+            var user = groupResponse.candidates.getAggregate("MAX", "user.sys_id");
+            groupUsers.push(user);
+            if (!this.resourceInfo[user]) {
+                var userInfoObj = {};
+                userInfoObj.resourceID = user;
+                userInfoObj.userID = user;
+                userInfoObj.groupID = groupResponse.candidates.getAggregate("MAX", "group.sys_id");
+                userInfoObj.resourceName = groupResponse.candidates.getAggregate("MAX", "user.name");
+                userInfoObj.userName = groupResponse.candidates.getAggregate("MAX", "user.name");
+                userInfoObj.timezone = groupResponse.candidates.getAggregate("MAX", "user.time_zone");
+                userInfoObj.location = {};
+                userInfoObj.location.locationID = groupResponse.candidates.getAggregate("MAX", "user.location.sys_id");
+                userInfoObj.location.longitude = groupResponse.candidates.getAggregate("MAX", "user.location.longitude");
+                userInfoObj.location.latitude = groupResponse.candidates.getAggregate("MAX", "user.location.latitude");
+                userInfoObj.schedule = groupResponse.candidates.getAggregate("MAX", "user.schedule.sys_id");
+                this.resourceInfo[user] = userInfoObj;
+            }
+        }
+        return groupUsers;
+    },
+
+    _noScheduleRecommendation: function(candidates, task, sortedResources, overallRating, ignoreTravelTimeCalculation, windowTimes) {
+        var response = {};
+        response.success = true;
+        response.message = "";
+        response.msgType = "info";
+        response.assignmentMode = "noSchedule";
+        response.resourceType = this.getResourceType();
+        response.resourceField = this.getResourceFieldInTask();
+        response.suggestedResources = [];
+
+        var resourceNamesToLog = [];
+
+        if (ignoreTravelTimeCalculation) {
+            var resource = sortedResources[0];
+            var candidateResponse = {};
+            candidateResponse.resourceID = this.resourceInfo[resource].resourceID;
+            candidateResponse.groupID = this.resourceInfo[resource].groupID;
+            candidateResponse.resourceName = this.resourceInfo[resource].resourceName;
+            candidateResponse.agentName = this.resourceInfo[resource].resourceName;
+            candidateResponse.rating = overallRating[resource];
+            candidateResponse.taskUpdates = {};
+            candidateResponse.taskUpdates.assignment_group = candidateResponse.groupID;
+            candidateResponse.taskUpdates.assigned_to = candidateResponse.resourceID;
+
+            //var windowTimes = this._initWindow(task);
+            var windowStart = windowTimes.window_start;
+            var windowEnd = windowTimes.window_end;
+            var finalWindowStart = windowStart;
+            var currentResourceAvailabilityMap = {};
+            var agentScheduleUtil = new global.AgentScheduleExtPointUtil().loadExtension("global.AgentScheduleUtil");
+
+            var isFSMWFOEnabled = new global.FSMWFOUtil().enableFsmWfoLogic();
+            if (isFSMWFOEnabled) {
+                var qualifierMap = {};
+                qualifierMap["territory"] = task.territory;
+                var agentScheduleWFOUtil = new sn_fsm_shift_schdl.AgentScheduleWFOUtil();
+                currentResourceAvailabilityMap = agentScheduleWFOUtil.getAvailabilityMap(this.resourceInfo[resource].resourceID, new GlideDateTime(windowStart).getDisplayValue(), new GlideDateTime(windowEnd).getDisplayValue(), qualifierMap);
+            } else {
+                currentResourceAvailabilityMap = agentScheduleUtil.getAvailabilityMap(this.resourceInfo[resource].resourceID, windowStart, windowEnd);
+            }
+
+            if (currentResourceAvailabilityMap &amp;&amp; currentResourceAvailabilityMap.hasNext()) {
+                var earliestSpan = currentResourceAvailabilityMap.next();
+                var spanStart = new GlideDateTime();
+                var timeZone = this.resourceInfo[resource].timezone;
+                var tz = Packages.java.util.TimeZone.getTimeZone(timeZone);
+                spanStart.setTZ(tz);
+                spanStart.setValue(earliestSpan.toString().substring(0, 19));
+                if (spanStart.getNumericValue() &gt; finalWindowStart.getNumericValue()){
+                    finalWindowStart = spanStart;
+                }
+            }
+
+            candidateResponse.taskUpdates.expected_start = finalWindowStart.getDisplayValue();
+            candidateResponse.taskUpdates.expected_travel_start = finalWindowStart.getDisplayValue();
+
+            var estEnd = new GlideDateTime(finalWindowStart);
+            estEnd.addSeconds(this.workDuration / 1000);
+            candidateResponse.taskUpdates.estimated_end = estEnd.getDisplayValue();
+            response.suggestedResources.push(candidateResponse);
+            if(this.useLogger)
+                resourceNamesToLog.push(candidateResponse.resourceName);
+
+            this.loggerUtil.logDebug("ignoreTravelTimeCalculation Recommendation only resource :" + resourceNamesToLog);
+
+        } else {
+            for (var i = 0; i &lt; sortedResources.length; i++) {
+                var resource = sortedResources[i];
+                var candidateResponse = {};
+                candidateResponse.resourceID = this.resourceInfo[resource].resourceID;
+                candidateResponse.groupID = this.resourceInfo[resource].groupID;
+                candidateResponse.resourceName = this.resourceInfo[resource].resourceName;
+                candidateResponse.agentName = this.resourceInfo[resource].resourceName;
+                candidateResponse.rating = overallRating[resource];
+                candidateResponse.taskUpdates = {};
+                candidateResponse.taskUpdates.assignment_group = candidateResponse.groupID;
+                candidateResponse.taskUpdates.assigned_to = candidateResponse.resourceID;
+                response.suggestedResources.push(candidateResponse);
+                if(this.useLogger)
+                    resourceNamesToLog.push(candidateResponse.resourceName);
+            };
+            this.loggerUtil.logDebug("Sorted resources :" + resourceNamesToLog);
+        }
+
+        response.logs = this.loggerUtil.getLogs();
+        return response;
+    },
+
+    _getResourceTZMap: function(agents) {
+        var agentScheduleUtil = new global.AgentScheduleUtil();
+        //get user timezone
+        var resourceTZMap = agentScheduleUtil.getUsersTZ(agents);
+        return resourceTZMap;
+    },
+
+    _getResourceWorkSchedule: function(agents, rangeStartForTravel, rangeEndForTravel) {
+        var agentScheduleUtil = new global.AgentScheduleUtil();
+        var userTimeMap = agentScheduleUtil.getWorkScheduleForUsers(agents, rangeStartForTravel, rangeEndForTravel);
+        return userTimeMap;
+    },
+
+    _getResourceWorkScheduleWFO: function(agents, rangeStartForTravel, rangeEndForTravel, qualifierMap) {
+        var agentScheduleWFOUtil = new sn_fsm_shift_schdl.AgentScheduleWFOUtil();
+        var userTimeMap = agentScheduleWFOUtil.getWorkScheduleForAgents(agents, rangeStartForTravel, rangeEndForTravel, qualifierMap);
+        return userTimeMap;
+    },
+
+    _getTimeOffMap: function(agents, rangeStartForTravel, rangeEndForTravel) {
+        var timeOffMap = new global.AgentScheduleExtPointUtil().loadExtension("global.AgentScheduleUtil").getTimeOffSpansForUsers(agents, rangeStartForTravel, rangeEndForTravel);
+        return timeOffMap;
+    },
+
+    _getTimeOffMapWFO: function(agents, rangeStartForTravel, rangeEndForTravel) {
+        var agentScheduleWFOUtil = new sn_fsm_shift_schdl.AgentScheduleWFOUtil();
+        var timeOffMap = agentScheduleWFOUtil.getAgentEventSchedules(agents, rangeStartForTravel, rangeEndForTravel);
+        return timeOffMap;
+    },
+
+    _getResourceHomeLocation: function(resources) {
+        var resourceGR = new GlideRecord("sys_user");
+        resourceGR.addEncodedQuery("sys_idIN" + resources.join());
+        resourceGR.query();
+        while (resourceGR.next()) {
+            if (JSUtil.notNil(resourceGR.getValue("location")) &amp;&amp; JSUtil.notNil(resourceGR.location.latitude) &amp;&amp; JSUtil.notNil(resourceGR.location.longitude)) {
+                this.locationMap[resourceGR.getValue("location")] = {};
+                this.resourceHomeLocation[resourceGR.getValue("sys_id")] = resourceGR.getValue("location");
+                this.isResourceHomeLocationMap[resourceGR.getValue("location")] = true;
+            } else if (JSUtil.notNil(resourceGR.getValue("location")) &amp;&amp; (JSUtil.nil(resourceGR.location.latitude) || JSUtil.nil(resourceGR.location.longitude))) {
+                this.invalidLocations[resourceGR.getValue("location")] = {};
+            }
+        }
+    },
+
+    _getResourceGeoHistoryLocation: function(agents) {
+        var agentGeoLatLong = new global.FSMExtPointUtil().loadExtension("global.SMGeoAgentLocation").getMultiAgentGeoLatLong(agents);
+        for (var agent in agentGeoLatLong) {
+            if (agentGeoLatLong[agent].updatedOn) {
+                this.resourceGeoHistoryLocation[agent] = agentGeoLatLong[agent];
+            }
+        }
+    },
+
+    _getTasksForResources: function(agents, rangeStart, rangeEnd, tasks) {
+        var activeTaskMap = {};
+        //var allAgentsTaskMap = {};
+        var agentsTasks = new GlideRecord("sm_task");
+        //agentsTasks.addEncodedQuery("stateNOT IN3,4,7");
+        agentsTasks.addActiveQuery();
+        //agentsTasks.addEncodedQuery("assigned_toISNOTEMPTY");
+        agentsTasks.addEncodedQuery("assigned_toIN" + agents.join());
+        //agentsTasks.addEncodedQuery("sys_idNOT IN" + tasks.join());
+
+        //TODO: add query for dates not empty
+        if (!this.useGeoLoc) {
+            agentsTasks.addQuery("expected_travel_start", "&gt;=", rangeStart).addOrCondition("estimated_end", "&gt;=", rangeStart);
+            agentsTasks.addQuery("expected_travel_start", "&lt;=", rangeEnd).addOrCondition("estimated_end", "&lt;=", rangeEnd);
+        } else {
+            agentsTasks.addQuery("expected_start", "&gt;=", rangeStart).addOrCondition("estimated_end", "&gt;=", rangeStart);
+            agentsTasks.addQuery("expected_start", "&lt;=", rangeEnd).addOrCondition("estimated_end", "&lt;=", rangeEnd);
+        }
+        agentsTasks.query();
+        while (agentsTasks.next()) {
+            var taskStart;
+            if (!this.useGeoLoc)
+                taskStart = new GlideScheduleDateTime(agentsTasks.getValue("expected_travel_start"));
+            else
+                taskStart = new GlideScheduleDateTime(agentsTasks.getValue("expected_start"));
+            taskStart.addSeconds(-this.taskSpacing);
+
+            if (!gs.nil(agentsTasks.getValue("work_start"))) {
+                taskStart = new GlideScheduleDateTime(agentsTasks.getValue("work_start"));
+            }
+
+            var taskEndMS = new SMScheduleGrabber().getWorkEnd(agentsTasks);
+            var taskEndVal = new GlideDateTime();
+            taskEndVal.setValue(taskEndMS);
+            var taskEnd = new GlideScheduleDateTime(taskEndVal);
+            taskEnd.addSeconds(this.taskSpacing);
+            var taskObj = {};
+            taskObj.taskID = agentsTasks.getValue("sys_id");
+            taskObj.taskNumber = agentsTasks.getValue("number");
+            taskObj.startDate = taskStart;
+            taskObj.endDate = taskEnd;
+            taskObj.startDateMS = taskStart.getMS();
+            taskObj.endDateMS = taskEnd.getMS();
+            taskObj.assigned_to = agentsTasks.getValue("assigned_to");
+            taskObj.location = agentsTasks.getValue("location");
+
+            if (JSUtil.notNil(taskObj.location)) {
+                this.taskLocationMap[taskObj.taskID] = taskObj.location;
+                this.isTaskLocationMap[taskObj.location] = true;
+
+                if (gs.nil(this.locationMap[taskObj.location])){
+                    this.locationMap[taskObj.location] = {};
+                    this._populateLocationMapByID(taskObj.location);
+                    if(!gs.nil(this.locationMap[taskObj.location]) &amp;&amp; this.locationMap[taskObj.location].isValid)
+                        this.newLocationFound = true;
+                }
+            }
+
+            if (!(taskObj.assigned_to in activeTaskMap))
+                activeTaskMap[taskObj.assigned_to] = [];
+
+            this.insertObjToSortedArray(taskObj, activeTaskMap[taskObj.assigned_to], "startDateMS");
+            // activeTaskMap[taskObj.assigned_to].push(taskObj);
+        }
+
+        if(this.newLocationFound){
+            this._populateTravelTimes(this.mapProvider);
+        }
+
+        return activeTaskMap;
+    },
+
+    _getResourceWorkParameter: function(agents) {
+        this.resourceWorkParamater = new global.FSMExtPointUtil().loadExtension("global.AgentWorkConfigUtil").getWorkParametersForUsers(agents);
+        return this.resourceWorkParamater;
+    },
+
+
+
+    _getBestBlockForResource: function(task, agent, windowStart, windowEnd, overallRating, agentWorkBlockMap, unAssignData) {
+        var windowStartMS = windowStart.getNumericValue();
+        var windowEndMS = windowEnd.getNumericValue();
+        var workBlockArray = agentWorkBlockMap[agent];
+        var bestWorkBlock = null;
+        var agentOverride;
+        var membershipType = 'primary';
+
+
+        if(this.isFSMTerritoryPlanningActive){
+            var territoryMembershipMap = this.territoryMembershipOverrideMap[task.territory];
+            if(territoryMembershipMap){
+                agentOverride = territoryMembershipMap[agent];
+            }
+            var territoryGroupsMap = this.territoryGroupMembershipMap[task.territory];
+            if(territoryGroupsMap){
+                var groupId = this.resourceInfo[agent].groupID;
+                membershipType = territoryGroupsMap[groupId].membershipType;
+            }
+        }
+
+        if (JSUtil.notNil(workBlockArray)) {
+            var startPosition = this.getPositionOfKeyInArray(windowStartMS, workBlockArray, "startDateMS", "endDateMS");
+            var endPosition = this.getPositionOfKeyInArray(windowEndMS, workBlockArray, "startDateMS", "endDateMS");
+            endPosition = endPosition + 1;
+            //gs.log(startPosition+":"+ endPosition);
+            var agentWorkBlocksForTask = workBlockArray.slice(startPosition, endPosition);
+			for (var i = 0; i &lt; agentWorkBlocksForTask.length; i++) {
+				var workBlock = agentWorkBlocksForTask[i];
+				if (workBlock.type == "wb")
+					workBlock.workBlockIndex = startPosition + i;
+			}
+
+            //if crew scheduling plugin is active, check and filter out the workblocks which conflict with agent's crew membership/task assignee for crew tasks
+            if (GlidePluginManager.isActive("com.snc.fsm_crew_scheduling")) {
+                var now = new GlideDateTime();
+                var crew_member_gr = new GlideAggregate("wm_crew_member");
+                crew_member_gr.addQuery("member", agent);
+                crew_member_gr.addQuery("active", true);
+                var condition = crew_member_gr.addQuery("effective_to", '&gt;', now);
+                condition.addOrCondition('effective_to', null);
+                crew_member_gr.addAggregate('COUNT');
+                crew_member_gr.query();
+
+                var crew_member_result = 0;
+                if (crew_member_gr.next()) {
+                    crew_member_result = crew_member_gr.getAggregate('COUNT');
+                }
+
+                var task_assignee_gr = new GlideAggregate("wm_task_assignee");
+                task_assignee_gr.addQuery("assignee", agent);
+                task_assignee_gr.addQuery("task.active", true);
+                task_assignee_gr.addQuery("task.estimated_end", '&gt;', now);
+                task_assignee_gr.addAggregate('COUNT');
+                task_assignee_gr.query();
+
+                var task_assignee_result = 0;
+                if (task_assignee_gr.next()) {
+                    task_assignee_result = task_assignee_gr.getAggregate('COUNT');
+                }
+
+                //if agent is a crew member or task assignee
+                if (crew_member_result &gt; 0 || task_assignee_result &gt; 0) {
+                    var filteredWorkBlocks = [];
+                    var wb_printed = false;
+                    for (var i = 0; i &lt; agentWorkBlocksForTask.length; i++) {
+                        var workBlock = agentWorkBlocksForTask[i];
+
+                        if (workBlock.type == "wb") {
+
+                            var wb_start = new GlideDateTime(workBlock.startDate);
+                            var wb_end = new GlideDateTime(workBlock.endDate);
+                            var conflictMemberWBs = [];
+                            var noWbPresent = false;
+                            //check for conflict between workblock and agent's crew membership
+                            if (crew_member_result &gt; 0) {
+                                var crew_member_GR = new GlideRecord("wm_crew_member");
+                                crew_member_GR.addQuery("member", agent);
+                                crew_member_GR.addQuery("active", true);
+                                crew_member_GR.addQuery("effective_from", '&lt;', wb_end);
+                                var condition1 = crew_member_GR.addQuery('effective_to', '&gt;', wb_start);
+                                condition1.addOrCondition('effective_to', null);
+                                crew_member_GR.orderBy('effective_from');
+                                crew_member_GR.query();
+
+                                while (crew_member_GR.next()) {
+                                    var cStart = new GlideDateTime(crew_member_GR.effective_from);
+                                    var cEnd = "";
+
+                                    if (gs.nil(crew_member_GR.getValue("effective_to")))
+                                        cEnd = new GlideDateTime(wb_end);
+									else
+										cEnd = new GlideDateTime(crew_member_GR.getValue("effective_to"));
+
+                                    if (cStart &lt;= wb_start &amp;&amp; cEnd &gt;= wb_end) {
+                                        noWbPresent = true;
+                                        break;
+                                    }
+
+                                    conflictMemberWBs.push({
+                                        "start": cStart,
+                                        "end": cEnd
+                                    });
+                                }
+
+                                //if conflict exists, ignore this workblock, else move to task assignee check if applicable 
+                                if (noWbPresent) {
+                                    continue;
+                                }
+                            }
+
+                            var conflictAssigneeWBs = [];
+                            //check for conflict between workblock and task assigned to agent who is a task assignee
+                            if (task_assignee_result &gt; 0) {
+                                var task_assignee_gr = new GlideRecord("wm_task_assignee");
+                                task_assignee_gr.addQuery("assignee", agent);
+                                task_assignee_gr.addQuery("task.active", true);
+                                task_assignee_gr.addQuery("task.expected_travel_start", '&lt;', wb_end);
+                                task_assignee_gr.addQuery('task.estimated_end', '&gt;', wb_start);
+                                task_assignee_gr.orderBy('task.expected_travel_start');
+                                task_assignee_gr.query();
+
+                                while (task_assignee_gr.next()) {
+                                    cStart = new GlideDateTime(task_assignee_gr.task.expected_travel_start);
+                                    cEnd = new GlideDateTime(task_assignee_gr.task.estimated_end);
+
+                                    if (cStart &lt;= wb_start &amp;&amp; cEnd &gt;= wb_end) {
+                                        noWbPresent = true;
+                                        break;
+                                    }
+
+                                    conflictAssigneeWBs.push({
+                                        "start": cStart,
+                                        "end": cEnd
+                                    });
+                                }
+                                //if conflict exists, ignore this workblock, else add the workblock in filtered work blocks list for the agent
+                                if (noWbPresent) {
+                                    continue;
+                                }
+                            }
+
+                            var mergedConflictWBs = this.mergeWorkBlocks(conflictMemberWBs, conflictAssigneeWBs);
+                            if (!gs.nil(mergedConflictWBs) &amp;&amp; mergedConflictWBs.length &gt; 0) {
+                                var availableWBs = this.findNonConflictWBs(workBlock, mergedConflictWBs);
+                                for (var k = 0; k &lt; availableWBs.length; k++) {
+                                    var wb = this._cloneWorkBlock(workBlock);
+                                    wb.id = this._generateID();
+                                    wb.startDate = new GlideDateTime();
+									wb.startDate.setValue(availableWBs[k].start);
+                                    wb.endDate = new GlideDateTime();
+									wb.endDate.setValue(availableWBs[k].end);
+                                    wb.startDateMS = availableWBs[k].start;
+                                    wb.endDateMS = availableWBs[k].end;
+                                    wb.workBlockIndex = startPosition;
+                                    startPosition++;
+                                    this.loggerUtil.logInfo(gs.getMessage("wb -- {0} -- {1}", [wb.startDate.getDisplayValue(), wb.endDate.getDisplayValue()]));
+                                    filteredWorkBlocks.push(wb);
+                                }
+                            } else {
+                                workBlock.workBlockIndex = startPosition;
+                                startPosition++;
+                                this.loggerUtil.logInfo(gs.getMessage("wb -- {0} -- {1}", [wb_start.getDisplayValue(), wb_end.getDisplayValue()]));
+                                filteredWorkBlocks.push(workBlock);
+                            }
+
+                            if (!wb_printed) {
+                                this.loggerUtil.logInfo(gs.getMessage("Filtered work blocks for {0} after removing workblocks which intersect with agent's crew membership timings", this.resourceInfo[agent].userName));
+                                wb_printed = true;
+                            }
+
+                        }
+                    }
+
+                    if (gs.nil(filteredWorkBlocks) || filteredWorkBlocks.length == 0) {
+                        this.loggerUtil.logInfo(gs.getMessage("All workblocks for {0} have been removed because they intersect with agent's crew membership timings.", this.resourceInfo[agent].userName));
+                    }
+
+                    //update the original array with the filtered work blocks
+                    agentWorkBlocksForTask = filteredWorkBlocks;
+                }
+            }
+
+            this.foundWBWithCapacity = false;
+            this.capacityEvaluated = false;
+            if (global.FSMUtil.canAssignAcrossMultipleSchedules(task) == false) {
+                for (var i = 0; i &lt; agentWorkBlocksForTask.length; i++) {
+                    var workBlock = agentWorkBlocksForTask[i];
+                    if(this.isFSMTerritoryPlanningActive){
+                        workBlock.membershiptype = membershipType;
+                    }
+                    if (workBlock.type == "wb" &amp;&amp; this.isActiveWorkBlock(agentOverride, workBlock,  agent, task)) {
+                        bestWorkBlock = this._evaluateWorkBlock(workBlock, task, bestWorkBlock, windowStart, windowEnd, overallRating, workBlock.workBlockIndex, agent, agentOverride, unAssignData);
+                    } else
+                        continue;
+                }
+            } else {
+                var prevBestWorkBlock = null;
+                var minDurationForFirstSchedule = new sn_fsm_multiday.MultiDayTasksUtilExtensionPoint().getMinDurationForFirstWorkSchedule() * 60 * 1000;
+                for (var i = 0; i &lt; agentWorkBlocksForTask.length; i++) {
+                    var workDuration = this._getTaskDuration(task);
+                    bestWorkBlock = null;
+                    for (var j = i; j &lt; agentWorkBlocksForTask.length; j++) {
+                        var workBlock = agentWorkBlocksForTask[j];
+                        if (workBlock.type == "wb") {
+                            if (bestWorkBlock) {
+                                workDuration = bestWorkBlock.remainingTime;
+                                if (bestWorkBlock.remainingTime == 0)
+                                    break;
+                            }
+                            if(this.isFSMTerritoryPlanningActive){
+                                workBlock.membershipType = membershipType;
+                            }
+                            if (!this.isActiveWorkBlock(agentOverride, workBlock,  agent, task)) {
+                                break;
+                            }
+                            bestWorkBlock = this._evaluateWorkBlockMultiDay(workBlock, task, bestWorkBlock, windowStart, windowEnd, overallRating, workBlock.workBlockIndex, agent, workDuration, minDurationForFirstSchedule, agentOverride);
+                        } else {
+                            if (bestWorkBlock) {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
+
+                    if (bestWorkBlock &amp;&amp; bestWorkBlock.remainingTime != 0) {
+                        bestWorkBlock = null;
+                    }
+
+                    if(!prevBestWorkBlock){
+                        prevBestWorkBlock = bestWorkBlock;
+                        continue;
+                    }
+
+                    if ((bestWorkBlock &amp;&amp; prevBestWorkBlock &amp;&amp; bestWorkBlock.rating &gt; prevBestWorkBlock.rating)) {
+                        if(this._isBetterWorkBlock(bestWorkBlock, prevBestWorkBlock, bestWorkBlock.rating)){
+                            prevBestWorkBlock = bestWorkBlock;
+                        }
+                    }
+                }
+                bestWorkBlock = prevBestWorkBlock;
+            }
+
+            if (this.isCapacityPluginActive &amp;&amp; this.capacityEvaluated &amp;&amp; !this.foundWBWithCapacity &amp;&amp; this.resourceInfo[agent] &amp;&amp; agentWorkBlocksForTask.length != 0)
+                this.loggerUtil.logError(gs.getMessage("Agent {0} has reached the maximum capacity allocation", this.resourceInfo[agent].userName));
+
+        }
+        return bestWorkBlock;
+    },
+
+
+    isResourceAdhoc: function(task, resource) {
+        var fieldServiceTerritoryAPI = new sn_fsm_tp.FieldServiceTerritoryPlanning();
+        return fieldServiceTerritoryAPI.isResourceAdhocAgent(task, resource);
+    },
+
+
+    getResourceType: function(){
+        return "sys_user";
+    },
+
+    getResourceFieldInTask: function() {
+        return "assigned_to";
+    },
+
+    getTerritoryOverrideMembers: function(territory, agents, windowStart, windowEnd) {
+        var agentOverrides = {};
+        for (var j = 0; j &lt; agents.length; j++) {
+            var overrideArray = [];
+            var previousToDate = new GlideDateTime();
+            var previousActiveState = true;
+            var i = 0;
+            var gr = new GlideRecord('sn_tp_territory_membership_override');
+            gr.addQuery('user', agents[j]);
+            gr.addQuery('territory', territory);
+            gr.addQuery('from', '&lt;', windowEnd);
+            gr.addQuery('to', '&gt;', windowStart);
+            gr.orderBy('from');
+            gr.query();
+            while (gr.next()) {
+                //joining consecutive overrides if have same active state
+                if (i != 0 &amp;&amp; previousToDate.getNumericValue() == new GlideDateTime(gr.from).getNumericValue() &amp;&amp; previousActiveState == !!gr.active) {
+                    overrideArray[i - 1].to = new GlideDateTime(gr.to);
+                } else {
+                    var overrideObj = {};
+                    previousToDate = new GlideDateTime(gr.to);
+                    previousActiveState = !!gr.active;
+                    overrideObj.resource = gr.user.getValue();
+                    overrideObj.active = !!gr.active;
+                    overrideObj.from = new GlideDateTime(gr.from);
+                    overrideObj.to = new GlideDateTime(gr.to);
+                    overrideObj.membershiptype = gr.membershiptype.toString();
+                    overrideArray.push(overrideObj);
+                    i++;
+                }
+            }
+            if (overrideArray.length &gt; 0)
+                agentOverrides[agents[j]] = overrideArray;
+        }
+        return agentOverrides;
+    },
+
+    getResourceSkills: function(skills, resourceId){
+        var useSkillGr = new GlideRecord("sys_user_has_skill");
+        useSkillGr.addEncodedQuery("skillIN"+skills);
+        useSkillGr.addQuery('user', resourceId);
+        useSkillGr.query();
+        return useSkillGr;
+    },
+
+    getResourceParts: function(resourceId, modelsArr, reservedAssetsForTask){
+        var FIELD_AGENT_STOCKROOM_TYPE = "e2aa2b3f3763100044e0bfc8bcbe5dde";
+
+        var asset = new GlideAggregate('alm_asset');
+        asset.addQuery('model', 'IN', modelsArr);
+        //asset.addQuery('install_status', '6');
+        var assetStatusCondition = asset.addQuery('substatus', 'available').addOrCondition('substatus', 'pre_allocated');
+        if(reservedAssetsForTask &amp;&amp; reservedAssetsForTask.length &gt; 0)
+            assetStatusCondition.addOrCondition("sys_id", "IN", reservedAssetsForTask);
+        asset.addQuery('stockroom.manager', resourceId);
+        asset.addQuery('stockroom.type', FIELD_AGENT_STOCKROOM_TYPE);
+        asset.groupBy('stockroom');
+        asset.groupBy('model');
+        asset.addAggregate('SUM', 'quantity');
+        asset.query();
+        return asset;
+    },
+
+    /************ FSM Capacity Module Implementations **************/
+    _getGroupsWithCapacity: function(task, groupIDs, capacityUsageMap, config) {
+        var capacityManagement = new DynamicSchedulingCapacityManagement();
+        groupIDs = capacityManagement.getGroupsWithCapacity(task, groupIDs, capacityUsageMap, config);
+        return groupIDs;
+    },
+
+	_checkIfTerritoryHasCapacity: function(task, capacityUsageMap, config) {
+        var capacityManagement = new DynamicSchedulingCapacityManagement();
+        return capacityManagement.checkTerritoryCapacity(task, capacityUsageMap, config);
+    },
+
+    _getPossibleStartByCapacity: function(task, possibleStart, rangeEnd, resource, capacityUsageMap, resourceWorkDuration, resourceInfo, beforeTime, capacityArgs){
+        var capacityManagement = new DynamicSchedulingCapacityManagement();
+        possibleStart = capacityManagement.checkCapacityForWB(task, possibleStart, rangeEnd, resource, capacityUsageMap, resourceWorkDuration, resourceInfo, beforeTime, capacityArgs);
+        return possibleStart;
+    },
+
+    _getScheduleDurationForAgent: function(fullScheduleTimeMap, resource, rangeStart, rangeEnd, resourceWorkDuration, qualifierMap){
+        var territory = "";
+		if(!gs.nil(qualifierMap) &amp;&amp; !(gs.nil(qualifierMap.territory))){
+            territory = qualifierMap.territory;
+        }
+
+        var capacityManagement = new DynamicSchedulingCapacityManagement();
+        capacityManagement._getScheduleDurationForAgent(fullScheduleTimeMap, resource, rangeStart, rangeEnd, resourceWorkDuration, territory);
+    },
+
+    _updateUsageMapForTask: function(taskToAdd, agent, capacityUsageMap, isUnassign, startDateMS, taskUpdates){
+        var capacityManagement = new DynamicSchedulingCapacityManagement();
+        capacityManagement.updateUsageMapForTask(taskToAdd, agent, capacityUsageMap, isUnassign, startDateMS, taskUpdates);
+    },
+
+    _updateUsageMapUnassign: function(unAssignData, task){
+        var capacityManagement = new DynamicSchedulingCapacityManagement();
+        capacityManagement.updateUsageMapUnassign(unAssignData, task, this.capacityUsageMap);
+    },
+
+    getTasksWithCapacity: function(taskUpdates){
+        var capacityManagement = new DynamicSchedulingCapacityManagement();
+        taskUpdates = capacityManagement.getTasksWithCapacity(taskUpdates);
+        return taskUpdates;
+    },
+
+    type: 'DynamicSchedulingUserImpl'
+});]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-07-28 05:11:31&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;3d98ec365ba53010461b52380a81c731&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;42&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;DynamicSchedulingUserImpl&lt;/sys_name&gt;
+        &lt;sys_package display_value="Dynamic Scheduling" source="com.snc.dynamic_scheduling"&gt;88cb5ebf4722c210cd4e1ce4316d43f3&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_3d98ec365ba53010461b52380a81c731&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-07 10:51:08&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:36:05</sys_created_on>
+        <sys_id>aa6630d983f01210c6695855eeaad386</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>DynamicSchedulingUserImpl</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_aa6630d983f01210c6695855eeaad386</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:36:05</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

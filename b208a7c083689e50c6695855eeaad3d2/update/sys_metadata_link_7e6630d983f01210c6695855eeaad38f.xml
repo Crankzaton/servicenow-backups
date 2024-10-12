@@ -1,0 +1,399 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>3de0f527eb7120101b262c148f52280f</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_doc.DocumentTemplateBlockUtilsSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;DocumentTemplateBlockUtilsSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var DocumentTemplateBlockUtilsSNC = Class.create();
+DocumentTemplateBlockUtilsSNC.prototype = {
+    initialize: function() {},
+
+    /**
+     * Get the DT Blocks list
+     *
+     * @return List of DT Blocks JSON object
+     */
+    getDTBlocks: function(queryParams) {
+        var MAX_SEARCH_RESULTS = 25;
+        var dtBlocksList = {
+            moreResults: false,
+            result: []
+        };
+        var searchKeyword = '',
+            table = '';
+        if (!queryParams)
+            return dtBlocksList;
+        if (queryParams.searchKeyword)
+            searchKeyword = queryParams.searchKeyword.toString();
+        if (queryParams.table)
+            table = queryParams.table.toString();
+        if (searchKeyword.length &lt; 3)
+            return dtBlocksList;
+        if (gs.nil(table))
+            return dtBlocksList;
+        var tableHierarchy = new GlideTableHierarchy(table);
+        var tablesList = tableHierarchy.getTables();
+        var dtBlockInfoGr = new GlideRecord('sn_doc_template_block');
+        dtBlockInfoGr.addActiveQuery();
+        dtBlockInfoGr.addQuery('table', 'IN', tablesList.toString());
+        var keywordSearch = this._appendPartialSearch(searchKeyword);
+        dtBlockInfoGr.addQuery('IR_AND_OR_QUERY', keywordSearch);
+        dtBlockInfoGr.setLimit(MAX_SEARCH_RESULTS + 1);
+        dtBlockInfoGr.query();
+        while (dtBlockInfoGr.next()) {
+            if (!dtBlockInfoGr.canRead())
+                continue;
+            var dtBlock = {
+                name: dtBlockInfoGr.getDisplayValue('name').toString(),
+                description: dtBlockInfoGr.getDisplayValue('description')||"",
+                sys_id: dtBlockInfoGr.sys_id.toString()
+            };
+            dtBlocksList.result.push(dtBlock);
+        }
+        if (dtBlocksList.result.length &gt; MAX_SEARCH_RESULTS) {
+            dtBlocksList.result.pop();
+            dtBlocksList.moreResults = true;
+        }
+        return dtBlocksList;
+    },
+    /*
+     * Get the template html content with valid blocks
+     */
+    replaceBlocksWithContent: function(templateBody, targetId) {
+        var blocksInTemplate = this.extractBlocksFromHtmlSnippet(templateBody);
+        if (gs.nil(blocksInTemplate))
+            return templateBody;
+
+        var referencedBlocks = Object.keys(blocksInTemplate);
+        if (gs.nil(referencedBlocks) || referencedBlocks.length == 0)
+            return templateBody;
+
+        if (referencedBlocks.length &gt; 0) {
+            var validBlocks = this.getValidTemplateBlocks(referencedBlocks, targetId);
+            var validBlocksIds = Object.keys(validBlocks);
+            //Replace all valid blocks with content
+            for (var i = 0; i &lt; validBlocksIds.length; i++) {
+                var validBlock = validBlocks[validBlocksIds[i]];
+                var blockInstances = blocksInTemplate[validBlocksIds[i]];
+                for (var index = 0; index &lt; blockInstances.length; index++) {
+                    var realTimeBlocksInTemplate = this.extractBlocksFromHtmlSnippet(templateBody);
+                    var realTimeBlockInstances = realTimeBlocksInTemplate[validBlocksIds[i]];
+                    var block = realTimeBlockInstances[0];
+                    templateBody = templateBody.substr(0, block.startIndex) + validBlock.body + templateBody.substr(block.lastIndex);
+                }
+            }
+        }
+
+        return templateBody;
+    },
+
+    /*
+     * Find the block content start and end indexes
+     */
+    findBlockContentIndexes: function(body, start, end, content) {
+        var blockSnippetBody = body.substr(start, end);
+        var contentStart = blockSnippetBody.indexOf(content);
+        return {
+            contentStart: start + contentStart,
+            contentEnd: start + contentStart + content.length
+        };
+    },
+    /*
+     * Get Valid Template Blocks for based on user criteria and conditions
+     */
+    getValidTemplateBlocks: function(referencedBlocks, targetId) {
+        return this.getTemplateBlocksContent(referencedBlocks, targetId);
+    },
+    /*
+     * Get block contents for given block ids
+     */
+    getTemplateBlocksContent: function(blockIDs, targetId) {
+        var blocksContent = {};
+        for (var iBlock = 0; iBlock &lt; blockIDs.length; iBlock++) {
+            var blockDetailsGr = new GlideRecord('sn_doc_template_block_content');
+            blockDetailsGr.addActiveQuery();
+            blockDetailsGr.addQuery('block', blockIDs[iBlock]);
+            blockDetailsGr.orderBy("order");
+            blockDetailsGr.query();
+            var areConditionsSatisfied = false;
+            while (blockDetailsGr.next()) {
+                areConditionsSatisfied = true;
+                var blockObj = {
+                    applies_when: blockDetailsGr.applies_when,
+                    applies_to: blockDetailsGr.applies_to,
+                    applies_to_user: blockDetailsGr.applies_to_user,
+                    order: blockDetailsGr.order,
+                    body: blockDetailsGr.body
+                };
+                blocksContent[blockDetailsGr.block] = blockObj;
+                var applyWhenCondition = blockDetailsGr.applies_when;
+                var blockGr = new GlideRecord("sn_doc_template_block");
+                blockGr.get(blockIDs[iBlock]);
+                var blockTable = blockGr.getDisplayValue("table");
+                var blockTableGr = new GlideRecord(blockTable);
+                blockTableGr.get(targetId);
+                // check apply when condition
+                if (!ScopedGlideFilter.checkRecord(blockTableGr, applyWhenCondition)) {
+                    areConditionsSatisfied = false;
+                    continue;
+                }
+
+                // check if any user criteria is there or not
+                if (gs.nil(blockDetailsGr.applies_to))
+                    break;
+                // check user is satisfying the user criteria or not
+                var appliesToUser = blockTableGr.getValue(blockDetailsGr.applies_to_user);
+                var UArray = blockDetailsGr.applies_to.split(",");
+                if (sn_uc.UserCriteriaLoader.userMatches(appliesToUser, UArray))
+                    break;
+
+                // if all conditions are not satisfied
+                areConditionsSatisfied = false;
+            }
+            // if all block content are inactive
+            if (!areConditionsSatisfied)
+                blocksContent[blockIDs[iBlock]] = {
+                    body: ""
+                };
+        }
+        return blocksContent;
+    },
+
+    /*
+     * Extract Document template blocks using regex from html template content
+     */
+    extractBlocksFromHtmlSnippet: function(templateBody) {
+        var regex = new RegExp(this.getBlockSnippetPattern('',true), 'gm');
+        var m;
+        var dtBlocks = {};
+        while ((m = regex.exec(templateBody)) !== null) {
+            // This is necessary to avoid infinite loops with zero-width matches
+            if (m.index === regex.lastIndex)
+                regex.lastIndex++;
+
+            var matchObj = {};
+
+            if (m[1]) {
+                matchObj.startIndex = m.index;
+                matchObj.lastIndex = m.index + m[0].length;
+                matchObj.fullBlock = m[0];
+                matchObj.blockId = m[1];
+                matchObj.blockContent = m[2];
+                if (dtBlocks[m[1]])
+                    dtBlocks[m[1]].push(matchObj);
+                else
+                    dtBlocks[m[1]] = [matchObj];
+            }
+        }
+        return dtBlocks;
+    },
+
+    extractBlockIdsFromHtmlSnippet: function(templateBody) {
+        var regex = /data-dtblock-id="(.*)"/gm;
+        var m;
+        var dtBlocks = [];
+        while ((m = regex.exec(templateBody)) !== null) {
+            // This is necessary to avoid infinite loops with zero-width matches
+            if (m.index === regex.lastIndex) {
+                regex.lastIndex++;
+            }
+            if (m[1])
+                dtBlocks.push(m[1]);
+        }
+        return dtBlocks;
+    },
+    /*
+     *	Returns snippets generated for each block
+     *	@returns JSON
+     */
+    getBlockSnippet: function(blockSysIds) {
+        var retDTBlockSnippet = [];
+        var blockList = blockSysIds.split(",");
+        for (var iBlock = 0; iBlock &lt; blockList.length; iBlock++) {
+            var blockDetailsGr = new GlideRecord('sn_doc_template_block');
+            var blockDetails = blockDetailsGr.get(blockList[iBlock]);
+            if (blockDetails)
+                retDTBlockSnippet.push(this._generateBlockSnippetDiv(blockDetailsGr));
+        }
+        return JSON.stringify(retDTBlockSnippet);
+    },
+    /*
+     *	Generates snippets of blocks to be inserted
+     *	@params block number
+     *	@returns JSON
+     */
+    _generateBlockSnippetDiv: function(blockDetailsGr) {
+        var dtBlockJSON = {};
+        var time = new Date();
+        var dtBlockNumber = blockDetailsGr.getDisplayValue('sys_id');
+        var dtBlockName = blockDetailsGr.getDisplayValue('name');
+        var description = blockDetailsGr.getDisplayValue('description') || "";
+        description = description.replace(/&lt;/g, "&amp;lt;");
+        description = description.replace(/&gt;/g, "&amp;gt;");
+        dtBlockJSON.idBlock = 'dtblock_' + dtBlockNumber + '_' + time.getTime() + '_dtblock';
+        dtBlockJSON.name = dtBlockName;
+        dtBlockJSON.dtBlockNumber = dtBlockNumber;
+        dtBlockJSON.description = description;
+        var displayBlockContent = this.getInsertBlockDisplayFormat();
+        displayBlockContent = displayBlockContent.replace('$$id$$', dtBlockJSON.idBlock);
+        displayBlockContent = displayBlockContent.replace('$$number$$', dtBlockNumber);
+        displayBlockContent = displayBlockContent.replace('$$name$$', dtBlockName);
+        displayBlockContent = displayBlockContent.replace('$$description$$', description);
+        dtBlockJSON.blockdetails = displayBlockContent;
+
+        return dtBlockJSON;
+    },
+
+    getInsertBlockDisplayFormat: function() {
+        return '&lt;div tabindex="0" id="' + '$$id$$' + '" class="dt-block-content-item mceNonEditable" contenteditable="false" data-dt-type="dtblock" data-dtblock-id="' + '$$number$$' + '" style="border: 1px solid #ddd; padding: 10px;margin: 5px 0;disabled: true; display: block; color: RGB(var(now-color--neutral-14,var(--now-color_surface--neutral-6,53,59,73)));text-overflow: ellipsis; overflow: hidden; white-space: nowrap; line-height: 1.42857;font-weight: 700; width: 95%;"&gt;' +
+            '&lt;div data-dt-type="dtblockcontent" class="block-info" style="display: inline-block; vertical-align: top;"&gt;&lt;div class="block-text-title" &gt;' + '$$name$$' +
+            '&lt;/div&gt;&lt;div class="description" style="font-weight:100"&gt;' + '$$description$$' + '&lt;/div&gt;' +
+            '&lt;/div&gt;&lt;/div&gt;&lt;br/&gt;';
+    },
+
+    checkTemplateReferences: function(dtbSysId) {
+        var grM2M = new GlideRecord('sn_doc_m2m_html_template_to_block');
+        grM2M.addQuery('template_block', dtbSysId);
+        grM2M.setLimit(1);
+        grM2M.query();
+        return grM2M.hasNext();
+    },
+    createM2MTemplateToBlocks: function(templateId, templateBody) {
+        var existingDtBlocks = [];
+        var insertBlockList = [];
+        var deleteBlockList = [];
+        var dtBlocksInfo = this.extractBlocksFromHtmlSnippet(templateBody);
+        var dtBlocks = Object.keys(dtBlocksInfo);
+        if (templateId) {
+            existingDtBlocks = this.getExistingM2MBlocks(templateId);
+            for (var i = 0; i &lt; existingDtBlocks.length; i++) {
+                if (dtBlocks.indexOf(existingDtBlocks[i]) === -1) {
+                    deleteBlockList.push(existingDtBlocks[i]);
+                }
+            }
+            for (var j = 0; j &lt; dtBlocks.length; j++) {
+                if (existingDtBlocks.indexOf(dtBlocks[j]) === -1) {
+                    insertBlockList.push(dtBlocks[j]);
+                }
+            }
+            for (var insertBlockIndex = 0; insertBlockIndex &lt; insertBlockList.length; insertBlockIndex++) {
+                this.insertIntoM2M(templateId, insertBlockList[insertBlockIndex]);
+            }
+            for (var deleteBlockIndex = 0; deleteBlockIndex &lt; deleteBlockList.length; deleteBlockIndex++) {
+                this.deleteFromM2M(templateId, deleteBlockList[deleteBlockIndex]);
+            }
+        }
+    },
+    insertIntoM2M: function(dtSysId, dtbSysId) {
+        var grM2M = new GlideRecord('sn_doc_m2m_html_template_to_block');
+        grM2M.initialize();
+        grM2M.setValue('html_template', dtSysId);
+        grM2M.setValue('template_block', dtbSysId);
+        grM2M.insert();
+    },
+    deleteFromM2M: function(dtSysId, dtbSysId) {
+        var grM2M = new GlideRecord('sn_doc_m2m_html_template_to_block');
+        grM2M.addQuery('html_template', dtSysId);
+        grM2M.addQuery('template_block', dtbSysId);
+        grM2M.query();
+        grM2M.next();
+        grM2M.deleteRecord();
+    },
+    getExistingM2MBlocks: function(dtSysId) {
+        var existingBlocks = [];
+        var grM2M = new GlideRecord('sn_doc_m2m_html_template_to_block');
+        grM2M.addQuery('html_template', dtSysId);
+        grM2M.query();
+        while (grM2M.next()) {
+            existingBlocks.push(grM2M.getValue('template_block'));
+        }
+        return existingBlocks;
+    },
+
+    /**
+     * Replaces the block snippets in the given template body html
+     * with latest name and short description values of current
+     * session language.
+     */
+    refreshBlockSnippets: function(templateBody) {
+        var blockSnippet;
+        var blockRegExp;
+
+        var blocks = this.extractBlockIdsFromHtmlSnippet(templateBody);
+        var that = this;
+        blocks.forEach(function(blockId) {
+            blockSnippet = JSON.parse(that.getBlockSnippet(blockId))[0];
+            blockRegExp = new RegExp(that.getBlockSnippetPattern(blockId,true), 'gm');
+            templateBody = templateBody.replace(blockRegExp, blockSnippet.blockdetails);
+        });
+
+        return templateBody;
+    },
+
+    getBlockSnippetPattern: function(blockId, withGroups) {
+        if (gs.nil(blockId))
+            blockId = '.*';
+
+        if (withGroups)
+            return '&lt;div .* data-dtblock-id="(' + blockId + ')"&gt;(?:\\W)*(&lt;div .* data-dt-type="dtblockcontent"&gt;(?:(?:\\W)*.*){2}&lt;\\/div&gt;(?:\\W)*&lt;\\/div&gt;)(?:\\W)*&lt;\\/div&gt;';
+
+        return '&lt;div .*?data-dtblock-id="' + blockId + '?"(\\W)*&lt;div .*?(\\W)*&lt;div .*?&lt;\\/div&gt;.*?(\\W)*&lt;div .*?(\\W)*&lt;\\/div&gt;.*?(\\W)*&lt;\\/div&gt;.*?(\\W)*&lt;\\/div&gt;';
+    },
+
+    /**
+     * Force a search term to allow partial matching
+     * @param searchTerm String Search term to force partial searching on
+     * @return String Partialized search term
+     */
+    _appendPartialSearch: function(searchTerm) {
+        if (searchTerm.indexOf("*") == -1 &amp;&amp;
+            searchTerm.indexOf('"') == -1 &amp;&amp;
+            searchTerm.indexOf("'") != 0 // Not the first character
+            &amp;&amp;
+            searchTerm.indexOf("'") != (searchTerm.length - 1) // Not the last character
+            &amp;&amp;
+            searchTerm != "AND" &amp;&amp;
+            searchTerm != "OR" &amp;&amp;
+            searchTerm != "|")
+            return searchTerm += "*";
+        return searchTerm;
+    },
+    type: 'DocumentTemplateBlockUtilsSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-01-25 08:24:32&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;3de0f527eb7120101b262c148f52280f&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;155&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;DocumentTemplateBlockUtilsSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Document Templates" source="sn_doc"&gt;6a9ea833b763330088d9bc78ee11a88q&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Document Templates"&gt;6a9ea833b763330088d9bc78ee11a88q&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_3de0f527eb7120101b262c148f52280f&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-03-23 15:57:54&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:36:06</sys_created_on>
+        <sys_id>7e6630d983f01210c6695855eeaad38f</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>DocumentTemplateBlockUtilsSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_7e6630d983f01210c6695855eeaad38f</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:36:06</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

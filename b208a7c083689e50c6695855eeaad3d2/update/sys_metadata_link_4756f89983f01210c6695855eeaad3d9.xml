@@ -1,0 +1,620 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>37bf98c62dda0110fa9bb8e1eb575758</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.OneApiExecutionUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;OneApiExecutionUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var OneApiExecutionUtil = Class.create();
+OneApiExecutionUtil.prototype = {
+    initialize: function() {
+    },
+
+	makeExecutionServicePlan: function(inputs, outputs) {
+		// find service plan features
+		var planFeatureGr = new GlideRecord("one_api_service_plan_feature");
+		planFeatureGr.addActiveQuery();
+		planFeatureGr.addQuery("service_plan", inputs.service_plan.getUniqueValue());
+		planFeatureGr.query();
+
+		var featureList = [];
+		var planObj = {};
+		var planInput = inputs.input;
+
+		this.validatePlanInput(planInput, inputs.service_plan.name);
+
+		if (!this.isObject(planInput)) {
+			planInput = this.escapeJSONString(planInput);
+		}
+
+		while (planFeatureGr.next()) {
+			var feature = {
+				"sys_id" : new String(planFeatureGr.feature.sys_id),
+				"name": planFeatureGr.feature.name,
+				"app_request_id" : planInput.features[new String(planFeatureGr.feature.name)].requestId,
+				"timeout_sec": planFeatureGr.timeout_sec,
+			};
+			featureList.push(feature);
+			planObj[planFeatureGr.feature.name] = this.generateDependencies(planFeatureGr.depends_on.feature.name.toString());
+		}
+
+		// run algorithm that sorts features according to dependencies
+		var executionPlanArray = this.determinePlanOrder(planObj);
+
+		var metadata = this.escapeJSONString(inputs.input).meta || {};
+		var servicePlanIsBlocking = metadata.blocking === true || metadata.blocking === 'true';
+
+		// Create the one_api_service_plan_invocation record
+		var planInvocationRecord = new GlideRecord("one_api_service_plan_invocation");
+		planInvocationRecord.flow_context = FlowScriptAPI.getContextID();
+		planInvocationRecord.service_plan = inputs.service_plan.sys_id;
+		planInvocationRecord.input = inputs.input;
+		planInvocationRecord.execution_plan = JSON.stringify(executionPlanArray);
+		planInvocationRecord.app_document_table = planInput.documentTable;
+		planInvocationRecord.app_document = planInput.documentId;
+		planInvocationRecord.app_transaction_id = planInput.transactionId;
+		planInvocationRecord.execution_mode = (true === servicePlanIsBlocking ? "sync": "async");
+		var planInvocationSysId = planInvocationRecord.insert();
+
+		var featuresById = this.arrayToMap(featureList, "sys_id");
+		var executionPlanMap =  this.arrayToMap(executionPlanArray, "feature");
+
+		// create the one_api_service_plan_feature_invocation records
+		var featureProviderIdsByFeatureIds = this.getFeatureProvidersByFeatureId(featureList);
+		for (var byFeatureId in featureProviderIdsByFeatureIds) {
+			if (Object.prototype.hasOwnProperty.call(featureProviderIdsByFeatureIds, byFeatureId)) {
+				var byFeature = featureProviderIdsByFeatureIds[byFeatureId];
+				var featureInvocationGr = new GlideRecord("one_api_service_plan_feature_invocation");
+				var hasDependentFeature = true === executionPlanMap[byFeature.feature_name].has_dependent;
+				var featureIsBlocking = servicePlanIsBlocking || hasDependentFeature;
+
+				featureInvocationGr.active = true;
+				featureInvocationGr.service_plan_invocation = planInvocationSysId;
+				featureInvocationGr.execution_mode = (true === featureIsBlocking ? "blocking": "non-blocking");
+				featureInvocationGr.feature_provider = byFeature.feature_provider_sys_id;
+				featureInvocationGr.app_request_id = featuresById[byFeatureId].app_request_id;
+				featureInvocationGr.timeout_sec = featuresById[byFeatureId].timeout_sec;
+				featureInvocationGr.timeout_policy = featuresById[byFeatureId].timeout_policy;
+				featureInvocationGr.insert();
+			}
+		}
+
+		// set the outputs
+		outputs.service_plan_invocation = planInvocationRecord;
+		outputs.feature_execution_plan = executionPlanArray;
+	},
+
+	prepareFeature: function(inputs, outputs) {
+		var featureInvocationGR = new GlideRecord("one_api_service_plan_feature_invocation");
+		featureInvocationGR.addQuery("service_plan_invocation", inputs.service_plan_invocation.sys_id);
+		featureInvocationGR.addQuery("feature_provider.feature.name", inputs.feature_name);
+		featureInvocationGR.query();
+		featureInvocationGR.next();
+		
+		var completedAt = new global.GlideDateTime();
+
+		// Short-circuit if this feature is NOT applicable
+		if (!this.isApplicable(inputs, outputs)) {
+			completedAt = new global.GlideDateTime();
+			featureInvocationGR.completed_at = completedAt;
+			featureInvocationGR.completed_at_millis = completedAt.getNumericValue();
+			featureInvocationGR.output = JSON.stringify({ status: 'N/A' });
+			featureInvocationGR.sequence = this.escapeJSONString(inputs.sequence);
+			featureInvocationGR.status = 'N/A';
+			featureInvocationGR.update();
+			outputs.skipped = true;
+			this.logFeatureInvocation(featureInvocationGR);
+			return;
+		}
+
+		// Parse the feature's inputs, then adapt the inputs required by the target FDIH Action (or Subflow)
+		var featureInput = inputs.service_plan_input;
+		var featureInputText = inputs.service_plan_input;
+		while (!this.isObject(featureInput)) {
+			featureInputText = featureInput;
+			var parsed = this.escapeJSONString(featureInput);
+			if (parsed == null || parsed === featureInput) break;
+			featureInput = parsed;
+		}
+		var rawFeatureInput = featureInput.features[inputs.feature_name].payload;
+		featureInvocationGR.raw_input = JSON.stringify(rawFeatureInput);
+		var startedAt = new global.GlideDateTime();
+		featureInvocationGR.started_at = startedAt;
+		featureInvocationGR.started_at_millis = startedAt.getNumericValue();
+
+		var statusCheckGR = new GlideRecord("one_api_service_plan_feature_invocation");
+		statusCheckGR.addQuery("service_plan_invocation", inputs.service_plan_invocation.sys_id);
+		statusCheckGR.addQuery("status", 'timed_out');
+		statusCheckGR.addQuery("timeout_policy", "exit_service_plan_execution");
+		statusCheckGR.query();
+		if (statusCheckGR.next()) {
+			// previous step timed out, exit early
+			completedAt = new global.GlideDateTime();
+			featureInvocationGR.completed_at = completedAt;
+			featureInvocationGR.completed_at_millis = completedAt.getNumericValue();
+			featureInvocationGR.output = JSON.stringify({ warning: 'skipped' });
+			featureInvocationGR.sequence = this.escapeJSONString(inputs.sequence);
+			featureInvocationGR.status = 'skipped';
+			featureInvocationGR.update();
+			outputs.skipped = true;
+			this.logFeatureInvocation(featureInvocationGR);
+			return;
+		}
+
+		if (!this.isFeatureInputValid(featureInput, inputs.feature_name)) {
+			completedAt = new global.GlideDateTime();
+			featureInvocationGR.completed_at = completedAt;
+			featureInvocationGR.completed_at_millis = completedAt.getNumericValue();
+			featureInvocationGR.output = JSON.stringify({ error: 'Missing input' });
+			featureInvocationGR.sequence = this.escapeJSONString(inputs.sequence);
+			featureInvocationGR.status = 'error';
+			featureInvocationGR.update();
+			this.logFeatureInvocation(featureInvocationGR);
+			throw new Error('Missing feature input for: Service Plan ['
+				+ inputs.service_plan_invocation.service_plan.name + '], '
+				+ 'Feature [' + inputs.feature_name + ']');
+		}
+
+		var fdihDocSysId = featureInvocationGR.feature_provider.type_document;
+		var featureService = this.getFeatureService(featureInvocationGR.feature_provider);
+		var adaptedFeatureInput = featureService.toProviderInput(rawFeatureInput);
+		var adaptedFeatureInputText = JSON.stringify(adaptedFeatureInput);
+		featureInvocationGR.input = adaptedFeatureInputText;
+		featureInvocationGR.update();
+
+		if (!this.isObject(adaptedFeatureInput)) {
+			completedAt = new global.GlideDateTime();
+			featureInvocationGR.completed_at = completedAt;
+			featureInvocationGR.completed_at_millis = completedAt.getNumericValue();
+			featureInvocationGR.output = JSON.stringify({ error: 'Invalid JSON' });
+			featureInvocationGR.sequence = this.escapeJSONString(inputs.sequence);
+			featureInvocationGR.status = 'error';
+			featureInvocationGR.update();
+			this.logFeatureInvocation(featureInvocationGR);
+			throw new Error('Feature service produced invalid JSON for: Service Plan ['
+							+ inputs.service_plan_invocation.service_plan.name + '], '
+							+ 'Feature [' + inputs.feature_name + ']');
+		}
+
+		outputs.feature_input = adaptedFeatureInputText;
+		outputs.timeout_sec = featureInvocationGR.timeout_sec;
+		outputs.skipped = false;
+		outputs.feature_invocation_id = featureInvocationGR.getUniqueValue();
+
+		var subflowGR = new GlideRecord('sys_hub_flow');
+		subflowGR.get(fdihDocSysId);
+		outputs.subflow = subflowGR;
+	},
+
+	completeFeature: function(inputs, outputs) {
+		var featureInvocationGR = new GlideRecord('one_api_service_plan_feature_invocation');
+		featureInvocationGR.get(inputs.invocation_id);
+
+		var featureService = this.getFeatureService(featureInvocationGR.feature_provider);
+		var rawFeatureOutputs = inputs.feature_outputs;
+		var rawFeatureOutputsText = JSON.stringify(rawFeatureOutputs);
+		var featureOutputs = featureService.fromProviderOutput(rawFeatureOutputs);
+		var featureOutputsText = featureOutputs;
+		var validJson = true;
+		if (this.isObject(featureOutputsText)) {
+			featureOutputsText = JSON.stringify(featureOutputsText);
+		} else {
+			validJson = false;
+		}
+
+		outputs.output = featureOutputs;
+		var completedAt = new global.GlideDateTime();
+		featureInvocationGR.completed_at = completedAt;
+		featureInvocationGR.completed_at_millis = completedAt.getNumericValue();
+		featureInvocationGR.raw_output = rawFeatureOutputsText;
+		featureInvocationGR.output = featureOutputsText;
+		featureInvocationGR.flow_context = inputs.context_id;
+		featureInvocationGR.status = 'success';
+		featureInvocationGR.update();
+		this.logFeatureInvocation(featureInvocationGR);
+
+		if (!validJson) {
+			gs.warn('One API - Invalid JSON returned from provider for feature invocation [' + inputs.invocation_id + ']');
+		}
+	},
+
+	executeFeature: function(inputs, outputs) {
+		var MILLISECONDS = 1000;
+
+		var featureInput = inputs.featureInput;
+		var featureName = inputs.featureScope + '.' + inputs.featureName;
+		var timeout = inputs.timeout;
+
+		if (timeout) {
+			timeout = timeout * MILLISECONDS;
+		}
+
+		var execution = sn_fd.FlowAPI.getRunner()
+			.subflow(featureName)
+			.inForeground()
+			.timeout(timeout)
+			.withInputs({ input: featureInput });
+
+		var result;
+		try {
+			result = execution.run();
+		} catch (e) {
+			if (e.toString().startsWith('com.glide.sys.ExecutionTimeoutException')) {
+				outputs.timed_out = true;
+				return;
+			}
+			throw e;
+		}
+
+		if (result.getOutputs()) {
+			outputs.output = result.getOutputs().output;
+		}
+		outputs.timed_out = false;
+		outputs.context_id = result.getContextId();
+	},
+
+	gatherAllOutputs: function(inputs, outputs) {
+		var gr = new GlideRecord("one_api_service_plan_feature_invocation");
+		gr.addQuery("service_plan_invocation", inputs.service_plan_invocation.sys_id);
+		gr.addNotNullQuery("completed_at");
+		gr.query();
+
+		var output =
+			{
+				"service_plan" : new String(inputs.service_plan_invocation.service_plan.sys_id),
+				"contextId": new String(inputs.service_plan_invocation.flow_context.sys_id),
+				"output": {
+					"status": "COMPLETE",
+					"error": "",
+					"transactionId": new String(inputs.service_plan_invocation.app_transaction_id),
+					"documentId": new String(inputs.service_plan_invocation.app_document),
+					"documentTable": new String(inputs.service_plan_invocation.app_document_table),
+					"features": {},
+					"completedAt": new global.GlideDateTime().getDisplayValue()
+				}
+			};
+
+		var failureDetected = false;
+
+		while (gr.next()) {
+			var theResultOutput = gr.output;
+			if (!this.isString(theResultOutput)) {
+				theResultOutput = this.escapeJSONString(theResultOutput.toString());
+			}
+
+			var featureResult = {
+				"requestId": new String(gr.app_request_id),
+				"contextId": new String(gr.flow_context.sys_id),
+				"sequence": parseInt(gr.sequence),
+				"completedAt": new String(gr.completed_at),
+				"status" : new String(gr.status),
+				"result": theResultOutput,
+				"meta" : {},
+				"errors" : []
+			};
+
+			if (gr.status == 'timed_out' &amp;&amp; gr.timeout_policy == 'exit_service_plan_execution') {
+				output.output.status = 'TIMED_OUT';
+			}
+
+			if (gr.status == 'error') {
+				failureDetected = true;
+			}
+
+			output.output.features[new String(gr.feature_provider.feature.name)] = featureResult;
+		}
+
+		if (failureDetected) {
+			output.output.status = 'COMPLETE_WITH_ERRORS';
+		}
+
+		outputs.output = JSON.stringify(output);
+		return output;
+	},
+
+	determinePlanOrder: function(plan) {
+		// associate each node with a level
+		var util = this;
+		function findLevels(tree) {
+			var levels = {};
+			Object.keys(tree).forEach(function(node) {
+				findLevel(levels, tree, node, {});
+			});
+			return levels;
+		}
+
+		// associate given node with a level
+		function findLevel(levels, tree, node, history) {
+			if (tree[node] == null) {
+				levels[node] = 0;
+				history[node] = true;
+				return 0;
+			}
+			if (levels[node]) return levels[node];
+			if (history[node]) {
+				throw new Error('Feature cycle detected.');
+			}
+			var dependencyLevels = [];
+			history[node] = true;
+			tree[node].forEach(function(dependency) {
+				dependencyLevels.push(findLevel(levels, tree, dependency, history));
+			});
+			var level = util.max(dependencyLevels) + 1;
+			levels[node] = level;
+			return level;
+		}
+
+		// get a complete map of nodes which other nodes depend on
+		function findDependencyNodes(tree) {
+			var dependencies = {};
+			util.objectValues(tree).forEach(function(nodeDependencies) {
+				if (nodeDependencies) {
+					nodeDependencies.forEach(function(node) { dependencies[node] = true; });
+				}
+			});
+			return dependencies;
+		}
+
+		// generate a sorting score which prioritizes level, then lack of dependents
+		function generateSortingScore(level, hasDependent) {
+			return level + (hasDependent ? .5 : 0);
+		}
+
+		var levels = findLevels(plan);
+		var dependencies = findDependencyNodes(plan);
+		var order = [];
+		this.objectEntries(levels).forEach(function(level) {
+			var node = level[0];
+			var baseScore = level[1];
+			has_dependent = !!dependencies[node];
+			var score = generateSortingScore(baseScore, has_dependent);
+			if (plan.hasOwnProperty(node)) {
+				order.push({ feature: node, has_dependent: has_dependent, score: score });
+			}
+		});
+		order.sort(function(a, b) { return (a.score - b.score); });
+		order.forEach(function(feature) { delete feature.score; });
+		return order;
+	},
+
+	/** convert feature's depends_on into a list of dependencies */
+	generateDependencies: function(dependsOn) {
+		if (!dependsOn) return null;
+		var dependencies = dependsOn.split(',');
+		var results = [];
+		dependencies.forEach(function(dependency) {
+			results.push(dependency.trim());
+		});
+		return results;
+	},
+
+	getFeatureProvidersByFeatureId: function(featureList) {
+		var featureSysIds = featureList.map(function(f){return f.sys_id;});
+		var gr = new GlideRecord("one_api_feature_provider");
+		gr.addActiveQuery();
+		gr.addQuery("feature", "IN", featureSysIds);
+		gr.query();
+		var featureProvidersByFeatureId = {};
+		while (gr.next()) {
+			var featureSysId = new String(gr.feature.sys_id);
+			featureProvidersByFeatureId[featureSysId] = {
+				"feature_name": new String(gr.feature.name),
+				"feature_sys_id": featureSysId,
+				"feature_provider_sys_id": new String(gr.sys_id)
+			};
+		}
+		return featureProvidersByFeatureId;
+	},
+
+	getFeatureService: function(featureProviderSysId) {
+		var featureProviderGr = new GlideRecord("one_api_feature_provider");
+		featureProviderGr.get(featureProviderSysId);
+		var evaluator = new GlideScopedEvaluator();
+		var featureService = evaluator.evaluateScript(featureProviderGr, 'feature_service_factory', null);
+		return featureService;
+	},
+
+	isApplicable: function(inputs, outputs) {
+		var servicePlanSysId = inputs.service_plan_invocation.service_plan.sys_id;
+		var planFeatureGr = new GlideRecord("one_api_service_plan_feature");
+		var query = "active=true^applicability_typeANYTHING^applicability_scriptISNOTEMPTY^" +
+			"ORapplicability_conditionISNOTEMPTY^service_plan=" + servicePlanSysId + "^feature.name=" + inputs.feature_name;
+		planFeatureGr.addEncodedQuery(query, true);
+		planFeatureGr.query();
+		if (planFeatureGr.next()) {
+			if ("script" == planFeatureGr.applicability_type) {
+				return this.evaluateScriptApplicability(inputs, outputs, planFeatureGr);
+			} else if ("condition" == planFeatureGr.applicability_type) {
+				return this.evaluateConditionApplicability(inputs, outputs, planFeatureGr);
+			}
+		}
+		return true;
+	},
+
+	evaluateScriptApplicability: function(inputs, outputs, planFeatureGr) {
+		try {
+			var previousFeatureOutputs;
+			if (!gs.nil(planFeatureGr.depends_on)) {
+				previousFeatureOutputs = this.gatherAllOutputs(inputs, outputs).output.features;
+			}
+			var servicePlanInput = this.escapeJSONString(inputs.service_plan_input);
+			var evaluator = new GlideScopedEvaluator();
+			evaluator.putVariable('featureInput', servicePlanInput.features[inputs.feature_name].payload);
+			evaluator.putVariable('previousFeatureOutputs', previousFeatureOutputs);
+			var isApplicable = evaluator.evaluateScript(planFeatureGr, 'applicability_script', null);
+			return true === isApplicable;
+		} catch (e) {
+			gs.warn('Exception while evaluating OneAPI feature applicability ' + JSON.stringify(e));
+			return false;
+		}
+	},
+
+	evaluateConditionApplicability: function(inputs, outputs, planFeatureGr) {
+		var gr = new GlideRecord(planFeatureGr.applicability_condition_table);
+		gr.addEncodedQuery(planFeatureGr.applicability_condition);
+		gr.query();
+		return gr.next();
+	},
+
+	validatePlanInput: function(planInput, plan) {
+		var input;
+		try {
+			input = this.escapeJSONString(planInput);
+		} catch (e) {
+			throw new Error('Invalid JSON provided for service plan ['
+							+ plan + '].', { cause: e });
+		}
+		if (!input || !this.isObject(input)) {
+			throw new Error('Invalid JSON provided for service plan ['
+							+ plan + '].');
+		}
+		if (!input.features) {
+			throw new Error('Invalid JSON provided for service plan ['
+							+ plan + ']: missing "features" key.');
+		}
+	},
+
+	isFeatureInputValid: function(servicePlanInput, featureName) {
+		if (servicePlanInput == null) return false;
+		if (servicePlanInput.features == null) return false;
+		return this.isObject(servicePlanInput.features[featureName]);
+	},
+
+	isString: function(val) {
+		return !this.isObject(val) &amp;&amp; Object.prototype.toString.call(val) === '[object String]';
+	},
+
+	isObject: function(val) {
+		var type = typeof val;
+		return type === 'function' || type === 'object' &amp;&amp; !!val;
+	},
+
+	/** equivalent of Math.max(...array) */
+	max: function(values) {
+		var maximum = 0;
+		values.forEach(function(value) {
+			maximum = Math.max(maximum, value);
+		});
+		return maximum;
+	},
+
+	/** equivalent of Object.entries(object) */
+	objectEntries: function(object) {
+		var keys = Object.keys(object);
+		var values = this.objectValues(object);
+		var result = [];
+		var index;
+		for (index = 0; index &lt; keys.length; index++) {
+			result.push([keys[index], values[index]]);
+		}
+		return result;
+	},
+
+	arrayToMap: function(arr, arrayKeyName) {
+		var asMap = {};
+		for (var i = 0; i &lt; arr.length; ++i){
+			var arrElement = arr[i];
+			asMap[arrElement[arrayKeyName]] = arrElement;
+		}
+		return asMap;
+	},
+
+	/** equivalent of Object.values(object) */
+	objectValues: function(object) {
+		var keys = Object.keys(object);
+		var result = [];
+		var index;
+		for (index = 0; index &lt; keys.length; index++) {
+			result.push(object[[keys[index]]]);
+		}
+		return result;
+	},
+
+	logFeatureInvocation: function(featureInvocationGR) {
+		if (gs.nil(featureInvocationGR)) return;
+
+		var logProp = gs.getProperty("com.glide.oneapi.feature.invocation.node_logging_enabled", "true");
+		var enabled = (true == logProp || "true" == logProp);
+		if (!enabled) return;
+
+		var feature = featureInvocationGR.feature_provider.feature;
+		var servicePlanInvocation = featureInvocationGR.service_plan_invocation;
+
+		var context = this.newLoggingContext();
+		context.api_type = "ONE_API_FEATURE";
+		context.api_id = feature.sys_id;
+		context.api_name = feature.name;
+		context.service_plan = servicePlanInvocation.service_plan.sys_id;
+		context.service_plan_name = servicePlanInvocation.service_plan.name;
+		context.status = featureInvocationGR.status;
+		context.mode = servicePlanInvocation.execution_mode;
+		context.context_id = featureInvocationGR.flow_context.sys_id;
+		context.app_document = servicePlanInvocation.app_document;
+		context.app_document_table = servicePlanInvocation.app_document_table;
+		context.transaction_id = servicePlanInvocation.app_transaction_id;
+		context.started_at = servicePlanInvocation.started_at.getDisplayValue();
+		context.started_at_millis = servicePlanInvocation.started_at_millis;
+		if (!gs.nil(featureInvocationGR.completed_at)) {
+			context.completed_at = featureInvocationGR.completed_at.getDisplayValue();
+			context.completed_at_millis = featureInvocationGR.completed_at_millis;
+			context.feature_duration = (featureInvocationGR.completed_at_millis - featureInvocationGR.started_at_millis);
+			context.feature_in_plan_duration =
+				(featureInvocationGR.completed_at_millis - servicePlanInvocation.started_at_millis);
+		}
+		new sn_log.GlideLogger("com.glide.oneapi", context, Object.keys(context)).info("Feature Invocation Result");
+	},
+
+	escapeJSONString: function(JSONString) {
+		var EscapedJSONString = JSONString.replace(/\\n/g, "\\n")
+						.replace(/\\'/g, "\\'")
+						.replace(/\\"/g, '\\"')
+						.replace(/\\&amp;/g, "\\&amp;")
+						.replace(/\\r/g, "\\r")
+						.replace(/\\t/g, "\\t")
+						.replace(/\\b/g, "\\b")
+						.replace(/\\f/g, "\\f");
+	return JSON.parse(EscapedJSONString);
+	},
+
+	newLoggingContext: function() {
+		return {"app": "CI", "track": "ONE_API", "layer":"FDIH"};
+	},
+
+    type: 'OneApiExecutionUtil'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-03-18 23:38:19&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;37bf98c62dda0110fa9bb8e1eb575758&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;82&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;OneApiExecutionUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="One API FlowDesigner/IntegrationHub execution environment" source="com.glide.oneapi.fdih"&gt;757df0203c75311068bcf327dfe37fd8&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_37bf98c62dda0110fa9bb8e1eb575758&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-02-25 21:57:46&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:35:50</sys_created_on>
+        <sys_id>4756f89983f01210c6695855eeaad3d9</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>OneApiExecutionUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_4756f89983f01210c6695855eeaad3d9</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:35:50</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

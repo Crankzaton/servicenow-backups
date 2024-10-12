@@ -1,0 +1,705 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>8f62256fc781a110c59d3d9c95c2605c</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_nlu_workbench.NLUIARTuning&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;NLUIARTuning&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var NLUIARTuning = Class.create();
+var MAX_SAMPLES_PER_PREDICTION = 100;
+var tables = NLUWorkbenchConstants.tables;
+
+function createBatchTestDefinition(modelId) {
+    var definitionGr = new GlideRecord(tables.NLU_BATCH_TEST_RUN_DEFINITION);
+    definitionGr.setValue('models', modelId);
+    definitionGr.setValue('test_type', 'analysis');
+    return definitionGr.insert();
+}
+
+function createBatchTestExecution(definitionId) {
+    var testGr = new GlideRecord(tables.NLU_BATCH_TEST_RUN_EXECUTION);
+    testGr.setValue("test_run_definition", definitionId);
+    return testGr.insert();
+}
+
+function getAnalysisGr(analysisId) {
+    var analysisGr = new GlideRecord(tables.NLU_ANALYSIS_DEFINITION);
+    analysisGr.get(analysisId);
+    return analysisGr;
+}
+
+function getMlSolutionID(solutionName, solutionVersion) {
+    var mlSolutionGr = new GlideRecord(tables.ML_SOLUTION);
+    mlSolutionGr.addQuery('solution_name', solutionName);
+    if (solutionVersion)
+        mlSolutionGr.addQuery('version', solutionVersion);
+    else {
+        mlSolutionGr.addActiveQuery();
+        mlSolutionGr.setLimit(1);
+        mlSolutionGr.orderByDesc('sys_created_on');
+    }
+    mlSolutionGr.query();
+    return mlSolutionGr.next() ? mlSolutionGr.getUniqueValue() : '';
+}
+
+NLUIARTuning.getIARModelPublishedTime = function(table, language) {
+    var result = global.AutoResolutionAPI.isTrainedWorkflowSolutionAvailable(table, language);
+
+    var solution = new GlideRecord('ml_solution');
+    solution.addActiveQuery();
+    solution.addQuery('solution_name', result.solution_name);
+    solution.addQuery('version', result.solution_version);
+    solution.query();
+
+    return solution.next() ? solution.getDisplayValue('sys_updated_on') : '';
+};
+
+NLUIARTuning.createAnalysisDef = function(modelId) {
+    var testDefId = createBatchTestDefinition(modelId);
+    var result = global.AutoResolutionAPI.isTrainedWorkflowSolutionAvailable('incident', 'en');
+    if (!result.trained_solution) {
+        throw new Error(gs.getMessage("Trained solution doesn't exist for incident config in English"));
+    }
+    var solutionId = getMlSolutionID(result.solution_name);
+    var definitionGr = new GlideRecord(tables.NLU_ANALYSIS_DEFINITION);
+    definitionGr.setValue('model', modelId);
+    definitionGr.setValue('prediction_definition', testDefId);
+    definitionGr.setValue('solution', solutionId);
+    return definitionGr.insert();
+};
+
+NLUIARTuning.runAnalysis = function(modelId) {
+    try {
+        var analysisId = NLUIARTuning.createAnalysisDef(modelId);
+        var inputs = {
+            "analysis_sys_id": analysisId
+        };
+        sn_fd.FlowAPI.getRunner().subflow('sn_nlu_workbench.iar_analysis_in_nlu_wb').inBackground().withInputs(inputs).run();
+    } catch (e) {
+        return {
+            status: 'failure',
+            message: e.message
+        };
+    }
+    return {
+        status: 'success',
+        analysisId: analysisId
+    };
+};
+
+NLUIARTuning.getIARNLUModelGr = function(modelDomain, language) {
+    var modelGr = new GlideRecord(tables.SYS_NLU_MODEL);
+    modelGr.addQuery('category', 'issue_auto_resolution');
+    modelGr.addQuery('oob', true);
+    modelGr.addQuery('model_domain', modelDomain);
+    modelGr.addQuery('language', language);
+    modelGr.query();
+    return modelGr.next() &amp;&amp; modelGr;
+};
+
+NLUIARTuning.populateLabelCandidates = function(solutionName, solutionVersion) {
+    try {
+        var result = global.AutoResolutionAPI.isTrainedWorkflowSolutionAvailable('incident', 'en');
+        if (result.trained_solution === true &amp;&amp; result.solution_name == solutionName) {
+            var mlSolution = sn_ml.AgentZeroSolutionStore.get(solutionName);
+            var labelingData = JSON.parse(mlSolution.getActiveVersion().getLabelingData());
+
+            var modelGr = NLUIARTuning.getIARNLUModelGr('itsm', 'en');
+            if (!modelGr) {
+                throw new Error('ITSM Model for IAR not found');
+            }
+
+            var lctGR = new GlideRecord(tables.LCT);
+            lctGR.initialize();
+            labelingData.forEach(function(sample) {
+                lctGR.setValue('text', sample.short_description);
+                lctGR.setValue('suggested_label', "intent:" + modelGr.getValue('name') + "." + sample.predicted_intent);
+                lctGR.setValue('prediction_probability', sample.predicted_probs);
+                lctGR.setValue('label_rank', sample.labeling_rank);
+                lctGR.setValue('source', 'issue_auto_resolution');
+                lctGR.setValue('product', 'nlu');
+                lctGR.insert();
+
+                lctGR.initialize();
+            });
+        }
+    } catch (e) {
+        gs.info("Exception caught in NLUIARUtils populateLabelCandidates: " + e.message);
+    }
+};
+
+function getResults(executionId, mappedIntents, modelIntents) {
+    var resultsObj = {};
+    var resultsGr = new GlideAggregate(tables.NLU_BATCH_TEST_RESULT);
+    resultsGr.addQuery('test_run_execution', executionId);
+    resultsGr.groupBy('expected_intent');
+    resultsGr.addAggregate('count');
+    resultsGr.query();
+    var stats = {
+        "correct": 0,
+        "total": 0,
+        "activeCorrect": 0,
+        "activeTotal": 0
+    };
+    while (resultsGr.next()) {
+        var samplesPerIntent = parseInt(resultsGr.getAggregate('count'));
+        var correctPredictions = 0;
+        var expectedIntent = resultsGr.getValue('expected_intent');
+        var correctPredictionsGr = new GlideAggregate(tables.NLU_BATCH_TEST_RESULT);
+        correctPredictionsGr.addQuery('test_run_execution', executionId);
+        correctPredictionsGr.addQuery('expected_intent', expectedIntent);
+        correctPredictionsGr.addQuery('outcome', 'correct');
+        correctPredictionsGr.addAggregate('count');
+        correctPredictionsGr.query();
+        if (correctPredictionsGr.next()) {
+            correctPredictions = parseInt(correctPredictionsGr.getAggregate('count'));
+        }
+
+        resultsObj[expectedIntent] = {
+            "total": samplesPerIntent,
+            "correct": correctPredictions
+        };
+        stats.correct += correctPredictions;
+        stats.total += samplesPerIntent;
+        if (mappedIntents.indexOf(expectedIntent) != -1) {
+            stats.activeCorrect += correctPredictions;
+            stats.activeTotal += samplesPerIntent;
+        }
+    }
+    var expectedIntents = Object.keys(resultsObj);
+    modelIntents.forEach(function(intent) {
+        if (expectedIntents.indexOf(intent) == -1) {
+            resultsObj[intent] = {
+                "total": 0,
+                "correct": 0
+            };
+        }
+    });
+    return {
+        resultsObj: resultsObj,
+        matchRate: stats.total &gt; 0 ? Math.round((stats.correct / stats.total) * 100) : 0,
+        iarCoverage: stats.activeTotal &gt; 0 ? Math.round((stats.activeCorrect / stats.activeTotal) * 100) : 0
+    };
+}
+
+function getCellWithProgressBar(total, correct) {
+    var progress = Math.round((correct / total) * 100);
+    var cell = {
+        "block_id": "be2d5fa6e4766d10f877156278d53193",
+        "id": "be2d5fa6e4766d10f877156278d53193",
+        "parent_block_id": "",
+        "parent_block_route": "",
+        "active": true,
+        "name": "Precision Container",
+        "label": "Precision Container",
+        "title": "",
+        "subtitle": "",
+        "order": "2",
+        "type": {
+            "group": "element",
+            "name": "Generic Block",
+            "id": "4cb9f85453db5110c733ddeeff7b12b4",
+            "route": "generic",
+            "props": [{
+                    "element": "component_name",
+                    "type": "string"
+                },
+                {
+                    "element": "component_properties",
+                    "type": "data_object"
+                }
+            ]
+        },
+        "lazyLoad": "0",
+        "children": [{
+                "block_id": "7a2d9b2ae4766d10f877156278d531ff",
+                "id": "7a2d9b2ae4766d10f877156278d531ff",
+                "parent_block_id": "be2d5fa6e4766d10f877156278d53193",
+                "parent_block_route": "generic",
+                "active": true,
+                "name": "Precision",
+                "label": "Precision",
+                "title": "",
+                "subtitle": "",
+                "order": "0",
+                "type": {
+                    "group": "element",
+                    "name": "Generic Block",
+                    "id": "4cb9f85453db5110c733ddeeff7b12b4",
+                    "route": "generic",
+                    "props": [{
+                            "element": "component_name",
+                            "type": "string"
+                        },
+                        {
+                            "element": "component_properties",
+                            "type": "data_object"
+                        }
+                    ]
+                },
+                "lazyLoad": "0",
+                "children": [],
+                "props_details": {
+                    "component_name": "now-stylized-text",
+                    "component_properties": "{\"text\":\"" + progress + "%\",\"tag\":\"div\",\"css\":\"* { }\"}"
+                },
+                "props_details_display": {},
+                "props_overrides": {},
+                "style": {
+                    "text-align": "right",
+                    "width": "8%"
+                },
+                "elementId": "stylized_text_2",
+                "slotname": "@default",
+                "post_script": "(function(context, pageParams, blockcontext, dataParams){\n\t// write code here\n})(context, pageParams, blockcontext, dataParams);",
+                "visibility": "answer=true;",
+                "lazy_script": "(function(context, pageParams, blockcontext, dataParams){\n\t// write code here\n})(context, pageParams, blockcontext, dataParams);",
+                "scope": "31f5f491c3a710100bf407720f40ddf4",
+                "package": "31f5f491c3a710100bf407720f40ddf4",
+                "slots": [],
+                "hasChildren": true
+            },
+            {
+                "block_id": "fa2ddb2ae4766d10f877156278d53102",
+                "id": "fa2ddb2ae4766d10f877156278d53102",
+                "parent_block_id": "be2d5fa6e4766d10f877156278d53193",
+                "parent_block_route": "generic",
+                "active": true,
+                "name": "Precision progress bar",
+                "label": "Precision progress bar",
+                "title": "",
+                "subtitle": "",
+                "order": "1",
+                "type": {
+                    "group": "element",
+                    "name": "Generic Block",
+                    "id": "4cb9f85453db5110c733ddeeff7b12b4",
+                    "route": "generic",
+                    "props": [{
+                            "element": "component_name",
+                            "type": "string"
+                        },
+                        {
+                            "element": "component_properties",
+                            "type": "data_object"
+                        }
+                    ]
+                },
+                "lazyLoad": "0",
+                "children": [],
+                "props_details": {
+                    "component_name": "now-progress-bar",
+                    "component_properties": "{\"label\":\"\",\"labelPosition\":\"top\",\"size\":\"lg\",\"pathType\":\"initial\",\"max\":\"100\",\"value\":\"" + progress + "\",\"configAria\":{}}"
+                },
+                "props_details_display": {},
+                "props_overrides": {},
+                "style": {
+                    "width": "10rem"
+                },
+                "elementId": "progress_bar_14f01",
+                "slotname": "@default",
+                "post_script": "(function(context, pageParams, blockcontext, dataParams){\n\t// write code here\n})(context, pageParams, blockcontext, dataParams);",
+                "visibility": "answer=true;",
+                "lazy_script": "(function(context, pageParams, blockcontext, dataParams){\n\t// write code here\n})(context, pageParams, blockcontext, dataParams);",
+                "scope": "31f5f491c3a710100bf407720f40ddf4",
+                "package": "31f5f491c3a710100bf407720f40ddf4",
+                "slots": []
+            }
+        ],
+        "props_details": {
+            "component_name": "sn-styleable-container",
+            "component_properties": {
+                "styles": {
+                    "display": "flex",
+                    "flex-direction": "row",
+                    "gap": "0.5rem",
+                    "justify-content": "center",
+                    "align-items": "center"
+                }
+            }
+        },
+        "props_details_display": {},
+        "props_overrides": {},
+        "pageParams": null,
+        "style": {},
+        "elementId": "styleable_container_1ce06",
+        "slotname": "",
+        "post_script": "(function(context, pageParams, blockcontext, dataParams){\n\t// write code here\n})(context, pageParams, blockcontext, dataParams);",
+        "visibility": "answer=true;",
+        "lazy_script": "(function(context, pageParams, blockcontext, dataParams){\n\t// write code here\n})(context, pageParams, blockcontext, dataParams);",
+        "scope": "31f5f491c3a710100bf407720f40ddf4",
+        "package": "31f5f491c3a710100bf407720f40ddf4",
+        "slots": [
+            "@default"
+        ],
+        "hasChildren": true
+    }
+    return cell;
+}
+
+function getNoInfoTxt() {
+    return {
+        "active": true,
+        "hasChildren": true,
+        "post_script": "(function(context, pageParams, blockcontext, dataParams){\n\t// write code here\n})(context, pageParams, blockcontext, dataParams);",
+        "lazy_script": "(function(context, pageParams, blockcontext, dataParams){\n\t// write code here\n})(context, pageParams, blockcontext, dataParams);",
+        "visibility": "",
+        "children": [],
+        "slotname": "",
+        "props_details": {
+            "component_name": "now-stylized-text",
+            "component_properties": {
+                "text": "N/A",
+                "tag": "div",
+                "css": "* { }"
+            }
+        },
+        "type": {
+            "route": "generic"
+        },
+        "elementId": "stylized_text_1",
+        "name": "No info text",
+        "slots": [],
+        "block_id": "5af6-6f16-9aaaa8-1c1d-898ae199",
+        "style": {},
+        "parent_block_id": ""
+    };
+}
+
+function getRowDefinitions(tunedResults, currentResults, mappedIntents) {
+    var groupedRow = {
+        key: 'unMappedIntents',
+        type: 'grouped',
+        groupedRowLabel: 'See unmapped intents',
+        children: []
+    };
+    var rows = Object.keys(tunedResults).reduce(function(result, intent) {
+        var intentObj = tunedResults[intent];
+        var isMappedIntent = mappedIntents.indexOf(intent) &gt;= 0;
+        var row = {
+            key: intent,
+            cells: {
+                intents: {
+                    value: intent
+                },
+                numberOfFeedbackSamples: {
+                    value: intentObj.total
+                },
+                mapped: {
+                    value: isMappedIntent ? gs.getMessage('Yes') : gs.getMessage('No')
+                },
+                matchPercentBeforeTuning: {
+                    value: "",
+                    componentProps: {
+                        contentTree: intentObj.total &gt; 0 ? getCellWithProgressBar(intentObj.total, currentResults[intent].correct) : getNoInfoTxt()
+                    }
+                },
+                matchPercentAfterTuning: {
+                    value: "",
+                    componentProps: {
+                        contentTree: intentObj.total &gt; 0 ? getCellWithProgressBar(intentObj.total, intentObj.correct) : getNoInfoTxt()
+                    }
+                },
+                improvement: {
+                    value: intentObj.total &gt; 0 ? Math.round(((intentObj.correct - currentResults[intent].correct) / intentObj.total) * 100) : 0
+                }
+            }
+        };
+        if (isMappedIntent) result.push(row);
+        else groupedRow.children.push(row);
+        return result;
+    }, []);
+    if (groupedRow.children.length &gt; 0) {
+        rows.push(groupedRow);
+    }
+    return {
+        rows: rows
+    };
+}
+
+NLUIARTuning.getAnalysisData = function(analysisId) {
+    var resultsObj = {
+        "current": {},
+        "precision": {},
+        "automation": {},
+        "balance": {}
+    };
+
+    var iarAnalysisOverview = {
+        "precision": {},
+        "automation": {},
+        "balance": {}
+    };
+
+    var mappedIntents = global.AutoResolutionAPI.getActiveMappedIntents('incident');
+
+    var analysisGr = getAnalysisGr(analysisId);
+
+    var modelIntents = [];
+    var modelIntentsGr = new GlideRecord(tables.SYS_NLU_INTENT);
+    modelIntentsGr.addQuery('model', analysisGr.getValue('model'));
+    modelIntentsGr.query();
+    while (modelIntentsGr.next()) {
+        modelIntents.push(modelIntentsGr.getValue('name'));
+    }
+
+    var currentResults = getResults(analysisGr.getValue('prediction'), mappedIntents, modelIntents);
+    resultsObj["current"] = currentResults.resultsObj;
+
+    var tuningGr = new GlideRecord(tables.NLU_ANALYSIS_EXECUTION);
+    tuningGr.addQuery('tuning_definition', analysisId);
+    tuningGr.query();
+
+    while (tuningGr.next()) {
+        var bias = tuningGr.getValue('tuning_bias');
+        var result = getResults(tuningGr.getValue('batch_test_run'), mappedIntents, modelIntents);
+        resultsObj[bias] = result.resultsObj;
+        iarAnalysisOverview[bias] = {
+            "matchRate": result.matchRate + "%",
+            "matchRateImprovement": (result.matchRate - currentResults.matchRate) + "%",
+            "iarCoverage": result.iarCoverage + "%",
+            "iarCoverageImprovement": (result.iarCoverage - currentResults.iarCoverage) + "%"
+        };
+    }
+
+    var stepperJSON = [{
+            "id": "step1",
+            "label": "Feedback",
+            "progress": "done",
+            "disabled": true
+        },
+        {
+            "id": "step2",
+            "label": "Analyze",
+            "progress": "done",
+            "disabled": true
+        },
+        {
+            "id": "step3",
+            "label": "Publish",
+            "progress": "partial",
+        }
+    ];
+
+    var analysisRowDefinitions = {
+        precision: getRowDefinitions(resultsObj.precision, resultsObj.current, mappedIntents),
+        automation: getRowDefinitions(resultsObj.automation, resultsObj.current, mappedIntents),
+        balance: getRowDefinitions(resultsObj.balance, resultsObj.current, mappedIntents),
+    };
+
+    return {
+        analysisRowDefinitions: analysisRowDefinitions,
+        selectedBiasRowDefinitions: analysisRowDefinitions.precision,
+        analysisStats: resultsObj,
+        selectedPhase: "step3",
+        showPublishPhase: true,
+        showAnalysisBlock: false,
+        stepperJSON: stepperJSON,
+        matchRate: iarAnalysisOverview.precision.matchRate,
+        matchRateImprovement: iarAnalysisOverview.precision.matchRateImprovement,
+        iarCoverage: iarAnalysisOverview.precision.iarCoverage,
+        iarCoverageImprovement: iarAnalysisOverview.precision.iarCoverageImprovement,
+        iarAnalysisOverview: iarAnalysisOverview
+    };
+};
+
+NLUIARTuning.prototype = {
+    initialize: function(analysisId) {
+        this.analysisGr = getAnalysisGr(analysisId);
+    },
+
+    predictResults: function(versionNumber) {
+        var executionId = createBatchTestExecution(this.analysisGr.prediction_definition);
+        var output = {
+            executionId: executionId
+        };
+        try {
+            var solution = sn_ml.AgentZeroSolutionStore.get(this.analysisGr.getDisplayValue('solution'));
+            var solutionVersion = solution.getVersion(versionNumber);
+
+            var options = {
+                "top_n": 5
+            };
+
+            var shortDescriptions = {};
+            var modelId = this.analysisGr.getValue('model');
+            var modelName = this.analysisGr.model.name;
+            var ultGr = new GlideRecord(tables.ULT);
+            ultGr.addQuery('label', 'STARTSWITH', 'intent:' + modelName + '.');
+            ultGr.query();
+            while (ultGr.next()) {
+                var labelType = ultGr.getValue('label_type');
+                var feedbackIntent = '';
+                if (labelType === 'irrelevant' || (labelType === 'negative' &amp;&amp; !ultGr.getValue('correct_label'))) {
+                    feedbackIntent = 'NO_INTENT';
+                } else {
+                    feedbackIntent = labelType === 'positive' ? ultGr.getValue('label').substring(7).split('.')[1] : ultGr.getValue('correct_label').substring(7).split('.')[1];
+                }
+                shortDescriptions[ultGr.getValue('text')] = feedbackIntent;
+            }
+            var predictSamples = Object.keys(shortDescriptions).map(function(sample) {
+                return {
+                    "short_description": sample
+                };
+            });
+
+            var i = 0;
+            for (i = 0; i &lt; predictSamples.length; i = i + MAX_SAMPLES_PER_PREDICTION) {
+                var results = JSON.parse(solutionVersion.predict(predictSamples.slice(i, i + MAX_SAMPLES_PER_PREDICTION), options));
+
+                var resultGr = new GlideRecord(tables.NLU_BATCH_TEST_RESULT);
+                var idx = 0;
+                Object.keys(results).forEach(function(key) {
+                    var result = results[key];
+                    var sampleUtterance = predictSamples[idx++].short_description;
+                    var correctIntent = shortDescriptions[sampleUtterance];
+                    resultGr.setValue("test_run_execution", executionId);
+                    resultGr.setValue("prediction_model", modelId);
+                    resultGr.setValue("test_utterance", sampleUtterance);
+                    resultGr.setValue("predicted_intent", result[0].predictedValue);
+                    resultGr.setValue("predictions", JSON.stringify(result));
+                    resultGr.setValue("confidence_threshold", result[0].confidence);
+                    resultGr.setValue('outcome', result[0].predictedValue == correctIntent ? "correct" : "incorrect");
+                    resultGr.setValue('expected_intent', correctIntent);
+                    resultGr.insert();
+
+                    resultGr.initialize();
+                });
+            }
+            output.status = 'success';
+        } catch (e) {
+            output.status = 'failure';
+            gs.info("Exception caught while Prediction: " + JSON.stringify(e.message));
+        }
+
+        var executionGr = new GlideRecord(tables.NLU_BATCH_TEST_RUN_EXECUTION);
+        executionGr.get(executionId);
+        executionGr.setValue('status', output.status === 'success' ? 'success' : 'failed');
+        executionGr.update();
+
+        return output;
+    },
+
+    tuneModel: function(bias) {
+        var executionGr = new GlideRecord(tables.NLU_ANALYSIS_EXECUTION);
+        executionGr.setValue('tuning_definition', this.analysisGr.getUniqueValue());
+        executionGr.setValue('tuning_bias', bias);
+        var executionId = executionGr.insert();
+        executionGr.initialize();
+        executionGr.get(executionId);
+
+        var options = {
+            "tuningTarget": bias
+        };
+
+        var modelName = this.analysisGr.model.name;
+        var labeledData = [];
+        var ultGr = new GlideRecord(tables.ULT);
+        ultGr.addQuery('label', 'STARTSWITH', 'intent:' + modelName + '.');
+        ultGr.query();
+
+        while (ultGr.next()) {
+            var predictedIntent = ultGr.getValue('label').substring(7).split('.')[1];
+            var labelType = ultGr.getValue('label_type');
+            var feedbackIntent = '';
+            if (labelType === 'irrelevant' || (labelType === 'negative' &amp;&amp; !ultGr.getValue('correct_label'))) {
+                feedbackIntent = 'NO_INTENT';
+            } else {
+                feedbackIntent = labelType === 'positive' ? predictedIntent : ultGr.getValue('correct_label').substring(7).split('.')[1];
+            }
+            labeledData.push({
+                "predicted_intent": predictedIntent,
+                "predicted_probs": ultGr.getValue('prediction_probability'),
+                "label": feedbackIntent
+            });
+        }
+
+        var result = {};
+        try {
+            var solutionName = this.analysisGr.getDisplayValue('solution');
+            var solution = sn_ml.AgentZeroSolutionStore.get(solutionName);
+            var tuningResults = JSON.parse(solution.tuneThresholds(this.analysisGr.solution.version, labeledData, options));
+
+            executionGr.setValue('response_json', JSON.stringify(tuningResults));
+            var runSuccess = false;
+            if (tuningResults.tuningSuccessful) {
+                var tunedSolutionVersion = tuningResults.tunedSolutionVersion;
+                var solutionId = getMlSolutionID(solutionName, tunedSolutionVersion);
+                executionGr.setValue('solution', solutionId);
+                var predictionResult = this.predictResults(tunedSolutionVersion);
+                if (predictionResult.status === 'success') {
+                    runSuccess = true;
+                }
+                executionGr.setValue('batch_test_run', predictionResult.executionId);
+            }
+            executionGr.setValue('status', runSuccess === true ? 'success' : 'failed');
+            result.status = runSuccess === true ? 'success' : 'failed';
+        } catch (e) {
+            executionGr.setValue('status', 'failed');
+            result.status = 'failed';
+            result.message = e.message;
+            gs.info("Exception caught while tuning: " + JSON.stringify(e.message));
+        }
+        executionGr.update();
+        return result;
+    },
+
+    publishModel: function(tuneBias) {
+        try {
+            var executionGr = new GlideRecord(tables.NLU_ANALYSIS_EXECUTION);
+            executionGr.addQuery('tuning_definition', this.analysisGr.getUniqueValue());
+            executionGr.addQuery('tuning_bias', tuneBias);
+            executionGr.query();
+
+            if (executionGr.next()) {
+                var solutionVersion = executionGr.solution.version;
+                var mlSolution = sn_ml.AgentZeroSolutionStore.get(executionGr.getDisplayValue('solution'));
+                mlSolution.setActiveVersion(solutionVersion);
+
+                global.AutoResolutionAPI.updateActiveSolutionVersionNumber('incident', solutionVersion, 'en');
+            } else {
+                gs.info("No execution found with tune bias " + tuneBias + " and analysisId " + this.analysisGr.getUniqueValue());
+            }
+        } catch (ex) {
+            gs.info("Exception caught while publishing a tuned version for IAR model: " + JSON.stringify(ex.message));
+        }
+    },
+
+    type: 'NLUIARTuning'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-02-22 09:18:11&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;8f62256fc781a110c59d3d9c95c2605c&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;62&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;NLUIARTuning&lt;/sys_name&gt;
+        &lt;sys_package display_value="NLU Workbench - Advanced Features" source="sn_nlu_workbench"&gt;31f5f491c3a710100bf407720f40ddf4&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="NLU Workbench - Advanced Features"&gt;31f5f491c3a710100bf407720f40ddf4&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_8f62256fc781a110c59d3d9c95c2605c&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-06-28 13:56:42&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:45:25</sys_created_on>
+        <sys_id>ef88345183341210c6695855eeaad36d</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>NLUIARTuning</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_ef88345183341210c6695855eeaad36d</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:45:25</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,281 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>8b26aebc53723010610bddeeff7b128b</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_sow_on_call.OnCallUtilsSowSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;OnCallUtilsSowSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var OnCallUtilsSowSNC = Class.create();
+OnCallUtilsSowSNC.prototype = {
+    initialize: function() {
+		this.recommendedGroups = {};
+		this.MAX_CMDB_ITEMS_ALLOWED = 1;
+		this.MAX_RECOMMENDED_GROUPS_ALLOWED = 3;
+		this.TABLES = {
+			INCIDENT: "incident",
+			CMDB_CI: "cmdb_ci",
+			CMDB_CI_SERVICE: "cmdb_ci_service",
+			TASK_CI: "task_ci",
+			TASK_CMDB_CI_SERVICE: "task_cmdb_ci_service",
+			SHIFT: "cmn_rota",
+			SHIFT_MEMBER: "cmn_rota_member"
+		};
+		
+		this.CALCULATE_NEXT_SHIFT_FOR_DAYS = 30;
+		this.EXPERTS_ON_CALL_CONFIG_EXTENSION_POINT = "sn_sow_on_call.ExpertsOnCallTabConfig";
+    },
+	
+    TCM_COLLAB_FEB_VERSION: 202202,
+
+    isTeamsPluginActive: function() {
+        var tcmCollabVersion = gs.getProperty("sn_tcm_collab_hook.version");
+        return (GlidePluginManager.isActive('com.snc.ms_teams') &amp;&amp; GlidePluginManager.isActive('com.snc.tcm_collab_hook')) &amp;&amp; !gs.nil(tcmCollabVersion) &amp;&amp; tcmCollabVersion &gt;= this.TCM_COLLAB_FEB_VERSION;
+    },
+
+	isSupportedScreen: function(tableName, sysId) {
+		var supportedTablesStr = gs.getProperty('com.snc.sow_on_call.supported_tables');
+		if (!tableName || !sysId)
+			return false;
+
+		var result = false;
+		try {
+			var epoints = new GlideScriptedExtensionPoint().getExtensions(this.EXPERTS_ON_CALL_CONFIG_EXTENSION_POINT);
+			for (var i = 0; i &lt; epoints.length; i++){
+				var point = epoints[i];
+				if (point.getTableName() === tableName) {
+					result = point.isExpertOnCallTabSupported();
+					break;
+				}
+			} 
+		} catch(ex) {
+			gs.error("Error running extension points!");
+		}
+
+		if (result)
+			return true;
+
+		var supportedTables = supportedTablesStr.split(',');
+		if (!supportedTablesStr || supportedTables.indexOf(tableName) === -1)
+			return false;
+		
+		var recordGr = new GlideRecord(tableName);
+		if (!recordGr.get(sysId))
+			return false;
+		
+		return true;
+	},
+	
+	_isOnCallDefinedForTheGroup: function(groupSysId) {
+		var cmnRotaGr = new GlideRecord(this.TABLES.SHIFT);
+		cmnRotaGr.addQuery('group', groupSysId);
+		cmnRotaGr.addActiveQuery();
+		cmnRotaGr.query();
+
+		return cmnRotaGr.hasNext();
+	},
+	
+	/*
+	 return the following format
+	 {
+		 &lt;sys_id of the recommended group id&gt;: {
+			 message: "Recommended from field name",
+			 order: &lt;specify the order&gt;
+		 }
+	 }
+	*/
+	getRecommendedGroups: function(table, sysId, fieldWatchList) {
+		if(!table || !sysId) {
+			return {};
+		}
+		
+		var gr = new GlideRecord(table);
+		if (!gr.get(sysId))
+			return this.recommendedGroups;
+		
+		var result = {};
+		try {
+			var epoints = new GlideScriptedExtensionPoint().getExtensions(this.EXPERTS_ON_CALL_CONFIG_EXTENSION_POINT);
+			for (var i = 0; i &lt; epoints.length; i++){
+				var point = epoints[i];
+				if (point.getTableName() === table) {
+					result = point.getRecommendedGroups(gr, fieldWatchList);
+					break;
+				}
+			} 
+		} catch(ex) {
+			gs.error("Error running extension points!");
+		}
+		
+		return result;
+	},
+	
+	getNextShiftDateTime: function(groupId) {
+		var startDate = new GlideDateTime();
+		var endDate = new GlideDateTime();
+		endDate.addDaysLocalTime(this.CALCULATE_NEXT_SHIFT_FOR_DAYS);
+
+		var formatter = new global.OCDHTMLXCalendarFormatter();
+
+		var spans = new global.OCRotationV2(null, formatter)
+			.setStartDate(startDate.getDate())
+			.setEndDate(endDate.getDate())
+			.setGroupIds(groupId)
+			.getSpans();
+
+		spans = spans.filter(function(span) {
+			return span.type != 'rota' &amp;&amp; span.type != 'timeoff';
+		});
+
+		var earliestStartDate;
+
+		spans.forEach(function(span) {
+			var spanStartDate = new GlideDateTime();
+			spanStartDate.setDisplayValueInternal(span.start_date + "");
+
+			if (startDate.getNumericValue() &lt; spanStartDate.getNumericValue() &amp;&amp; (!earliestStartDate || spanStartDate.getNumericValue() &lt; earliestStartDate.getNumericValue()))
+				earliestStartDate = spanStartDate;
+		});
+		
+		if (earliestStartDate) {
+			earliestStartDate.addDaysLocalTime(-1);
+			return earliestStartDate.getDisplayValueInternal();
+		}
+		
+		throw new Error("No on-call member available for the next 30 days");
+	},
+
+	handleChannelRedirect: function(table, sysId, userSysId) {
+        var chatUtils = new sn_tcm_collab_hook.MSTeamsChatUtil();
+        var sourceGr = new GlideRecord(table);
+        if (!sourceGr.get(sysId)) {
+            return '';
+        }
+
+        var userIds = [userSysId, gs.getUserID()];
+		
+        var clientType = gs.getUser().getPreference('sn_tcm_collab_hook_teams_preferred_client') || 'web_client';
+        var autoImport = chatUtils.importChatUtil.isAutoImportEnabled(sourceGr);
+        var appDetails = new sn_tcm_collab_hook.MSTeamsChatUtil().getAppDetails();
+        var useIHActionsForSingleTenant = new sn_tcm_collab_hook.MSTeamsChatUtil().useIHActionsForSingleTenant();
+
+        if (!("multiTenant" in appDetails) &amp;&amp; !useIHActionsForSingleTenant)
+            return '';
+
+		
+        if (appDetails.multiTenant || useIHActionsForSingleTenant) {
+			try {
+				var chatInfo = new sn_tcm_collab_hook.MSTeamsChatUtil().createChatFromChatModal(sourceGr, userIds, null, null, clientType, autoImport);
+				var requesterUserGr = this._getRecordById("sys_user", userSysId);
+				new sn_tcm_collab_hook.MSTeamsAjaxUtils().addCommentForGroupChat(GlideStringUtil.escapeHTML(gs.getUserDisplayName()), GlideStringUtil.escapeHTML(requesterUserGr.getDisplayValue('name')), '[]', table, sysId, 'work_notes', chatInfo);
+				
+				return chatInfo.url;
+			}
+
+			catch (e) {
+				var error = {};
+				error.errorMsg = e.message;
+				return error;
+			}
+            
+        }
+	
+		throw new Error();
+	},
+	
+	_getRecordById: function(table, id) {
+		var gr = new GlideRecord(table);
+		if (gr.get(id))
+			return gr;
+	},
+	
+	
+	_getCommonlyUsedGroups: function(table, column, count, encodedQuery) {
+		var ga = new GlideAggregate(table);
+		ga.addAggregate('COUNT', column);
+		ga.orderByAggregate('COUNT', column);
+		if (encodedQuery)
+			ga.addEncodedQuery(encodedQuery);
+		ga.query();
+		
+		var supportGroups = [];
+		
+		while (ga.next() &amp;&amp;  count &gt; 0) {
+			var supportGroupSysId = ga.getValue(column);
+			if (!this.recommendedGroups[supportGroupSysId] &amp;&amp; this._isOnCallDefinedForTheGroup(supportGroupSysId)) {
+				supportGroups.push(supportGroupSysId);
+				count--;
+			}
+		}
+		
+		return supportGroups;
+	},
+	
+	getAffectedCIsSupportGroups:  function(recordGr) {
+		var encodedQuery = "task=" + recordGr.getUniqueValue();
+		if (recordGr.cmdb_ci)
+			encodedQuery += "^ci_item!=" + recordGr.cmdb_ci;
+		return this._getCommonlyUsedGroups(this.TABLES.TASK_CI, "ci_item.support_group", this.MAX_CMDB_ITEMS_ALLOWED, encodedQuery);
+	},
+	
+	getImpactedServicesSupportGroups: function(recordGr) {
+		var encodedQuery = "task=" + recordGr.getUniqueValue();
+		if (recordGr.business_service)
+			encodedQuery += "^cmdb_ci_service!=" + recordGr.business_service;
+		return this._getCommonlyUsedGroups(this.TABLES.TASK_CMDB_CI_SERVICE, "cmdb_ci_service.support_group", this.MAX_CMDB_ITEMS_ALLOWED, encodedQuery);
+	},
+	
+	getSupportGroups: function(table, sysId) {
+		var cmdbGr = this._getRecordById(table, sysId);
+		if (cmdbGr.isValidRecord() &amp;&amp; cmdbGr.support_group) {
+			return cmdbGr.support_group + "";
+		}
+		return "";
+	},
+	
+	updateRecommendedGroups: function(groupSysId, message, order) {
+		if (this.recommendedGroups[groupSysId] || !this._isOnCallDefinedForTheGroup(groupSysId))
+			return;
+		this.recommendedGroups[groupSysId] = {
+			message: message,
+			order: order
+		};
+	},
+
+    type: 'OnCallUtilsSowSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-09-22 12:26:43&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;8b26aebc53723010610bddeeff7b128b&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;61&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;OnCallUtilsSowSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="On Call Scheduling for Service Operations Workspace" source="sn_sow_on_call"&gt;7e3c2481539260100c54ddeeff7b127b&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="On Call Scheduling for Service Operations Workspace"&gt;7e3c2481539260100c54ddeeff7b127b&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_8b26aebc53723010610bddeeff7b128b&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-08-21 17:46:24&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:45:05</sys_created_on>
+        <sys_id>6e78305183341210c6695855eeaad349</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>OnCallUtilsSowSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_6e78305183341210c6695855eeaad349</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:45:05</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

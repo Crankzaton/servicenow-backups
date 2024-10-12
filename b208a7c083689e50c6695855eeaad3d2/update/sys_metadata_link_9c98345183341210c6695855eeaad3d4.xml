@@ -1,0 +1,378 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>901d5d6cc3616010389691f58640dd01</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.LFTMSTranslator&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;This class contains responsibilities specific to tms translation.&lt;/description&gt;
+        &lt;name&gt;LFTMSTranslator&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var LFTMSTranslator = Class.create();
+LFTMSTranslator.prototype = {
+
+    initialize: function() {
+        this.lfConstants = new LFConstants();
+        this.lfUtils = new LFUtils();
+        this.tmsSubflowSysIdToNameMap = {};
+        this.AUTO_MODE = "Auto";
+        this.MANUAL_MODE = "Manual";
+    },
+
+    translate: function(taskId, content, tmsName) {
+        // Passing mode for upgrade tasks created in Q/R in Auto mode. These upgrade tasks does not have mode parameter as their flow snapshot taken during Q/R.
+        return this.translateRequestedItems(taskId, content, tmsName, this.lfConstants.AUTO);
+    },
+
+    translateRequestedItems: function(taskId, content, tmsName, mode) {
+        var taskUtils = new LFTaskUtils(taskId);
+
+        if (taskUtils.hasValidRecord()) {
+            var tmsInfo = taskUtils.getTMSProjectInfo();
+            if (tmsInfo["fileUploadStatus"] == this.lfConstants.IN_PROGRESS) {
+                var message = gs.getMessage("Request to translate this task using {0} TMS is already in progress.", tmsName);
+                taskUtils.updateLastPerformedAction(message, this.lfConstants.ERROR);
+                return this._createFinalResponse(this.lfConstants.ERROR, message);
+            }
+            try {
+                var tmsConfigurationUtils = new LFTMSConfigurationUtils(tmsName);
+                var requestTranslationSubflow = tmsConfigurationUtils.getRequestTranslationSubflowName();
+                var timeout = this.lfUtils.getTranslationflowTimeout();
+                var inputs = this._extractContentToBeTranslated(taskUtils, content, tmsConfigurationUtils.getVersion());
+                var outputs = sn_fd.FlowAPI.getRunner().subflow(requestTranslationSubflow).inForeground().withInputs(inputs).timeout(timeout).run().getOutputs();
+                return this._prepareTranslationStatus(taskUtils, outputs, tmsName, tmsConfigurationUtils.getVersion(), mode);
+            } catch (ex) {
+                var message = gs.getMessage("Error while sending the task to {0} TMS for translation.", tmsName);
+                this._setAdditionalInfoTMS(taskUtils, {}, tmsName, this.lfConstants.ERROR, message, mode);
+                return this._createFinalResponse(this.lfConstants.ERROR, message);
+            }
+        }
+    },
+
+    autoRetrieveTranslations: function() {
+        var tmsGr = new GlideRecord("sn_lf_tms_config");
+        tmsGr.addQuery("enable_auto_retrieval", true);
+        tmsGr.query();
+        if (tmsGr.hasNext()) {
+            var grTask = new GlideRecord("sn_lf_task");
+            var tmsNameORQuery;
+            while (tmsGr.next()) {
+                if (tmsNameORQuery) {
+                    tmsNameORQuery.addOrCondition('additional_info', 'CONTAINS', tmsGr.getValue("name"));
+                } else {
+                    tmsNameORQuery = grTask.addQuery('additional_info', 'CONTAINS', tmsGr.getValue("name"));
+                }
+            }
+            grTask.addQuery('state', 'IN', [this.lfConstants.TASK_STATES.Translation_In_Progress, this.lfConstants.TASK_STATES.In_Progress]);
+            grTask.addQuery('additional_info', 'DOES NOT CONTAIN', 'hasRetrievedFromTms');
+            grTask.addQuery('additional_info', 'CONTAINS', 'hasSentToTms');
+            grTask.query();
+            while (grTask.next()) {
+                this._retrieveTranslationsForTask(new LFTaskUtils(grTask), this.AUTO_MODE);
+            }
+        }
+    },
+
+    retrieveTranslations: function(taskId, mode) {
+        var taskUtils = new LFTaskUtils(taskId);
+        return this._retrieveTranslationsForTask(taskUtils, mode);
+    },
+
+    _extractContentToBeTranslated: function(taskUtils, content, tmsVersion) {
+        var translationInput = {
+            'lftask_number': taskUtils.getTaskNumber()
+        };
+        // Added this code to handle V1 TMS integrations
+        if (tmsVersion === "v1") {
+            var lfUtils = new LFUtils();
+            var sourceLanguageCode = taskUtils.getSourceLanguageCode();
+            var targetLanguageCode = taskUtils.getTargetLanguageCode();
+            var originalFile = taskUtils.getTaskNumber();
+            var contentToBeTranslated = content; // For upgraded task via automatic flow
+            if (!contentToBeTranslated || Object.keys(contentToBeTranslated).length == 0) {
+                if (taskUtils.hasBulkTranslations()) {
+                    // For new tasks post upgrade
+                    var itemToTranslate = taskUtils.getRelatedRequestedItemDetailsWithPagination(0, 1);
+                    var requestedItemNumbers = Object.keys(itemToTranslate);
+                    if (requestedItemNumbers.length &gt; 0) {
+                        var requestedItemDetails = itemToTranslate[requestedItemNumbers[0]];
+                        sourceLanguageCode = requestedItemDetails.sourceLanguage;
+                        targetLanguageCode = requestedItemDetails.targetLanguage;
+                        originalFile = requestedItemNumbers[0];
+                        var artifactContent = this._getContent(requestedItemDetails.documentContent);
+                        if (artifactContent) {
+                            contentToBeTranslated = lfUtils.groupByProperty(artifactContent);
+                        }
+                    }
+                } else {
+                    // For upgraded task via manual flow
+                    artifactContent = this._getContent(taskUtils.getDocumentContent());
+                    if (artifactContent) {
+                        contentToBeTranslated = lfUtils.groupByProperty(artifactContent);
+                    }
+                }
+            }
+            var XLIFFContent = lfUtils.createXLIFFFromDocumentContent(contentToBeTranslated, sourceLanguageCode, targetLanguageCode, originalFile);
+            translationInput['source_language'] = sourceLanguageCode;
+            translationInput['target_language'] = targetLanguageCode;
+            translationInput['xliff_1_2_content'] = XLIFFContent;
+        } else if (tmsVersion === "v2") {
+            translationInput['tms_additional_info'] = taskUtils.getTMSAdditionalInfo();
+        }
+        return translationInput;
+    },
+
+    _getContent: function(documentContent) {
+        return (documentContent &amp;&amp; documentContent["version"] === "v1") ? documentContent["content"] : "";
+    },
+
+    _prepareTranslationStatus: function(taskUtils, outputs, tmsName, tmsVersion, mode) {
+        // Added this code to handle upgrade scenarios from Q &amp; R
+        var projectInfoKey = (tmsVersion === "v1") ? "Project_Info" : "project_info";
+        var projectInfo = outputs[projectInfoKey];
+        var status = outputs['status'];
+        var errorMessage = outputs['error_message'];
+        var message, infoMessage;
+
+        if (status === this.lfConstants.SUCCESS) {
+            infoMessage = gs.getMessage("Task sent to {0} TMS for translation.", tmsName);
+            message = gs.getMessage("Successfully sent to {0} TMS for translation.", tmsName);
+        } else if (status === this.lfConstants.IN_PROGRESS) {
+            infoMessage = gs.getMessage("Translation request using the {0} TMS is in progress.", tmsName);
+            message = infoMessage;
+        } else {
+            infoMessage = gs.getMessage("Error while sending the task to {0} TMS for translation. {1}", [tmsName, errorMessage]);
+            message = infoMessage;
+        }
+        this._setAdditionalInfoTMS(taskUtils, projectInfo, tmsName, status, infoMessage, mode);
+        return this._createFinalResponse(status, message);
+    },
+
+    _createFinalResponse: function(status, msg) {
+        return {
+            status: status,
+            MSG: msg
+        };
+    },
+
+    _setAdditionalInfoTMS: function(taskUtils, projectInfo, tmsName, status, content, mode) {
+        var additionalInfo = new LFTaskUtils(taskUtils.getSysId()).getAdditionalInfo();
+        if (projectInfo &amp;&amp; Object.keys(projectInfo).length &gt; 0) {
+            if (!projectInfo["name"]) {
+                projectInfo["name"] = tmsName;
+            }
+            projectInfo["fileUploadStatus"] = status;
+            if (status === this.lfConstants.SUCCESS) {
+                projectInfo["hasSentToTms"] = true;
+            }
+            additionalInfo["TMS"] = projectInfo;
+            taskUtils.setAdditionalInfo(additionalInfo);
+        }
+        if (taskUtils.hasBulkTranslations() &amp;&amp; (status !== this.lfConstants.IN_PROGRESS)) {
+            var message;
+            var isError = (status === this.lfConstants.ERROR);
+            if (isError) {
+                message = gs.getMessage("Error while sending the requested item to {0} TMS for translation.", tmsName);
+            } else {
+                message = gs.getMessage("Requested item sent to {0} TMS for translation.", tmsName);
+            }
+            var requestedItemIds = taskUtils.getRelatedRequestedItemIdsFilterOutByState();
+            LFRequestedItemUtils.updateLocalizationRequestedItemsWithJournalFields(requestedItemIds, {
+                'work_notes': message,
+                "error": isError,
+                state: taskUtils.lfConstants.REQUESTED_ITEM_STATES.In_Progress
+            });
+        }
+        if (status === this.lfConstants.SUCCESS) {
+            taskUtils.moveToInProgress();
+            taskUtils.update();
+        } else if (status === this.lfConstants.ERROR) {
+            taskUtils.moveToErrorInTranslation();
+            taskUtils.update();
+        }
+        additionalInfo["readOnly"] = false;
+        taskUtils.setAdditionalInfo(additionalInfo);
+        taskUtils.updateLastPerformedAction(content, status);
+        var luaDetails = taskUtils.getLUADetails();
+        new LFLUAUtils().sendTranslationEvent('Sent to TMS', tmsName, mode,
+            luaDetails.artifacts,
+            luaDetails.targetLanguages,
+            luaDetails.sourceLanguages,
+            isError,
+            taskUtils.hasLocalizationProject());
+    },
+
+    _createTranslationResponse: function(tmsName, outputs, taskUtils, mode, tmsVersion) {
+        var status = outputs['status'];
+        var errorMessage = outputs['error_message'];
+        var message;
+        var isError = false;
+
+        if (status === this.lfConstants.SUCCESS) {
+            // Added this code to handle upgrade scenarios from Q &amp; R
+            if (tmsVersion === "v1") {
+                var translatedXliff = outputs['translated_xliff_1_2'];
+                if (taskUtils.hasBulkTranslations()) {
+                    // For new tasks post upgrade
+                    this._updateTranslatedContentInRequestedItem(translatedXliff, taskUtils, tmsName);
+                } else {
+                    // For upgraded task via manual flow
+                    this._updateTranslatedContentInTask(translatedXliff, taskUtils);
+                }
+            }
+            // For v2 version we are updating Document Content with Translated XLIFF in Retrieve Translations Subflow
+            message = gs.getMessage("Successfully retrieved translations from {0} TMS.", tmsName);
+        } else {
+            var fileIdsSaved = outputs.file_ids_saved;
+            message = gs.getMessage("Failed to retrieve translations from {0} TMS. {1}", [tmsName, errorMessage]);
+            isError = true;
+        }
+        this._updateTask(taskUtils, message, status, mode, tmsName, fileIdsSaved);
+        var luaDetails = taskUtils.getLUADetails();
+        new LFLUAUtils().sendTranslationEvent('Retrieved from TMS', tmsName, mode,
+            luaDetails.artifacts,
+            luaDetails.targetLanguages,
+            luaDetails.sourceLanguages,
+            isError,
+            taskUtils.hasLocalizationProject());
+        return this._createFinalResponse(status, message);
+    },
+
+    _updateTranslatedContentInRequestedItem: function(translatedXliff, taskUtils, tmsName) {
+        var utils = new LFUtils();
+        // Fetching only one LRITM as TMS V1 version doesn't support bulk translations
+        var itemToTranslate = taskUtils.getRelatedRequestedItemDetailsWithPagination(0, 1);
+        var requestedItemNumbers = Object.keys(itemToTranslate);
+        var requestedItemDetails = itemToTranslate[requestedItemNumbers[0]];
+        var documentContent = requestedItemDetails.documentContent;
+        var content = documentContent["content"];
+        utils.updateContentFromXLIFF(translatedXliff, content, requestedItemDetails.sourceLanguage, requestedItemDetails.targetLanguage, requestedItemNumbers[0]);
+        documentContent["content"] = content;
+        var requestedItemUtils = new LFRequestedItemUtils(requestedItemDetails.sysId);
+        requestedItemUtils.setStatus(new LFGenerateLocalizationInsights().getTranslationStatus(documentContent));
+        requestedItemUtils.setDocumentContent(documentContent);
+        requestedItemUtils.moveToInProgress();
+        requestedItemUtils.setError(false);
+        var hasConflicts = utils.hasConflicts(documentContent["content"]);
+        requestedItemUtils.setConflict(hasConflicts);
+        if (hasConflicts) {
+            new LFLUAUtils().sendConflictEvent("TMS", "requestedItem");
+        }
+        requestedItemUtils.setFieldLevelMessagesInfo({});
+        requestedItemUtils.addWorkNotes(gs.getMessage("Successfully retrieved translations from {0} TMS.", tmsName));
+        requestedItemUtils.update();
+    },
+
+    _updateTranslatedContentInTask: function(translatedXliff, taskUtils) {
+        var utils = new LFUtils();
+        documentContent = taskUtils.getDocumentContent();
+        var content = documentContent["content"];
+        utils.updateContentFromXLIFF(translatedXliff, content, taskUtils.getSourceLanguageCode(), taskUtils.getTargetLanguageCode(), taskUtils.getTaskNumber());
+        documentContent["content"] = content;
+        taskUtils.setDocumentContent(documentContent);
+        var additionalInfo = taskUtils.getAdditionalInfo();
+        var hasConflicts = utils.hasConflicts(documentContent["content"]);
+        additionalInfo['conflict'] = hasConflicts;
+
+        if (hasConflicts) {
+            new LFLUAUtils().sendConflictEvent("TMS", "task");
+        }
+
+        taskUtils.setAdditionalInfo(additionalInfo);
+    },
+
+    _retrieveTranslationsForTask: function(taskUtils, mode) {
+        if (taskUtils.hasValidRecord()) {
+            var additionalInfo = taskUtils.getAdditionalInfo();
+            var tmsInfo = additionalInfo.TMS;
+            var tmsName = tmsInfo.name;
+            var tmsConfigurationUtils = new LFTMSConfigurationUtils(tmsName);
+            if (!this.tmsSubflowSysIdToNameMap[tmsName]) {
+                this.tmsSubflowSysIdToNameMap[tmsName] = tmsConfigurationUtils.getRetrieveTranslationSubflowName();
+            }
+            var retrieveTranslationSubflow = this.tmsSubflowSysIdToNameMap[tmsName];
+
+            try {
+                var inputs = {};
+                inputs['project_info'] = tmsInfo;
+                inputs['lftask_number'] = taskUtils.getTaskNumber();
+                var timeout = this.lfUtils.getTranslationflowTimeout();
+                var result = sn_fd.FlowAPI.getRunner().subflow(retrieveTranslationSubflow).inForeground().withInputs(inputs).timeout(timeout).run();
+                var outputs = result.getOutputs();
+                return this._createTranslationResponse(tmsName, outputs, new LFTaskUtils(taskUtils.getSysId()), mode, tmsConfigurationUtils.getVersion());
+            } catch (ex) {
+                message = gs.getMessage("Failed to retrieve translations from {0} TMS.", tmsName);
+                this._updateTask(new LFTaskUtils(taskUtils.getSysId()), message, this.lfConstants.ERROR, mode, tmsName, []);
+                return this._createFinalResponse(this.lfConstants.ERROR, message);
+            }
+        }
+    },
+
+    _updateTask: function(taskUtils, message, status, mode, tmsName, fileIdsSaved) {
+        taskUtils.updateLastPerformedAction(message, status);
+        additionalInfo = taskUtils.getAdditionalInfo();
+        if (status === this.lfConstants.SUCCESS) {
+            additionalInfo["TMS"]["hasRetrievedFromTms"] = true;
+            if (mode === this.AUTO_MODE &amp;&amp; (taskUtils.checkIfAutoPublishEnabled() || (taskUtils.isAutoTranslated() &amp;&amp; taskUtils.getAutoTranslateMode() == "send_to_tms"))) {
+                taskUtils.moveToUnderReview();
+                if (taskUtils.checkIfAutoPublishEnabled()) {
+                    taskUtils.setPublishSourceForLUA(this.lfConstants.AUTO);
+                }
+            }
+        } else {
+            if (taskUtils.hasBulkTranslations()) {
+                var requestedItemIds = taskUtils.getRelatedRequestedItemIdsFilterOutByState();
+                requestedItemIds = requestedItemIds.filter(function(eachItemId) {
+                    return fileIdsSaved ? fileIdsSaved.indexOf(eachItemId) &lt; 0 : true;
+                });
+                LFRequestedItemUtils.updateLocalizationRequestedItemsWithJournalFields(requestedItemIds, {
+                    "state": this.lfConstants.REQUESTED_ITEM_STATES.In_Progress,
+                    "error": true,
+                    "work_notes": gs.getMessage("Failed to retrieve translations from {0} TMS.", tmsName)
+                });
+            } else {
+                additionalInfo["errorDetails"] = {
+                    "error": !(status === this.lfConstants.SUCCESS)
+                };
+            }
+        }
+        additionalInfo["readOnly"] = false;
+        taskUtils.setAdditionalInfo(additionalInfo);
+        taskUtils.update();
+    },
+
+    type: 'LFTMSTranslator'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-01-03 12:58:55&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;901d5d6cc3616010389691f58640dd01&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;31&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;LFTMSTranslator&lt;/sys_name&gt;
+        &lt;sys_package display_value="Localization Framework" source="com.glide.localization_framework"&gt;a4dd193447720210cd4e1ce4316d4312&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_901d5d6cc3616010389691f58640dd01&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-07-20 03:47:12&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:45:29</sys_created_on>
+        <sys_id>9c98345183341210c6695855eeaad3d4</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>LFTMSTranslator</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_9c98345183341210c6695855eeaad3d4</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:45:29</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

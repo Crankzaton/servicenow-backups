@@ -1,0 +1,260 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>6d37d4a0777821109c62f5f3cb5a99cd</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_entitlement.AppEntitlementProcessor&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Processes entitlement requests for app artifacts&lt;/description&gt;
+        &lt;name&gt;AppEntitlementProcessor&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var AppEntitlementProcessor = Class.create();
+AppEntitlementProcessor.prototype = {
+    initialize: function() {
+        this.logger = new LoggingUtil();
+    },
+
+    // returns true if license check required attribute for the given app_id is set to true, else returns false
+    isLicenseCheckRequired: function(appId) {
+        try {
+            var licenseCheckRequired = new UAAppFamilyDAO().isLicenseCheckRequiredForApp(appId);
+            if (gs.nil(licenseCheckRequired))
+                return false;
+            if (LicensingEngineConstants.TRUE_ONE.equals(licenseCheckRequired) || LicensingEngineConstants.TRUE.equals(licenseCheckRequired))
+                return true;
+            if (this.logger.isEntitlementLoggingEnabled()) {
+                this.logger.logInfo(LicensingEngineConstants.APP_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.IS_LICENSE_CHECK_REQUIRED,
+                    LicensingEngineConstants.LICENSE_CHECK_IS_NOT_REQUIRED.concat(LicensingEngineConstants.COLON).concat(appId));
+            }
+
+            return false;
+        } catch (error) {
+            const errorMsg = LicensingEngineConstants.LICENSING_ERROR_CODES[LicensingEngineConstants.ENTITLEMENT_API_CODE.LICENSE_CHECK_REQUIRED_FAILED] + appId + error + " \n " + error.stack;
+            this.logger.logError(LicensingEngineConstants.APP_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.IS_LICENSE_CHECK_REQUIRED, errorMsg, LicensingEngineConstants.ENTITLEMENT_API_CODE.LICENSE_CHECK_REQUIRED_FAILED, LicensingEngineConstants.LICENSING_ERROR_TYPES.ENTITLEMENT_API);
+            return false;
+        }
+    },
+
+    // returns true if the instance is entitled to the given app_id, else returns false
+    isEntitled: function(appId) {
+        try {
+            if (!this.doesAppExist(appId)) {
+                // if the given app_id doesn't have a record in ua_app_family, then it is not a valid app_id for performing entitlement checks
+                if (this.logger.isEntitlementLoggingEnabled()) {
+                    this.logger.logInfo(LicensingEngineConstants.APP_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.IS_ENTITLED,
+                        LicensingEngineConstants.APP_DOES_NOT_EXIST.concat(LicensingEngineConstants.COLON).concat(appId));
+                }
+                return LicensingEngineConstants.UNABLE_TO_DETERMINE_ENTITLEMENT;
+            }
+            if (!this.isLicenseCheckRequired(appId))
+                return true;
+
+            const familyIds = new UAAppFamilyDAO().getFamilyListOfApp(appId);
+            const isLicensable = new SubscriptionHasFamilyDAO().getLicensableStateForFamily(familyIds);
+            // Check explicit entitlement for app - if family is not installable no need to perform further check for app.
+            if (!isLicensable)
+                return false;
+
+            let activeAppSubscriptions = this.getActiveSubscriptions(appId);
+            if (activeAppSubscriptions.length == 0) {
+                let errorMsg = LicensingEngineConstants.LICENSING_ERROR_CODES[LicensingEngineConstants.ENTITLEMENT_API_CODE.NO_APP_ENTITLEMENT] + appId;
+                this.logger.auditErrorWithoutLog(LicensingEngineConstants.APP_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.IS_ENTITLED, errorMsg, LicensingEngineConstants.ENTITLEMENT_API_CODE.NO_APP_ENTITLEMENT, LicensingEngineConstants.LICENSING_ERROR_TYPES.ENTITLEMENT_API);
+
+                if (this.logger.isEntitlementLoggingEnabled()) {
+                    this.logger.logErrorWithoutAudit(LicensingEngineConstants.APP_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.IS_ENTITLED, errorMsg);
+                }
+                return false;
+            }
+            return true;
+        } catch (error) {
+            errorMsg = LicensingEngineConstants.LICENSING_ERROR_CODES[LicensingEngineConstants.ENTITLEMENT_API_CODE.NO_APP_ENTITLEMENT] + appId + error + " \n " + error.stack;
+            this.logger.logError(LicensingEngineConstants.APP_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.IS_ENTITLED, errorMsg, LicensingEngineConstants.ENTITLEMENT_API_CODE.NO_APP_ENTITLEMENT, LicensingEngineConstants.LICENSING_ERROR_TYPES.ENTITLEMENT_API);
+
+            return LicensingEngineConstants.UNABLE_TO_DETERMINE_ENTITLEMENT;
+        }
+    },
+
+    // returns the license details for the appId
+    getLicenseDetailsForArtifact: function(appId) {
+        var entitlementBO = new EntitlementBO();
+        try {
+            var entitlementIds = this.getActiveSubscriptions(appId);
+            var prodInstNames = new SubscriptionEntitlementDAO().getProdInstNamesByEntitlementIds(entitlementIds);
+
+            var isLicenseCheckRequired = false;
+            var licenseCheckRequired = new UAAppFamilyDAO().isLicenseCheckRequiredForApp(appId);
+            if (gs.nil(licenseCheckRequired)) {
+                isLicenseCheckRequired = true;
+            } else {
+                isLicenseCheckRequired = LicensingEngineConstants.TRUE_ONE.equals(licenseCheckRequired) || LicensingEngineConstants.TRUE.equals(licenseCheckRequired);
+            }
+
+            var isEntitled = !isLicenseCheckRequired ? true : entitlementIds.length &gt; 0;
+            var isPermitted = !new GlideEntitlementAPI().isInstanceLicenseAware() ? true : isEntitled;
+
+            entitlementBO.setIsEntitled(isEntitled);
+            entitlementBO.setIsPermitted(isPermitted);
+            entitlementBO.setProductionInstanceNames(prodInstNames);
+
+            return entitlementBO;
+        } catch (error) {
+            this.logger.logErrorInDetermining(LicensingEngineConstants.APP_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.LICENSE_DETAILS_FOR_ARTIFACT,
+                LicensingEngineConstants.GET_LICENSE_DETAILS_FOR_APP, error);
+
+            return entitlementBO;
+        }
+    },
+
+    // Returns the map of app with associated production instance, state of entitlement and permitted for the given app id list.
+    getLicenseDetailsForArtifacts: function(appIdList) {
+        let appEntitlementBOMap = {};
+        let responseMap;
+        let entitlementBO = {};
+        try {
+            let appSubscriptionMap = new SubscriptionHasAppDAO().getActiveSubscriptionMapForApps(appIdList);
+            const isPermitted = new InstanceInfoUtil().isOpenInstance();
+            let prodInstNames;
+            for (let key in appSubscriptionMap) {
+                entitlementBO = Object.create(LicensingEngineConstants.entitlementBO);
+                entitlementBO['isEntitled'] = false;
+                entitlementBO['isPermitted'] = isPermitted;
+
+                if (!gs.nil(appSubscriptionMap[key])) {
+                    prodInstNames = new SubscriptionEntitlementDAO().getProdInstNamesByEntitlementIds(appSubscriptionMap[key]);
+                    entitlementBO['productionInstanceNames'] = prodInstNames;
+                } else {
+                    this.logger.logCouldNotFind(LicensingEngineConstants.APP_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.LICENSE_DETAILS_FOR_ARTIFACT_LIST,
+                        LicensingEngineConstants.ACTIVE_ASSOCIATED_SUBSCRIPTIONS + key);
+                }
+                appEntitlementBOMap[key] = entitlementBO;
+            }
+            appEntitlementBOMap = new UAAppFamilyDAO().getAppToEntitlmentMap(appIdList, appEntitlementBOMap, appSubscriptionMap);
+            responseMap = JSON.stringify(appEntitlementBOMap);
+            this.logger.logInfo(LicensingEngineConstants.APP_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.LICENSE_DETAILS_FOR_ARTIFACT_LIST,
+                responseMap);
+        } catch (error) {
+            this.logger.logErrorInDetermining(LicensingEngineConstants.APP_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.LICENSE_DETAILS_FOR_ARTIFACT_LIST,
+                LicensingEngineConstants.GET_LICENSE_DETAILS_FOR_APP_LIST + appIdList, error);
+
+
+        }
+        return responseMap;
+    },
+
+    // returns all the entitlement ids of the subscriptions that are active and associated with the given app
+    getActiveSubscriptions: function(appId) {
+        return new SubscriptionHasAppDAO().getActiveSubscriptionsForApp(appId);
+    },
+
+    // returns user access check type for the given app_id
+    getUserAccessCheckType: function(appId) {
+        try {
+            var subscriptionEntIds = this.getActiveSubscriptions(appId);
+            if (subscriptionEntIds.length == 0) {
+                this.logger.logCouldNotFind(LicensingEngineConstants.APP_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.GET_USER_ACCESS_CHECK_TYPE,
+                    LicensingEngineConstants.ACTIVE_ASSOCIATED_SUBSCRIPTIONS);
+                return LicensingEngineConstants.CHECK;
+            }
+
+            var subscriptionTypes = new SubscriptionEntitlementDAO().getSubscriptionTypesByEntIds(subscriptionEntIds);
+            return new UserAccessManagerUtil().getUserAccessCheckBySubscriptionTypes(subscriptionTypes);
+        } catch (error) {
+            this.logger.logErrorInDetermining(LicensingEngineConstants.APP_ENTITLEMENT_PROCESSOR,
+                LicensingEngineConstants.GET_USER_ACCESS_CHECK_TYPE, LicensingEngineConstants.USER_ACCESS_CHECK_TYPE, error);
+            // if we catch any unexpected exception, we return true as we don't want to restrict customers
+            return LicensingEngineConstants.ALLOW;
+        }
+    },
+
+
+
+    doesAppExist: function(appId) {
+        return new UAAppFamilyDAO().doesAppExist(appId);
+    },
+
+    // returns true if user is entitled for the input role and given appId
+    isUserEntitledForRole: function(userId, role, appId) {
+        try {
+            if (!this.doesAppExist(appId)) {
+                // if the given app_id doesn't have a record in ua_app_family, then it is not a valid app_id for performing entitlement checks
+                this.logger.logInfo(LicensingEngineConstants.APP_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.IS_USER_ENTITLED_FOR_ROLE,
+                    LicensingEngineConstants.APP_DOES_NOT_EXIST.concat(LicensingEngineConstants.COLON).concat(appId));
+                return LicensingEngineConstants.UNABLE_TO_DETERMINE_ENTITLEMENT;
+            }
+
+            if (!this.isLicenseCheckRequired(appId))
+                return true;
+
+            var highPrivilegeRoleList = new LicenseRoleTypeDAO().getRoleTypesWithEqualOrHighPrivileges(role);
+            var subscriptionEntIds = this.getActiveSubscriptions(appId);
+            if (subscriptionEntIds.length == 0)
+                this.logger.logCouldNotFind(LicensingEngineConstants.APP_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.IS_USER_ENTITLED_FOR_ROLE,
+                    LicensingEngineConstants.ACTIVE_ASSOCIATED_SUBSCRIPTIONS);
+
+            for (var i in subscriptionEntIds) {
+                var subscriptionRoleTypeSysIds = new SubscriptionEntitlementDAO().getMeasuredRoleTypesByEntId(subscriptionEntIds[i]);
+                var arrayUtil = new global.ArrayUtil();
+                var intersectedArray = arrayUtil.intersect(highPrivilegeRoleList, subscriptionRoleTypeSysIds);
+                if (intersectedArray.length == 0)
+                    continue;
+
+                if (new UserHasSubscriptionDAO().doesUserHasSubscriptionByEntId(userId, subscriptionEntIds[i]))
+                    return true;
+
+                var userGroups = new SysUserGrmemberDAO().getUserGroups(userId);
+                if (new GroupHasSubscriptionDAO().doesGroupsHaveSubscriptionByEntId(userGroups, subscriptionEntIds[i]))
+                    return true;
+            }
+            var errorMsg = LicensingEngineConstants.LICENSING_ERROR_CODES[LicensingEngineConstants.ENTITLEMENT_API_CODE.NO_USER_ROLE_ENTITLEMENT] + " user Id : " + userId + " appId : " + appId + " role : " + role;
+            this.logger.logError(LicensingEngineConstants.APP_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.IS_USER_ENTITLED_FOR_ROLE, errorMsg, LicensingEngineConstants.ENTITLEMENT_API_CODE.NO_USER_ROLE_ENTITLEMENT, LicensingEngineConstants.LICENSING_ERROR_TYPES.ENTITLEMENT_API);
+
+            return false;
+        } catch (error) {
+            errorMsg = LicensingEngineConstants.LICENSING_ERROR_CODES[LicensingEngineConstants.ENTITLEMENT_API_CODE.NO_USER_ROLE_ENTITLEMENT] + " user Id : " + userId + " appId : " + appId + " role : " + role + error + " \n " + error.stack;
+            this.logger.logError(LicensingEngineConstants.APP_ENTITLEMENT_PROCESSOR, LicensingEngineConstants.IS_USER_ENTITLED_FOR_ROLE, errorMsg, LicensingEngineConstants.ENTITLEMENT_API_CODE.NO_USER_ROLE_ENTITLEMENT, LicensingEngineConstants.LICENSING_ERROR_TYPES.ENTITLEMENT_API);
+
+
+            return LicensingEngineConstants.UNABLE_TO_DETERMINE_ENTITLEMENT;
+        }
+    },
+
+
+    getActiveSubscriptionSysIds: function(appId) {
+        return new SubscriptionHasAppDAO().getActiveSubscriptionSysIdsForApp(appId);
+    },
+
+    type: 'AppEntitlementProcessor'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-02-09 10:00:20&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;6d37d4a0777821109c62f5f3cb5a99cd&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;65&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AppEntitlementProcessor&lt;/sys_name&gt;
+        &lt;sys_package display_value="Licensing Engine" source="sn_entitlement"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Licensing Engine"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_6d37d4a0777821109c62f5f3cb5a99cd&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-11-08 18:22:29&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:38:22</sys_created_on>
+        <sys_id>d4f6b05d83f01210c6695855eeaad321</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AppEntitlementProcessor</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_d4f6b05d83f01210c6695855eeaad321</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:38:22</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

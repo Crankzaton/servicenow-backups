@@ -1,0 +1,226 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>a3fd0c945f212110f082532aca7313ae</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_deploy_pipeline.ScanSuiteService&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;A script that returns all instance scans and ATF scans for test environments in a pipeline&lt;/description&gt;
+        &lt;name&gt;ScanSuiteService&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ScanSuiteService = Class.create();
+(function() {
+
+    var utils = new DeploymentPipelineGenericUtils();
+
+    var pipelineHelpers = {
+        PIPELINE_TABLE: 'sn_pipeline_pipeline',
+        ENVIRONMENT_TABLE: 'sn_pipeline_environment',
+        PIPELINE_ENVIRONMENT_ORDER_TABLE: 'sn_pipeline_pipeline_environment_order',
+        APP_DEPLOYMENT_PIPELINE_TYPE_SYSID: '268f9c0fb73430100290b9708e11a9de',
+        ENVIRONMENT_COLUMNS: ['sys_id', 'name', 'instance_type', 'instance_id', 'is_controller', 'instance_url'],
+
+        getAppDeploymentPipelines: function() {
+            var pipelines = [];
+            var gr = new GlideRecordSecure(this.PIPELINE_TABLE);
+
+            gr.addQuery('pipeline_type', this.APP_DEPLOYMENT_PIPELINE_TYPE_SYSID);
+            gr.addActiveQuery();
+            gr.query();
+
+            while (gr.next()) {
+                var pipelineObj = {
+                    sys_id: gr.getUniqueValue(),
+                    source_environment: gr.getValue('source_environment')
+                };
+                pipelines.push(pipelineObj);
+            }
+            return pipelines;
+        },
+        getPipelineTestEnvironments: function() {
+            var pipelines = this.getAppDeploymentPipelines();
+            var environments = []; // unique list of env sysIds
+            var environmentFields = this.ENVIRONMENT_COLUMNS;
+
+            for (var i = 0; i &lt; pipelines.length; i++) {
+                var gr = new GlideRecord(this.PIPELINE_ENVIRONMENT_ORDER_TABLE);
+                gr.addQuery('pipeline', pipelines[i].sys_id);
+                gr.query();
+
+                while (gr.next()) {
+                    var environment = utils.getObjectFromGlideRecord(gr.environment.getRefRecord(), environmentFields);
+
+                    if (environment.instance_type === ScanSuiteConstants.INSTANCE_TYPE_TEST) {
+                        environments.push(environment);
+                    }
+                }
+            }
+
+            return environments;
+        },
+        getURLCredentials: function(environments) {
+            var urlAndCredentials = [];
+            var gr = new GlideRecord(this.ENVIRONMENT_TABLE);
+
+            gr.addQuery('sys_id', 'IN', environments.join());
+            gr.query();
+
+            while (gr.next()) {
+                var urlCreds = {
+                    sys_id: gr.getUniqueValue(),
+                    instance_url: gr.getValue('instance_url'),
+                    credential: gr.instance_credential.getRefRecord()
+                };
+
+                urlAndCredentials.push(urlCreds);
+            }
+            return urlAndCredentials;
+        }
+    };
+
+    /**
+     * Method used for "/api/sn_deploy_pipeline/admin/scansuites"
+     * @returns object containing list of scan suites
+     */
+    ScanSuiteService.getScanSuites = function() {
+        var suites = [];
+
+        var instanceScanSuites = new GlideRecordSecure(ScanSuiteConstants.INSTANCE_SCAN_SUITE_TABLE);
+        var atfScanSuites = new GlideRecordSecure(ScanSuiteConstants.ATF_SCAN_SUITE_TABLE);
+
+        instanceScanSuites.addActiveQuery();
+        instanceScanSuites.query();
+
+        atfScanSuites.addActiveQuery();
+        atfScanSuites.query();
+
+        while (instanceScanSuites.next()) {
+            // The sys_id defined below is tied to the suite sys_id on the test instances. If the ids change anywhere, please ensure 
+            // the logic for the `sn_deploy_pipeline.ScanSuitePopulate` script include is also updated.
+            suites.push({
+                sys_id: ScanSuiteService.getUniqueScanSuiteId(instanceScanSuites.getValue('sys_id'), ScanSuiteConstants.INSTANCE_SCAN_SUITE_TABLE),
+                suite_sys_id: instanceScanSuites.getValue('sys_id'),
+                suite_name: instanceScanSuites.getValue('name'),
+                suite_type: ScanSuiteConstants.INSTANCE_SCAN_SUITE
+            });
+        }
+
+        while (atfScanSuites.next()) {
+            // The sys_id defined below is tied to the suite sys_id on the test instances. If the ids change anywhere, please ensure 
+            // the logic for the `sn_deploy_pipeline.ScanSuitePopulate` script include is also updated.
+            suites.push({
+                sys_id: ScanSuiteService.getUniqueScanSuiteId(atfScanSuites.getValue('sys_id'), ScanSuiteConstants.ATF_SCAN_SUITE_TABLE),
+                suite_sys_id: atfScanSuites.getValue('sys_id'),
+                suite_name: atfScanSuites.getValue('name'),
+                suite_type: ScanSuiteConstants.ATF_SCAN_SUITE
+            });
+        }
+
+        return {
+            suites: suites
+        };
+    };
+
+    /**
+     * Retrieves scans from the test environments in a pipeline
+     * @returns {Array} API responses generated by ScanSuiteService.getScanSuites()
+     */
+    ScanSuiteService.getScansFromPipelineEnvs = function() {
+        var pipelineConfigChecks = new sn_pipeline.PipelineConfigChecks();
+
+        // If this instance is not a controller, do not run
+        if (!pipelineConfigChecks.getCurrentInstanceInfo()['isController']) {
+            return [];
+        }
+
+        var environments = pipelineHelpers.getPipelineTestEnvironments();
+        var environmentSysIds = [];
+
+        environments.forEach(function(env) {
+            environmentSysIds.push(env.sys_id);
+        });
+
+        // array: {sys_id, instance_url, credential}
+        var envURLCredentials = pipelineHelpers.getURLCredentials(environmentSysIds);
+
+        // Array of objects containing the instance scan data from the environments in each pipeline
+        // grouped by environment sysId
+        var scanSuitesAPIResponses = [];
+
+        // Iterate through all environments in each pipeline
+        envURLCredentials.forEach(function(credential) {
+            try {
+                var instanceOutput = RemoteTableData.getInstanceDataFromFlowAction(
+                    credential.instance_url,
+                    credential.credential,
+                    '/api/sn_deploy_pipeline/admin/scansuites'
+                );
+
+                scanSuitesAPIResponses.push({
+                    environment: credential.sys_id,
+                    instanceURL: credential.instance_url,
+                    result: instanceOutput,
+                    isController: false
+                });
+            } catch (e) {
+                gs.error("Error getting scan suites from instance: " + e);
+
+                throw new sn_ws_err.ServiceError()
+                    .setStatus(500)
+                    .setMessage(gs.getMessage("Error getting scan suites from instance"));
+            }
+        });
+
+        return scanSuitesAPIResponses;
+    };
+
+    /**
+     * Retrieves scans from the test environments in a pipeline
+     * @param suiteId suite sys_id
+     * @param suiteTable suite table
+     * @returns {Array} API responses generated by ScanSuiteService.getScanSuites()
+     */
+    ScanSuiteService.getUniqueScanSuiteId = function(suiteId, suiteTable) {
+        var digest = new GlideDigest();
+        return digest.getMD5Hex(suiteId + suiteTable);
+    };
+
+    ScanSuiteService.prototype = {
+        initialize: function() {},
+
+        type: 'ScanSuiteService'
+    };
+})();]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-03-08 21:32:58&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;a3fd0c945f212110f082532aca7313ae&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;27&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ScanSuiteService&lt;/sys_name&gt;
+        &lt;sys_package display_value="Deployment Pipeline" source="sn_deploy_pipeline"&gt;bb67ed7253e83010b846ddeeff7b1204&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Deployment Pipeline"&gt;bb67ed7253e83010b846ddeeff7b1204&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_a3fd0c945f212110f082532aca7313ae&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-05-18 18:28:53&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:46:33</sys_created_on>
+        <sys_id>00d8b49183341210c6695855eeaad305</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ScanSuiteService</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_00d8b49183341210c6695855eeaad305</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:46:33</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

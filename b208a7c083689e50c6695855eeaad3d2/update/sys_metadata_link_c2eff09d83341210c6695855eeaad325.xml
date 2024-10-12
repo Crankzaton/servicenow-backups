@@ -1,0 +1,338 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>a962c877535630100999ddeeff7b12a2</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_sow_on_call.OnCallRotationSowSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;ServiceNow On-Call Rotation for SOW implementation&lt;/description&gt;
+        &lt;name&gt;OnCallRotationSowSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var OnCallRotationSowSNC = Class.create();
+
+OnCallRotationSowSNC.LOG_PROPERTY = 'com.snc.on_call_rotation.log.level';
+
+OnCallRotationSowSNC.prototype = {
+	initialize: function() {
+		this._log = new global.GSLog(OnCallRotationSowSNC.LOG_PROPERTY, this.type);
+		global.OnCallRotation.prototype.prepareOnCallGroupsDataGroup = OnCallRotationSowSNC.methods.prepareOnCallGroupsDataGroup.bind(this);
+		global.OnCallRotation.prototype.prepareOnCallGroupsDataRota = OnCallRotationSowSNC.methods.prepareOnCallGroupsDataRota.bind(this);
+		global.OnCallRotation.prototype.prepareOnCallGroupsDataRoster = OnCallRotationSowSNC.methods.prepareOnCallGroupsDataRoster.bind(this);
+		global.OnCallRotation.prototype.prepareOnCallGroupsDataMember = OnCallRotationSowSNC.methods.prepareOnCallGroupsDataMember.bind(this);
+		global.OnCallRotation.prototype.prepareOnCallGroupsDataUser = OnCallRotationSowSNC.methods.prepareOnCallGroupsDataUser.bind(this);
+		global.OnCallRotation.prototype._getGroupsWithRotasByName = OnCallRotationSowSNC.methods._getGroupsWithRotasByName.bind(this);
+		this._onCallRotation = new global.OnCallRotation();
+	},
+
+	_getUsers: function(userSysIds) {
+		return this._onCallRotation._getUsers(userSysIds);
+	},
+	
+	processIndividualOCData: function (groupsData, gdt) {
+		return this._onCallRotation.processIndividualOCData(groupsData, gdt);
+	},
+
+	simulateEscalationToAllRotas: function (indicator) {
+		return this._onCallRotation.simulateEscalationToAllRotas(indicator);
+	},
+
+	getOnCallGroupData: function(dateTime, offset, groupsLimit, textSearch, excludeGroupSysIds, showOnlyActiveGroups) {
+		dateTime = dateTime || '';
+		textSearch = textSearch || '';
+		offset = offset || 0;
+		excludeGroupSysIds = excludeGroupSysIds || '';
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug('[getOnCallGroupData] dateTime: ' + dateTime);
+
+		this._recommendedGroups = (excludeGroupSysIds || '').split(',');
+		return this._onCallRotation.getOnCallGroupData(dateTime, offset, groupsLimit, textSearch, excludeGroupSysIds, showOnlyActiveGroups);
+	},
+
+	getOnCallGroupDataByGroupSysId: function(dateTime, groupSysIds) {
+		dateTime = dateTime || '';
+		groupSysIds = groupSysIds || '';
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug('[getOnCallGroupDataByGroupSysId] dateTime: ' + dateTime + ' groupSysIds: ' + groupSysIds);
+
+		this._recommendedGroups = (groupSysIds || '').split(',');
+		return this._onCallRotation.getOnCallGroupDataByGroupSysId(dateTime, groupSysIds);
+	},
+
+	/**
+	* This returns the next request time in UTC factoring:
+	* 1. End of current and Start next shift
+	* 2. End of current and Start next cover record
+	* 3. End of current and Start next Time Off record
+	* 4. End of current and Start next Extra Time record
+	*/
+	_getNextRequestDateTimeUTC: function(rotaGr, gdt) {
+		if (!rotaGr)
+			return null;
+
+		gdt = gdt || new GlideDateTime();
+
+		var span = this.getSpanByGdt(rotaGr.getValue('schedule', gdt));
+		if (!span)
+			return null;
+
+		return span.getEnd() + '';
+	},
+
+	_getRosterCount: function(rotaGr) {
+		var rosterCount = 0;
+
+		if (!rotaGr)
+			return rosterCount;
+
+		var groupSysId = rotaGr.getValue('group');
+		var rotaSysId = rotaGr.getUniqueValue();
+		var ga = new GlideAggregate('cmn_rota_roster');
+		ga.addAggregate('COUNT');
+		ga.addQuery('rota', rotaSysId);
+		ga.addQuery('active', true);
+		ga.query();
+
+		rosterCount = parseInt(ga.next() ? ga.getAggregate('COUNT') : 0);
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug('[_getRosterCount] rosterCount: ' + rosterCount);
+
+		return rosterCount;
+	},
+
+	/**
+	* This returns rota details message used by UIB/WEP oncall macroponent
+	* example is: 2 members on-call from 8:00 AM yesterday to 5:00 PM today
+	*/
+	_getRotaDetailsMsg: function(dateTime) {
+		var msg = '';
+
+		if (!dateTime || !dateTime.start || !dateTime.end)
+			return msg;
+
+		var start = dateTime.start;
+		var end = dateTime.end;
+
+		msg = gs.getMessage('From {0} to {1}', [start, end]);
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug('[_getRotaDetailsMsg] msg: ' + msg);
+
+		return msg;
+	},
+
+	getDaysDifference: function(startDateTime, endDateTime) {
+		var start = new GlideDate();
+		
+		start.setValue(startDateTime.getLocalDate());
+		var end = new GlideDate();
+		end.setValue(endDateTime.getLocalDate());
+
+		var diff = GlideDate.subtract(start, end);
+		return diff.getRoundedDayPart();
+	},
+	_getRotaHumanizedDetailsMsg: function(dateTime) {
+		var msg = '';
+
+		if (!dateTime || !dateTime.start || !dateTime.end)
+			return msg;
+
+		var start = dateTime.start;
+		var end = dateTime.end;
+
+		var gdt = new GlideDateTime();
+		gdt.setDisplayValue(start);
+		var startGdt = new GlideDateTime(gdt);
+		gdt.setDisplayValue(end);
+		var endGdt = new GlideDateTime(gdt);
+		endGdt.addSeconds(-1);
+
+		var dayDiff = 0;
+		msg = gs.getMessage('From {0} to {1}', [startGdt.getDisplayValue(), endGdt.getDisplayValue()]);
+		
+		var nowGdt = new GlideDateTime();
+		var startEndDaysDiff = this.getDaysDifference(startGdt, endGdt);
+
+		var startDayDiff = this.getDaysDifference(nowGdt, startGdt);
+		var endDayDiff = this.getDaysDifference(nowGdt, endGdt);
+		if (startEndDaysDiff === 0) {
+			if (endDayDiff === 0) {
+				msg = gs.getMessage('From {0} to {1} today', [startGdt.getTime().getDisplayValue(), endGdt.getTime().getDisplayValue()]);
+			}
+			else if (endDayDiff === -1) {
+				msg = gs.getMessage('From {0} to {1} yesterday', [startGdt.getTime().getDisplayValue(), endGdt.getTime().getDisplayValue()]);
+			}
+			else if (endDayDiff === 1) {
+				msg = gs.getMessage('From {0} to {1} tomorrow', [startGdt.getTime().getDisplayValue(), endGdt.getTime().getDisplayValue()]);
+			}
+		} else {
+			if (startDayDiff === 0) {
+				if (endDayDiff === 1) {
+					msg = gs.getMessage('From {0} today to {1} tomorrow', [startGdt.getTime().getDisplayValue(), endGdt.getTime().getDisplayValue()]);
+				} else {
+					msg = gs.getMessage('From {0} today to {1}', [startGdt.getTime().getDisplayValue(), endGdt.getDisplayValue()]);
+				}
+			}
+			else if (startDayDiff === -1) {
+				if (endDayDiff === 0) {
+					msg = gs.getMessage('From {0} yesterday to {1} today', [startGdt.getTime().getDisplayValue(), endGdt.getTime().getDisplayValue()]);
+				}
+				else if (endDayDiff === 1) {
+					msg = gs.getMessage('From {0} yesterday to {1} tomorrow', [startGdt.getTime().getDisplayValue(), endGdt.getTime().getDisplayValue()]);
+				}  else {
+					msg = gs.getMessage('From {0} yesterday to {1}', [startGdt.getTime().getDisplayValue(), endGdt.getDisplayValue()]);
+				}
+			}
+			else if (startDayDiff === 1) {
+				msg = gs.getMessage('From {0} tomorrow to {1}', [startGdt.getTime().getDisplayValue(), endGdt.getDisplayValue()]);
+			}
+		}
+
+		if (this._log.atLevel(global.GSLog.DEBUG))
+			this._log.debug('[_getRotaHumanizedDetailsMsg] msg: ' + msg);
+
+		return msg;
+	},
+
+	_getLocation: function(userSysId) {
+		if (!userSysId)
+			return;
+
+		var userGr = new GlideRecord('sys_user');
+		if (!userGr.get(userSysId))
+			return;
+
+		var locationGr = userGr.location.getRefRecord();
+		if (locationGr &amp;&amp; locationGr.canRead())
+			return {
+				city: {
+					display_value: locationGr.getDisplayValue("city")
+				}
+			};
+	},
+
+	contains: function (arr, obj) {
+		var i = arr.length;
+		while (i--)
+			if (arr[i] === obj)
+				return true;
+		return false;
+	},
+
+	getSpanByGdt: global.OnCallRotationSNC._getSpanByGdt,
+
+	getRotaTime: global.OnCallRotationSNC._getRotaTime,
+
+	type: 'OnCallRotationSowSNC'
+};
+
+OnCallRotationSowSNC.methods = {
+
+	prepareOnCallGroupsDataGroup: function(groupGr, group) {
+		if (!group)
+			return;
+
+		group.isRecommended = this.contains(this._recommendedGroups, group.sys_id);
+		return group;
+	},
+
+	prepareOnCallGroupsDataRota: function(rotaGr, rota) {
+		if (!rota)
+			return null;
+
+		var rotaTime = this.getRotaTime(rotaGr.getValue('schedule'));
+		var rosterCount = this._getRosterCount(rotaGr);
+		var membersMsg = '';
+		if (rosterCount &lt; 1)
+			membersMsg = gs.getMessage('No members currently available');
+		else if (rosterCount === 1)
+			membersMsg = gs.getMessage('{0} member on-call', [rosterCount + '']);
+		else
+			membersMsg = gs.getMessage('{0} members on-call', [rosterCount + '']);
+
+		rota.details = {
+			"members": membersMsg,
+			"default": this._getRotaDetailsMsg(rotaTime),
+			"humanized": this._getRotaHumanizedDetailsMsg(rotaTime)
+		};
+		rota.nextRequestDateTimeUTC = this._getNextRequestDateTimeUTC(rotaGr);
+		return rota;
+	},
+
+	prepareOnCallGroupsDataRoster: function(rosterGr, roster) {
+		if (!roster)
+			return;
+
+		return roster;
+	},
+
+	prepareOnCallGroupsDataMember: function(memberGr, member) {
+		if (!member)
+			return;
+
+		return member;
+	},
+
+	prepareOnCallGroupsDataUser: function(glideUser, user) {
+		if (!user || !user.sys_id)
+			return;
+
+		var location = this._getLocation(user.sys_id + "");
+		user.city = location &amp;&amp; location.city ? location.city.display_value : '';
+		return user;
+	},
+	
+	_getGroupsWithRotasByName: function(textSearch) {
+		var gr = new GlideRecord('cmn_rota');
+		var encodedQuery = 'active=true^group.active=true^ORDERBYgroup.name';
+		if (textSearch)
+			encodedQuery += '^group.nameLIKE' + textSearch;
+
+		gr.addEncodedQuery(encodedQuery);
+		gr.query();
+		
+		var groupKeys = {};
+		while (gr.next()) {
+			groupKeys[gr.group.getRefRecord().getUniqueValue()] = true;
+		}
+
+		
+		
+		return Object.keys(groupKeys);
+	}
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-09-06 11:44:01&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;a962c877535630100999ddeeff7b12a2&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;26&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;OnCallRotationSowSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="On Call Scheduling for Service Operations Workspace" source="sn_sow_on_call"&gt;7e3c2481539260100c54ddeeff7b127b&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="On Call Scheduling for Service Operations Workspace"&gt;7e3c2481539260100c54ddeeff7b127b&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_a962c877535630100999ddeeff7b12a2&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-09-14 08:14:24&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 09:17:33</sys_created_on>
+        <sys_id>c2eff09d83341210c6695855eeaad325</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>OnCallRotationSowSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_c2eff09d83341210c6695855eeaad325</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 09:17:33</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

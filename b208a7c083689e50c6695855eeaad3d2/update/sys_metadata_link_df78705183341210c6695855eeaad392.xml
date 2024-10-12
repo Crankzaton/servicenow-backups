@@ -1,0 +1,1475 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>8c1168780723301028ef0a701ad3002c</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_nlu_workbench.NLUExpertFeedbackUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Utilities to get the Data Labeling (Expert Feedback Loop) information. &lt;/description&gt;
+        &lt;name&gt;NLUExpertFeedbackUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var NLUExpertFeedbackUtil = Class.create();
+
+(function() {
+    var tables = sn_nlu_workbench.NLUWorkbenchConstants.tables;
+    var coreTables = global.NLUConstants.tables;
+
+    var RECORDS_PER_PAGE_LIMIT = 10;
+
+    var TODO_FURTHER_REVIEW_FIELDS = {
+        LABEL: 'lct_suggested_label',
+        UTTERANCE_REF: 'lft_utterance_reference'
+    };
+
+    var tabNames = {
+        TODO: 'todo',
+        DONE: 'done',
+        FURTHER_REVIEW: 'further_review'
+    };
+
+    var outcomes = {
+        MATCH: 'positive',
+        MISMATCH: 'negative',
+        UNSURE: 'notsure',
+        IRRELEVANT: 'irrelevant',
+        IRRELEVANT_TO_THIS_MODEL: 'irrelevant_to_this_model'
+    };
+
+    NLUExpertFeedbackUtil.getCorrectedIntents = function() {
+        var correctedIntents = [];
+        var correctedIntentsGr = new GlideRecord('sys_nlu_intent');
+        var modelStatus = correctedIntentsGr.addJoinQuery('sys_nlu_model_status', 'model', 'model');
+        correctedIntentsGr.addQuery('model.category', 'virtual_agent');
+        modelStatus.addCondition('published_version', '&gt;', 0);
+        correctedIntentsGr.query();
+        while (correctedIntentsGr.next()) {
+            correctedIntents.push({
+                'id': correctedIntentsGr.getUniqueValue(),
+                'label': correctedIntentsGr.getValue('name'),
+                'sublabel': correctedIntentsGr.model.display_name.toString(),
+                'language': correctedIntentsGr.model.language.toString(),
+            });
+        }
+        return correctedIntents;
+    };
+
+    NLUExpertFeedbackUtil.checkDuplicateIrrelevantUtterance = function(utterance, labelType, model) {
+        var gr = new GlideRecord(tables.ULT);
+        gr.addQuery('text', utterance);
+        gr.addQuery('label_type', labelType);
+        if (labelType === "irrelevant_to_this_model") {
+            gr.addQuery('label', 'CONTAINS', model);
+        }
+        gr.query();
+        return gr.hasNext();
+    };
+
+    NLUExpertFeedbackUtil.addIrrelevantUtterance = function(utterance, labelType, modelName) {
+
+        if (NLUExpertFeedbackUtil.checkDuplicateIrrelevantUtterance(utterance, labelType, modelName))
+            return null;
+
+        var label = "intent:" + modelName;
+        var gr = new GlideRecord(tables.ULT);
+        gr.initialize();
+        gr.setValue('text', utterance);
+        gr.setValue('source', "manual");
+        gr.setValue('product', "nlu");
+        gr.setValue('label_type', labelType);
+        if (labelType === "irrelevant_to_this_model") {
+            gr.setValue('label', label);
+        }
+        gr.insert();
+
+        return NLUExpertFeedbackUtil.createIrrelevantUtteranceObject(gr);
+    };
+
+    NLUExpertFeedbackUtil.editIrrelevantUtterance = function(utterance, sysId) {
+        var gr = new GlideRecord(tables.ULT);
+        gr.get(sysId);
+        var labelType = gr.getValue('label_type');
+        var label = gr.getValue('label');
+        if (NLUExpertFeedbackUtil.checkDuplicateIrrelevantUtterance(utterance, labelType, label))
+            return {
+                isDuplicate: true,
+                label: label,
+                labelType: labelType
+            };
+
+        gr.setValue('text', utterance);
+        gr.update();
+
+        return NLUExpertFeedbackUtil.createIrrelevantUtteranceObject(gr);
+    };
+
+    NLUExpertFeedbackUtil.deleteIrrelevantUtterance = function(sysId) {
+        var gr = new GlideRecord(tables.ULT);
+        gr.get(sysId);
+        return gr.deleteRecord();
+    };
+
+    NLUExpertFeedbackUtil.getIrrelevantUtterancesRowDefinition = function(offset, limit, searchText, model) {
+        var irrelevant_utterances = NLUExpertFeedbackUtil.getIrrelevantUtterances(offset, limit, searchText, model);
+        var rows = (irrelevant_utterances.length &gt; 0) ? NLUExpertFeedbackUtil.createIrrelevantUtterancesRows(irrelevant_utterances) : [];
+        return rows;
+    };
+
+    NLUExpertFeedbackUtil.createIrrelevantUtterancesRows = function(irrelevant_utterances) {
+        var cellKeys = Object.keys(irrelevant_utterances[0]);
+        var rows = irrelevant_utterances.map(function(data) {
+            return {
+                key: data.sys_id,
+                cells: cellKeys.reduce(function(cellsObj, key) {
+
+                    cellsObj[key] = {
+                        value: data[key]
+                    };
+                    if (key === 'corrected_intent') {
+                        cellsObj[key]['componentProps'] = {
+                            "size": "md",
+                            "selected-item": data[key],
+                            "append-to-payload": {
+                                rowKey: data['sys_id'],
+                                colKey: key
+                            }
+                        };
+                    }
+                    return cellsObj;
+                }, {})
+            };
+        }) || [];
+
+        return rows;
+    };
+
+
+    NLUExpertFeedbackUtil.createIrrelevantUtteranceObject = function(utteranceGr) {
+
+        return {
+            'sys_id': utteranceGr.getUniqueValue(),
+            'utterance': utteranceGr.getValue('text'),
+            'corrected_intent': utteranceGr.getValue('correct_label'),
+            'source': utteranceGr.getDisplayValue('source'),
+            'last_modified': utteranceGr.getValue('sys_updated_on')
+        };
+    };
+
+
+    NLUExpertFeedbackUtil.getIrrelevantUtterances = function(offset, limit, searchText, model) {
+
+        var irrelevant_utterances = [];
+        var windowEnd = offset + limit;
+        var utteranceGr = new GlideRecord('ml_labeled_data');
+        if (model === "irrelevant") {
+            utteranceGr.addQuery('label_type', 'irrelevant');
+        } else if (model) {
+            utteranceGr.addQuery('label_type', 'irrelevant_to_this_model');
+            utteranceGr.addQuery('label', 'CONTAINS', model);
+        } else {
+            utteranceGr.addEncodedQuery('label_type=irrelevant^ORlabel_type=irrelevant_to_this_model');
+        }
+
+        if (searchText) {
+            utteranceGr.addQuery('text', 'CONTAINS', searchText);
+        }
+        utteranceGr.orderByDesc('sys_updated_on');
+        utteranceGr.chooseWindow(offset, windowEnd);
+        utteranceGr.query();
+
+        while (utteranceGr.next()) {
+            irrelevant_utterances.push(NLUExpertFeedbackUtil.createIrrelevantUtteranceObject(utteranceGr));
+        }
+
+        return irrelevant_utterances;
+    };
+
+    NLUExpertFeedbackUtil.getTotalIrrelevantUtterancesCount = function(searchText, model) {
+        var utteranceGr = new GlideRecord('ml_labeled_data');
+        if (model === "irrelevant") {
+            utteranceGr.addQuery('label_type', 'irrelevant');
+        } else if (model) {
+            utteranceGr.addQuery('label_type', 'irrelevant_to_this_model');
+            utteranceGr.addQuery('label', 'CONTAINS', model);
+        } else {
+            utteranceGr.addEncodedQuery('label_type=irrelevant^ORlabel_type=irrelevant_to_this_model');
+        }
+        if (searchText) {
+            utteranceGr.addQuery('text', 'CONTAINS', searchText);
+        }
+        utteranceGr.query();
+        return utteranceGr.getRowCount();
+    };
+
+
+    NLUExpertFeedbackUtil.getModelOptimizeInfo = function(modelId) {
+        var modelStatusGr = global.NLUModel.getModelStatusGr(modelId);
+        var trainedVersion = modelStatusGr.getValue('trained_version');
+        var latestTrainOptimizeInfo = NLUBatchTestExecution.getReportInfo(modelId, true, trainedVersion, true) || {};
+        var latestModelPublished = trainedVersion === modelStatusGr.getValue('published_version');
+        return {
+            executionId: latestTrainOptimizeInfo.executionId,
+            definitionId: latestTrainOptimizeInfo.definitionId,
+            status: latestTrainOptimizeInfo.status,
+            lastTrainedVersionOptimizedOn: latestTrainOptimizeInfo.lastTrainedVersionOptimizedOn,
+            latestModelPublished: latestModelPublished
+        };
+    };
+
+    NLUExpertFeedbackUtil.labeledCountSince = function(modelName, fromDate) {
+        var ga = new GlideAggregate(tables.ULT);
+        ga.addQuery('product', 'nlu');
+        if (fromDate) ga.addQuery('sys_updated_on', '&gt;=', new GlideDateTime(fromDate));
+        ga.addEncodedQuery('labelSTARTSWITHintent:' + modelName + '.^ORlabelSTARTSWITHmodel:' + modelName);
+        ga.addAggregate('COUNT');
+        ga.query();
+        return ga.next() &amp;&amp; parseInt(ga.getAggregate('COUNT')) || 0;
+    };
+
+    NLUExpertFeedbackUtil.getLabelFromReference = function(label_reference) {
+        var gr = new GlideRecord(coreTables.SYS_NLU_INTENT);
+        if (gr.get(label_reference))
+            return 'intent:' + gr.model.name + '.' + gr.name;
+        return '';
+    };
+
+    NLUExpertFeedbackUtil.getReferenceFromLabel = function(label) {
+        if (!label || !label.includes(":")) return null;
+        var labelTable = '';
+        var query = '';
+        var labelArr1 = label.split(":");
+        if (labelArr1[0] === 'intent' &amp;&amp; labelArr1[1].includes(".")) {
+            labelTable = coreTables.SYS_NLU_INTENT;
+            var labelArr2 = labelArr1[1].split(".");
+            query = 'model.name=' + labelArr2[0] + '^name=' + labelArr2[1];
+        } else if (labelArr1[0] === 'model') {
+            labelTable = coreTables.SYS_NLU_MODEL;
+            query = 'name=' + labelArr1[1];
+        }
+        if (!query) return null;
+        var gr = new GlideRecord(labelTable);
+        gr.addEncodedQuery(query);
+        gr.setLimit(1);
+        gr.orderBy('sys_updated_on');
+        gr.query();
+        if (gr.next()) {
+            return {
+                label_table: labelTable,
+                label_reference: gr.getUniqueValue()
+            };
+        }
+        return null;
+    };
+
+    NLUExpertFeedbackUtil.prototype = {
+        initialize: function(category) {
+            this.category = category || 'virtual_agent';
+            this.modelToIntentMap = {};
+            this.lctDeletes = [];
+            this.ultDeletes = [];
+            this.uftDeletes = [];
+            this.uncategorizedUtterances = {};
+            this.uncategorizedUtterances[tabNames.TODO] = 0;
+            this.uncategorizedUtterances[tabNames.DONE] = 0;
+        },
+
+        getModelList: function() {
+            this._populateModelIntentMap(tables.LCT, 'suggested_label');
+            this._populateModelIntentMap(tables.ULT, 'label');
+
+            var modelList = [];
+            for (var modelName in this.modelToIntentMap) {
+                var aggr = new GlideAggregate(coreTables.SYS_NLU_INTENT);
+                aggr.addQuery('model.name', modelName);
+                aggr.addQuery('name', this.modelToIntentMap[modelName]);
+                aggr.groupBy('model');
+                aggr.addAggregate('COUNT');
+                aggr.query();
+                if (aggr.next()) {
+                    var statusGr = new GlideRecord(coreTables.SYS_NLU_MODEL_STATUS);
+                    statusGr.addQuery('model.name', modelName);
+                    statusGr.query();
+
+                    modelList.push({
+                        modelId: aggr.getValue('model'),
+                        displayName: aggr.getDisplayValue('model'),
+                        intentCount: aggr.getAggregate('COUNT') || 0,
+                        name: modelName,
+                        language: aggr.model.language,
+                        lastTunedOn: statusGr.next() ? statusGr.getValue('last_tuned_on') : null
+                    });
+                }
+            }
+
+            var modelAgg = new GlideAggregate(coreTables.SYS_NLU_MODEL_STATUS);
+            modelAgg.addQuery('published_version', '&gt;=', '1');
+            modelAgg.addAggregate('COUNT');
+            modelAgg.query();
+
+            return {
+                hasPublishedModels: modelAgg.next() &amp;&amp; modelAgg.getAggregate('COUNT') &gt; 0,
+                modelList: modelList,
+                uncategorizedUtterances: this.uncategorizedUtterances
+            };
+        },
+
+        getIntentList: function(modelId) {
+            var intentsData = [];
+
+            if (!modelId) {
+                return {
+                    intents: intentsData
+                };
+            }
+
+            var intentGr = new GlideRecord(coreTables.SYS_NLU_INTENT);
+            intentGr.addQuery('model', modelId);
+            intentGr.query();
+            var modelName = null;
+            var intentDataMap = {};
+            while (intentGr.next()) {
+                if (!modelName) modelName = intentGr.model.name;
+                var label = 'intent:' + modelName + '.' + intentGr.name;
+                intentDataMap[label] = {
+                    intentId: intentGr.getUniqueValue(),
+                    name: intentGr.getValue('name'),
+                    label: label
+                };
+            }
+
+            if (this.category == 'issue_auto_resolution') {
+                var intentLabel = 'intent:' + modelName + '.' + 'NO_INTENT';
+                intentDataMap[intentLabel] = {
+                    intentId: '',
+                    name: 'NO_INTENT',
+                    label: intentLabel
+                };
+            }
+
+            var reviewProgressMap = this.getReviewProgressMap(Object.keys(intentDataMap), modelId);
+            for (var _label in reviewProgressMap) {
+                intentDataMap[_label].reviewProgress = reviewProgressMap[_label];
+                intentsData.push(intentDataMap[_label]);
+            }
+
+            var optimizeData = NLUExpertFeedbackUtil.getModelOptimizeInfo(modelId);
+            return {
+                optimizeData: optimizeData,
+                labeledCountSinceLastOptimized: NLUExpertFeedbackUtil.labeledCountSince(modelName, optimizeData.lastTrainedVersionOptimizedOn),
+                intents: intentsData
+            };
+        },
+
+        getReviewProgressMap: function(labelList, modelId) {
+            var reviewProgressMap = {};
+            var doneData = this._getUtteranceCountForLabels(
+                tables.ULT,
+                'label',
+                labelList,
+                modelId
+            );
+            var todoFurtherReviewData = this._getTodoFurtherReviewCountForLabels(
+                labelList
+            );
+            var todoData = todoFurtherReviewData[tabNames.TODO] || {};
+            var furtherReviewData = todoFurtherReviewData[tabNames.FURTHER_REVIEW] || {};
+
+            labelList.forEach(function(_label) {
+                var todo = todoData[_label] || 0;
+                var done = doneData[_label] || 0;
+                var furtherReview = furtherReviewData[_label] || 0;
+                if (!_label) { // For uncategorised utterances:
+                    todo += furtherReview;
+                    furtherReview = 0;
+                }
+                if (todo + done + furtherReview &gt; 0) {
+                    reviewProgressMap[_label] = {};
+                    reviewProgressMap[_label][tabNames.TODO] = todo;
+                    reviewProgressMap[_label][tabNames.DONE] = done;
+                    reviewProgressMap[_label][tabNames.FURTHER_REVIEW] = furtherReview;
+                }
+            });
+
+            return reviewProgressMap;
+        },
+
+        /**
+         *
+         * feedbackConfig example
+         * {
+         *  "todo": {
+         *      "sysId1": {
+         *          "feedback": "positive"
+         *      }
+         *  },
+         *  "done": {
+         *      "sysId11": {
+         *          "feedback": "negative",
+         *          "correct_label_reference": "sysId3434"
+         *      }
+         *  },
+         *  "review": {
+         *      "sysId23": {
+         *          "feedback": "notsure"
+         *      }
+         *  }
+         * }
+         */
+
+        updateFeedback: function(selectedIntent, feedbackConfig) {
+            try {
+                if (Object.keys(feedbackConfig[tabNames.TODO]).length &gt; 0) {
+                    this._updateTodoFeedback(feedbackConfig[tabNames.TODO]);
+                }
+                if (Object.keys(feedbackConfig[tabNames.DONE]).length &gt; 0) {
+                    this._updateDoneFeedback(feedbackConfig[tabNames.DONE]);
+                }
+                if (Object.keys(feedbackConfig[tabNames.FURTHER_REVIEW]).length &gt; 0) {
+                    this._updateReviewFeedback(feedbackConfig[tabNames.FURTHER_REVIEW]);
+                }
+                var modelIntentStr = (selectedIntent &amp;&amp; selectedIntent.substring(7)) || false;
+                var tgtModel = modelIntentStr &amp;&amp; modelIntentStr.split('.')[0];
+                var modelGr = global.NLUModel.getGRByName(tgtModel);
+                var map = this.getReviewProgressMap([selectedIntent], modelGr ? modelGr.getValue('sys_id') : null);
+                if (map &amp;&amp; map[selectedIntent]) {
+                    return map[selectedIntent];
+                }
+            } catch (error) {
+                throw error;
+            }
+            return {};
+        },
+        updateCorrectedLabel: function(feedbackConfig) {
+            try {
+                this._updateDoneFeedback(feedbackConfig[tabNames.DONE]);
+            } catch (error) {
+                throw error;
+            }
+            return {};
+
+        },
+        _updateTodoFeedback: function(todoConfig) {
+            var sysIds = Object.keys(todoConfig);
+            for (var i = 0; i &lt; sysIds.length; i++) {
+                var sysId = sysIds[i];
+                var correct_label_reference = todoConfig[sysId].correct_label_reference || '';
+                var feedback = todoConfig[sysId].feedback;
+                var lctData = this._getLCTRecord(sysId);
+                if (feedback === outcomes.MATCH) {
+                    // 1. Create record in ULT (label_type: positive)
+                    this._createULTRecord({
+                        text: lctData.text,
+                        product: lctData.product,
+                        source: lctData.source,
+                        label: lctData.label,
+                        label_type: outcomes.MATCH,
+                        prediction_probability: lctData.prediction_probability,
+                        label_rank: lctData.label_rank
+                    });
+                    // 2. Remove record in LCT
+                    this._markLCTDelete(sysId);
+                } else if (feedback === outcomes.MISMATCH || feedback === outcomes.IRRELEVANT || feedback === outcomes.IRRELEVANT_TO_THIS_MODEL) {
+                    // 1. Create record in ULT (label_type: negative, correct_label_reference if given)
+                    this._createULTRecord({
+                        text: lctData.text,
+                        product: lctData.product,
+                        source: lctData.source,
+                        label: lctData.label,
+                        label_type: feedback,
+                        correct_label_reference: correct_label_reference,
+                        prediction_probability: lctData.prediction_probability,
+                        label_rank: lctData.label_rank
+                    });
+                    // 2. Remove record in LCT
+                    this._markLCTDelete(sysId);
+                } else if (feedback === outcomes.UNSURE) {
+                    // 1. Create record in UFT (label_type: unsure)
+                    this._createUFTRecord({
+                        utterance_reference: sysId,
+                        utterance_table: tables.LCT,
+                        label_type: outcomes.UNSURE
+                    });
+                }
+            }
+
+            this._deleteRecords(tables.LCT);
+        },
+        _updateDoneFeedback: function(doneConfig) {
+            var sysIds = Object.keys(doneConfig);
+            for (var i = 0; i &lt; sysIds.length; i++) {
+                var sysId = sysIds[i];
+                var feedback = doneConfig[sysId].feedback;
+                var correct_label_reference = doneConfig[sysId].correct_label_reference || '';
+                var ultRecord = new GlideRecord(tables.ULT);
+                ultRecord.addQuery('sys_id', sysId);
+                ultRecord.query();
+
+                if (feedback === outcomes.MATCH) {
+                    if (ultRecord.next()) {
+                        // Update ULT record label_type
+                        ultRecord.setValue('label_type', feedback);
+                        ultRecord.setValue('label_table', coreTables.SYS_NLU_INTENT);
+                        ultRecord.setValue('correct_label_reference', '');
+                        ultRecord.update();
+                        return ultRecord.getUniqueValue();
+                    }
+                } else if (feedback === outcomes.MISMATCH || feedback === outcomes.IRRELEVANT || feedback === outcomes.IRRELEVANT_TO_THIS_MODEL) {
+                    if (ultRecord.next()) {
+                        ultRecord.setValue('label_type', feedback);
+                        if (correct_label_reference) {
+                            ultRecord.setValue('correct_label_reference', correct_label_reference);
+                            if (gs.nil(ultRecord.getValue('label_table')))
+                                ultRecord.setValue('label_table', coreTables.SYS_NLU_INTENT);
+                        } else {
+                            ultRecord.setValue('correct_label_reference', '');
+                        }
+                        ultRecord.update();
+                    }
+                } else if (feedback === outcomes.UNSURE) {
+                    // Create record in LCT - take reference
+                    var ultData = this._getULTRecord(sysId);
+
+                    var lctSysId = global.MLLabelCandidate.createRecord({
+                        text: ultData.text,
+                        suggested_label: ultData.label,
+                        source: ultData.source,
+                        product: ultData.product,
+                        prediction_probability: ultData.prediction_probability,
+                        label_rank: ultData.label_rank
+                    });
+
+                    // Create UFT record with label_type - unsure (notsure) with utterance_reference as the above LCT record sys_id
+                    this._createUFTRecord({
+                        utterance_reference: lctSysId,
+                        utterance_table: tables.LCT,
+                        label_type: feedback
+                    });
+
+                    // delete ULT record
+                    this._markULTDelete(sysId);
+                }
+            }
+            this._deleteRecords(tables.ULT);
+        },
+        _updateReviewFeedback: function(furtherReviewConfig) {
+            var sysIds = Object.keys(furtherReviewConfig);
+
+            for (var i = 0; i &lt; sysIds.length; i++) {
+                var sysId = sysIds[i];
+                var feedback = furtherReviewConfig[sysId].feedback;
+                var correct_label_reference = furtherReviewConfig[sysId].correct_label_reference || '';
+                var uftData = this._getUFTRecord(sysId);
+                var lctData = this._getLCTRecord(uftData.utterance_reference);
+                var ultSysId;
+
+                // 1. Create record in ULT - take note of sysId
+                if (feedback === outcomes.MATCH) {
+                    ultSysId = this._createULTRecord({
+                        text: lctData.text,
+                        product: lctData.product,
+                        source: lctData.source,
+                        label: lctData.label,
+                        label_type: outcomes.MATCH,
+                        correct_label_reference: '',
+                        prediction_probability: lctData.prediction_probability,
+                        label_rank: lctData.label_rank
+                    });
+                } else if (feedback === outcomes.MISMATCH || feedback === outcomes.IRRELEVANT || feedback === outcomes.IRRELEVANT_TO_THIS_MODEL) {
+                    ultSysId = this._createULTRecord({
+                        text: lctData.text,
+                        product: lctData.product,
+                        source: lctData.source,
+                        label: lctData.label,
+                        label_type: feedback,
+                        correct_label_reference: (feedback === outcomes.IRRELEVANT || feedback === outcomes.IRRELEVANT_TO_THIS_MODEL) ? '' : correct_label_reference,
+                        prediction_probability: lctData.prediction_probability,
+                        label_rank: lctData.label_rank
+                    });
+                }
+
+
+                // 2. Update record of UFT (utterance_reference to sysId from point 1.)
+                this._updateUtteranceReference({
+                    sys_id: sysId,
+                    utterance_reference: ultSysId,
+                    utterance_table: tables.ULT,
+                    label_type: feedback,
+                    correct_label_reference: correct_label_reference
+                });
+
+                // 3. Remove record from LCT
+                this._markLCTDelete(uftData.utterance_reference);
+            }
+
+            this._deleteRecords(tables.LCT);
+
+        },
+
+        _updateUtteranceReference: function(data) {
+
+            var uftRecord = new GlideRecord(tables.LABEL_USER_FEEDBACK);
+            uftRecord.addQuery('sys_id', data.sys_id);
+            uftRecord.query();
+
+            if (uftRecord.next()) {
+                uftRecord.setValue('utterance_reference', data.utterance_reference);
+                uftRecord.setValue('utterance_table', data.utterance_table);
+                uftRecord.setValue('label_type', data.label_type);
+                uftRecord.setValue('correct_label_reference', data.correct_label_reference);
+                uftRecord.setValue('utterance_table', tables.ULT);
+                uftRecord.update();
+            }
+        },
+
+        _getLCTRecord: function(sysId) {
+            var gr = new GlideRecord(tables.LCT);
+            gr.addQuery('sys_id', sysId);
+            gr.query();
+            if (gr.next()) {
+                return {
+                    text: gr.getValue('text'),
+                    product: gr.getValue('product'),
+                    source: gr.getValue('source'),
+                    label: gr.getValue('suggested_label'),
+                    prediction_probability: gr.getValue('prediction_probability'),
+                    label_rank: gr.getValue('label_rank')
+                };
+            }
+
+            return null;
+        },
+
+        _getULTRecord: function(sysId) {
+            var gr = new GlideRecord(tables.ULT);
+            gr.addQuery('sys_id', sysId);
+            gr.query();
+            if (gr.next()) {
+                return {
+                    text: gr.getValue('text'),
+                    label: gr.getValue('label'),
+                    label_type: gr.getValue('label_type'),
+                    correct_label_reference: gr.getValue('correct_label_reference'),
+                    product: gr.getValue('product'),
+                    source: gr.getValue('source'),
+                    prediction_probability: gr.getValue('prediction_probability'),
+                    label_rank: gr.getValue('label_rank')
+                };
+            }
+
+            return null;
+        },
+
+        _getUFTRecord: function(sysId) {
+            var gr = new GlideRecord(tables.LABEL_USER_FEEDBACK);
+            gr.addQuery('sys_id', sysId);
+            gr.query();
+
+            if (gr.next()) {
+                return {
+                    utterance_reference: gr.getValue('utterance_reference'),
+                    utterance_table: gr.getValue('utterance_table'),
+                    label_type: gr.getValue('label_type'),
+                    correct_label_reference: gr.getValue('correct_label_reference'),
+                    user: gr.getValue('user')
+                };
+            }
+
+            return null;
+        },
+
+        /**
+         * To create a record in ml_labeled_data table (ULT)
+         */
+        _createULTRecord: function(data) {
+            var gr = new GlideRecord(tables.ULT);
+            gr.initialize();
+            gr.setValue('text', data.text);
+            gr.setValue('label_type', data.label_type);
+            gr.setValue('source', data.source);
+            gr.setValue('product', data.product);
+            gr.setValue('label', data.label);
+            gr.setValue('usage', 'nlu_model_train');
+            gr.setValue('prediction_probability', data.prediction_probability);
+            gr.setValue('label_rank', data.label_rank);
+            var labelRef = NLUExpertFeedbackUtil.getReferenceFromLabel(data.label);
+            if (labelRef) {
+                gr.setValue('label_reference', labelRef.label_reference);
+                gr.setValue('label_table', labelRef.label_table);
+            }
+
+            if (data.correct_label_reference) {
+                gr.setValue('correct_label_reference', data.correct_label_reference);
+                gr.setValue('correct_label', NLUExpertFeedbackUtil.getLabelFromReference(data.correct_label_reference));
+                gr.setValue('label_table', coreTables.SYS_NLU_INTENT);
+            }
+
+            gr.insert();
+
+            return gr.getUniqueValue();
+        },
+
+        /**
+         * To create a record in ml_label_candidate table (LCT)
+         */
+        _createLCTRecord: function() {},
+
+        /**
+         * To create a record in ml_label_user_feedback table (UFT)
+         */
+        _createUFTRecord: function(data) {
+            var gr = new GlideRecord(tables.LABEL_USER_FEEDBACK);
+            gr.initialize();
+            gr.setValue('utterance_reference', data.utterance_reference);
+            gr.setValue('utterance_table', data.utterance_table);
+            gr.setValue('label_type', data.label_type);
+
+            gr.insert();
+
+            return gr.getUniqueValue();
+        },
+
+        _markLCTDelete: function(sysId) {
+            this.lctDeletes.push(sysId);
+        },
+        _markULTDelete: function(sysId) {
+            this.ultDeletes.push(sysId);
+        },
+        _markUFTDelete: function(sysId) {
+            this.uftDeletes.push(sysId);
+        },
+
+        _deleteRecords: function(table) {
+            var records = [];
+            if (table === tables.LCT) {
+                records = this.lctDeletes;
+                global.MLLabelCandidate.deleteRecords('sys_idIN' + records.join(','));
+                this.lctDeletes = [];
+            } else if (table === tables.ULT) {
+                records = this.ultDeletes;
+                global.MLLabeledData.deleteRecords('sys_idIN' + records.join(','));
+                this.ultDeletes = [];
+            }
+        },
+
+        _getLabelListQuery: function(field, labels) {
+            var query = field + 'IN' + labels.join(',');
+            var index = labels.indexOf('');
+            if (index &gt; -1) {
+                query = field + 'ISEMPTY';
+                var other = labels.filter(function(x) {
+                    return x != '';
+                });
+                if (other.length &gt; 0)
+                    query += '^OR' + field + 'IN' + other.join(',');
+            }
+            return query;
+        },
+
+        _getUtteranceCountForLabels: function(tableName, field, labels, modelId) {
+            var aggr = new GlideAggregate(tableName);
+            aggr.addQuery('product', 'nlu');
+            aggr.addQuery('source', this.category);
+            aggr.addEncodedQuery(this._getLabelListQuery(field, labels));
+            aggr.addAggregate('COUNT', field);
+
+            var statusGr = new GlideRecord('sys_nlu_model_status');
+            statusGr.addQuery('model', modelId);
+            statusGr.query();
+            if (statusGr.next() &amp;&amp; statusGr.getValue('last_tuned_on')) {
+                aggr.addQuery('sys_updated_on', '&gt;=', statusGr.getValue('last_tuned_on'));
+            }
+
+            aggr.query();
+            var labelReviewCountMap = {};
+            while (aggr.next()) {
+                var label = aggr.getValue(field);
+                labelReviewCountMap[label] =
+                    parseInt(aggr.getAggregate('COUNT', field)) || 0;
+            }
+            return labelReviewCountMap;
+        },
+
+        _getTodoFurtherReviewCountForLabels: function(labels) {
+            var result = {};
+            var todo = {};
+            var furtherReview = {};
+            var aggr = new GlideAggregate(tables.DBVIEW_TODO_FURTHER_REVIEW);
+            aggr.groupBy(TODO_FURTHER_REVIEW_FIELDS.LABEL);
+            aggr.groupBy(TODO_FURTHER_REVIEW_FIELDS.UTTERANCE_REF);
+            aggr.addEncodedQuery(this._getLabelListQuery(TODO_FURTHER_REVIEW_FIELDS.LABEL, labels));
+            aggr.addAggregate('COUNT');
+            aggr.query();
+
+            while (aggr.next()) {
+                var label = aggr.getValue(TODO_FURTHER_REVIEW_FIELDS.LABEL);
+                var isFurtherReview = aggr.getValue(
+                    TODO_FURTHER_REVIEW_FIELDS.UTTERANCE_REF
+                );
+                if (isFurtherReview)
+                    furtherReview[label] =
+                    (furtherReview[label] || 0) +
+                    (parseInt(aggr.getAggregate('COUNT')) || 0);
+                else todo[label] = parseInt(aggr.getAggregate('COUNT')) || 0;
+            }
+
+            result[tabNames.TODO] = todo;
+            result[tabNames.FURTHER_REVIEW] = furtherReview;
+            return result;
+        },
+
+        _populateModelIntentMap: function(tableName, field) {
+            var aggr = new GlideAggregate(tableName);
+            aggr.addQuery('product', 'nlu');
+            aggr.addQuery('source', this.category);
+            aggr.addAggregate('COUNT', field);
+            aggr.query();
+            while (aggr.next()) {
+                var label = aggr.getValue(field);
+                if (!label) {
+                    var key = tableName === tables.LCT ? tabNames.TODO : tabNames.DONE;
+                    this.uncategorizedUtterances[key] = aggr.getAggregate('COUNT', field) || 0;
+                } else if (label.indexOf('intent:') === 0) {
+                    var modelIntentStr = label.substring('intent:'.length);
+                    var model = modelIntentStr.split('.')[0];
+                    var intent = modelIntentStr.substring(model.length + 1);
+                    if (!this.modelToIntentMap.hasOwnProperty(model))
+                        this.modelToIntentMap[model] = [];
+
+                    if (this.modelToIntentMap[model].indexOf(intent) === -1)
+                        this.modelToIntentMap[model].push(intent);
+                }
+            }
+        },
+
+
+        formatEFLListRowDefinition: function(feedbackData) {
+            var row_definition = {
+                rows: [],
+                customCellEmittedActions: [
+                    "NOW_SELECT#SELECTED_ITEM_SET",
+                    "NOW_BUTTON_STATEFUL#SELECTED_SET"
+                ]
+            };
+            if (!feedbackData) {
+                return row_definition;
+            }
+            var cellKeys = (feedbackData.length &gt; 0) ? Object.keys(feedbackData[0]) : [];
+            row_definition.rows = feedbackData.map(function(data, index) {
+                return {
+                    key: data['sys_id'],
+                    cells: cellKeys.reduce(function(cellsObj, key) {
+                        cellsObj[key] = {
+                            value: data[key]
+                        };
+                        if (key == 'corrected_intent') {
+                            cellsObj[key]['componentProps'] = {
+                                disabled: (data['mismatch'] == true || data['tabKey'] == 'uncategorized_todo' || data['tabKey'] == 'uncategorized_done') ? false : true,
+                                selectedItem: data[key],
+                                "append-to-payload": {
+                                    rowKey: data['sys_id'],
+                                    colKey: key,
+                                    tabKey: data['tabKey']
+                                }
+                            };
+                        }
+                        if (key == 'match' || key == 'mismatch' || key == 'unsure') {
+                            cellsObj[key]['componentProps'] = {
+                                "selected": data[key],
+                                "append-to-payload": {
+                                    rowKey: data['sys_id'],
+                                    colKey: key,
+                                    tabKey: data['tabKey']
+                                }
+                            }
+                        }
+                        return cellsObj;
+                    }, {})
+                };
+            });
+            return row_definition;
+        },
+
+        feedbackValues: function(feedback, id, match, mismatch, unsure, correctedIntent, showCorrectedIntent) {
+            var matchVal = match || false;
+            var mismatchVal = mismatch || false;
+            var unsureVal = unsure || false;
+            var correctedIntentVal = correctedIntent || '';
+            var showCorrectedIntentVal = showCorrectedIntent || false;
+            var unsavedFeedback = feedback &amp;&amp; feedback[id];
+            if (unsavedFeedback) {
+                switch (unsavedFeedback.feedback) {
+                    case outcomes.MATCH:
+                        matchVal = true;
+                        mismatchVal = false;
+                        unsureVal = false;
+                        correctedIntentVal = '';
+                        showCorrectedIntentVal = false;
+                        break;
+                    case outcomes.MISMATCH:
+                        matchVal = false;
+                        mismatchVal = true;
+                        unsureVal = false;
+                        correctedIntentVal = unsavedFeedback.correct_label_reference || '';
+                        showCorrectedIntentVal = true;
+                        break;
+                    case outcomes.IRRELEVANT_TO_THIS_MODEL:
+                    case outcomes.IRRELEVANT:
+                        matchVal = false;
+                        mismatchVal = true;
+                        unsureVal = false;
+                        correctedIntentVal = unsavedFeedback.feedback;
+                        showCorrectedIntentVal = true;
+                        break;
+                    case outcomes.UNSURE:
+                        matchVal = false;
+                        mismatchVal = false;
+                        unsureVal = true;
+                        correctedIntentVal = '';
+                        showCorrectedIntentVal = false;
+                        break;
+                }
+            }
+            return {
+                match: matchVal,
+                mismatch: mismatchVal,
+                unsure: unsureVal,
+                correctedIntent: correctedIntentVal,
+                showCorrectedIntent: showCorrectedIntentVal
+            };
+        },
+
+        getCorrectedIntents: function(correctedIntents, sysId, lftId, lctId, tabKey, selectedIntentId, selectedModel) {
+            return correctedIntents.map(function(correctedIntent) {
+                return {
+                    'id': correctedIntent.id,
+                    'label': correctedIntent.label,
+                    'sublabel': correctedIntent.sublabel,
+                    'sys_id': sysId,
+                    'lft_id': lftId,
+                    'lct_id': lctId,
+                    'tabKey': tabKey,
+                    'language': correctedIntent.language
+                };
+            }).filter(function(intent) {
+                return intent.id !== selectedIntentId &amp;&amp; (intent.language == selectedModel.language || !intent.language);
+            });
+        },
+
+        filterFeedback: function(filterValue, feedback, tabKey, unsavedFeedback) {
+            if (filterValue == 'match' || filterValue == 'mismatch' || filterValue == 'unsure') {
+                feedback = feedback.filter(function(feedback) {
+                    return feedback[filterValue] == true;
+                });
+            } else if (filterValue == 'unsaved') {
+                if (tabKey == tabNames.DONE) {
+                    var feedback_ids = Object.keys(unsavedFeedback);
+                    feedback = feedback.filter(function(feedback) {
+                        return feedback_ids.indexOf(feedback.sys_id) != -1;
+                    });
+                } else {
+                    feedback = feedback.filter(function(feedback) {
+                        return (feedback['match'] == true || feedback['mismatch'] == true || feedback['unsure'] == true);
+                    });
+                }
+            }
+            return {
+                feedback: feedback,
+                totalRecords: feedback.length
+            };
+        },
+
+        getTotalLabeledRecords: function(selectedIntentLabel, lastTunedOn) {
+            var totalRecords = 0;
+            var labeled_data = new GlideRecord(tables.ULT);
+            labeled_data.addQuery('label', selectedIntentLabel);
+            if (lastTunedOn) {
+                labeled_data.addQuery('sys_updated_on', '&gt;=', lastTunedOn);
+            }
+            labeled_data.query();
+            totalRecords = labeled_data.getRowCount();
+            return totalRecords;
+        },
+
+        getTotalTobeLabeledRecords: function(selectedIntentLabel) {
+            var totalRecords = 0;
+            var expert_feedback_todo_gr = new GlideRecord(tables.DBVIEW_TODO_FURTHER_REVIEW);
+            expert_feedback_todo_gr.addEncodedQuery(TODO_FURTHER_REVIEW_FIELDS.UTTERANCE_REF + 'ISEMPTY' + '^' + TODO_FURTHER_REVIEW_FIELDS.LABEL + '=' + selectedIntentLabel);
+            expert_feedback_todo_gr.query();
+            totalRecords = expert_feedback_todo_gr.getRowCount();
+            return totalRecords;
+        },
+
+        getTotalNeedsFurtherReviewRecords: function(selectedIntentLabel) {
+            var totalRecords = 0;
+            var expert_feedback_nfr_gr = new GlideRecord(tables.DBVIEW_TODO_FURTHER_REVIEW);
+            expert_feedback_nfr_gr.addEncodedQuery('lft_utterance_referenceISNOTEMPTY^lft_label_type=notsure^lct_suggested_label=' + selectedIntentLabel);
+            expert_feedback_nfr_gr.query();
+            totalRecords = expert_feedback_nfr_gr.getRowCount();
+            return totalRecords;
+        },
+
+        getTodoFeedback: function(feedback, searchText, filterValue, selectedIntentDetails, pageNumber, totalRecords, correctedIntents, selectedModelDetails) {
+            var _self = this;
+            var selectedIntentLabel = selectedIntentDetails.label;
+            var selectedIntentId = selectedIntentDetails.intentId;
+            var totalRecordsWithSearch = totalRecords;
+            var start = (pageNumber * RECORDS_PER_PAGE_LIMIT);
+            var end = Math.min((start + RECORDS_PER_PAGE_LIMIT), totalRecords);
+            var expert_feedback_todo = [];
+            var expert_feedback_todo_gr = new GlideRecord(tables.DBVIEW_TODO_FURTHER_REVIEW);
+            expert_feedback_todo_gr.addEncodedQuery(TODO_FURTHER_REVIEW_FIELDS.UTTERANCE_REF + 'ISEMPTY' + '^' + TODO_FURTHER_REVIEW_FIELDS.LABEL + '=' + selectedIntentLabel);
+            if (searchText) {
+                expert_feedback_todo_gr.addQuery('lct_text', 'CONTAINS', searchText);
+            }
+            expert_feedback_todo_gr.orderBy('lct_sys_created_on');
+            expert_feedback_todo_gr.chooseWindow(start, end);
+            expert_feedback_todo_gr.query();
+            if (searchText) {
+                totalRecordsWithSearch = expert_feedback_todo_gr.getRowCount();
+            }
+            while (expert_feedback_todo_gr.next()) {
+                var sysId = expert_feedback_todo_gr.getUniqueValue();
+                var lctId = expert_feedback_todo_gr.getValue('lct_sys_id');
+                var lftId = expert_feedback_todo_gr.getValue('lft_sys_id');
+                var feedbackValues = _self.feedbackValues(feedback, lctId);
+                var tabKey = tabNames.TODO;
+                expert_feedback_todo.push({
+                    'sys_id': sysId,
+                    'lft_id': lftId,
+                    'lct_id': lctId,
+                    'utterance': expert_feedback_todo_gr.getValue('lct_text'),
+                    'match': feedbackValues.match,
+                    'mismatch': feedbackValues.mismatch,
+                    'unsure': feedbackValues.unsure,
+                    'corrected_intent': feedbackValues.correctedIntent,
+                    'showCorrectedIntent': feedbackValues.showCorrectedIntent,
+                    'showUnsureIcon': true,
+                    'tabKey': tabKey,
+                    'correctedIntents': _self.getCorrectedIntents(correctedIntents, sysId, lftId, lctId, tabKey, selectedIntentId, selectedModelDetails)
+                });
+            }
+            if (filterValue &amp;&amp; filterValue != 'all') {
+                var filterFeedback = _self.filterFeedback(filterValue, expert_feedback_todo, tabKey);
+                expert_feedback_todo = filterFeedback.feedback;
+                totalRecordsWithSearch = filterFeedback.totalRecords;
+            }
+            return {
+                feedback: expert_feedback_todo,
+                totalRecords: totalRecordsWithSearch
+            };
+        },
+
+        getDoneFeedback: function(feedback, searchText, filterValue, selectedIntentDetails, pageNumber, totalRecords, correctedIntents, lastTunedOn, selectedModelDetails) {
+            var _self = this;
+            var totalRecordsWithSearch = totalRecords;
+            var selectedIntentLabel = selectedIntentDetails.label;
+            var selectedIntentId = selectedIntentDetails.intentId;
+            var start = (pageNumber * RECORDS_PER_PAGE_LIMIT);
+            var end = Math.min((start + RECORDS_PER_PAGE_LIMIT), totalRecords);
+            var expert_feedback_done = [];
+            var expert_feedback_done_gr = new GlideRecord(tables.ULT);
+            expert_feedback_done_gr.addQuery('label', selectedIntentLabel);
+            if (lastTunedOn) {
+                expert_feedback_done_gr.addQuery('sys_updated_on', '&gt;=', lastTunedOn);
+            }
+            if (searchText) {
+                expert_feedback_done_gr.addQuery('text', 'CONTAINS', searchText);
+            }
+            expert_feedback_done_gr.orderByDesc('sys_updated_on');
+            expert_feedback_done_gr.chooseWindow(start, end);
+            expert_feedback_done_gr.query();
+            if (searchText) {
+                totalRecordsWithSearch = expert_feedback_done_gr.getRowCount();
+            }
+            while (expert_feedback_done_gr.next()) {
+                var id = expert_feedback_done_gr.getUniqueValue();
+                var labelType = expert_feedback_done_gr.getValue('label_type');
+                var match = (labelType == 'positive') ? true : false;
+                var mismatch = (labelType == 'negative' || labelType == 'irrelevant_to_this_model' || labelType == 'irrelevant') ? true : false;
+                var unsure = false;
+                var correctedIntent = (labelType == 'irrelevant_to_this_model' || labelType == 'irrelevant') ? expert_feedback_done_gr.getValue('label_type') : expert_feedback_done_gr.getValue('correct_label_reference');
+                var showCorrectedIntent = (labelType == 'negative' || labelType == 'irrelevant_to_this_model' || labelType == 'irrelevant') ? true : false;
+                var feedbackValues = _self.feedbackValues(feedback, id, match, mismatch, unsure, correctedIntent, showCorrectedIntent);
+                var tabKey = tabNames.DONE;
+                expert_feedback_done.push({
+                    'sys_id': id,
+                    'utterance': expert_feedback_done_gr.getValue('text'),
+                    'match': feedbackValues.match,
+                    'mismatch': feedbackValues.mismatch,
+                    'unsure': feedbackValues.unsure,
+                    'corrected_intent': feedbackValues.correctedIntent,
+                    'showCorrectedIntent': feedbackValues.showCorrectedIntent,
+                    'date_modified': expert_feedback_done_gr.getDisplayValue('sys_updated_on'),
+                    'showUnsureIcon': true,
+                    'tabKey': tabKey,
+                    'correctedIntents': _self.getCorrectedIntents(correctedIntents, id, '', '', tabKey, selectedIntentId, selectedModelDetails)
+                });
+            }
+            if (filterValue &amp;&amp; filterValue != 'all') {
+                var filterFeedback = _self.filterFeedback(filterValue, expert_feedback_done, tabKey, feedback);
+                expert_feedback_done = filterFeedback.feedback;
+                totalRecordsWithSearch = filterFeedback.totalRecords;
+            }
+            return {
+                feedback: expert_feedback_done,
+                totalRecords: totalRecordsWithSearch
+            };
+        },
+
+        getNfrFeedback: function(feedback, searchText, filterValue, selectedIntentDetails, pageNumber, totalRecords, correctedIntents, selectedModelDetails) {
+            var _self = this;
+            var selectedIntentLabel = selectedIntentDetails.label;
+            var selectedIntentId = selectedIntentDetails.intentId;
+            var totalRecordsWithSearch = totalRecords;
+            var start = (pageNumber * RECORDS_PER_PAGE_LIMIT);
+            var end = Math.min((start + RECORDS_PER_PAGE_LIMIT), totalRecords);
+            var expert_feedback_nfr = [];
+            var expert_feedback_nfr_gr = new GlideRecord(tables.DBVIEW_TODO_FURTHER_REVIEW);
+            expert_feedback_nfr_gr.addEncodedQuery('lft_utterance_referenceISNOTEMPTY^lft_label_type=notsure^lct_suggested_label=' + selectedIntentLabel);
+            if (searchText) {
+                expert_feedback_nfr_gr.addQuery('lct_text', 'CONTAINS', searchText);
+            }
+            expert_feedback_nfr_gr.orderByDesc('lft_sys_created_on');
+            expert_feedback_nfr_gr.chooseWindow(start, end);
+            expert_feedback_nfr_gr.query();
+            if (searchText) {
+                totalRecordsWithSearch = expert_feedback_nfr_gr.getRowCount();
+            }
+            while (expert_feedback_nfr_gr.next()) {
+                var sysId = expert_feedback_nfr_gr.getUniqueValue();
+                var lftId = expert_feedback_nfr_gr.getValue('lft_sys_id');
+                var lctId = expert_feedback_nfr_gr.getValue('lct_sys_id');
+                var feedbackValues = _self.feedbackValues(feedback, lftId);
+                var tabKey = 'nfr';
+                expert_feedback_nfr.push({
+                    'sys_id': sysId,
+                    'lft_id': lftId,
+                    'lct_id': lctId,
+                    'utterance': expert_feedback_nfr_gr.getValue('lct_text'),
+                    'match': feedbackValues.match,
+                    'mismatch': feedbackValues.mismatch,
+                    'corrected_intent': feedbackValues.correctedIntent,
+                    'date_modified': expert_feedback_nfr_gr.getDisplayValue('lft_sys_updated_on'),
+                    'showCorrectedIntent': feedbackValues.showCorrectedIntent,
+                    'showUnsureIcon': false,
+                    'tabKey': tabKey,
+                    'correctedIntents': _self.getCorrectedIntents(correctedIntents, sysId, lftId, lctId, tabKey, selectedIntentId, selectedModelDetails)
+                });
+            }
+            if (filterValue &amp;&amp; filterValue != 'all') {
+                var filterFeedback = _self.filterFeedback(filterValue, expert_feedback_nfr, tabKey);
+                expert_feedback_nfr = filterFeedback.feedback;
+                totalRecordsWithSearch = filterFeedback.totalRecords;
+            }
+            return {
+                feedback: expert_feedback_nfr,
+                totalRecords: totalRecordsWithSearch
+            };
+        },
+
+        uncategorizedUtterancesCount: function() {
+            var mlLabelCandidate = new GlideRecord(tables.LCT);
+            mlLabelCandidate.addEncodedQuery('suggested_labelISEMPTY');
+            mlLabelCandidate.query();
+            var uncategorizedTodoUtterancesTotalRecords = mlLabelCandidate.getRowCount();
+            var mlLabeledData = new GlideRecord(tables.ULT);
+            mlLabeledData.addEncodedQuery('labelISEMPTY');
+            mlLabeledData.query();
+            var uncategorizedDoneUtterancesTotalRecords = mlLabeledData.getRowCount();
+            return {
+                uncategorizedTodoUtterancesTotalRecords: uncategorizedTodoUtterancesTotalRecords,
+                uncategorizedDoneUtterancesTotalRecords: uncategorizedDoneUtterancesTotalRecords
+            };
+        },
+
+
+        getTodoUncategorizedUtterances: function(correctedIntents, searchText, pageNumber, totalRecords) {
+            var _self = this;
+            var todoUncategorizedUtterances = [];
+            var totalRecordsWithSearch = totalRecords;
+            var start = (pageNumber * RECORDS_PER_PAGE_LIMIT);
+            var end = Math.min((start + RECORDS_PER_PAGE_LIMIT), totalRecords);
+            var mlLabelCandidate = new GlideRecord(tables.LCT);
+            mlLabelCandidate.addEncodedQuery('suggested_labelISEMPTY');
+            if (searchText) {
+                mlLabelCandidate.addQuery('text', 'CONTAINS', searchText);
+            }
+            mlLabelCandidate.orderByDesc('sys_created_on');
+            mlLabelCandidate.chooseWindow(start, end);
+            mlLabelCandidate.query();
+            if (searchText) {
+                totalRecordsWithSearch = mlLabelCandidate.getRowCount();
+            }
+            while (mlLabelCandidate.next()) {
+                var recommendation = mlLabelCandidate.getValue('recommendation');
+                var recommendedModel = '';
+                var recommendedIntent = '';
+                if (recommendation) {
+                    var recommendedModelIntent = recommendation.split(':')[1];
+                    recommendedModel = _self.getModelDisplayName(recommendedModelIntent.split('.')[0]);
+                    recommendedIntent = recommendedModelIntent.split('.')[1];
+                }
+                todoUncategorizedUtterances.push({
+                    'sys_id': mlLabelCandidate.getUniqueValue(),
+                    'utterance': mlLabelCandidate.getValue('text'),
+                    'corrected_intent': "",
+                    'tabKey': 'uncategorized_todo',
+                    'recommended_model': recommendedModel,
+                    'recommended_intent': recommendedIntent,
+                    'date_modified': mlLabelCandidate.getDisplayValue('sys_updated_on'),
+                    'correctedIntents': correctedIntents.map(function(correctedIntent) {
+                        return {
+                            'id': correctedIntent.id,
+                            'label': correctedIntent.label,
+                            'sublabel': correctedIntent.sublabel,
+                            'sys_id': mlLabelCandidate.getUniqueValue(),
+                            'tabKey': 'uncategorized_todo'
+                        };
+                    })
+                });
+            }
+            return {
+                totalRecords: totalRecordsWithSearch,
+                uncategorizedUtterances: todoUncategorizedUtterances
+            }
+
+        },
+
+        getDoneUncategorizedUtterances: function(correctedIntents, searchText, pageNumber, totalRecords) {
+            var _self = this;
+            var doneUncategorizedUtterances = [];
+            var totalRecordsWithSearch = totalRecords;
+            var start = (pageNumber * RECORDS_PER_PAGE_LIMIT);
+            var end = Math.min((start + RECORDS_PER_PAGE_LIMIT), totalRecords);
+            var mlLabeledData = new GlideRecord(tables.ULT);
+            mlLabeledData.addEncodedQuery('labelISEMPTY');
+            if (searchText) {
+                mlLabeledData.addQuery('text', 'CONTAINS', searchText);
+            }
+            mlLabeledData.orderByDesc('sys_created_on');
+            mlLabeledData.chooseWindow(start, end);
+            mlLabeledData.query();
+            if (searchText) {
+                totalRecordsWithSearch = mlLabeledData.getRowCount();
+            }
+            while (mlLabeledData.next()) {
+                var labelType = mlLabeledData.getValue('label_type');
+                var recommendation = mlLabeledData.getValue('recommendation');
+                var recommendedModel = '';
+                var recommendedIntent = '';
+                if (recommendation) {
+                    var recommendedModelIntent = recommendation.split(':')[1];
+                    recommendedModel = _self.getModelDisplayName(recommendedModelIntent.split('.')[0]);
+                    recommendedIntent = recommendedModelIntent.split('.')[1];
+                }
+                doneUncategorizedUtterances.push({
+                    'sys_id': mlLabeledData.getUniqueValue(),
+                    'utterance': mlLabeledData.getValue('text'),
+                    'corrected_intent': (labelType == outcomes.IRRELEVANT_TO_THIS_MODEL || labelType == outcomes.IRRELEVANT) ? mlLabeledData.getValue('label_type') : mlLabeledData.getValue('correct_label_reference'),
+                    'tabKey': 'uncategorized_done',
+                    'recommended_model': recommendedModel,
+                    'recommended_intent': recommendedIntent,
+                    'date_modified': mlLabeledData.getDisplayValue('sys_updated_on'),
+                    'correctedIntents': correctedIntents.map(function(correctedIntent) {
+                        return {
+                            'id': correctedIntent.id,
+                            'label': correctedIntent.label,
+                            'sublabel': correctedIntent.sublabel,
+                            'sys_id': mlLabeledData.getUniqueValue(),
+                            'tabKey': 'uncategorized_done'
+                        };
+                    })
+                });
+            }
+            return {
+                totalRecords: totalRecordsWithSearch,
+                uncategorizedUtterances: doneUncategorizedUtterances
+            }
+        },
+
+        getTuneModelFeedback: function(searchText, intentId, modelId, lastTunedOn) {
+            var feedback = [];
+            var feedbackRowDefinition = {
+                rows: []
+            };
+            var labeled_data = new GlideRecord(tables.ULT);
+            if (searchText) {
+                labeled_data.addQuery('text', 'CONTAINS', searchText);
+            }
+            if (lastTunedOn) {
+                labeled_data.addQuery('sys_updated_on', '&gt;=', lastTunedOn);
+            }
+            if (intentId == 'irrelevant' || intentId == 'irrelevant_to_this_model') {
+                labeled_data.addQuery('label_type', intentId);
+            }
+            var intent = labeled_data.addJoinQuery(tables.SYS_NLU_INTENT, 'label_reference', 'sys_id');
+            intent.addCondition('model', modelId);
+            labeled_data.orderByDesc('sys_updated_on');
+            labeled_data.query();
+            while (labeled_data.next()) {
+                var labelType = labeled_data.getValue('label_type');
+                var correctedIntent = labeled_data.getValue('correct_label_reference');
+                feedback.push({
+                    'sys_id': labeled_data.getUniqueValue(),
+                    'utterance': labeled_data.getValue('text'),
+                    'correctedIntent': correctedIntent,
+                    'intentKey': (labelType == 'irrelevant_to_this_model' || labelType == 'irrelevant') ? labeled_data.getValue('label_type') : (labelType == 'negative' &amp;&amp; correctedIntent) ? labeled_data.getValue('correct_label_reference') : labeled_data.getValue('label_reference'),
+                    'intent': (labelType == 'irrelevant_to_this_model' || labelType == 'irrelevant') ? labeled_data.getDisplayValue('label_type') : (labelType == 'negative' &amp;&amp; correctedIntent) ? labeled_data.correct_label_reference.name.toString() : labeled_data.label_reference.name.toString(),
+                });
+            }
+            if (intentId &amp;&amp; intentId != 'all' &amp;&amp; intentId != 'irrelevant' &amp;&amp; intentId != 'irrelevant_to_this_model') {
+                feedback = feedback.filter(function(feedback) {
+                    return ((feedback.intentKey == intentId) || (feedback.correctedIntent == intentId));
+                });
+            }
+
+            if (feedback.length &gt; 0) {
+                var cellKeys = Object.keys(feedback[0]);
+                feedbackRowDefinition.rows = feedback.map(function(data) {
+                    return {
+                        key: data['sys_id'],
+                        cells: cellKeys.reduce(function(cellsObj, key) {
+                            cellsObj[key] = {
+                                value: data[key]
+                            };
+                            return cellsObj;
+                        }, {})
+                    };
+                });
+
+            }
+            return {
+                feedback: feedback,
+                feebackRowDefinition: feedbackRowDefinition
+            }
+        },
+
+        getTuneModelFeedbackIntentsList: function(searchText, intentId, modelId, lastTunedOn) {
+            var _self = this;
+            var tuneModelFeedback = _self.getTuneModelFeedback(searchText, intentId, modelId, lastTunedOn) || {};
+            var feedbackData = [];
+            if (!searchText &amp;&amp; !intentId) {
+                feedbackData = tuneModelFeedback.feedback;
+            } else {
+                var labeledData = new GlideRecord(tables.ULT);
+                if (lastTunedOn) {
+                    labeledData.addQuery('sys_updated_on', '&gt;=', lastTunedOn);
+                }
+                var nlu_intent = labeledData.addJoinQuery(tables.SYS_NLU_INTENT, 'label_reference', 'sys_id');
+                nlu_intent.addCondition('model', modelId);
+                labeledData.orderByDesc('sys_updated_on');
+                labeledData.query();
+                while (labeledData.next()) {
+                    var label_type = labeledData.getValue('label_type');
+                    var corrected_intent = labeledData.getValue('correct_label_reference');
+                    feedbackData.push({
+                        'intentKey': (label_type == 'irrelevant_to_this_model' || label_type == 'irrelevant') ? labeledData.getValue('label_type') : (label_type == 'negative' &amp;&amp; corrected_intent) ? labeledData.getValue('correct_label_reference') : labeledData.getValue('label_reference'),
+                        'intent': (label_type == 'irrelevant_to_this_model' || label_type == 'irrelevant') ? labeledData.getDisplayValue('label_type') : (label_type == 'negative' &amp;&amp; corrected_intent) ? labeledData.correct_label_reference.name.toString() : labeledData.label_reference.name.toString()
+                    });
+                }
+            }
+
+            var tuneModelIntentFilterList = [{
+                id: 'all',
+                label: 'All Intents',
+            }];
+
+            var tuneModelIntents = {};
+            var viewFeedbackIntents = feedbackData.map(function(feedback) {
+                if (tuneModelIntents[feedback.intentKey]) {
+                    return null;
+                }
+                tuneModelIntents[feedback.intentKey] = true;
+                return {
+                    id: feedback.intentKey,
+                    label: feedback.intent,
+                };
+            }).filter(Boolean);
+            tuneModelIntentFilterList = tuneModelIntentFilterList.concat(viewFeedbackIntents);
+            return {
+                filterList: tuneModelIntentFilterList
+            };
+        },
+        getModelDisplayName: function(modelName) {
+            var modelDisplayName = modelName;
+            var nluModel = new GlideRecord(tables.SYS_NLU_MODEL);
+            nluModel.addQuery('name', modelName);
+            nluModel.query();
+            if (nluModel.next()) {
+                modelDisplayName = nluModel.getValue('display_name');
+            }
+            return modelDisplayName;
+        },
+        getEFLCorrectedIntents: function(modelId) {
+            var category = this.category;
+            var correctedIntents = [];
+            var correctedIntentsGr = new GlideRecord('sys_nlu_intent');
+            if (category === 'virtual_agent') {
+                correctedIntents.push({
+                    id: 'irrelevant_to_this_model',
+                    label: gs.getMessage('Mark as not relevant to this model'),
+                    sublabel: ''
+                }, {
+                    id: 'irrelevant',
+                    label: gs.getMessage('Mark as not relevant to any model'),
+                    sublabel: ''
+                });
+                var modelStatus = correctedIntentsGr.addJoinQuery('sys_nlu_model_status', 'model', 'model');
+                correctedIntentsGr.addQuery('model.category', category);
+                modelStatus.addCondition('published_version', '&gt;', 0);
+            } else {
+                correctedIntents.push({
+                    id: 'irrelevant',
+                    label: gs.getMessage('Mark as not relevant'),
+                    sublabel: ''
+                });
+                if (modelId) {
+                    correctedIntentsGr.addQuery('model', modelId);
+                }
+            }
+            correctedIntentsGr.query();
+            while (correctedIntentsGr.next()) {
+                correctedIntents.push({
+                    'id': correctedIntentsGr.getUniqueValue(),
+                    'label': correctedIntentsGr.getValue('name'),
+                    'sublabel': correctedIntentsGr.model.display_name.toString(),
+                    'language': correctedIntentsGr.model.language.toString(),
+                });
+            }
+            return correctedIntents;
+        },
+        type: 'NLUExpertFeedbackUtil'
+    };
+})();]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-10-29 09:41:30&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;8c1168780723301028ef0a701ad3002c&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;240&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;NLUExpertFeedbackUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="NLU Workbench - Advanced Features" source="sn_nlu_workbench"&gt;31f5f491c3a710100bf407720f40ddf4&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="NLU Workbench - Advanced Features"&gt;31f5f491c3a710100bf407720f40ddf4&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_8c1168780723301028ef0a701ad3002c&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-07-14 10:26:39&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:45:08</sys_created_on>
+        <sys_id>df78705183341210c6695855eeaad392</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>NLUExpertFeedbackUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_df78705183341210c6695855eeaad392</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:45:08</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

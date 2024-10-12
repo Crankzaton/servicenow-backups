@@ -1,0 +1,322 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>6cab26e6eb86211078aca892e25228b8</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_entitlement.MigrateLicenseDataToSMV2&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Migrate Subscription Data from SURF based entitlement management system to SMV2&lt;/description&gt;
+        &lt;name&gt;MigrateLicenseDataToSMV2&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var MigrateLicenseDataToSMV2 = Class.create();
+MigrateLicenseDataToSMV2.prototype = {
+    initialize: function() {
+        this._logger = new LoggingUtil();
+        this._licenseGroupHasSubscriptionService = new sn_entitlement.LicenseGroupHasSubscriptionDAO();
+        this._subscriptionEntitlementService = new sn_entitlement.SubscriptionEntitlementDao();
+        this._groupHasSubscriptionDAOService = new sn_entitlement.GroupHasSubscriptionDAO();
+        this._licenseDetailsAuditLogDAOService = new sn_entitlement.LicenseDetailsAuditLogDAO();
+        this._subscriptionEntitlementAuditLogDAOService = new sn_entitlement.SubscriptionEntitlementAuditLogDAO();
+        this._licenseCustTableAllotmentDAO = new sn_entitlement.LicenseCustTableAllotmentDAO();
+        this._customTableInventoryDAO = new sn_entitlement.CustomTableInventoryDAO();
+        this._licenseDetailMetricHistoryDAO = new sn_entitlement.LicenseDetailMetricHistoryDAO();
+        this._subscriptionDetailDAO = new sn_entitlement.SubscriptionDetailDao();
+        this._licensingEngineGlobalHelper = new global.LicensingEngineGlobalHelper();
+        this.logMessages = {
+            'NO_GROUP_TO_SUBSCRIPTION_MAPPING': "No group to subscription mapping found on customer instance.",
+            'NO_SUBSCRIPTION_FOUND': "The subscription(s) mapped to group(s) missing on customer instance.",
+            'REQUIRED_SUBSCRIPTION_MISSING': "Subscription required for product is missing - [product code]:",
+            'GROUPS_NOT_ELIGIBLE_FOR_MIGRATION': "No Group(s) found eligible for migration. Either the group mapping already exist in table or subscription mapped to group is missing on customer instance.",
+            'NUMBER_OF_GROUPS_MIGRATED': "Number of Group(s) successfully migrated: ",
+            'GROUPS_MIGRATED_SUCCESSFULLY': "Group(s) successfully migrated to SMV2: ",
+            'INITIATE_GROUP_MIGRATION': "[start group to subscription mapping data migration]",
+            'GROUP_MIGRATION_FAILED': "[group to subscription mapping data migration failed]",
+            'USER_MIGRATION_FAILED': "[user to subscription mapping data migration failed]",
+            'GROUP_MIGRATION_COMPLETE': "[group to subscription mapping data migration complete]",
+            'USER_MIGRATION_COMPLETE': "[user to subscription mapping data migration complete]",
+            'DUPLICATE_GROUP_FOUND': "Group mapping already present in group_has_subscription table",
+            'INITIATE_ENTITLEMENT_HISTORY_MIGRATION': "[start entitlement purchase history log migration]",
+            'ENTITLEMENT_PURCHASE_HISTORY_DATA_MIGRATION_COMPLETE': "[entitlement purchase history log migration complete]",
+            'ENTITLEMENT_PURCHASE_HISTORY_DATA_NOT_FOUND': "Entitlement purchase history data not found",
+            'SCRIPT_EXCEPTION': "Execution failed with exception. Exception - ",
+            'INITIATE_CUSTOM_TABLE_MAPPING': "Start custom table reference mapping",
+            'CUSTOM_TABLE_MAPPING_COMPLETE': "Custom table mapping successfully completed.",
+            'INITIATE_LICENSE_CUSTOM_TABLE_ALLOTMENT_MAPPING': "Start license_cust_table_allotment reference mapping",
+            'LICENSE_CUSTOM_TABLE_ALLOTMENT_MAPPED_SUCCESSFULLY': "license_cust_table_allotment mapping successfully completed.",
+            'INITIATE_CUSTOM_TABLE_INVENTORY_MAPPING': "Start ua_custom_table_inventory reference mapping",
+            'CUSTOM_TABLE_INVENTORY_MAPPED_SUCCESSFULLY': "ua_custom_table_inventory mapping successfully completed.",
+            'INITIATE_ALLOTMENT_HISTORY_MIGRATION': "[start allotment history migration]",
+            'ENTITLEMENT_ALLOTMENT_HISTORY_DATA_MIGRATION_COMPLETE': "[entitlement allotment history log migration complete]",
+            'ENTITLEMENT_ALLOTMENT_HISTORY_DATA_NOT_FOUND': "Entitlement allotment history data not found"
+        };
+    },
+
+    /**
+     * Migrates the Licensing data from SMV1 to SMV2
+     *
+     */
+    migrate: function() {
+        var migrationSummary = [];
+
+        try {
+            migrationSummary.push(this._migrateGroupToSubscriptionMapping());
+            migrationSummary.push(this._migrateUserToSubscriptionMapping());
+            migrationSummary.push(this._migrateEntitlementPurchaseHistory());
+            migrationSummary.push(this._mapSubscriptionReferenceForCustomTables());
+            migrationSummary.push(this._migrateAllotmentHistory());
+        } catch (e) {
+            let errorMessage = this.logMessages['SCRIPT_EXCEPTION'] + e;
+            this._logger.logError(this.type, "migrate", errorMessage);
+            migrationSummary.push(this._createMigrationResultObject("migrate", false, errorMessage, true));
+        }
+
+        return migrationSummary;
+    },
+
+    _migrateUserToSubscriptionMapping: function() {
+        try {
+            new sn_entitlement.UserSubscriptionMapper().syncUsersToSubscriptions();
+            this._logger.logInfo(this.type, "_migrateUserToSubscriptionMapping", this.logMessages['USER_MIGRATION_COMPLETE']);
+            return this._createMigrationResultObject("migrateUserToSubscriptionMapping", true, this.logMessages['USER_MIGRATION_COMPLETE'], false);
+        } catch (e) {
+            this._logger.logError(this.type, "_migrateUserToSubscriptionMapping", this.logMessages['USER_MIGRATION_FAILED']);
+            return this._createMigrationResultObject("migrateUserToSubscriptionMapping", false, this.logMessages['USER_MIGRATION_FAILED'], true);
+        }
+    },
+
+    /**
+     * Migrate Data from license_group_has_subscription to group_has_subscription
+     */
+    _migrateGroupToSubscriptionMapping: function() {
+        this._logger.logInfo(this.type, "_migrateGroupToSubscriptionMapping", this.logMessages['INITIATE_GROUP_MIGRATION']);
+
+        //&lt;key:groupSysId, value: productCode&gt; derived from license_group_has_subscription
+        const groupSysIdToProductCodeMap = this._licenseGroupHasSubscriptionService.getGroupSysIdToProductCodeMap();
+        if (global.JSUtil.nil(groupSysIdToProductCodeMap)) {
+            this._logger.logInfo(this.type, "_migrateGroupToSubscriptionMapping", this.logMessages['NO_GROUP_TO_SUBSCRIPTION_MAPPING']);
+            return this._createMigrationResultObject("migrateGroupToSubscriptionMapping", false, this.logMessages['NO_GROUP_TO_SUBSCRIPTION_MAPPING'], false);
+        }
+
+        const productCodes = Object.values(groupSysIdToProductCodeMap);
+
+        //&lt;key:productCode, value: subscriptionSysId&gt; derived from subscription_entitlement
+        const productCodeToEmsSubscriptionSysIdMap = this._subscriptionEntitlementService.getProductCodeToEmsSubscriptionSysIdMap(productCodes);
+        if (global.JSUtil.nil(productCodeToEmsSubscriptionSysIdMap)) {
+            this._logger.logError(this.type, "_migrateGroupToSubscriptionMapping", this.logMessages['GROUP_MIGRATION_COMPLETE'] + this.logMessages['NO_SUBSCRIPTION_FOUND']);
+            return this._createMigrationResultObject("migrateGroupToSubscriptionMapping", false, this.logMessages['NO_SUBSCRIPTION_FOUND'], false);
+        }
+        const existingGroupSysIdsMappedToSubscription = this._groupHasSubscriptionDAOService.getGroupsMappedToSubscription();
+        const groupToSubscriptionMappingDataToMigrate = [];
+
+        for (let mapKey in groupSysIdToProductCodeMap) {
+            let productCode = groupSysIdToProductCodeMap[mapKey];
+            if (groupSysIdToProductCodeMap[mapKey] === "group_mapped_to_license_with_no_product_code" || groupSysIdToProductCodeMap[mapKey] === "group_mapped_to_consolidated_license")
+                this._logger.logError(this.type, "_migrateGroupToSubscriptionMapping", this.logMessages['GROUP_MIGRATION_FAILED'] + " for group sysId: " + mapKey + " reason: " + productCode);
+            else {
+                const subscriptionSysId = productCodeToEmsSubscriptionSysIdMap[productCode]; //find the sysID of license from subscription entitlement table with product code
+
+                if (global.JSUtil.nil(subscriptionSysId)) {
+                    this._logger.logError(this.type, "_migrateGroupToSubscriptionMapping", this.logMessages['GROUP_MIGRATION_FAILED'] + " for group sysId: " + mapKey + " reason: " + this.logMessages['REQUIRED_SUBSCRIPTION_MISSING'] + productCode);
+                    continue;
+                }
+				/**
+				 * key for the map is - groupSysID-productCode
+				 * b85d44954a3623120004689b2d5dd60a-PROD17145
+				 * The combination of group to product code(subscription) will always be unique
+				 */
+				var groupSysId = global.JSUtil.nil(mapKey.split('-')) ? null : mapKey.split('-')[0]; 
+				if (global.JSUtil.notNil(groupSysId)) {
+                   if (existingGroupSysIdsMappedToSubscription.includes(groupSysId)) {
+                      this._logger.logError(this.type, "_migrateGroupToSubscriptionMapping", this.logMessages['GROUP_MIGRATION_FAILED'] + " for group sysId: " + mapKey + " reason: " + this.logMessages['DUPLICATE_GROUP_FOUND']);
+                      continue;
+                    }					
+                    groupToSubscriptionMappingDataToMigrate.push({
+                      group: groupSysId,
+                      subscription: subscriptionSysId
+                    });
+				}
+            }
+        }
+
+        if (global.JSUtil.nil(groupToSubscriptionMappingDataToMigrate)) {
+            this._logger.logError(this.type, "_migrateGroupToSubscriptionMapping", this.logMessages['GROUP_MIGRATION_COMPLETE'] + this.logMessages['GROUPS_NOT_ELIGIBLE_FOR_MIGRATION']);
+            return this._createMigrationResultObject("migrateGroupToSubscriptionMapping", false, this.logMessages['GROUPS_NOT_ELIGIBLE_FOR_MIGRATION'], false);
+        }
+        this._groupHasSubscriptionDAOService.insertSubscriptionGroups(groupToSubscriptionMappingDataToMigrate);
+        this._logger.logInfo(this.type, "_migrateGroupToSubscriptionMapping", this.logMessages['GROUP_MIGRATION_COMPLETE'] + this.logMessages['NUMBER_OF_GROUPS_MIGRATED'] + "[" + groupToSubscriptionMappingDataToMigrate.length + "]." + this.logMessages['GROUPS_MIGRATED_SUCCESSFULLY'] + JSON.stringify(groupToSubscriptionMappingDataToMigrate));
+        return this._createMigrationResultObject("migrateGroupToSubscriptionMapping", true, this.logMessages['GROUP_MIGRATION_COMPLETE'], false);
+        /**
+         * In ideal scenario, once we migrate data from license_group_has_subscription to group_has_subscription, the group to subscription mapping data should be deleted in Source Table.
+         * Here, license_group_has_subscription is in global scope and the MigrateLicenseDataToSMV2 script in scoped this deletion is not possible.
+         * Also, we can keep the old data for any future reference.
+         */
+    },
+
+    /**
+     * Migrate Data from license_group_has_subscription to group_has_subscription
+     */
+    _migrateEntitlementPurchaseHistory: function() {
+        this._logger.logInfo(this.type, "_migrateEntitlementPurchaseHistory", this.logMessages['INITIATE_ENTITLEMENT_HISTORY_MIGRATION']);
+        const productCodesThatHavePurchaseHistoryLog = this._licenseDetailsAuditLogDAOService.getProductCodesThatHavePurchaseHistoryLog();
+
+        //map&lt;productCode, subscriptionSysId&gt; from subscription_entitlement
+        const productCodeToEmsSubscriptionSysIdMap = this._subscriptionEntitlementService.getProductCodeToEmsSubscriptionSysIdMap(productCodesThatHavePurchaseHistoryLog);
+        const entitlementPurchaseHistory = this._licenseDetailsAuditLogDAOService.getEntitlementPurchaseHistory(productCodeToEmsSubscriptionSysIdMap);
+        if (global.JSUtil.nil(entitlementPurchaseHistory)) {
+            this._logger.logInfo(this.type, "_migrateEntitlementPurchaseHistory", this.logMessages['ENTITLEMENT_PURCHASE_HISTORY_DATA_MIGRATION_COMPLETE'] + this.logMessages['ENTITLEMENT_PURCHASE_HISTORY_DATA_NOT_FOUND']);
+            return this._createMigrationResultObject("migrateEntitlementPurchaseHistory", false, this.logMessages['ENTITLEMENT_PURCHASE_HISTORY_DATA_NOT_FOUND'], false);
+        }
+
+        this._subscriptionEntitlementAuditLogDAOService.migrateEntitlementPurchaseHistory(entitlementPurchaseHistory);
+        this._logger.logInfo(this.type, "_migrateEntitlementPurchaseHistory", this.logMessages['ENTITLEMENT_PURCHASE_HISTORY_DATA_MIGRATION_COMPLETE']);
+        return this._createMigrationResultObject("migrateEntitlementPurchaseHistory", true, this.logMessages['ENTITLEMENT_PURCHASE_HISTORY_DATA_MIGRATION_COMPLETE'], false);
+    },
+
+    _createMigrationResultObject: function(type, success, message, isSystemException) {
+        let result = {};
+        result.type = type;
+        result.success = success;
+        result.message = message;
+        result.isSystemException = isSystemException;
+
+        return result;
+    },
+
+    /**
+     * 1. Get the list of product_code to license_details.sys_id map
+     * 2. Get the list of product_code from #1 and load the product_code to subscription_entitlement.sys_id map
+     * 3. Iterate over result from #1 and get the subsquent entry from #2 to update the entry in license_cust_table_allotment/ua_custom_table_inventory/sys_scope(sys_app/sys_store_app)
+     * 4. Capture missing productCodes for logging/reporting.
+     *
+     * We don't have to check any over-allocation.
+     */
+    _mapSubscriptionReferenceForCustomTables: function() {
+        this._logger.logInfo(this.type, "_mapSubscriptionReferenceForCustomTables", this.logMessages['INITIATE_CUSTOM_TABLE_MAPPING']);
+
+        // Map license_cust_table_allotment table data
+        const grandfatherSubscriptionEntSysId = this._mapLicenseCustTableAllotment();
+
+        // Maps ua_custom_table_inventory and sys_scope (sys_app/sys_store_app) table data
+        this._mapUACustomTableInventory(grandfatherSubscriptionEntSysId);
+
+        return this._createMigrationResultObject("_mapSubscriptionReferenceForCustomTables", true, this.logMessages['CUSTOM_TABLE_MAPPING_COMPLETE'], false);
+    },
+
+    _mapLicenseCustTableAllotment: function() {
+        this._logger.logInfo(this.type, "_mapLicenseCustTableAllotment", this.logMessages['INITIATE_LICENSE_CUSTOM_TABLE_ALLOTMENT_MAPPING']);
+
+        // map&lt;productCode, licenseSysId&gt; from license_cust_table_allotment
+        const productCodeToLicenseSysIdMap = this._licenseCustTableAllotmentDAO.getLicenseProductCodesToSysIdsMap();
+        const productCodes = Object.keys(productCodeToLicenseSysIdMap);
+
+        // map&lt;productCode, subscriptionEntitlementSysId&gt; from subscription_entitlement
+        const productCodeToEmsSubscriptionSysIdMap = this._subscriptionEntitlementService.getProductCodeToEmsSubscriptionSysIdMap(productCodes);
+
+        let grandfatherSubscriptionEntSysId = null;
+
+        for (productCode in productCodeToLicenseSysIdMap) {
+            const licenseCustTblAllotSysId = productCodeToLicenseSysIdMap[productCode].licenseCustTblAllotSysId;
+            const licenseSysId = productCodeToLicenseSysIdMap[productCode].licenseSysId;
+
+            const subEntSysId = productCodeToEmsSubscriptionSysIdMap[productCode];
+
+            if (global.JSUtil.nil(subEntSysId)) {
+                this._logger.logError(this.type, "_mapLicenseCustTableAllotment", this.logMessages['REQUIRED_SUBSCRIPTION_MISSING'] + productCode + ", License Details: " + licenseSysId + ", Subscription Entitlement: " + subEntSysId);
+                continue;
+            }
+            const isGrandfatherSubscription = this._licenseCustTableAllotmentDAO.updateSubscriptionEntitlementReference(licenseCustTblAllotSysId, subEntSysId);
+
+            // There will be only one Grandfather Subscription for a customer
+            if (isGrandfatherSubscription &amp;&amp; global.JSUtil.nil(grandfatherSubscriptionEntSysId))
+                grandfatherSubscriptionEntSysId = subEntSysId;
+        }
+        this._logger.logInfo(this.type, "_mapLicenseCustTableAllotment", this.logMessages['LICENSE_CUSTOM_TABLE_ALLOTMENT_MAPPED_SUCCESSFULLY']);
+        return grandfatherSubscriptionEntSysId;
+    },
+
+    _mapUACustomTableInventory: function(grandfatherSubscriptionEntSysId) {
+        this._logger.logInfo(this.type, "_mapUACustomTableInventory", this.logMessages['INITIATE_CUSTOM_TABLE_INVENTORY_MAPPING']);
+
+        this._logger.logInfo(this.type, "_mapUACustomTableInventory", "Grandfather Subscription Entitlement SysId: " + grandfatherSubscriptionEntSysId);
+
+        // map&lt;productCode, custTblList&gt; from ua_custom_table_inventory
+        const productCodeToCustTblListMap = this._customTableInventoryDAO.getLicenseProductCodeToCustTblListMap();
+        const productCodes = Object.keys(productCodeToCustTblListMap);
+
+        // map&lt;productCode, subscriptionEntitlementSysId&gt; from subscription_entitlement
+        const productCodeToEmsSubscriptionSysIdMap = this._subscriptionEntitlementService.getProductCodeToEmsSubscriptionSysIdMap(productCodes);
+
+        for (productCode in productCodeToCustTblListMap) {
+
+            for (itr in productCodeToCustTblListMap[productCode]) {
+                const custTbl = productCodeToCustTblListMap[productCode][itr];
+                const uaCustTblSysId = custTbl.uaCustTblSysId;
+                const licenseSysId = custTbl.licenseSysId;
+                const subEntSysId = productCodeToEmsSubscriptionSysIdMap[productCode];
+
+                if (global.JSUtil.nil(subEntSysId)) {
+                    this._logger.logError(this.type, "_mapUACustomTableInventory", this.logMessages['REQUIRED_SUBSCRIPTION_MISSING'] + productCode + ", License Details: " + licenseSysId + ", Subscription Entitlement: " + subEntSysId);
+                    continue;
+                }
+                this._licensingEngineGlobalHelper.updateSubscriptionEntitlementReference(uaCustTblSysId, subEntSysId, grandfatherSubscriptionEntSysId);
+
+            }
+        }
+        this._logger.logInfo(this.type, "_mapUACustomTableInventory", this.logMessages['CUSTOM_TABLE_INVENTORY_MAPPED_SUCCESSFULLY']);
+    },
+
+    /**
+     * Migrate Data last 3 months of entitlement allotment history from license_detail_metric_history to subscription_detail
+     */
+    _migrateAllotmentHistory: function() {
+        this._logger.logInfo(this.type, "_migrateAllotmentHistory", this.logMessages['INITIATE_ALLOTMENT_HISTORY_MIGRATION']);
+        const productCodesThatHaveAllotmentHistoryLog = this._licenseDetailMetricHistoryDAO.getProductCodesThatHaveAllotmentHistoryLog();
+
+        //map&lt;productCode, subscriptionSysId&gt; from subscription_entitlement
+        const productCodeToEmsSubscriptionSysIdMap = this._subscriptionEntitlementService.getProductCodeToEmsSubscriptionSysIdMap(productCodesThatHaveAllotmentHistoryLog);
+        const allotmentHistory = this._licenseDetailMetricHistoryDAO.getEntitlementAllotmentHistory(productCodeToEmsSubscriptionSysIdMap);
+        if (global.JSUtil.nil(allotmentHistory)) {
+            this._logger.logInfo(this.type, "_migrateAllotmentHistory", this.logMessages['ENTITLEMENT_ALLOTMENT_HISTORY_DATA_MIGRATION_COMPLETE'] + this.logMessages['ENTITLEMENT_ALLOTMENT_HISTORY_DATA_NOT_FOUND']);
+            return this._createMigrationResultObject("migrateAllotmentHistory", false, this.logMessages['ENTITLEMENT_ALLOTMENT_HISTORY_DATA_NOT_FOUND'], false);
+        }
+
+        this._subscriptionDetailDAO.migrateAllotmentHistory(allotmentHistory);
+        this._logger.logInfo(this.type, "_migrateAllotmentHistory", this.logMessages['ENTITLEMENT_ALLOTMENT_HISTORY_DATA_MIGRATION_COMPLETE']);
+        return this._createMigrationResultObject("migrateAllotmentHistory", true, this.logMessages['ENTITLEMENT_ALLOTMENT_HISTORY_DATA_MIGRATION_COMPLETE'], false);
+    },
+
+    type: 'MigrateLicenseDataToSMV2'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;maint&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-04-10 05:07:24&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;6cab26e6eb86211078aca892e25228b8&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;121&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;MigrateLicenseDataToSMV2&lt;/sys_name&gt;
+        &lt;sys_package display_value="Licensing Engine" source="sn_entitlement"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Licensing Engine"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_6cab26e6eb86211078aca892e25228b8&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;maint&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-10-04 07:39:21&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:38:21</sys_created_on>
+        <sys_id>00f6705d83f01210c6695855eeaad3c8</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>MigrateLicenseDataToSMV2</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_00f6705d83f01210c6695855eeaad3c8</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:38:21</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

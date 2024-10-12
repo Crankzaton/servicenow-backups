@@ -1,0 +1,246 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>a602f06453e961102920ddeeff7b1245</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_employee.searchLicensedProfilesSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Various User operations including isManager and getDirectReports. getDirectReports - Given a manager and a list of employees to exclude, get a list of all employees which are direct reports to the manager and exclude all users provided in the exclusion list&amp;#13;
+&lt;/description&gt;
+        &lt;name&gt;searchLicensedProfilesSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var searchLicensedProfilesSNC = Class.create();
+searchLicensedProfilesSNC.prototype = {
+    initialize: function() {
+    },
+
+    /* Search for all users that are licensed for a specific application
+     * @param payload {Object} - The search payload
+     * @return {Object} - The search result object with an array of users
+     */
+    search: function(payload) {
+        // Supported @payload properties
+        var licenseName = payload.licenseName;
+        var searchFields = payload.searchFields || 'profile.user.name';
+        var searchTerm = payload.searchTerm || '';
+        var pageNum = payload.pageNum || 0;
+        var pageSize = payload.pageSize || 10;
+        var additionalQuery = payload.additionalQuery || '';
+
+        if (!licenseName)
+            return {
+                list: [],
+                total: 0
+            };
+
+        // Search for sys_user records through the `sn_employee_app_access` table
+        var searchResults = [];
+        var grSearch = new GlideRecord('sn_employee_app_access');
+        grSearch.addActiveQuery();
+        grSearch.addQuery('app.name', licenseName);
+        grSearch.addEncodedQuery(this._buildEncodedQuery(searchFields, searchTerm));
+        if (additionalQuery)
+            grSearch.addEncodedQuery(additionalQuery);
+        grSearch.addQuery('profile.user.active', true);
+        grSearch.chooseWindow(pageNum * pageSize, pageNum * pageSize + pageSize);
+        grSearch.orderBy("profile.user.name");
+        grSearch.query();
+
+        var totalPossibleResults = grSearch.getRowCount();
+
+        while (grSearch.next()) {
+            var grProfile = new GlideRecord('sn_employee_profile');
+            if (!grProfile.get(grSearch.getValue('profile')) 
+                    || !grProfile.canRead() 
+                    || !grProfile.getElement('user').canRead() 
+                    || !grProfile.getElement('user').getRefRecord().canRead())
+                continue;
+
+            searchResults.push(this._buildUserObject(grProfile));
+        }
+
+        return {
+            list: searchResults,
+            total: totalPossibleResults
+        };
+    },
+
+    /* Build an encoded query to search
+     * @param searchFields {String} - csv string of fields to search
+     * @param searchTerm {String} - string search term
+     * @return {String} - encoded query to search with
+     */
+    _buildEncodedQuery: function(searchFields, searchTerm) {
+        var searchFieldsArr = searchFields.split(",");
+        var queryArr = [];
+        for (var i = 0; i &lt; searchFieldsArr.length; i++) 
+            queryArr.push(searchFieldsArr[i] + 'LIKE' + searchTerm);
+        
+        return queryArr.join('^OR');
+    },
+
+    /* Build a user object from an Employee Profile
+     * @param grProfile {GlideRecord} - The GlideRecord to build the user object from
+     * @return {Object} - An object representing a user 
+     */
+    _buildUserObject: function(grProfile) {
+        return {
+            sys_id: grProfile.getValue('user'),
+            profile_id: grProfile.getUniqueValue(),
+            name: grProfile.getDisplayValue('user.name'),
+            title: grProfile.getDisplayValue('user.title'),
+            department: grProfile.getDisplayValue('user.department'),
+            avatar: grProfile.getDisplayValue('user.avatar'),
+            email: grProfile.getDisplayValue('user.email')
+        };
+    },
+
+    /**
+     * @params
+     * {String} licenseName - name of the app for employee lookup
+     * {String} searchTermParam - the input part of a users name
+     * {Integer} pageNumParam - the current page number
+     * {Integer} pageSizeParam - the number of items per page
+     * {String} excludedEmployeeIdsParam - the sys_ids of users that have already been added as mentors or that should be ignored.
+     * These users will be left out of the results
+     * {String} managerIdParam - the sys_id of the user that is the manager of the provided managed employee.
+     * {Boolean} useGroupingMessage - group results if true
+     * {Boolean} directReportsOnly - does not include non direct employees if true
+     * {String} searchFields - comma separted list of fields to search on
+     */
+    searchHierarchy: function(licenseName, searchTermParam, pageNumParam, pageSizeParam, excludedEmployeeIdsParam, managerIdParam, useGroupingMessage, directReportsOnly, searchFields) {
+        var MAX_NUM_EXCLUDE = 25;
+        if (excludedEmployeeIdsParam &amp;&amp; excludedEmployeeIdsParam.length &gt; MAX_NUM_EXCLUDE) {
+            gs.warn('searchLicensedProfilesSNC Do not have more than 25 users selected at a time');
+            return {
+                results: []
+            };
+        }
+
+        // Search direct reports
+        var directReports = this._searchDirectReports(licenseName, searchTermParam, excludedEmployeeIdsParam, managerIdParam, pageNumParam, pageSizeParam, searchFields);
+
+        if (directReportsOnly)
+            return directReports;
+
+        // Search non direct reports
+        var nonDirectReports = this._searchNonDirectReports(licenseName, searchTermParam, excludedEmployeeIdsParam, managerIdParam, pageNumParam, pageSizeParam, searchFields, directReports);
+
+        // Add row for grouping message
+        var shouldAddRowWithGroupingMessage = useGroupingMessage &amp;&amp; pageNumParam === 0 &amp;&amp; directReports.list.length;
+        if (shouldAddRowWithGroupingMessage)
+            directReports.list.unshift({
+                groupingMessage: true
+            });
+
+        return {
+            list: directReports.list.concat(nonDirectReports.list),
+            total: directReports.total + nonDirectReports.total
+        };
+    },
+
+    // Search for all users that are direct reports to the provided manager. Exclude users with
+    // ids in excludedEmployeeIdsParam from the results.
+    _searchDirectReports: function(licenseName, searchTermParam, excludedEmployeeIdsParam, managerIdParam, pageNumParam, pageSizeParam, searchFields) {
+        if (!managerIdParam)
+            return {
+                list: [],
+                total: 0
+            };
+
+        var additionalQueryArr = ['profile.user!=' + gs.getUserID()];
+        if (excludedEmployeeIdsParam)
+            additionalQueryArr.push('profile.user.sys_idNOT IN' + excludedEmployeeIdsParam.join(','));
+        if (managerIdParam)
+            additionalQueryArr.push('profile.user.manager=' + managerIdParam);
+
+        var directReports = this.search({
+            licenseName: licenseName,
+            searchFields: searchFields,
+            searchTerm: searchTermParam,
+            pageNum: pageNumParam,
+            pageSize: pageSizeParam,
+            additionalQuery: additionalQueryArr.join('^')
+        });
+
+        // Set 'sameManager' property on these searched users
+        for (var i = 0; i &lt; directReports.list.length; i++) 
+            directReports.list[i].sameManager = true;
+
+        return directReports;
+    },
+
+    // Search for all users that are NOT direct reports to the provided manager. Exclude users with
+    // ids in excludedEmployeeIdsParam from the results.
+    _searchNonDirectReports: function(licenseName, searchTermParam, excludedEmployeeIdsParam, managerIdParam, pageNumParam, pageSizeParam, searchFields, directReports) {
+        var isDirectReportsDoneOrLastPageIncomplete = pageNumParam * pageSizeParam &lt;= directReports.total ?
+            pageSizeParam - directReports.total &gt; 0 :
+            false;
+
+        var pageNum = pageNumParam * pageSizeParam &gt; directReports.total ?
+            pageNumParam - Math.floor(directReports.total / pageSizeParam) :
+            0;
+
+        var pageSize = isDirectReportsDoneOrLastPageIncomplete || pageNum &gt; 0 ?
+            pageSizeParam :
+            0; // just get total count when not retrieving records
+
+        var additionalQueryArr = ['profile.user!=' + gs.getUserID()];
+        if (excludedEmployeeIdsParam)
+            additionalQueryArr.push('profile.user.sys_idNOT IN' + excludedEmployeeIdsParam.join(','));
+        if (managerIdParam)
+            additionalQueryArr.push('profile.user.manager!=' + managerIdParam + '^ORprofile.user.managerISEMPTY');
+
+        var nonDirectReports = this.search({
+            licenseName: licenseName,
+            searchFields: searchFields,
+            searchTerm: searchTermParam,
+            pageNum: pageNum,
+            pageSize: pageSize,
+            additionalQuery: additionalQueryArr.join('^')
+        });
+
+        var shouldDelimitResults = directReports.total &amp;&amp; pageNum === 0 &amp;&amp; nonDirectReports.total;
+        if (shouldDelimitResults)
+            nonDirectReports.list.unshift({
+                delimiter: true
+            }); // add delimiter row between direct and non direct reports
+
+        return nonDirectReports;
+    },
+
+    type: 'searchLicensedProfilesSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-03-09 18:35:09&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;a602f06453e961102920ddeeff7b1245&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;32&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;searchLicensedProfilesSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Employee Profile" source="sn_employee"&gt;1e95bac2738f001001b566b90ff6a7cd&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Employee Profile"&gt;1e95bac2738f001001b566b90ff6a7cd&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_a602f06453e961102920ddeeff7b1245&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-05-02 04:36:12&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:46:40</sys_created_on>
+        <sys_id>bdd8789183341210c6695855eeaad3c4</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>searchLicensedProfilesSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_bdd8789183341210c6695855eeaad3c4</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:46:40</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

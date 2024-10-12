@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>a9040f70eb223010506f7558b5522866</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.UrlUnfurlingCacheUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;UrlUnfurlingCacheUtils&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var UrlUnfurlingCacheUtils = Class.create();
+UrlUnfurlingCacheUtils.prototype = {
+	initialize: function() {
+	},
+
+	/**
+	 * Query the cache to get unfurl data for the given url
+	 */
+	getDataFromCache: function(url, deviceType) {
+		deviceType = deviceType || 'mweb';
+		
+		var result = {};
+		result.url_unfurl_data = "";
+		result.is_unfurl_data_present = false;
+		var logUtil = new LinkUnfurlingLoggingUtils();
+
+		if (!gs.nil(url)) {
+			var gr = new GlideRecord("sys_cs_url_unfurl_cache");
+			if (gr.isValid()) {
+				gr.addQuery("url", url);
+				gr.addQuery("device_type", deviceType);
+				gr.query();
+				if (gr.next()) {
+					result.is_unfurl_data_present = true;
+					result.url_unfurl_data = gr.getValue("unfurl_data");
+					logUtil.atDebug(url).log('Link Unfurling cache hit for url={0}', url);
+					return result;
+				}
+			}
+		}
+
+		logUtil.atDebug(url).log('Link Unfurling cache miss for url={0}', url);
+		return result;
+	},
+
+	/**
+	 * Unfurl a HTML page and save the unfurl data to the cache
+	 */
+	getUnfurlDataFromHTMLAndSaveToCache: function(url, html, deviceType) {
+		deviceType = deviceType || 'mweb';
+		
+		var urlUnfurlData = "";
+		var logUtil = new LinkUnfurlingLoggingUtils();
+
+		try {
+			var jsonObj = {};
+			var tagMap = sn_cs.ChatLinkUnfurlObject.unfurlLink(html, url);
+
+			if (!gs.nil(tagMap)) {
+				jsonObj["title"] = tagMap["title"];
+				jsonObj["site_name"] = tagMap["site_name"];
+				jsonObj["url"] = tagMap["url"];
+				jsonObj["short_description"] = tagMap["short_description"];
+				jsonObj["image_link"] = tagMap["image_link"];
+				jsonObj["video_link"] = tagMap["video_link"];
+				jsonObj["type"] = tagMap["type"];
+				jsonObj["fav_icon"] = tagMap["fav_icon"];
+			}
+
+			urlUnfurlData = JSON.stringify(jsonObj);
+
+			// Update the cache with this data
+			this.saveToCacheIfEnabled(url, urlUnfurlData, deviceType);
+		} catch (ex) {
+			logUtil.atError(url).log("Error trying to unfurl and cache the url={0}, with data={1}: {2}",
+								url, urlUnfurlData, ex.toString());
+		}
+
+		return urlUnfurlData;
+	},
+
+	saveToCacheIfEnabled: function(url, urlUnfurlData, deviceType) {
+		var logUtil = new LinkUnfurlingLoggingUtils();
+
+		var cacheEnabled = gs.getProperty("com.glide.cs.enable_link_unfurling_cache", "true");
+		logUtil.atDebug(url).log("Link Unfurling cache is enabled: {0}", cacheEnabled);
+		if (cacheEnabled == "true") {
+			var unfurlCacheGr = new GlideRecord("sys_cs_url_unfurl_cache");
+			if (unfurlCacheGr.isValid()) {
+				unfurlCacheGr.addQuery("url", url);
+				unfurlCacheGr.addQuery("device_type", deviceType);
+				unfurlCacheGr.setLimit(1);
+				unfurlCacheGr.query();
+
+				if(unfurlCacheGr.next()) {
+					unfurlCacheGr.setValue("unfurl_data", urlUnfurlData);
+					if(unfurlCacheGr.update()) {
+						logUtil.atInfo(url).log("Successfully updated cache for url={0}, device type={1} with data={2}", url, deviceType, urlUnfurlData);
+					}
+				} else {
+					unfurlCacheGr.initialize();
+					unfurlCacheGr.setValue("url", url);
+					unfurlCacheGr.setValue("unfurl_data", urlUnfurlData);
+					unfurlCacheGr.setValue("device_type", deviceType);
+					unfurlCacheGr.insert();
+					logUtil.atInfo(url).log("Successfully cached url={0} for device type={1} with data={2}", url, deviceType, urlUnfurlData);
+				}
+			}
+		}
+	},
+
+	/**
+	 * Create and send the unfurling card
+	 */
+	createAndSendUnfurlingCard: function(jsonData, url, deviceType, messageId, conversationId) {
+		var result = {};
+		var logUtil = new LinkUnfurlingLoggingUtils();
+
+		try {
+			if (gs.nil(jsonData)) {
+				logUtil.atError(url, conversationId).log("Error creating unfurling card: input JSON data is nil");
+				result.error_message = gs.getMessage("Create and send unfurling card: input Json data is nil.");
+				result.success = false;
+				return result;
+			}
+
+			var tagMap = JSON.parse(jsonData);
+			if (Object.keys(tagMap).length === 0) {
+				logUtil.atError(url, conversationId).log("Error creating unfurling card: input JSON data is empty");
+				result.error_message = gs.getMessage("Create and send unfurling card: input Json data is empty.");
+				result.success = false;
+				return result;
+			}
+
+			if (gs.nil(tagMap["short_description"]) || gs.nil(tagMap["title"])) {
+				logUtil.atError(url, conversationId).log("Error creating unfurling card: Missing short description or title tags");
+				result.error_message = gs.getMessage("Create and send unfurling card: Cannot create card as short description or title tags are empty.");
+				result.success = false;
+				return result;
+			}
+
+			if (gs.nil(tagMap["site_name"]))
+				tagMap["site_name"] = url;
+			if (gs.nil(tagMap["url"]))
+				tagMap["url"] = url;
+
+			if (!tagMap["image_link"].toLowerCase().startsWith("http"))
+				tagMap["image_link"] = "";
+
+			var unfurlUrlUtils = new UrlUnfurlingUtils();
+			var templateType = unfurlUrlUtils.getTemplateType(tagMap);
+			// Use default favicon location if no favicon found or if the favicon that is found is a relative path
+			tagMap["fav_icon"] = unfurlUrlUtils.updateFavicon(tagMap);
+
+			sn_cs.ChatLinkUnfurlObject.sendUnfurledMessageQ(templateType, tagMap, deviceType, messageId, conversationId);
+			result.success = true;
+		} catch (ex) {
+			result.success = false;
+			result.error_message = gs.getMessage("Create and send unfurling card: Error has occurred during link unfurling: {0} ", ex);
+			logUtil.atError(url, conversationId).log("Error creating unfurling card: {0}", ex);
+			return result;
+		}
+
+		return result;
+	},
+
+	type: 'UrlUnfurlingCacheUtils'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-09-10 04:23:48&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;a9040f70eb223010506f7558b5522866&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;20&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;UrlUnfurlingCacheUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Glide Conversation Server" source="com.glide.cs"&gt;ad7df0203c75311068bcf327dfe37f75&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_a9040f70eb223010506f7558b5522866&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-09-09 02:25:27&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 09:17:31</sys_created_on>
+        <sys_id>f9efb09d83341210c6695855eeaad3ea</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>UrlUnfurlingCacheUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_f9efb09d83341210c6695855eeaad3ea</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 09:17:31</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

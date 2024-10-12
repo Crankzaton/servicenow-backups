@@ -1,0 +1,197 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>3245cf6c777730104cdac0c23e5a99b3</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_employee.EP_MLPortalUtilsSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;EP_MLPortalUtilsSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var EP_MLPortalUtilsSNC = Class.create();
+EP_MLPortalUtilsSNC.prototype = {
+    initialize: function() {},
+
+
+	/* getSimilarUsers : To get the list of similar users for the logged in user based on similar Employee profiles
+		Parameters: 1) userId: userId of the logged in user
+					2) topN: gets the topN similar users
+	*/
+    getSimilarUsers: function(userId, topN) {
+        var similarUsers = [];
+        var profiles = this.getSimilarProfiles(userId, topN);
+        if (!gs.nil(profiles)) {
+            var userProfile = new GlideRecord('sn_employee_profile'); 
+            for (var i = 0; i &lt; profiles.length; i++) {
+                if (userProfile.get(profiles[i]))
+                    similarUsers.push(userProfile.getValue('user'));
+            }
+        }
+        return similarUsers;
+    },
+
+    /* getSimilarProfiles:Gets the similar Employee profiles of the logged in user.The first time when user is logged in , a call is made to ML prediction server to fetch the similar profiles, these results are stored in ml_predictor_results table.Hence when the user is logged in from second time onwards results are fetched from ml_predictor_results table
+		Parameters: 1) userId: userId of the logged in user
+					2) topN: gets the topN similar Employee Profiles
+	*/
+
+    getSimilarProfiles: function(userId, topN) {
+        var predictedConfidenceTopNValue;
+        var predictedConfidenceTopNList = [];
+        var predictedOutputArray = [];
+        var similarProfiles = [];
+        var results = {};
+        var currentDomain;
+        var user = new GlideRecord('sys_user');
+        if (user.get(userId))
+            currentDomain = user.sys_domain;
+
+        var profile = new GlideRecord('sn_employee_profile');
+        profile.addQuery('user', userId);
+        profile.setLimit(1);
+        profile.query();
+        if (profile.next()) {
+            /*Get the solution definition from EP AI Configuration */
+            var config = this.fetchEPAiConfig('similar_users', currentDomain);
+            if (!config.next()) {
+                config = this.fetchEPAiConfig('similar_users', 'global');
+                if (!config.next())
+                    return;
+            }
+            if (config.solution_capability_definition.active) {
+                var solution = config.solution_capability_definition.solution_name;
+                var solutionGr = new GlideRecord('ml_solution');
+                solutionGr.addQuery('solution_name', solution);
+                solutionGr.addActiveQuery();
+                solutionGr.setLimit(1);
+                solutionGr.query();
+                if (solutionGr.next()) {
+                    var thresholdLimit = solutionGr.threshold;
+                    var predictorResults = new GlideRecord('ml_predictor_results');
+                    predictorResults.addQuery('source_sys_id', profile.getUniqueValue());
+                    predictorResults.addQuery('solution', solutionGr.getUniqueValue());
+                    predictorResults.orderByDesc('sys_created_on');
+                    predictorResults.setLimit(1);
+                    predictorResults.query();
+                    if (predictorResults.next()) {
+						/* If the predicted confidence of the  ML result is less than the threshold limit set for the solution return null*/
+                        if (predictorResults.predicted_confidence &lt; thresholdLimit)
+                            return null;
+                        /*If ML Predictor table has the latest solution only then query the ML predictor else repredict the value for the latest results */
+                        if (predictorResults.solution.version == config.solution_capability_definition.current_solution_version) {
+                            predictedConfidenceTopNValue = predictorResults.predicted_confidence_topn;
+                            predictedConfidenceTopNList = predictedConfidenceTopNValue.split(',');
+                            results = predictorResults.predicted_output_value;
+                            predictedOutputArray = results.split(",");
+                            for (var i = 0; i &lt; predictedConfidenceTopNList.length; i++) {
+                                if (predictedConfidenceTopNList[i] &lt; thresholdLimit)
+                                    break;
+                                similarProfiles.push(predictedOutputArray[i]);
+                            }
+                            return similarProfiles;
+                        } else {
+                            return this.predictSimilarProfiles(profile, solution, topN);
+                        }
+                    } else {
+                        return this.predictSimilarProfiles(profile, solution, topN);
+                    }
+                } else {
+                    gs.error("Solution GlideRecord does not exist, please train the solution definition.");
+                    return null;
+                }
+            } else {
+                gs.error("Please provide a solution defintion for similar users in the EP AI Configuration");
+                return null;
+            }
+        } else
+            return null;
+
+    },
+	
+	/* predictSimilarProfiles: Returns the similar profiles of a HR Profile based on ML prediction 
+		Parameters: 1) profile: HR Profile Record for which the similar records need to be fetched
+					2) solution : Name of the solution of the corresponding ML solution definition defined for fetching similar HR Profiles
+					2) topN: gets the topN similar profiles
+	*/
+			
+    predictSimilarProfiles: function(profile, solution, topN) {
+        var mlSolution = sn_ml.MLSolutionFactory.getSolution(solution);
+        var similarProfiles = [];
+        var results = {};
+        try {
+            var options = {};
+            if (gs.nil(topN))
+                options.top_n = 25;
+            else
+                options.top_n = topN;
+            options.apply_threshold = true;
+            options.mluc = "MLUC-EX-00001";
+
+            results = mlSolution.predict(profile, options);
+            var resultsJson = JSON.parse(results);
+
+        } catch (e) {
+            gs.error(e);
+            return null;
+        }
+        var pedictedResults = resultsJson[profile.getUniqueValue()];
+		if(!gs.nil(pedictedResults)) {
+        for (var i = 0; i &lt; pedictedResults.length; i++)
+            similarProfiles.push(pedictedResults[i].predictedValue);
+		}
+
+        return similarProfiles;
+    },
+	/* fetchEPAiConfig : Returns the EP AI Configuration Record for the use case specified based on domain 
+		Parmenters: 1) useCase : Use Case specified in EP AI Confoguration table 
+					2) domain : Current domain of the user 
+	*/
+	
+    fetchEPAiConfig: function(useCase, domain) {
+        try {
+            var epAIConfiguration = new GlideRecord('sn_employee_ai_configuration');
+			epAIConfiguration.addQuery('use_case', useCase);
+            epAIConfiguration.addQuery('sys_domain', domain);
+            epAIConfiguration.setLimit(1);
+            epAIConfiguration.query();
+            return epAIConfiguration;
+        } catch (err) {
+            gs.error('Error in fetching EP AI configuration: ' + err.toString());
+        }
+    },
+
+    type: 'EP_MLPortalUtilsSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-11-10 13:07:55&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;3245cf6c777730104cdac0c23e5a99b3&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;4&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;EP_MLPortalUtilsSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Employee Profile" source="sn_employee"&gt;1e95bac2738f001001b566b90ff6a7cd&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Employee Profile"&gt;1e95bac2738f001001b566b90ff6a7cd&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_3245cf6c777730104cdac0c23e5a99b3&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-05-30 04:27:18&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:35:36</sys_created_on>
+        <sys_id>3746b89983f01210c6695855eeaad314</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>EP_MLPortalUtilsSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_3746b89983f01210c6695855eeaad314</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:35:36</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

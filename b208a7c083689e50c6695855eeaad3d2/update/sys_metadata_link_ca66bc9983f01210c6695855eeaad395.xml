@@ -1,0 +1,341 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>3c70d738c3602110cf33ad413b40dd6e</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;now_vis_extensions.GeomapUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;GeomapUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var GeomapUtil = Class.create();
+GeomapUtil.prototype = {
+	initialize: function () {},
+
+	getGeoMapData: function (table, field, mapSysId, mapKey, useLatLon) {
+		validateRequestParams(table, field, mapSysId, mapKey);
+
+		var refTable = getReferenceTable(table, field);
+		var reportMapResponse = getReportMapResponse(mapSysId, mapKey);
+		var mapSourceResponse = getMapSourceResponse(refTable, reportMapResponse.level, useLatLon);
+
+		var filterQuery = getFilterQuery(field, mapSourceResponse.parentField, reportMapResponse.key);
+
+		var result = {
+			"mapName": reportMapResponse.mapName,
+			"mapSysId": reportMapResponse.mapSysId,
+			"filterQuery": filterQuery,
+			"mapSourceField": mapSourceResponse.field,
+			"joinByColumn": mapSourceResponse.joinByColumn,
+			"typeMapping": mapSourceResponse.typeMapping,
+			"mapJSON": reportMapResponse.mapJSON,
+		};
+
+		if (mapSourceResponse.typeMapping === 'use_lat_lon') {
+			var locationResponse = getLocationResponse(mapSourceResponse.parentField, reportMapResponse.key);
+			result.locationData = locationResponse;
+		} else {
+			var locationMappingsResponse = getLocationMappingsResponse(
+				mapSourceResponse.reportMapSourceMapping,
+				reportMapResponse);
+
+			result.locationMappings = locationMappingsResponse;
+		}
+
+		return result;
+	},
+
+	type: 'GeomapUtilApi'
+};
+
+function queryExecutor(gr) {
+	gr.setCategory('reporting');
+	gr.query();
+}
+
+function isValidObj(obj) {
+	return obj !== null &amp;&amp; obj !== undefined;
+}
+
+function validateRequestParams(table, field, mapSysId, mapKey) {
+	if (!isValidObj(table))
+		throw getErrorMessage('MISSING_PARAM', 'table');
+
+	if (!isValidObj(field))
+		throw getErrorMessage('MISSING_PARAM', 'field');
+
+	if (!isValidObj(mapSysId) &amp;&amp; !isValidObj(mapKey))
+		throw getErrorMessage('MISSING_PARAM', 'mapSysId or mapKey');
+}
+
+function getReferenceTable(table, field) {
+	var gr = new GlideRecord(table);
+	if (gr.isValid()) {
+		queryExecutor(gr);
+
+		var fieldElement = gr.getElement(field);
+		if (fieldElement == null || fieldElement == undefined)
+			throw getErrorMessage('INVALID_REF_FIELD', field);
+
+		return fieldElement.getED().getReference();
+	}
+	throw getErrorMessage('INVALID_TABLE', table);
+}
+
+function executeGR(gr, fieldMap, table) {
+	if (gr.isValid()) {
+		queryExecutor(gr);
+
+		return buildRecords(gr, fieldMap);
+	}
+	return [];
+}
+
+function buildRecords(gr, fieldMap) {
+	var results = [];
+	var sourceFields = Object.keys(fieldMap);
+	while (gr.next()) {
+		var result = {};
+		sourceFields.forEach(function (sourceField) {
+			var targetField = fieldMap[sourceField];
+			result[targetField] = gr.getValue(sourceField);
+		});
+		results.push(result);
+	}
+	return results;
+}
+
+/*
+Returns the level sys id, map JSON and key from sys_report_map table
+*/
+function getReportMapResponse(mapSysId, mapKey) {
+	var reportMap = new GlideRecord('sys_report_map');
+	reportMap.addActiveQuery();
+	if (isValidObj(mapSysId))
+		reportMap.addQuery('sys_id', mapSysId);
+	else
+		reportMap.addQuery('key', mapKey);
+
+	var reportMapFieldMap = {
+		name: 'mapName',
+		type: 'level',
+		json_map: 'mapJSON',
+		key: 'key',
+		sys_id: 'mapSysId'
+	};
+	var reportMapResponse = executeGR(reportMap, reportMapFieldMap, 'sys_report_map');
+	if (reportMapResponse.length === 0)
+		throw getErrorMessage('INVALID_REPORT_MAP', isValidObj(mapSysId) ? mapSysId : mapKey);
+
+	return reportMapResponse[0];
+
+}
+
+/*
+Returns the map configurations from viz_map_source table.
+MapSourceResponse include Field name, How to Use data, Use these mappings and Use this key.
+Return the parent level field name to use it for fetching location maps
+*/
+function getMapSourceResponse(table, level, useLatLon) {
+	var mapSource = new GlideRecord("viz_map_source");
+	mapSource.addActiveQuery();
+	mapSource.addQuery('table', table);
+	if (useLatLon)
+		mapSource.addQuery('type_mapping', 'use_lat_lon');
+	else
+		mapSource.addQuery('type', level);
+
+	var mapSourceFieldMap = {
+		aggregate_field: 'field',
+		report_map_source_mapping: 'reportMapSourceMapping',
+		type_mapping: 'typeMapping',
+		join_by_column: 'joinByColumn',
+		parent: 'parentSysId',
+		sys_id: 'mapSourceSysId'
+	};
+	var mapSourceResponse = executeGR(mapSource, mapSourceFieldMap, 'viz_map_source');
+	if (mapSourceResponse.length == 0)
+		throw getErrorMessage('NO_MAP_SOURCE', table);
+
+	if (mapSourceResponse[0].parentSysId != null) {
+		mapSourceResponse[0].parentField = getMapSourceParentField(mapSourceResponse[0].parentSysId);
+	}
+	return mapSourceResponse[0];
+}
+
+function getMapSourceParentField(parentSysId) {
+	var mapSource = new GlideRecord("viz_map_source");
+	mapSource.addActiveQuery();
+	mapSource.addQuery('sys_id', parentSysId);
+	if (!mapSource.isValid())
+		return;
+
+	queryExecutor(mapSource);
+	if (!mapSource.next())
+		return;
+
+	return mapSource.getValue('aggregate_field');
+}
+
+/*
+Return key, value from Locations Mappings table
+*/
+function getLocationMappingsResponse(reportMapSourceMapping, reportMapResponse) {
+	var reportSourceMappings = new GlideRecord("sys_report_map_source_mappings");
+	reportSourceMappings.addQuery('report_map_source_mapping', reportMapSourceMapping);
+	var mapping = getMappingName(reportMapSourceMapping);
+
+    // For country mappings, do not add the query for map. sys_report_map_source_mappings does not have map populated correctly for Level 1(country mappings)
+	if (mapping != 'Country mappings')
+		reportSourceMappings.addQuery('map', reportMapResponse.mapSysId);
+
+	var locationFieldMap = {
+		key: 'key',
+		value: 'value'
+	};
+	return executeGR(reportSourceMappings, locationFieldMap, 'sys_report_map_source_mappings');
+}
+
+function getMappingName(reportMapSourceMapping) {
+	var mapping = new GlideRecord("sys_report_map_source_mapping");
+	mapping.addQuery('sys_id', reportMapSourceMapping);
+	if (!mapping.isValid())
+		return;
+
+	queryExecutor(mapping);
+	if (mapping.next())
+		return mapping.getValue('name');
+
+	return '';
+}
+
+/*
+Returns locations data from cmn_location table
+Apply filter to cmn_location table. If it does not return any result, fetch all records from cmn_location table
+*/
+function getLocationResponse(mapSourceParentField, reportMapKey) {
+	var locationResponse = getLocationResponseWithFilters(mapSourceParentField, reportMapKey);
+	if (locationResponse.length === 0)
+		return getLocationResponseWithFilters();
+
+	return locationResponse;
+}
+
+function getLocationResponseWithFilters(mapSourceParentField, reportMapKey) {
+	var location = new GlideRecord("cmn_location");
+	if (reportMapKey != null &amp;&amp; mapSourceParentField != null) {
+		var key = getLocationMappingKey(reportMapKey);
+		location.addQuery(mapSourceParentField, key);
+	}
+	var locationFieldMap = {
+		latitude: 'latidude',
+		longitude: 'longitude',
+		name: 'name',
+		city: 'city',
+		state: 'state',
+		country: 'country'
+	};
+	return executeGR(location, locationFieldMap, 'cmn_location');
+}
+
+function getLocationMappingKey(key) {
+	var reportSourceMappings = new GlideRecord("sys_report_map_source_mappings");
+	reportSourceMappings.addQuery('value', key);
+	if (!reportSourceMappings.isValid())
+		return;
+
+	queryExecutor(reportSourceMappings);
+	if (reportSourceMappings.next())
+		return reportSourceMappings.getValue('key');
+
+	return '';
+}
+
+function getFilterQuery(field, parentField, reportMapKey) {
+	if (!parentField)
+		return '';
+
+	var reportSourceMappings = new GlideRecord("sys_report_map_source_mappings");
+	reportSourceMappings.addQuery('value', reportMapKey);
+
+	if (!reportSourceMappings.isValid())
+		return;
+
+	queryExecutor(reportSourceMappings);
+	if (!reportSourceMappings.next())
+		return;
+
+	return field + "." + parentField + "=" + reportSourceMappings.getValue('key');
+}
+
+function getErrorMessage(errorCode, param) {
+	if (errorCode === 'MISSING_PARAM') {
+		return {
+			"status": "failure",
+			"msg": gs.getMessage("Unable to fetch geomap data due to missing {0}", param),
+			"errorCode": errorCode
+		};
+	} else if (errorCode === 'INVALID_TABLE') {
+		return {
+			"status": "failure",
+			"msg": gs.getMessage("Invalid Table {0}", param),
+			"detail": gs.getMessage("Table {0} is not valid", param),
+			"errorCode": errorCode
+		};
+	} else if (errorCode === 'INVALID_REF_FIELD') {
+		return {
+			"status": "failure",
+			"msg": gs.getMessage("No reference table found for {0}", param),
+			"detail": gs.getMessage("Field {0} is not a valid reference field", param),
+			"errorCode": errorCode
+		};
+	} else if (errorCode === 'NO_MAP_SOURCE') {
+		return {
+			"status": "failure",
+			"msg": gs.getMessage("No Map Source found"),
+			"detail": gs.getMessage("Map Source does not exist for {0} table", param),
+			"errorCode": errorCode
+		};
+	} else if (errorCode === 'INVALID_REPORT_MAP') {
+		return {
+			"status": "failure",
+			"msg": gs.getMessage("Report Map not found"),
+			"detail": gs.getMessage("Report map does not exist for {0}", param),
+			"errorCode": errorCode
+		};
+	}
+}
+]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-01-20 07:42:57&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;3c70d738c3602110cf33ad413b40dd6e&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;15&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;GeomapUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="now-visualization-extensions" source="now_vis_extensions"&gt;cd623f2ce6fc02f23595a409216e13b1&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="now-visualization-extensions"&gt;cd623f2ce6fc02f23595a409216e13b1&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_3c70d738c3602110cf33ad413b40dd6e&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-11 06:30:53&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:36:02</sys_created_on>
+        <sys_id>ca66bc9983f01210c6695855eeaad395</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>GeomapUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_ca66bc9983f01210c6695855eeaad395</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:36:02</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

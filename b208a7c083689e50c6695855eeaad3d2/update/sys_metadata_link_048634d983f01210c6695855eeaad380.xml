@@ -1,0 +1,258 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>4594c6ffc73e2010c636edf4c1c26022</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.FSMPartUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Util class for part related operations&lt;/description&gt;
+        &lt;name&gt;FSMPartUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var FSMPartUtil = Class.create();
+FSMPartUtil.prototype = {
+    initialize: function() {
+    },
+
+    clonePartRequirementForWOT: function(workOrderTaskID, workOrderTaskGR, existingPartRequirementGR){
+        var newPartRequirementGR = new GlideRecord("sm_part_requirement");
+        newPartRequirementGR.initialize();
+    
+        newPartRequirementGR.service_order_task = workOrderTaskID;
+        newPartRequirementGR.required_by_date = workOrderTaskGR.expected_start;
+        newPartRequirementGR.required_quantity = existingPartRequirementGR.required_quantity;
+        newPartRequirementGR.model = existingPartRequirementGR.model;
+        newPartRequirementGR.mandatory = existingPartRequirementGR.mandatory;
+        newPartRequirementGR.include_substitute = existingPartRequirementGR.include_substitute;
+    
+        return newPartRequirementGR;
+    },
+
+    type: 'FSMPartUtil'
+};
+
+FSMPartUtil.FIELD_AGENT_STOCKROOM_TYPE = "e2aa2b3f3763100044e0bfc8bcbe5dde";
+FSMPartUtil.getPersonalRoom = getPersonalRoom;
+FSMPartUtil.getPartsForTasks = getPartsForTasks;
+FSMPartUtil.getPartsForAgent = getPartsForAgent;
+FSMPartUtil.hasNoParts = hasNoParts;
+FSMPartUtil.createEAMCatalogRequest = createEAMCatalogRequest;
+
+/**
+ * get the personal stockroom for an agent.  Each agent has only one stock room
+ * @Param: userId - agent sys_id
+ *
+ * @Return: sys_id of the personal stockroom, null otherwise 
+ */
+function getPersonalRoom(agentId) {
+    if (gs.nil(agentId))
+        return null;
+
+    var room = new GlideRecord("alm_stockroom");
+    room.addQuery("type", FSMPartUtil.FIELD_AGENT_STOCKROOM_TYPE);
+    room.addQuery("manager", agentId);
+    room.addActiveQuery();
+    room.query();
+    if (room.next())
+        return room.getUniqueValue();
+    else
+
+        return null;
+}
+
+/**
+ * Query parts for all tasks
+ * @Param: taskIds - array of task sys_id
+ * @Param: arg - flag for whether to query mandatory parts or not
+ *
+ * @Return: only return tasks that have parts in a form of 
+ * {
+ * "parts":{
+ *  task1: { modelID: quantity},
+ *  task2: { modelID: quantity},
+ *  ...
+ *  }
+ * },
+ * {"uniqueParts": []}
+ * }
+ */
+function getPartsForTasks(taskIds, arg) {
+    var taskParts = {};
+    var uniqueParts = [];
+
+    if (gs.nil(taskIds))
+        return null;
+
+    // copy over the original list of taskIds and modify the copied over list.
+    // Otherwise it leads to incorrect results when a bundle task is part of the result set
+    var taskIdsToQuery = [].concat(taskIds);
+    var bundlePluginActive = GlidePluginManager.isActive('com.snc.fsm_task_bundle');
+
+    if (bundlePluginActive) {
+        var subtaskBundleMap = new sn_fsm_task_bundle.FSMTaskBundle().getSubtaskIdsWithBundleMappings(taskIds);
+	taskIdsToQuery = taskIdsToQuery.concat(Object.keys(subtaskBundleMap));
+	// filter out bundle task id as we dont want to consider parts associated with it for recommendation computation
+	for (var taskId in taskIdsToQuery) {
+	    var bundle = subtaskBundleMap[taskIdsToQuery[taskId]];
+	    if (bundle != undefined) {
+		var bundleIndex = taskIdsToQuery.indexOf(bundle);
+		if (bundleIndex !== -1)
+     		    taskIdsToQuery.splice(bundleIndex, 1);
+	    }
+	}
+    }
+
+    var partRequirement = new GlideAggregate("sm_part_requirement");
+    partRequirement.addQuery("service_order_task", "IN", taskIdsToQuery.join(","));
+    partRequirement.groupBy("service_order_task");
+    partRequirement.groupBy("model");
+    if (!gs.nil(arg) &amp;&amp; arg) {
+        partRequirement.addQuery("mandatory", true);
+    }
+    partRequirement.addAggregate("SUM", "required_quantity");
+    partRequirement.query();
+
+    while (partRequirement.next()) {
+        var task = partRequirement.getValue("service_order_task");
+	if (bundlePluginActive &amp;&amp; !gs.nil(subtaskBundleMap[task])) { 
+	    // task is a subtask for a bundle . Associate parts from this subtask to the bundle task 
+	    task = subtaskBundleMap[task]; 
+	} 
+        var model = partRequirement.getValue("model");
+        var requiredQuantity = +partRequirement.getAggregate("SUM", "required_quantity");
+        if (!taskParts.hasOwnProperty(task)) {
+            taskParts[task] = {};
+            taskParts[task][model] = requiredQuantity;
+        } else if (taskParts[task].hasOwnProperty(model)){
+            taskParts[task][model] = taskParts[task][model] + requiredQuantity;
+        } else {
+	    taskParts[task][model] = requiredQuantity;
+	}
+
+        if (uniqueParts.indexOf(model) == -1) {
+            uniqueParts.push(model);
+        }
+    }
+
+    var returnObj = {
+        "parts": taskParts,
+        "uniqueParts": uniqueParts
+    };
+
+    return returnObj;
+}
+
+/**
+ * Query all available parts an agent has
+ *
+ * @Param: personalRoom - agent stockroom sys_id
+ *
+ * @Return: an object of part model in a form of {modelID: quantity}
+ */
+function getPartsForAgent(personalRoom, uniqueParts) {
+    var agentParts = {};
+    if (gs.nil(personalRoom)) {
+        return agentParts;
+    }
+
+    var asset = new GlideAggregate("alm_asset");
+    asset.addQuery("install_status", "6"); // in stock
+    asset.addQuery("substatus", "available");
+    asset.addQuery("stockroom", personalRoom);
+    asset.addQuery("model", "IN", uniqueParts.join());
+    asset.groupBy("model");
+    asset.addAggregate("SUM", "quantity");
+    asset.query();
+
+    while (asset.next()) {
+        agentParts[asset.model] = +asset.getAggregate("SUM", "quantity");
+    }
+
+    return agentParts;
+}
+
+function hasNoParts(partObjs) {
+    var objKeys = Object.keys(partObjs);
+    if (partObjs &amp;&amp; objKeys.length === 0 &amp;&amp; partObjs.constructor === Object) {
+        return true;
+    }
+    return false;
+
+
+}
+
+
+function createEAMCatalogRequest(partReqList) {
+
+    var isEamActive = GlidePluginManager.isActive('com.sn_eam') || GlidePluginManager.isActive('sn_eam');
+    if(!isEamActive || gs.nil(partReqList)) {
+        return null;
+    }
+
+    var partReqGr = new GlideRecord("sm_part_requirement");
+    partReqGr.addQuery('sys_id','IN', partReqList);
+    partReqGr.addQuery('service_order_task.state', 'IN', '17,18'); // Accepted, Work In Progress
+    partReqGr.addQuery('requested', 'false');
+    partReqGr.query();
+
+    var cart;
+
+    while(partReqGr.next()) {
+        cart = new sn_sc.CartJS();
+        var item = {};
+        item.sysparm_id = sn_eam.EAMSourcingAutomationAPI.WORK_ORDER_CATALOG_ITEM;
+        item.sysparm_quantity = partReqGr.required_quantity + '';
+        if (!gs.nil(partReqGr.service_order_task) &amp;&amp; !(gs.nil(partReqGr.service_order_task.assigned_to))) {
+            item.sysparm_requested_for = partReqGr.service_order_task.assigned_to.toString();
+        }
+        item.variables = {};
+        item.variables.part_requirement = partReqGr.sys_id + '';
+        item.variables.model = partReqGr.model + '';
+        item.variables.eam_sourcing = 'true';
+        item.variables.sn_eam_process = 'sn_eam_work_order';
+        if (!gs.nil(partReqGr.service_order_task) &amp;&amp; !(gs.nil(partReqGr.service_order_task.location))) {
+            item.variables.location = partReqGr.service_order_task.location.toString();
+        }
+        cart.addToCart(item);
+        partReqGr.setValue('requested', 'true');
+        partReqGr.update();
+    }
+
+    if (gs.nil(cart)) {
+        gs.addErrorMessage(gs.getMessage('No part requirements found'));
+        return cart;
+    }
+    return cart.checkoutCart();
+}]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-03-16 21:33:34&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;4594c6ffc73e2010c636edf4c1c26022&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;17&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;FSMPartUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Field Service Management" source="com.snc.work_management"&gt;b66bd6bb4722c210cd4e1ce4316d4387&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_4594c6ffc73e2010c636edf4c1c26022&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-10-03 11:12:04&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:36:27</sys_created_on>
+        <sys_id>048634d983f01210c6695855eeaad380</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>FSMPartUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_048634d983f01210c6695855eeaad380</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:36:27</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

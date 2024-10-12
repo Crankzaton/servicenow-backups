@@ -1,0 +1,398 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>50607c205b71211006447da52d81c766</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.TemplateTaskRunPopulator&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Script to populate reconcile_template_task_run records for the template runs created in 'draft' state&lt;/description&gt;
+        &lt;name&gt;TemplateTaskRunPopulator&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[/**
+ * This script include serves the following purpose:
+ * 1. Get all the template runs in 'draft' state
+ * 2. For each run, populate the template column for tasks if there is a condition defined on the template
+ * 3. For each run, populate the task run records for the manual and conditionally added tasks in 'ready' state
+ * 4. For each run, populate the task run records for the skipped tasks in 'skipped' state
+ * 5. Update the template run state to 'ready'
+ */
+var TemplateTaskRunPopulator = Class.create();
+TemplateTaskRunPopulator.prototype = {
+    MUTEX_EXPIRATION_TIME_PROPERTY: 'glide.cmdb.create_template_task_run.mutex_expiration_time_seconds',
+    TEMPLATE_TASK_RUN_POPULATOR_MAX_RUN_TIME_PROPERTY: 'glide.cmdb.template_task_run.max_run_time_seconds',
+    MUTEX_NAME_PREFIX: 'reconcile_duplicate_template_run_',
+    RECONCILE_DUPLICATE_TEMPLATE: 'reconcile_duplicate_template',
+    RECONCILE_DUPLICATE_TEMPLATE_RUN: 'reconcile_duplicate_template_run',
+    RECONCILE_DUPLICATE_TEMPLATE_TASK_RUN: 'reconcile_duplicate_template_task_run',
+    RECONCILE_DUPLICATE_TASK: 'reconcile_duplicate_task',
+    RECONCILE_DUPLICATE_TASK_DATA: 'reconcile_duplicate_task_data',
+    DIFFERENT_TEMPLATE: 'different_template',
+    TEMPLATE_TASK_NOT_COMPATIBLE: 'template_task_not_compatible',
+    UPDATE_FAILED: 'update_failed',
+    OPEN_STATE: 1,
+    BATCH_SIZE: 100,
+    GLIDE_AGGREGATES_MAX_LIMIT_PROPERTY: 'glide.db.max.aggregates',
+
+    initialize: function() {
+        this.MUTEX_EXPIRATION_TIME = gs.getProperty(this.MUTEX_EXPIRATION_TIME_PROPERTY, 4 * 60 * 60); // 4 hours
+        this.MAX_RUN_TIME = gs.getProperty(this.TEMPLATE_TASK_RUN_POPULATOR_MAX_RUN_TIME_PROPERTY, 1 * 60 * 60); // 1 hour
+        this.IS_DOMAIN_SUPPORT_ACTIVE = GlidePluginManager.isActive('com.glide.domain.msp_extensions.installer');
+        this.MAX_SUPPORTED_GLIDE_AGGREGATES = parseInt(gs.getProperty(this.GLIDE_AGGREGATES_MAX_LIMIT_PROPERTY, 100000));
+    },
+
+    populateRecords: function() {
+        var timer = new GlideStopWatch();
+        var maxRunTimeInMs = this.MAX_RUN_TIME * 1000;
+        while (timer.getTime() &lt; maxRunTimeInMs) {
+            // Get the next template run currently in "draft" state
+            var templateRunObj = this._getTemplateRunInDraftState();
+            // No records in the "draft" state. Nothing to process
+            if (Object.keys(templateRunObj).length == 0) {
+                break;
+            }
+
+            /**
+             * 1. Try to acquire lock for the current template run_id.
+             * 2. If we are not able to acquire the lock, do NOT retry as some other job might be working on it
+             * 3. Proceed with the next run id and repeat the same steps
+             */
+            var mutex = new GlideSelfCleaningMutex(this.mutexName + templateRunObj.run, 'TemplateTaskRunPopulator');
+            mutex.setMutexExpires(this.MUTEX_EXPIRATION_TIME * 1000);
+            mutex.setMaxSpins(0);
+            if (mutex.get()) {
+                try {
+                    // Populate the task run records for each of the template runs
+                    var response = this._populateTaskRunRecords(templateRunObj);
+                    if (response.status == 'success') {
+                        // Update template run "state" column to ready and total column to # of tasks in the template task run table
+                        var templateRunGr = new GlideRecord(this.RECONCILE_DUPLICATE_TEMPLATE_RUN);
+                        templateRunGr.get(templateRunObj.run);
+                        templateRunGr.setValue('state', 'ready');
+                        templateRunGr.setValue('total', response.total);
+                        templateRunGr.setValue('skipped', response.skipped);
+                        templateRunGr.update();
+                    }
+                } finally {
+                    mutex.release();
+                }
+            } else {
+                gs.info('Falied to acquire mutex for Template Run: ' + templateRunObj.run);
+            }
+        }
+    },
+
+    /**
+     * Get the next template run currently in "draft state"
+     */
+    _getTemplateRunInDraftState: function() {
+        var templateRunObj = {};
+        var templateRunGr = new GlideRecord(this.RECONCILE_DUPLICATE_TEMPLATE_RUN);
+        templateRunGr.addQuery('state', 'draft');
+        templateRunGr.orderBy('sys_created_on');
+        templateRunGr.setLimit(1);
+        templateRunGr.query();
+        if (templateRunGr.next()) {
+            templateRunObj = {
+                run: templateRunGr.getValue('sys_id'),
+                template: templateRunGr.getValue('template'),
+                domain: templateRunGr.getValue('sys_domain')
+            };
+        }
+        return templateRunObj;
+    },
+
+    /**
+     * Populate the task run records for the given template run
+     */
+    _populateTaskRunRecords: function(templateRunObj) {
+        var runId = templateRunObj.run;
+        var templateId = templateRunObj.template;
+        var domain = templateRunObj.domain;
+
+        var response = {};
+
+        // If the template does not exist, log error and return
+        var templateGr = new GlideRecord(this.RECONCILE_DUPLICATE_TEMPLATE);
+        if (!templateGr.get(templateId)) {
+            gs.error('No template exists for run id: ' + runId);
+
+            response.status = 'error';
+            response.total = 0;
+            response.skipped = 0;
+
+            return response;
+        }
+
+        // Condition defined to get tasks on the template
+        var condition = templateGr.getValue('task_conditions');
+
+        /**
+         * If there is a condition defined, populate the template for the tasks that match the condition
+         * Otherwise, get the list of manually added tasks for the template
+         */
+        var resultTaskIds = {};
+        if (condition) {
+            resultTaskIds = this._populateTemplateForManualAndConditionalTasks(condition, templateId, domain);
+        } else {
+            resultTaskIds = this._getManualTaskIdsForTemplate(templateId);
+        }
+
+        // Populate the template task run records for the valid task ids with "state" as "ready"
+        var validTaskIds = Object.keys(resultTaskIds.validTaskIds);
+        for (var i = 0; i &lt; validTaskIds.length; i++) {
+            var templateTaskRunGr = new GlideRecord(this.RECONCILE_DUPLICATE_TEMPLATE_TASK_RUN);
+            templateTaskRunGr.setValue('template', templateId);
+            templateTaskRunGr.setValue('task', validTaskIds[i]);
+            templateTaskRunGr.setValue('run', runId);
+            templateTaskRunGr.setValue('state', 'ready');
+            templateTaskRunGr.setValue('sys_domain', domain);
+
+            templateTaskRunGr.insert();
+        }
+
+        // Populate the template task run records for the skipped task ids with "state" as "skipped"
+        var skippedTaskIds = Object.keys(resultTaskIds.skippedTaskIds);
+        for (var j = 0; j &lt; skippedTaskIds.length; j++) {
+            var taskId = skippedTaskIds[j];
+            var templateTaskRunSkippedGr = new GlideRecord(this.RECONCILE_DUPLICATE_TEMPLATE_TASK_RUN);
+            templateTaskRunSkippedGr.setValue('template', templateId);
+            templateTaskRunSkippedGr.setValue('task', taskId);
+            templateTaskRunSkippedGr.setValue('message', resultTaskIds.skippedTaskIds[taskId].message);
+            templateTaskRunSkippedGr.setValue('message_type', resultTaskIds.skippedTaskIds[taskId].messageType);
+            templateTaskRunSkippedGr.setValue('run', runId);
+            templateTaskRunSkippedGr.setValue('state', 'skipped');
+            templateTaskRunSkippedGr.setValue('sys_domain', domain);
+
+            templateTaskRunSkippedGr.insert();
+        }
+
+        response.status = 'success';
+        response.total = validTaskIds.length + skippedTaskIds.length;
+        response.skipped = skippedTaskIds.length;
+
+        return response;
+    },
+
+    /**
+     * For tasks that match the condition and do not have the template, populate the template
+     * For tasks that match the condition but already have a template, skip them
+     * For tasks that do not match the condition but already have a template, do nothing
+     * Return the set of valid (manual and conditional) and skipped task ids
+     */
+    _populateTemplateForManualAndConditionalTasks: function(condition, templateId, domain) {
+        // Tasks whose template column is already populated with some other templateId
+        var skippedTaskIds = {};
+        // Tasks whose template column is/will be populated with the current templateId
+        var validTaskIds = {};
+        // Tasks whose template column is not populated yet
+        var noTemplateTaskIds = {};
+
+        // Populate the manually added task ids first
+        validTaskIds = this._getManualTaskIdsForTemplate(templateId).validTaskIds;
+
+        var currentDomain = GlideSession.get().getCurrentDomainID();
+        try {
+            if (this.IS_DOMAIN_SUPPORT_ACTIVE) {
+                // Change the domain to the template run's domain
+                GlideSession.get().setDomainID(domain);
+            }
+
+            var start = 0;
+            var end = this.MAX_SUPPORTED_GLIDE_AGGREGATES;
+            // Platform has a limitation on number of aggregates returned using query, workaround is to call multiple times with varying offset
+            // If glide aggregate returns less data rows than asked (end -start), it indicates there is no more data to query
+            // If it returned exact rows as asked, we need to query again as there is potential of more data available
+            do {
+                var singleBatchRowCount = 0;
+                // Get all de-duplication tasks by evaluating the specified condition on the reconcile_duplicate_task_data table
+                var duplicateTaskDataGr = this._getTaskDataRecords(condition, start, end);
+
+                /**
+                 * If the template column is equal to the templateId, the task was manually added to the current template
+                 * If the template column is not equal to the templateId and it not null, the task is already a part of different template
+                 * If the template column is null, the task is not assigned to any template
+                 */
+                while (duplicateTaskDataGr.next()) {
+                    var currentTemplateId = duplicateTaskDataGr.getValue('task.template');
+                    var currentTaskId = duplicateTaskDataGr.getValue('task');
+                    if (currentTemplateId == templateId) {
+                        validTaskIds[currentTaskId] = {};
+                    } else if (currentTemplateId) {
+                        skippedTaskIds[currentTaskId] = {};
+                        skippedTaskIds[currentTaskId].messageType = this.DIFFERENT_TEMPLATE;
+                        skippedTaskIds[currentTaskId].message = 'Task is already added to a different template ' + currentTemplateId;
+                    } else {
+                        noTemplateTaskIds[currentTaskId] = {};
+                    }
+                    singleBatchRowCount++;
+                }
+                start = end + 1;
+                end = end + this.MAX_SUPPORTED_GLIDE_AGGREGATES;
+            } while (singleBatchRowCount == this.MAX_SUPPORTED_GLIDE_AGGREGATES);
+        } finally {
+            if (this.IS_DOMAIN_SUPPORT_ACTIVE) {
+                // Change the domain back to current domain
+                GlideSession.get().setDomainID(currentDomain);
+            }
+        }
+
+        // noTemplateTaskIds contains the tasks which matched the conidtion but do not have the template populated yet
+        // Check if these tasks can be added to the template
+        var canAddTasksToTemplateResult = sn_cmdb.DuplicateTemplate.canAddTasksToTemplate(Object.keys(noTemplateTaskIds), templateId);
+        noTemplateTaskIds = canAddTasksToTemplateResult.success.reduce(function(a, c) {
+            a[c] = true;
+            return a;
+        }, {});
+
+        // Add the tasks that cannot be added to template to the skippedTaskIds
+        for (var i in canAddTasksToTemplateResult.skipped) {
+            var skippedTaskId = canAddTasksToTemplateResult.skipped[i];
+            if (!skippedTaskIds[skippedTaskId]) {
+                skippedTaskIds[skippedTaskId] = {};
+                skippedTaskIds[skippedTaskId].messageType = this.TEMPLATE_TASK_NOT_COMPATIBLE;
+                skippedTaskIds[skippedTaskId].message = 'Class hierarchy for task and template do not match';
+            }
+        }
+        for (var j in canAddTasksToTemplateResult.failed) {
+            var failedTaskId = canAddTasksToTemplateResult.failed[j];
+            if (!skippedTaskIds[failedTaskId]) {
+                skippedTaskIds[failedTaskId] = {};
+                skippedTaskIds[failedTaskId].messageType = this.TEMPLATE_TASK_NOT_COMPATIBLE;
+                skippedTaskIds[failedTaskId].message = 'Cannot add task to template because of sn_cmdb.DuplicateTemplate.canAddTasksToTemplate API errors';
+            }
+        }
+
+        // Populate template column for the list of tasks with no template
+        var populateTemplateResult = this._populateTemplateForTaskIds(Object.keys(noTemplateTaskIds), templateId);
+
+        // Some tasks within noTemplateTaskIds might not get updated with template. Include them in the skippedTaskIds
+        for (var skipped in populateTemplateResult.skipped) {
+            if (!skippedTaskIds[skipped]) {
+                skippedTaskIds[skipped] = {};
+                skippedTaskIds[skipped].messageType = this.UPDATE_FAILED;
+                skippedTaskIds[skipped].message = 'Cannot update template column for task due to update errors';
+            }
+        }
+
+        // Add the tasks for which template column was populated in the set of validTaskIds
+        for (var success in populateTemplateResult.success) {
+            validTaskIds[success] = {};
+        }
+
+        var resultTaskIds = {
+            'validTaskIds': validTaskIds,
+            'skippedTaskIds': skippedTaskIds
+        };
+
+        return resultTaskIds;
+    },
+
+    /**
+     * Get the manually added task ids for the template
+     */
+    _getManualTaskIdsForTemplate: function(templateId) {
+        var manuallyAddedTaskIds = {};
+        var duplicateTaskGr = new GlideRecord(this.RECONCILE_DUPLICATE_TASK);
+        duplicateTaskGr.addQuery('template', templateId);
+        duplicateTaskGr.addQuery('state', this.OPEN_STATE);
+        duplicateTaskGr.query();
+        while (duplicateTaskGr.next()) {
+            var taskId = duplicateTaskGr.getValue('sys_id');
+            manuallyAddedTaskIds[taskId] = {};
+        }
+        var resultTaskIds = {
+            'validTaskIds': manuallyAddedTaskIds,
+            'skippedTaskIds': {}
+        };
+
+        return resultTaskIds;
+    },
+
+    /**
+     * Get all the open tasks by evaluating the condition on the reconcile_duplicate_task_data table
+     */
+    _getTaskDataRecords: function(condition, start, end) {
+        var duplicateTaskDataGr = new GlideAggregate(this.RECONCILE_DUPLICATE_TASK_DATA);
+        duplicateTaskDataGr.addEncodedQuery(condition);
+        duplicateTaskDataGr.groupBy('task');
+        duplicateTaskDataGr.groupBy('task.template');
+        duplicateTaskDataGr.addQuery('task.state', this.OPEN_STATE);
+        duplicateTaskDataGr.chooseWindow(start, end);
+        duplicateTaskDataGr.query();
+        return duplicateTaskDataGr;
+    },
+
+    /**
+     * Populate the "template" column for the list of task ids
+     */
+    _populateTemplateForTaskIds: function(taskIds, templateId) {
+        var successTaskIds = {};
+        var skippedTaskIds = {};
+        for (var i = 0; i &lt; taskIds.length; i += this.BATCH_SIZE) {
+            var chunk = taskIds.slice(i, i + this.BATCH_SIZE);
+            var duplicateTaskGr = new GlideRecord(this.RECONCILE_DUPLICATE_TASK);
+            duplicateTaskGr.addQuery('sys_id', 'IN', chunk);
+            duplicateTaskGr.addNullQuery('template');
+            duplicateTaskGr.setValue('template', templateId);
+            // updateMultiple() will still run individual update() operations because of BRs on the task table
+            // TODO: See if we can disable the BRs by analyzing what the OOB BRs are doing
+            duplicateTaskGr.updateMultiple();
+
+            // We need to check again if the update was successful because some of the tasks can be added to the templates (manually/through other template run)
+            duplicateTaskGr = new GlideRecord(this.RECONCILE_DUPLICATE_TASK);
+            duplicateTaskGr.addQuery('sys_id', 'IN', chunk);
+            duplicateTaskGr.addQuery('template', templateId);
+            duplicateTaskGr.query();
+            while (duplicateTaskGr.next()) {
+                var sysId = duplicateTaskGr.getValue('sys_id');
+                successTaskIds[sysId] = true;
+            }
+
+            // The tasks that were not updated with the template should be considered as skipped
+            for (var j in chunk) {
+                var taskId = chunk[j];
+                if (!successTaskIds[taskId]) {
+                    skippedTaskIds[taskId] = true;
+                }
+            }
+        }
+        return {
+            'success': successTaskIds,
+            'skipped': skippedTaskIds
+        };
+    },
+    type: 'TemplateTaskRunPopulator'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-03-22 04:43:35&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;50607c205b71211006447da52d81c766&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;5&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;TemplateTaskRunPopulator&lt;/sys_name&gt;
+        &lt;sys_package display_value="Configuration Management (CMDB)" source="com.snc.cmdb"&gt;8f64bce83c31311068bcf327dfe37f7e&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_50607c205b71211006447da52d81c766&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-02-04 17:24:23&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:37:00</sys_created_on>
+        <sys_id>0ca63cd983f01210c6695855eeaad39c</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>TemplateTaskRunPopulator</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_0ca63cd983f01210c6695855eeaad39c</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:37:00</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

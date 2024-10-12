@@ -1,0 +1,580 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>6fd96193c3152010389691f58640ddf2</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.LFMachineTranslator&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;This class contains responsibilities specific to  machine translation.&lt;/description&gt;
+        &lt;name&gt;LFMachineTranslator&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var LFMachineTranslator = Class.create();
+
+LFMachineTranslator.prototype = {
+
+    initialize: function() {
+        this.lfConstants = new LFConstants();
+        this.lfValidationUtils = new LFValidationUtils();
+        this.lfSettingUtils = new LFSettingUtils();
+        this.lfReadSaveScriptUtils = new LFReadSaveScriptUtils();
+        this.lfUtils = new LFUtils();
+        this.lfLUAUtils = new LFLUAUtils();
+        this.lfInsights = new LFGenerateLocalizationInsights();
+        this.FIELD_DELIMITER = ": ";
+    },
+
+    isGlobalError: function(code) {
+        return this.lfConstants.DT_ERROR_CODES.indexOf(code) != -1;
+    },
+
+    bulkTranslate: function(taskId, mode, additionalInfo) {
+        var taskUtils = new LFTaskUtils(taskId);
+        var hasProject = taskUtils.hasLocalizationProject();
+        var hasRequestedItems = false;
+        var taskAdditionalInfo = taskUtils.getAdditionalInfo();
+        if (taskUtils.hasBulkTranslations()) {
+            var requestedItemIds = taskUtils.getRelatedRequestedItemIdsFilterOutByState();
+            hasRequestedItems = true;
+            if (requestedItemIds.length &gt; 0) {
+                var result = this._translateRequestedItems(requestedItemIds, additionalInfo);
+            }
+            taskAdditionalInfo = new LFTaskUtils(taskId).getAdditionalInfo();
+            taskAdditionalInfo["readOnly"] = false;
+        } else {
+            result = this.translate(taskUtils.getDocumentContent(), {
+                "targetLanguages": [taskUtils.getTargetLanguageCode()],
+                "sourceLanguage": taskUtils.getSourceLanguageCode(),
+                "translator": additionalInfo.translator
+            });
+            taskUtils.setDocumentContent(result.itemToTranslate);
+        }
+        if (result.status == this.lfConstants.SUCCESS) {
+            taskUtils.moveToInProgress();
+            if (!hasRequestedItems) {
+                taskAdditionalInfo['errorDetails'] = {
+                    "error": false
+                };
+            }
+        } else {
+            taskUtils.moveToErrorInTranslation();
+            if (!hasRequestedItems) {
+                taskAdditionalInfo['errorDetails'] = {
+                    "fieldLevelMessages": result.errorMessages,
+                    "error": true
+                };
+            }
+        }
+        taskUtils.setAdditionalInfo(taskAdditionalInfo);
+        taskUtils.updateLastPerformedAction(result.message, result.status);
+        var luaDetails = taskUtils.getLUADetails();
+        var artifactInternalName = luaDetails.artifacts;
+        var targetLanguage = luaDetails.targetLanguages;
+        var sourceLanguage = luaDetails.sourceLanguages;
+        if (result.status == this.lfConstants.SUCCESS &amp;&amp; mode == this.lfConstants.AUTO) {
+            if (taskUtils.checkIfAutoPublishEnabled() || taskUtils.hasTranslationApprovalStep()) {
+                taskUtils.moveToUnderReview();
+                if (taskUtils.checkIfAutoPublishEnabled()) {
+                    taskUtils.setPublishSourceForLUA(mode);
+                }
+                taskUtils.update();
+            }
+        }
+        new LFLUAUtils().sendTranslationEvent('Machine Translation', additionalInfo.translator, mode,
+            artifactInternalName,
+            targetLanguage,
+            sourceLanguage,
+            result.status === this.lfConstants.ERROR,
+            hasProject);
+        return {
+            "status": result.status,
+            "message": result.message
+        };
+    },
+
+    artifactMachineTranslate: function(artifactInternalName, sysId, targetLanguage, additionalInfo) {
+        this.lfValidationUtils.validateUserHasRole(this.lfConstants.EDITOR);
+        this._validateInputsForMachineTranslate(artifactInternalName, sysId, targetLanguage, additionalInfo);
+        if (additionalInfo === undefined) {
+            additionalInfo = {};
+        }
+        var machineTranslateAdditionalInfo = this._checkIfMachineTranslationIsEnabled(artifactInternalName, targetLanguage, additionalInfo.sourceLanguage);
+
+        var documentContent = this.lfReadSaveScriptUtils.generateDocumentContent(artifactInternalName, sysId, targetLanguage);
+        var content = documentContent['content'];
+        var itemToTranslate = this.lfUtils.groupByProperty(content);
+        var sourceOfRequest = this.lfValidationUtils.isFieldTypeNonString(additionalInfo.sourceOfRequest) ? this.lfConstants.API : additionalInfo.sourceOfRequest;
+
+        machineTranslateAdditionalInfo['overrideExistingTranslations'] = additionalInfo.overrideExistingTranslations;
+        machineTranslateAdditionalInfo['populateDtErrorMessage'] = true;
+
+        var result = this.translate(itemToTranslate, machineTranslateAdditionalInfo);
+        if (result.status === this.lfConstants.ERROR || result.status === this.lfConstants.PARTIAL) {
+            this.lfLUAUtils.sendTranslationEvent("Machine Translation", machineTranslateAdditionalInfo.translator, sourceOfRequest,
+                artifactInternalName, targetLanguage, machineTranslateAdditionalInfo.sourceLanguage, true, false);
+
+            exceptionMapper = new LFExceptionMapper('MACHINE_TRANSLATION_FAILED', [result.message]);
+            exceptionMapper.throwException();
+        }
+        var translatedDocContent = {
+            'version': 'v1',
+            'content': this.lfUtils.retrieveOriginalContent(result.itemToTranslate)
+        };
+
+        var additionalParameters = documentContent['additionalParameters'];
+        var currentArtifactScope = (additionalParameters &amp;&amp; additionalParameters.scope) ? additionalParameters.scope : 'global';
+        var updateSetManager = new LFUpdateSetManager(this.lfConstants.ADHOC);
+        // Create dedicated update set in current artifact scope to save translations
+        updateSetManager.switchToUpdateSetInScope(currentArtifactScope);
+
+        var lfReadSaveScriptUtils = new LFReadSaveScriptUtils(this.lfConstants.ADHOC);
+        var saveScriptParms = {};
+        saveScriptParms[lfReadSaveScriptUtils.SAVE_SCRIPT_INPUTS.documentContent] = translatedDocContent;
+        saveScriptParms[lfReadSaveScriptUtils.SAVE_SCRIPT_INPUTS.language] = targetLanguage;
+        saveScriptParms[lfReadSaveScriptUtils.SAVE_SCRIPT_INPUTS.sysId] = sysId;
+        saveScriptParms["sourceOfRequest"] = this.lfConstants.API;
+        saveScriptParms["hasProject"] = false;
+        lfReadSaveScriptUtils.publishTranslations(artifactInternalName, saveScriptParms);
+        // Add previous update set as default in session
+        updateSetManager.switchToPreviousUpdateSet();
+
+        this.lfLUAUtils.sendTranslationEvent("Machine Translation", machineTranslateAdditionalInfo.translator, sourceOfRequest,
+            artifactInternalName, targetLanguage, machineTranslateAdditionalInfo.sourceLanguage, false, false);
+    },
+
+    translate: function(itemToTranslate, additionalInfo) {
+        var textStatus = this.lfConstants.SUCCESS;
+        var htmlStatus = this.lfConstants.SUCCESS;
+        var translationStatus = {};
+        var parms = {};
+        var errorMessages = {};
+
+        parms['event'] = {
+            "eventName": "LF - Platform"
+        };
+
+        parms['targetLanguages'] = additionalInfo.targetLanguages;
+        parms['sourceLanguage'] = additionalInfo.sourceLanguage;
+        parms['translator'] = additionalInfo.translator;
+        parms['additionalParameters'] = [{
+                "parameterName": "timeOut",
+                "parameterValue": gs.getProperty("com.glide.sn_lf.machine_translate.timeout", 270)
+            },
+            {
+                "parameterName": "updateCache",
+                "parameterValue": "false"
+            }
+        ];
+
+        var overrideExistingTranslations = additionalInfo.overrideExistingTranslations;
+
+        var textToBeTranslated = this._extractContentToBeTranslated(itemToTranslate, overrideExistingTranslations);
+        if (textToBeTranslated.fieldsOfTypeTranslatedText.length === 0 &amp;&amp; textToBeTranslated.fieldsOfTypeTranslatedHtml.length === 0) {
+            translationStatus.status = this.lfConstants.SUCCESS;
+            translationStatus.message = gs.getMessage("The task does not have any fields available for machine translation.");
+        } else {
+            // Translate using Dynamic translation
+            // translatedTextResponse contains translation response for text type fields
+            // translatedHtmlResponse contains translation response for html type fields
+            var translatedTextResponse, translatedHtmlResponse;
+            if (textToBeTranslated.fieldsOfTypeTranslatedText.length &gt; 0) {
+                translatedTextResponse = this._getTranslationsResponse(textToBeTranslated.fieldsOfTypeTranslatedText, parms);
+                textStatus = translatedTextResponse.status;
+            }
+            if (textToBeTranslated.fieldsOfTypeTranslatedHtml.length &gt; 0) {
+                parms["additionalParameters"].push({
+                    "parameterName": "texttype",
+                    "parameterValue": "html"
+                });
+                translatedHtmlResponse = this._getTranslationsResponse(textToBeTranslated.fieldsOfTypeTranslatedHtml, parms);
+                htmlStatus = translatedHtmlResponse.status;
+            }
+
+            // populate translated values obtained from translatedTextResponse,translatedHtmlResponse
+            var groupNameList = Object.keys(itemToTranslate);
+            var errorCode;
+            for (var groupIdx = 0; groupIdx &lt; groupNameList.length; groupIdx++) {
+                var groupName = groupNameList[groupIdx];
+                var groupDataOfItem = itemToTranslate[groupName];
+                for (var groupDataIndex in groupDataOfItem) {
+                    var groupDataElement = groupDataOfItem[groupDataIndex];
+                    var fieldInfo = groupDataElement.fieldInfo;
+                    var id = groupDataElement.id;
+                    for (var fieldInfoIndex in fieldInfo) {
+                        var fieldInfoElement = fieldInfo[fieldInfoIndex];
+                        var textToTranslate = fieldInfoElement.originalValue;
+                        var escapeDetailsValid = this._escapeDetailsValid(fieldInfoElement.escapeDetails);
+
+                        if (escapeDetailsValid) {
+                            var tokenMetaData = this.tokenMetaData[textToTranslate];
+                            textToTranslate = tokenMetaData.replacedString;
+                        }
+
+                        var index, status, translatedResponse, translationErrorsKey;
+                        if ((!fieldInfoElement.isFieldLocked || overrideExistingTranslations === true) &amp;&amp; textToTranslate) {
+                            if (fieldInfoElement.textType == "html" || fieldInfoElement.type == "translated_html") {
+                                index = textToBeTranslated.fieldsOfTypeTranslatedHtml.indexOf(textToTranslate);
+                                status = htmlStatus;
+                                translatedResponse = translatedHtmlResponse;
+                            } else {
+                                index = textToBeTranslated.fieldsOfTypeTranslatedText.indexOf(textToTranslate);
+                                status = textStatus;
+                                translatedResponse = translatedTextResponse;
+                            }
+
+                            if (status === this.lfConstants.ERROR) { // if Dynamic translation results in global error
+                                translationErrorsKey = this._getTranslationErrorsKey(fieldInfo.length, groupDataElement.groupName, groupDataElement.label, fieldInfoIndex, groupDataElement.id);
+                                errorCode = translatedResponse.error.code;
+                                errorMessages[translationErrorsKey] = {
+                                    "message": translatedResponse.error.message
+                                };
+                            } else if (!translatedResponse.translatedDataList[index].isError) { // if no error
+                                var translatedValue = translatedResponse.translatedDataList[index].textTranslations[0].translatedText;
+
+                                if (escapeDetailsValid) {
+                                    for (var item in tokenMetaData.tokenMappingObjects) {
+                                        translatedValue = translatedValue.replace(item, tokenMetaData.tokenMappingObjects[item]);
+                                    }
+                                }
+                                fieldInfoElement['primaryTranslatedValue'] = translatedValue;
+                                fieldInfoElement['translatedValue'] = translatedValue;
+                            } else { // partial scenario where there is no global error
+                                translationErrorsKey = this._getTranslationErrorsKey(fieldInfo.length, groupDataElement.groupName, groupDataElement.label, fieldInfoIndex, groupDataElement.id);
+                                errorMessages[translationErrorsKey] = {
+                                    "message": translatedResponse.translatedDataList[index].message
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+
+            var translationData = {
+                "textToBeTranslated": textToBeTranslated,
+                "translatedText": {
+                    "translatedTextResponse": translatedTextResponse,
+                    "translatedHtmlResponse": translatedHtmlResponse
+                }
+            };
+            translationStatus = this._prepareTranslationStatus(translationData, textStatus, htmlStatus, additionalInfo);
+        }
+        return {
+            'itemToTranslate': itemToTranslate,
+            'status': translationStatus.status,
+            'message': translationStatus.message,
+            'errorMessages': errorMessages,
+            'code': errorCode
+        };
+    },
+
+    replaceTokens: function(inputString, escapeDetails) {
+        var tokenMetaData = {};
+        var tokenMappingObjects = {};
+        var replaceIndex = 0;
+        for (var idx = 0; idx &lt; escapeDetails.length; idx++) {
+            var escapeDetailsElement = escapeDetails[idx];
+            if (!(escapeDetailsElement &amp;&amp;
+                    escapeDetailsElement.escapeRegex &amp;&amp;
+                    escapeDetailsElement.replaceWith &amp;&amp;
+                    escapeDetailsElement.regexFlag)) {
+                continue;
+            }
+            var regexStr = escapeDetailsElement.escapeRegex;
+            var replaceWith = escapeDetailsElement.replaceWith;
+            var regexFlag = escapeDetailsElement.regexFlag;
+            var regex = new RegExp(regexStr, regexFlag);
+            var matchedTokens = inputString.match(regex);
+            for (var tokenIdx in matchedTokens) {
+                var replaceKey = replaceWith.replace("&lt;IDX&gt;", replaceIndex);
+                tokenMappingObjects[replaceKey] = matchedTokens[tokenIdx];
+                inputString = inputString.replace(matchedTokens[tokenIdx], replaceKey);
+                replaceIndex += 1;
+            }
+        }
+        tokenMetaData.replacedString = inputString;
+        tokenMetaData.tokenMappingObjects = tokenMappingObjects;
+        return tokenMetaData;
+    },
+
+    _extractContentToBeTranslated: function(itemToTranslate, overrideExistingTranslations) {
+        var fieldsOfTypeTranslatedText = [];
+        var fieldsOfTypeTranslatedHtml = [];
+        this.tokenMetaData = {};
+        var mtTranslatorObject = this;
+
+        Object.keys(itemToTranslate).forEach(function(key) {
+            var groupDataOfItem = itemToTranslate[key];
+            for (var groupDataIndex in groupDataOfItem) {
+                var fieldInfoList = groupDataOfItem[groupDataIndex].fieldInfo;
+                for (var fieldInfoIndex in fieldInfoList) {
+                    var fieldInfoElement = fieldInfoList[fieldInfoIndex];
+                    var textToTranslate = fieldInfoElement.originalValue;
+                    var escapeDetails = fieldInfoElement.escapeDetails;
+                    if ((!fieldInfoList[fieldInfoIndex].isFieldLocked || overrideExistingTranslations === true) &amp;&amp; textToTranslate) {
+                        if (mtTranslatorObject._escapeDetailsValid(escapeDetails)) {
+                            var originalTextToTranslate = textToTranslate;
+                            var tokenMetaData = mtTranslatorObject.replaceTokens(textToTranslate, escapeDetails);
+                            textToTranslate = tokenMetaData.replacedString;
+                            mtTranslatorObject.tokenMetaData[originalTextToTranslate] = tokenMetaData;
+                        }
+                        if (fieldInfoList[fieldInfoIndex].textType == "html" || fieldInfoList[fieldInfoIndex].type == "translated_html") {
+                            fieldsOfTypeTranslatedHtml.push(textToTranslate);
+                        } else {
+                            fieldsOfTypeTranslatedText.push(textToTranslate);
+                        }
+                    }
+                }
+            }
+        });
+
+        return {
+            "fieldsOfTypeTranslatedText": fieldsOfTypeTranslatedText,
+            "fieldsOfTypeTranslatedHtml": fieldsOfTypeTranslatedHtml
+        };
+    },
+
+    _getTranslationsResponse: function(contentToBeTranslated, parms) {
+        var translatedDataList, status, error;
+        try {
+            var result = sn_dt_api.DynamicTranslation.getTranslations(contentToBeTranslated, parms);
+            translatedDataList = result.translations;
+            status = result.status;
+        } catch (ex) {
+            status = this.lfConstants.ERROR;
+            error = JSON.parse(ex);
+        }
+        return {
+            "translatedDataList": translatedDataList,
+            "status": status,
+            "error": error
+        };
+    },
+
+    _translateRequestedItems: function(requestedItemIds, additionalInfo) {
+        var status = this.lfConstants.SUCCESS;
+        var prevMessage, count = 0;
+        for (var idx = 0; idx &lt; requestedItemIds.length; idx++) {
+            var requestedItemUtils = new LFRequestedItemUtils(requestedItemIds[idx]);
+            var parms = {
+                'targetLanguages': [requestedItemUtils.getTargetLanguageCode()],
+                'sourceLanguage': requestedItemUtils.getSourceLanguageCode(),
+                'translator': additionalInfo.translator
+            };
+            var documentContent = requestedItemUtils.getDocumentContent();
+            var version = documentContent['version'];
+            if (version === "v1") {
+                var content = this.lfUtils.groupByProperty(documentContent['content']);
+            }
+            var result = this.translate(content, parms);
+            var message;
+            if (result.status == this.lfConstants.ERROR) {
+                status = this.lfConstants.ERROR;
+                if (this.isGlobalError(result.code)) {
+                    message = result.message;
+                    LFRequestedItemUtils.updateLocalizationRequestedItemsWithJournalFields(requestedItemIds, {
+                        'error': true,
+                        'additional_info': JSON.stringify({}),
+                        'work_notes': result.message,
+                        'state': this.lfConstants.REQUESTED_ITEM_STATES.In_Progress
+                    });
+                    break;
+                }
+                if (prevMessage &amp;&amp; count != -1) {
+                    count = (prevMessage == result.message) ? count + 1 : -1;
+                } else if (!prevMessage) {
+                    count = 1;
+                    prevMessage = result.message;
+                }
+                message = gs.getMessage("Failed to machine translate one or more requested items using {0}.", additionalInfo.translator);
+                requestedItemUtils.setError(true);
+                requestedItemUtils.addWorkNotes(result.message);
+                requestedItemUtils.setFieldLevelMessagesInfo(result.errorMessages);
+            } else if (result.status == this.lfConstants.PARTIAL) {
+                requestedItemUtils.setError(true);
+                status = this.lfConstants.ERROR; // Partial scenarios must be shown as error message
+                this._updateRequestedItem(requestedItemUtils, documentContent, result, additionalInfo.translator);
+                message = gs.getMessage("Failed to machine translate one or more requested items using {0}.", additionalInfo.translator);
+            } else if (result.status == this.lfConstants.SUCCESS) {
+                requestedItemUtils.setError(false);
+                if (prevMessage &amp;&amp; count != -1) {
+                    count = (prevMessage == result.message) ? count + 1 : -1;
+                } else if (!prevMessage) {
+                    count = 1;
+                    prevMessage = result.message;
+                }
+                this._updateRequestedItem(requestedItemUtils, documentContent, result, additionalInfo.translator);
+            }
+            requestedItemUtils.moveToInProgress();
+            requestedItemUtils.update();
+        }
+        if (status == this.lfConstants.SUCCESS) {
+            message = gs.getMessage("Successfully translated using {0}.", additionalInfo.translator);
+        }
+        if (count == requestedItemIds.length) {
+            message = prevMessage;
+        }
+        return {
+            "status": status,
+            "message": message
+        };
+    },
+
+    _prepareTranslationStatus: function(translationData, textStatus, htmlStatus, additionalInfo) {
+        var textToBeTranslated = translationData.textToBeTranslated;
+        var translatedTextResponse = translationData.translatedText.translatedTextResponse;
+        var translatedHtmlResponse = translationData.translatedText.translatedHtmlResponse;
+
+        if (textToBeTranslated.fieldsOfTypeTranslatedText.length == 0 &amp;&amp; textToBeTranslated.fieldsOfTypeTranslatedHtml.length &gt; 0) {
+            textStatus = htmlStatus;
+        } else if (textToBeTranslated.fieldsOfTypeTranslatedText.length &gt; 0 &amp;&amp; textToBeTranslated.fieldsOfTypeTranslatedHtml.length == 0) {
+            htmlStatus = textStatus;
+        }
+
+        var status, message;
+
+        if (textStatus === this.lfConstants.SUCCESS &amp;&amp; htmlStatus === this.lfConstants.SUCCESS) {
+            status = this.lfConstants.SUCCESS;
+            message = gs.getMessage("Successfully translated using {0}.", additionalInfo.translator);
+        } else if (textStatus === this.lfConstants.ERROR &amp;&amp; htmlStatus === this.lfConstants.ERROR) {
+            status = this.lfConstants.ERROR;
+            var errorMessage, errorCode;
+            if (translatedTextResponse.error) {
+                errorMessage = translatedTextResponse.error.message;
+                errorCode = translatedTextResponse.error.code;
+            } else if (translatedHtmlResponse.error) {
+                errorMessage = translatedHtmlResponse.error.message;
+                errorCode = translatedHtmlResponse.error.code;
+            }
+
+            message = this._getMessageForError(errorMessage, errorCode, additionalInfo);
+        } else {
+            status = this.lfConstants.PARTIAL;
+            message = this._getMessageForPartial(additionalInfo);
+        }
+        return {
+            "status": status,
+            "message": message
+        };
+    },
+
+    _getMessageForError: function(errorMessage, errorCode, additionalInfo) {
+        if (additionalInfo.populateDtErrorMessage === true) {
+            if (errorCode === '40051' || errorCode === '40010') { // For unknown error or multiple errors 
+                return gs.getMessage('Failed to machine translate using {0}', additionalInfo.translator);
+            }
+            return errorMessage;
+        }
+        return gs.getMessage("Failed to machine translate using {0}. {1}", [additionalInfo.translator, errorMessage]);
+    },
+
+    _getMessageForPartial: function(additionalInfo) {
+        if (additionalInfo.populateDtErrorMessage === true) {
+            return gs.getMessage('Failed to machine translate using {0}', additionalInfo.translator);
+        }
+        return gs.getMessage("Failed to machine translate using {0}. Translations for one or more fields have failed.", additionalInfo.translator);
+    },
+
+    _getTranslationErrorsKey: function(fieldInfoLength, groupName, label, index, id) {
+        var choiceId = (fieldInfoLength &gt; 1) ? " - choice_" + index : "";
+        if (!id) {
+            id = groupName + this.FIELD_DELIMITER + label;
+        }
+        return id + choiceId;
+    },
+
+    _checkIfMachineTranslationIsEnabled: function(artifactInternalName, targetLanguage, sourceLanguage) {
+        var targetLanguageSysId = this.lfUtils.getLanguageCodeDetails(targetLanguage).sysId;
+        var settings = this.lfSettingUtils.getLFSetting(artifactInternalName, targetLanguageSysId);
+        var settingKeys = this.lfConstants.SETTING_KEYS;
+        var translator = settings[settingKeys.TranslatorName];
+        if (settings[settingKeys.EnableMachineTranslate] === '1' &amp;&amp; translator) {
+            var additionalInfo = {
+                'targetLanguages': [targetLanguage],
+                'sourceLanguage': sourceLanguage,
+                'translator': translator
+            };
+            return additionalInfo;
+        }
+        var exceptionMapper = new LFExceptionMapper('MACHINE_TRANSLATION_DISABLED', [targetLanguage]);
+        exceptionMapper.throwException();
+    },
+
+    _validateInputsForMachineTranslate: function(artifactInternalName, sysId, targetLanguage, additionalInfo) {
+        this.lfValidationUtils.isArtifactTypeInvalid(artifactInternalName);
+        this.lfValidationUtils.isSysIdInvalid(sysId);
+        this.lfValidationUtils.isTargetLanguagesInvalid([targetLanguage]);
+        this.lfValidationUtils.isAdditionalInfoInvalid(additionalInfo);
+        var checkForSourceLang = additionalInfo.hasOwnProperty('sourceLanguage');
+        if (checkForSourceLang) {
+            var sourceLanguage = additionalInfo.sourceLanguage;
+            this.lfValidationUtils.isSourceLanguageInvalid(sourceLanguage);
+        } else {
+            sourceLanguage = this.lfUtils.getDefaultSourceLanguage();
+        }
+        this.lfValidationUtils.isSourceLanguageInTargetLanguages(sourceLanguage, [targetLanguage]);
+        if (additionalInfo.hasOwnProperty('overrideExistingTranslations')) {
+            this._validateOverrideExistingTranslations(additionalInfo.overrideExistingTranslations);
+        }
+        this.lfValidationUtils.validateArtifact(artifactInternalName, [sysId]);
+        this.lfValidationUtils.validateTargetLanguages([targetLanguage]);
+        if (checkForSourceLang) {
+            this.lfValidationUtils.validateSourceLanguage(sourceLanguage);
+        }
+        this.lfValidationUtils.validateTargetLanguageCodeSetting(artifactInternalName, [targetLanguage]);
+    },
+
+    _validateOverrideExistingTranslations: function(overrideExistingTranslations) {
+        if (this.lfValidationUtils.isFieldTypeNonBoolean(overrideExistingTranslations)) {
+            var exceptionMapper = new LFExceptionMapper('INVALID_OVERRIDE_EXISTING_TRANSLATIONS_PARAMETER');
+            exceptionMapper.throwException();
+        }
+    },
+
+    _escapeDetailsValid: function(escapeDetails) {
+        //It would be list of type: [{"escapeRegex": "\\${([^}]*)}", "replaceWith": "ZYZ&lt;IDX&gt;ZYZ", "regexFlag": "g"}, {...}]
+        return (escapeDetails &amp;&amp; escapeDetails.length !== 0);
+    },
+
+    _updateRequestedItem: function(requestedItemUtils, documentContent, result, translator) {
+        documentContent["content"] = this.lfUtils.retrieveOriginalContent(result.itemToTranslate);
+        requestedItemUtils.setDocumentContent(documentContent);
+        requestedItemUtils.setStatus(this.lfInsights.getTranslationStatus(documentContent));
+        requestedItemUtils.setFieldLevelMessagesInfo(result.errorMessages);
+        var message = (result.status == this.lfConstants.SUCCESS) ? gs.getMessage("Successfully translated using {0}.", translator) : result.message;
+        requestedItemUtils.addWorkNotes(message);
+    },
+
+    type: 'LFMachineTranslator'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-12-30 18:08:33&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;6fd96193c3152010389691f58640ddf2&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;25&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;LFMachineTranslator&lt;/sys_name&gt;
+        &lt;sys_package display_value="Localization Framework" source="com.glide.localization_framework"&gt;a4dd193447720210cd4e1ce4316d4312&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_6fd96193c3152010389691f58640ddf2&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-07-20 03:44:04&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:38:32</sys_created_on>
+        <sys_id>a2f6f05d83f01210c6695855eeaad3bd</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>LFMachineTranslator</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_a2f6f05d83f01210c6695855eeaad3bd</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:38:32</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

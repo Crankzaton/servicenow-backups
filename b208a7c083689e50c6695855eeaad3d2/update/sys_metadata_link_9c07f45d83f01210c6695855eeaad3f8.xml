@@ -1,0 +1,465 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>7225fdd40f02201039534ee7c8767e99</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.LFReadSaveScriptUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;It provides utility functions required for running the read and save scripts. Customers are not expected to override these core functions &lt;/description&gt;
+        &lt;name&gt;LFReadSaveScriptUtils&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var LFReadSaveScriptUtils = Class.create();
+LFReadSaveScriptUtils.prototype = {
+    initialize: function(publishMode, updateSetSuffix) {
+        this.SAVE_SCRIPT_INPUTS = {
+            // TODO: remove all the fields introduced in Quebec once all Rome artifact uptake new contract?
+            'documentContent': 'documentContent',
+            'language': 'language',
+            'sysId': 'sysId',
+            'taskId': 'taskId',
+            'requestItemId': 'requestItemId',
+            'additionalParameters': 'additionalParameters'
+        };
+        this.lfLogger = new LFLogger("LFReadSaveScriptUtils");
+        this.lfConstants = new LFConstants();
+        this.publishMode = publishMode;
+        this.updateSetSuffix = updateSetSuffix;
+    },
+
+    generateDocumentContent: function(internalName, sysId, targetLanguage, configAdditionalParams) {
+        var documentContent = {};
+        var artifactUtils = new LFArtifactUtils(internalName);
+        if (artifactUtils.isArtifactActive()) {
+            var artifactProcessorDetails = artifactUtils.getProcessorScriptDetails();
+            var configTableName = artifactUtils.getArtifactConfigurationTableName();
+            var artifactRecord = new GlideRecord(configTableName);
+            artifactRecord.get(sysId);
+            var tableName = artifactRecord.getValue('sys_class_name') || configTableName;
+            if (artifactProcessorDetails) {
+                var artifactProcessor = this._getArtifactProcessor(artifactProcessorDetails);
+                var params = {
+                    'tableName': tableName,
+                    'sysId': sysId,
+                    'language': targetLanguage,
+                    'additionalParameters': configAdditionalParams
+                };
+                var documentContentElement = artifactProcessor.getTranslatableContent(params);
+                documentContent = this.convertDocumentContentToJSON(documentContentElement);
+            } else {
+                var evaluator = new GlideScopedEvaluator();
+                evaluator.putVariable('table_name', tableName);
+                evaluator.putVariable('sysId', sysId);
+                evaluator.putVariable('language', targetLanguage);
+
+                documentContent = evaluator.evaluateScript(artifactUtils.getArtifact(), 'read_script');
+            }
+            if (documentContent == null || documentContent['version'] != "v1") {
+                var exceptionMapper = new LFExceptionMapper('READ_SCRIPT_ERROR');
+                exceptionMapper.throwException();
+            }
+        } else {
+            this.lfLogger.logError("From Generate Document, artifact does not exists or is inactive: " + internalName);
+        }
+        return this._addFieldLockPropertyToContent(documentContent);
+    },
+
+    publishTranslations: function(internalName, parms) {
+        var result = {};
+        var artifactUtils = new LFArtifactUtils(internalName);
+        if (artifactUtils.isArtifactActive()) {
+            var documentContent = parms[this.SAVE_SCRIPT_INPUTS.documentContent];
+            var sysId = parms[this.SAVE_SCRIPT_INPUTS.sysId];
+            var configTableName = artifactUtils.getArtifactConfigurationTableName();
+            var artifactRecord = new GlideRecord(configTableName);
+            artifactRecord.get(sysId);
+            var tableName = artifactRecord.getValue('sys_class_name') || configTableName;
+            var documentContentObject = this._convertJSONToDocumentContent(documentContent, parms[this.SAVE_SCRIPT_INPUTS.language], sysId, tableName, parms[this.SAVE_SCRIPT_INPUTS.additionalParameters]);
+            var artifactProcessorDetails = artifactUtils.getProcessorScriptDetails();
+            if (artifactProcessorDetails) {
+                var artifactProcessor = this._getArtifactProcessor(artifactProcessorDetails);
+                result = artifactProcessor.saveTranslatedContent(documentContentObject);
+            } else if (artifactUtils.getSaveScript()) {
+                if (parms[this.SAVE_SCRIPT_INPUTS.taskId] &amp;&amp; parms[this.SAVE_SCRIPT_INPUTS.requestItemId]) {
+                    this._updateTaskDetails(parms);
+                }
+                result = this._runTheSaveScript(artifactUtils.getArtifact(), parms);
+            } else {
+                this.saveTranslationsInStandardTables(documentContentObject);
+            }
+            new LFLUAUtils().sendPublishEvent(internalName, parms.sourceOfRequest, parms.hasProject);
+        } else {
+            this.lfLogger.logError("From Publish Translations, artifact does not exists or is inactive: " + internalName);
+        }
+        return result;
+    },
+
+    _updateTaskDetails: function(parms) {
+        var taskUtils = new LFTaskUtils(parms[this.SAVE_SCRIPT_INPUTS.taskId]);
+        var requestItemUtils = new LFRequestedItemUtils(parms[this.SAVE_SCRIPT_INPUTS.requestItemId]);
+        taskUtils.setDocumentContent(requestItemUtils.getDocumentContent());
+        taskUtils.setArtifactSysId(requestItemUtils.getArtifactSysId());
+        taskUtils.setSourceLanguageCode(requestItemUtils.getSourceLanguageCode());
+        taskUtils.setTargetLanguageCode(requestItemUtils.getTargetLanguageCode());
+        taskUtils.setArtifactConfig(requestItemUtils.getArtifactConfig());
+        taskUtils.setTableName(requestItemUtils.getTableName());
+        taskUtils.update();
+    },
+
+    _addFieldLockPropertyToContent: function(documentContent) {
+        var content = (documentContent &amp;&amp; documentContent.content) || [];
+        for (var contentIndex = 0; contentIndex &lt; content.length; contentIndex++) {
+            var contentElement = content[contentIndex];
+            var fieldInfo = contentElement.fieldInfo || [];
+            for (var fieldInfoIndex = 0; fieldInfoIndex &lt; fieldInfo.length; fieldInfoIndex++) {
+                var fieldInfoElement = fieldInfo[fieldInfoIndex];
+                if (!fieldInfoElement.hasOwnProperty("isFieldLocked")) {
+                    fieldInfoElement['isFieldLocked'] = fieldInfoElement.translatedValue ? true : false;
+                }
+            }
+        }
+        return documentContent;
+    },
+
+    _runTheSaveScript: function(configGr, parms) {
+        var evaluator = new GlideScopedEvaluator();
+        if (parms &amp;&amp; typeof(parms) === 'object') {
+            var saveScriptKeyNames = Object.keys(this.SAVE_SCRIPT_INPUTS);
+            for (var idx = 0; idx &lt; saveScriptKeyNames.length; idx++) {
+                var inputKey = saveScriptKeyNames[idx];
+                evaluator.putVariable(inputKey, parms[inputKey]);
+
+                // TODO: shall be removed in next defect merge after NLU/HR uptake!
+                if (inputKey == "language") {
+                    evaluator.putVariable("targetLanguage", parms[inputKey]);
+                } else if (inputKey == "sysId") {
+                    evaluator.putVariable("artifactSysId", parms[inputKey]);
+                }
+            }
+        }
+        return evaluator.evaluateScript(configGr, 'save_script');
+    },
+
+    saveTranslationsInStandardTables: function(documentContentObject) {
+
+        var targetLanguage = documentContentObject.getLanguage();
+        var version = documentContentObject.getVersion();
+        if (version == 'v1' &amp;&amp; targetLanguage) {
+            var updateSetManager = new LFUpdateSetManager(this.publishMode, this.updateSetSuffix);
+            var elements = documentContentObject.getElements();
+            for (var elementIdx = 0; elementIdx &lt; elements.length; elementIdx++) {
+                var element = elements[elementIdx];
+                if (element.isInternal() !== false) {
+                    var fields = element.getFields();
+                    for (var fieldIdx = 0; fieldIdx &lt; fields.length; fieldIdx++) {
+                        var field = fields[fieldIdx];
+                        var additionalParameters = field.getAdditionalParameters() || {};
+                        if (additionalParameters.scope) {
+                            updateSetManager.switchToUpdateSetInScope(additionalParameters.scope);
+                        }
+                        if (additionalParameters.hasOwnProperty('type')) {
+                            if (additionalParameters.type == 'translated_text' || additionalParameters.type == 'translated_html') {
+                                this._updateSysTranslatedText(field, targetLanguage);
+                            } else if (additionalParameters.type == 'translated_field') {
+                                this._updateSysTranslated(field, targetLanguage);
+                            }
+                        } else {
+                            this._updateSysUiMessage(field, targetLanguage);
+                        }
+                        if (additionalParameters.scope) {
+                            updateSetManager.switchToPreviousUpdateSet();
+                        }
+                    }
+                }
+            }
+        }
+    },
+
+    _updateSysTranslatedText: function(field, targetLanguage) {
+        var additionalParameters = field.getAdditionalParameters() || {};
+        var sysId = additionalParameters.sysId;
+        var name = additionalParameters.name;
+        var tableName = additionalParameters.table;
+        var translatedValue = field.getTranslatedValue();
+        var hasTranslatedValue = translatedValue &amp;&amp; translatedValue !== '';
+        var gr = new GlideRecord('sys_translated_text');
+        gr.addQuery('documentkey', sysId);
+        gr.addQuery('fieldname', name);
+        gr.addQuery('language', targetLanguage);
+        gr.addQuery('tablename', tableName);
+        gr.query();
+        //update or delete the record if it already exists
+        if (gr.next()) {
+            if (hasTranslatedValue) {
+                gr.setValue('value', translatedValue);
+                gr.update();
+            } else {
+                gr.deleteRecord();
+            }
+        }
+        //else create and insert a new record
+        else if (hasTranslatedValue) {
+            gr.initialize();
+            gr.setValue('documentkey', sysId);
+            gr.setValue('fieldname', name);
+            gr.setValue('language', targetLanguage);
+            gr.setValue('tablename', tableName);
+            gr.setValue('value', translatedValue);
+            gr.insert();
+        }
+    },
+
+    _updateSysTranslated: function(field, targetLanguage) {
+        var originalValue = field.getOriginalValue();
+        var translatedValue = field.getTranslatedValue();
+        var hasTranslatedValue = translatedValue &amp;&amp; translatedValue !== '';
+        var additionalParameters = field.getAdditionalParameters() || {};
+        var name = additionalParameters.name;
+        var tableName = additionalParameters.table;
+
+        var gr = new GlideRecord('sys_translated');
+        gr.addQuery('name', tableName);
+        gr.addQuery('element', name);
+        gr.addQuery('value', originalValue);
+        gr.addQuery('language', targetLanguage);
+        gr.query();
+        //update or delete the record if exisits
+        if (gr.next()) {
+            if (hasTranslatedValue) {
+                gr.setValue('label', translatedValue);
+                gr.update();
+            } else {
+                gr.deleteRecord();
+            }
+        } else if (hasTranslatedValue) {
+            gr.initialize();
+            gr.setValue('name', tableName);
+            gr.setValue('element', name);
+            gr.setValue('value', originalValue);
+            gr.setValue('language', targetLanguage);
+            gr.setValue('label', translatedValue);
+            gr.insert();
+
+        }
+    },
+
+    _updateSysUiMessage: function(field, targetLanguage) {
+        var additionalParameters = field.getAdditionalParameters() || {};
+        var originalKey = additionalParameters.key || field.getOriginalValue();
+        var translatedValue = field.getTranslatedValue();
+        var hasTranslatedValue = translatedValue &amp;&amp; translatedValue !== '';
+        var gr = new GlideRecord('sys_ui_message');
+        gr.addQuery('key', originalKey);
+        gr.addQuery('language', targetLanguage);
+        gr.query();
+        //update or delete the record if exists
+        if (gr.next()) {
+            if (hasTranslatedValue) {
+                gr.setValue('message', translatedValue);
+                gr.update();
+            } else {
+                gr.deleteRecord();
+            }
+        } else if (hasTranslatedValue) {
+            gr.initialize();
+            gr.setValue('key', originalKey);
+            gr.setValue('language', targetLanguage);
+            gr.setValue('message', translatedValue);
+            gr.insert();
+        }
+    },
+
+    convertDocumentContentToJSON: function(documentContentObject) {
+        var documentContent = {
+            'version': documentContentObject.getVersion(),
+            'language': documentContentObject.getLanguage(),
+            'sysId': documentContentObject.getSysId(),
+            'tableName': documentContentObject.getTableName(),
+            'additionalParameters': documentContentObject.getAdditionalParameters(),
+        };
+        var content = [];
+        var elementObjects = documentContentObject.getElements();
+        for (var elementIdx = 0; elementIdx &lt; elementObjects.length; elementIdx++) {
+            var elementObject = elementObjects[elementIdx];
+            var fieldObjects = elementObject.getFields();
+            var fields = [];
+            for (var fieldIdx = 0; fieldIdx &lt; fieldObjects.length; fieldIdx++) {
+                var field = fieldObjects[fieldIdx].field;
+                fields.push(field);
+            }
+
+            var element = {};
+            element.groupName = elementObject.getGroupName();
+            element.label = elementObject.getLabel();
+            element.id = elementObject.getId();
+            element.fieldInfo = fields;
+            element.additionalParameters = elementObject.getAdditionalParameters();
+            element.isInternal = elementObject.isInternal();
+            content.push(element);
+        }
+        documentContent['content'] = content;
+        return documentContent;
+    },
+
+    _convertJSONToDocumentContent: function(documentContentJson, language, sysId, tableName, additionalParameters) {
+        var content = documentContentJson.content;
+        // For backward compatibility where document content doesn't contain language or sysId or tableName or additionalParameters
+        language = documentContentJson.language || language;
+        sysId = documentContentJson.sysId || sysId;
+        tableName = documentContentJson.tableName || tableName;
+        additionalParameters = documentContentJson.additionalParameters || additionalParameters;
+
+        additionalParameters = this._getAdditionalParameters(documentContentJson, additionalParameters);
+
+        var documentContent = new LFDocumentContent(documentContentJson.version, language, sysId, tableName, additionalParameters);
+        for (var idx = 0; idx &lt; content.length; idx++) {
+            var fields = [];
+            var documentContentElement = content[idx];
+
+            this._populateAdditionalParametersInElement(documentContentElement);
+
+            var fieldInfo = documentContentElement['fieldInfo'];
+            for (var fieldInfoIdx = 0; fieldInfoIdx &lt; fieldInfo.length; fieldInfoIdx++) {
+                var fieldInfoElement = fieldInfo[fieldInfoIdx];
+                var field = LFDocumentContentHelper.createField(fieldInfoElement['originalValue'], fieldInfoElement['translatedValue']);
+                var keys = Object.keys(fieldInfoElement);
+                var additionalParametersForField = {};
+                for (var keyIdx = 0; keyIdx &lt; keys.length; keyIdx++) {
+                    var key = keys[keyIdx];
+                    switch (key) {
+                        case 'textType':
+                            field.setTextType(fieldInfoElement['textType']);
+                            break;
+                        case 'isFieldLocked':
+                            field.setIsFieldLocked(fieldInfoElement['isFieldLocked']);
+                            break;
+                        case 'escapeDetails':
+                            field.setEscapeDetails(fieldInfoElement['escapeDetails']);
+                            break;
+                        case 'additionalParameters':
+                            additionalParametersForField = fieldInfoElement['additionalParameters'];
+                            break;
+                        case 'originalValue':
+                        case 'translatedValue':
+                        case 'primaryTranslatedValue':
+                        case '$$hashKey': // Added the code to skip moving $$hashKey(generated by JS) to additionalParameters
+                            break;
+                            // For backward compatibility where document content doesn't contain additional parameters
+                        default:
+                            additionalParametersForField[key] = fieldInfoElement[key];
+                    }
+                }
+                if (Object.keys(additionalParametersForField).length &gt; 0) {
+                    field.setAdditionalParameters(additionalParametersForField);
+                }
+                fields.push(field);
+            }
+            var element = LFDocumentContentHelper.createElement(documentContentElement['groupName'], documentContentElement['label']);
+            if (documentContentElement.hasOwnProperty('additionalParameters')) {
+                element.setAdditionalParameters(documentContentElement['additionalParameters']);
+            }
+            element.setFields(fields);
+            element.setInternal(documentContentElement['isInternal']);
+            documentContent.addElement(element);
+        }
+        return documentContent;
+    },
+
+    _getAdditionalParameters: function(documentContentJson, additionalParameters) {
+        var documentContentJsonKeys = Object.keys(documentContentJson);
+        for (var dCJidx = 0; dCJidx &lt; documentContentJsonKeys.length; dCJidx++) {
+            var documentContentJsonKey = documentContentJsonKeys[dCJidx];
+            switch (documentContentJsonKey) {
+                case 'content':
+                case 'language':
+                case 'sysId':
+                case 'version':
+                case 'additionalParameters':
+                case 'tableName':
+                    break;
+                default:
+                    if (!additionalParameters) {
+                        additionalParameters = {};
+                    }
+                    additionalParameters[documentContentJsonKey] = documentContentJson[documentContentJsonKey];
+            }
+        }
+        return additionalParameters;
+    },
+
+    _populateAdditionalParametersInElement: function(documentContentElement) {
+        var documentContentElementKeys = Object.keys(documentContentElement);
+
+        for (var dCEidx = 0; dCEidx &lt; documentContentElementKeys.length; dCEidx++) {
+            var documentContentElementKey = documentContentElementKeys[dCEidx];
+            switch (documentContentElementKey) {
+                case 'groupName':
+                case 'label':
+                case 'fieldInfo':
+                case 'additionalParameters':
+                case 'isInternal':
+                case 'id':
+                case '$$hashKey': // Added the code to skip moving $$hashKey(generated by JS) to additionalParameters
+                    break;
+                default:
+                    if (!documentContentElement.hasOwnProperty('additionalParameters')) {
+                        documentContentElement['additionalParameters'] = {};
+                    }
+                    documentContentElement['additionalParameters'][documentContentElementKey] = documentContentElement[documentContentElementKey];
+            }
+        }
+    },
+
+    _getArtifactProcessor: function(artifactProcessorDetails) {
+        var scriptIncludeAPIName = artifactProcessorDetails.apiName;
+        var scriptIncludeName = artifactProcessorDetails.name;
+        var stringscript = 'new ' + scriptIncludeAPIName + '()';
+        // if error occurs while initialization, then artifactProcessor contains error
+        var artifactProcessor = new GlideScriptEvaluator().evaluateString(stringscript, true);
+        if (artifactProcessor.type != scriptIncludeName) {
+            this.lfLogger.logError("Error occurred while initializing ScriptInclude: " + scriptIncludeAPIName);
+            throw artifactProcessor;
+        } else if (artifactProcessor.__identifier != "LFArtifactProcessorSNC") {
+            var exceptionMapper = new LFExceptionMapper("INVALID_SCRIPT_INCLUDE", [scriptIncludeName]);
+            exceptionMapper.throwException();
+        }
+        if (this.publishMode) {
+            artifactProcessor.initializeUpdateSetManager(this.publishMode, this.updateSetSuffix);
+        }
+        return artifactProcessor;
+    },
+
+    type: 'LFReadSaveScriptUtils'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-01-27 16:37:41&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;7225fdd40f02201039534ee7c8767e99&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;17&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;LFReadSaveScriptUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Localization Framework" source="com.glide.localization_framework"&gt;a4dd193447720210cd4e1ce4316d4312&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_7225fdd40f02201039534ee7c8767e99&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-06-16 12:47:27&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:38:39</sys_created_on>
+        <sys_id>9c07f45d83f01210c6695855eeaad3f8</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>LFReadSaveScriptUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_9c07f45d83f01210c6695855eeaad3f8</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:38:39</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

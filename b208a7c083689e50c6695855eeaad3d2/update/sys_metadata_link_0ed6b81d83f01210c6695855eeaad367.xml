@@ -1,0 +1,1050 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>64e010b153255110456dddeeff7b12e4</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_cmdb_ws.MapService&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Service used to handle the business logic and implementation of the map &amp;amp; its related APIs for the Nodemap.&lt;/description&gt;
+        &lt;name&gt;MapService&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var MapService = Class.create();
+
+MapService.prototype = Object.extendsObject(MapBase, {
+
+	initialize: function() {
+		//A quick trick to enable multiple inheritance
+		this.inherit([
+			MapReferenceCIService,
+			MapOutputFormatService
+		]);
+		this.errorUtil = new MapErrorUtility();
+		this.log = new global.GSLog("com.snc.sn_cmdb_ws.log.level", this.type);
+	},
+	/**
+	 * Return the extended attributes of the specified CI; CMDB class level inheritance is supported.
+	 */
+	getCiDetails: function(ciSysId, ciClass) {
+		var result = {};
+		//input data validation
+		var errObj = {};
+		try {
+			if (this._isEmpty(ciSysId)) {
+				errObj = this.errorUtil._form40XErrorObject(this.errorUtil.CMDBUM_400_001);
+				return this._getErrorResponse(errObj);
+			} else if (this._isEmpty(ciClass)) {
+				errObj = this.errorUtil._form40XErrorObject(this.errorUtil.CMDBUM_400_004);
+				return this._getErrorResponse(errObj);
+			}
+
+			var gr = new GlideRecordSecure(ciClass);
+			// check if the given ciClass is a valid one
+			if (!gr.isValid()) {
+				errObj = this.errorUtil._form40XErrorObject(this.errorUtil.CMDBUM_400_015);
+				return this._getErrorResponse(errObj);
+			}
+			
+			//Check if the selected class has the follow hierarchy flag set
+			var followHierarchy = true;
+			var propMap = {};
+			var hierGr = new GlideRecordSecure(this.NODE_MAP_TABLE.CI_EXTENDED_PROPS);
+			hierGr.addActiveQuery();
+			hierGr.addQuery(this.COL_CMDB_CLASS_NAME, ciClass);
+			hierGr.setLimit(1);
+			hierGr.query();
+			if(hierGr.next()){
+				followHierarchy = hierGr.getValue(this.COL_FOLLOW_HIERARCHY) !== '0';
+				propMap[hierGr.getValue(this.COL_CMDB_CLASS_NAME)] = hierGr.getValue(this.COL_ATTRIBUTES);
+			}
+
+			if(followHierarchy){			
+				//Query for properties given class &amp; honor the class hierarchy
+				var inputClassHierarchy = new GlideTableHierarchy(ciClass).getTables();
+				//Query properties for this
+				var propGr = new GlideRecordSecure(this.NODE_MAP_TABLE.CI_EXTENDED_PROPS);
+				propGr.addActiveQuery();
+				propGr.addQuery(this.COL_CMDB_CLASS_NAME, this.IN_OP, inputClassHierarchy.join(this.COMMA_DELIMITER));
+				propGr.query();
+				var tmpValue = '';
+				while(propGr.next()) {
+					tmpValue = propGr.getValue(this.COL_ATTRIBUTES);
+					if (global.JSUtil.notNil(tmpValue) &amp;&amp; global.JSUtil.notNil(tmpValue.trim())) {
+						// if the class mapping doesn't exist yet just assign the value, if it does, concatenate the string
+						if (!propMap.hasOwnProperty(propGr.getValue(this.COL_CMDB_CLASS_NAME)))
+							propMap[propGr.getValue(this.COL_CMDB_CLASS_NAME)] = tmpValue;
+						else {
+							propMap[propGr.getValue(this.COL_CMDB_CLASS_NAME)] =
+								propMap[propGr.getValue(this.COL_CMDB_CLASS_NAME)] + "," + tmpValue;
+						}
+					}
+				}
+			}
+		
+			if (Object.keys(propMap).length &gt; 0) {
+				if (gr.get(ciSysId)) {
+					var _tmpRes = {};
+					//honor the class hierarchy
+					for (var propClass in propMap) {
+						_tmpRes = this._extractFieldValues(propClass, propMap[propClass], gr);
+						// remove duplicates but capture hilites
+						for (var fieldName in _tmpRes) {
+							if (!result.hasOwnProperty(fieldName) || Object.keys(_tmpRes[fieldName].highlightedStyle).length &gt; 0) {
+								result[fieldName] = _tmpRes[fieldName];
+							}
+						}
+					}
+				} else {
+					//Ci not found
+					errObj = this.errorUtil._form40XErrorObject(this.errorUtil.CMDBUM_404_001);
+					this.log.error('Ci is missing from the database. Input Sys Id: '+ciSysId+' Class: '+ciClass);
+					return this._getErrorResponse(errObj);
+				}
+			}
+			// convert back to an array
+			return this._getOutputResponse(Object.keys(result).map(function(key) {
+				return result[key];
+			}));
+		} catch (e) {
+			errObj = this.errorUtil._form50XErrorObject(e);
+			this.log.error(e.message);
+			return this._getErrorResponse(errObj);
+		}
+	},
+	/**
+	 * Create the relationships tree for the specified CI and return it, between the CIs, 
+	 * endpoints are skipped and connected as an Endpoint Connection.
+	 * 
+	 * The default maximum number of nodes recorded during the traversal is 250 (configurable by the 
+	 * sn_cmdb_ws.node.map.max.edge.count sys property), and the default number of layers is 3
+	 * (configurable by the sn_cmdb_ws.node.map.max.depth sys property).
+	 */
+	getMap : function(ciSysId, level) {
+		var result = {};
+		//input data validation
+		var errObj = {};
+		try {
+			//initial input validation
+			var traversalLimit = this._sanitizeNumber(level);
+			if (this._isEmpty(ciSysId)) {
+				errObj = this.errorUtil._form40XErrorObject(this.errorUtil.CMDBUM_400_001);
+				return this._getErrorResponse(errObj);
+			}
+			if (traversalLimit &lt;= 0) {
+				errObj = this.errorUtil._form40XErrorObject(this.errorUtil.CMDBUM_400_003);
+				return this._getErrorResponse(errObj);
+			}
+			//check if Ci exist
+			var tInfo = this._fetchAndValidateCis([ciSysId], 0);
+			if (tInfo[this.VALID_SYS_IDS].length == 0) {
+				errObj = this.errorUtil._form40XErrorObject(this.errorUtil.CMDBUM_404_001);
+				this.log.error('Ci is missing from the database. Input Sys Id: '+ciSysId);
+				return this._getErrorResponse(errObj);
+			}
+			this.ENDPOINT_CLASSES = new GlideTableHierarchy(this.CMDB_CI_ENDPOINT).getAllExtensions();
+
+			result[this.CI_NODE_INFO] = {};
+			result[this.EDGES] = {};
+			this._mergeData(result[this.CI_NODE_INFO], tInfo[this.CURR_NODE_INFO]);
+
+			return this._doGetMap(result, traversalLimit);
+		} catch (e) {
+			errObj = this.errorUtil._form50XErrorObject(e);
+			this.log.error(e.message);
+			return this._getErrorResponse(errObj);
+		}
+	},
+
+	getRelatedApplicationServices: function(ciSysIds) {
+		var result = {};
+		if (!ciSysIds || ciSysIds.length === 0 || !Array.isArray(ciSysIds)) {
+			return this._getErrorResponse(this.errorUtil._form40XErrorObject(this.errorUtil.CMDBUM_400_001));
+		}
+		var smUtility = new ServiceMapUtility();
+		try {
+			if (smUtility.isPluginActive()) {
+				result = smUtility.getCiApplicationServicesAssociation(ciSysIds);
+			} else {
+				// TODO: determine some behavior that does not require service mapping plugin.
+				// maybe fetch any parent and child application services from the list of cis in cmdb_rel_ci
+				result = {};
+			}
+		} catch (e) {
+			errObj = this.errorUtil._form50XErrorObject(e);
+			this.log.error(e.message);
+			return this._getErrorResponse(errObj);
+		}
+		return this._getOutputResponse(result);
+	},
+
+	_doGetMap: function(result, traversalLimit) {
+		var ciSysId = Object.keys(result[this.CI_NODE_INFO])[0];
+		var tableName = this.PROPERTY_LABEL_MAP[this.SYS_CLASS_NAME];
+		var currClass = result[this.CI_NODE_INFO][ciSysId][this.PROPERTIES][tableName];
+		var smUtility = new ServiceMapUtility();
+		var isApplicationService = smUtility.isAnApplicationService(currClass);
+		var errObj = {};
+		var tmpSMRes = {};
+		if (isApplicationService) {
+			if (smUtility.isPluginActive()) {
+				try {
+					var _this = this;
+					var getIconFromClass = function(ciClass) {
+						var ciIconMap = _this._getIconFromMappingTable();
+						if (ciIconMap[ciClass] &amp;&amp; ciIconMap[ciClass][_this.ICON])
+							return ciIconMap[ciClass][_this.ICON];
+						else
+							return _this._getClassDefaultIcon(ciClass); //default icon
+					};
+					tmpSMRes = smUtility.getSMMap(ciSysId, getIconFromClass);
+				} catch (e) {
+					errObj = this.errorUtil._form50XErrorObject(e, this.errorUtil.CMDBUM_500_002);
+					this.log.error(e.message);
+					return this._getErrorResponse(errObj);
+				}
+			}
+
+			//invoke cmdb api to get the business layer nodes
+			this._getCMDBMap(ciSysId, result, traversalLimit, true);
+
+			//merge cmdb &amp; sm outputs
+			//TODO: open it once we have integrated the SM APIs
+			this._mergeCMDBSMMap(result, tmpSMRes);
+
+		} else {
+			this._getCMDBMap(ciSysId, result, traversalLimit, false);
+		}
+		// Replace location sys ids and owner sys ids with pretty names
+		this._replaceLocationAndUserNames(result[this.CI_NODE_INFO]);
+		this._fixGroupEdges(result);
+		this._getProfileData(currClass, result);
+		return this._getOutputResponse(result);
+	},
+
+	_getCMDBMap: function(ciSysId, result, traversalLimit, isApplicationService) {
+		//ensure traversalLimit &lt;= MAX_LEVEL
+		traversalLimit = Math.min(traversalLimit, this.DEF_MAX_LEVEL);
+		// Limit number of nodes displayed
+		var edgeLimit = parseInt(gs.getProperty(this.MAX_NODE_PROP, this.DEF_MAX_NODE_VAL));
+		var currTraversalState = {}, childSysIds = [], parentSysIds = [], transientState = {};
+		var currTraversalCount = (edgeLimit - 1);
+		transientState[this.EXCLUDE_REL_IDS] = [];
+		transientState[this.REL_TYPE_IDS] = [];
+		transientState[this.REF_CI_VISITED] = {};
+		var smUtility = new ServiceMapUtility();
+
+		parentSysIds.push(ciSysId);
+		//for application services traverse children only when ServiceMapping is not installed.
+		if (!isApplicationService || !smUtility.isPluginActive())
+			childSysIds.push(ciSysId);
+
+		for (var i = 1; i &lt;= traversalLimit; i+= 1){
+			if (childSysIds.length &gt; 0 &amp;&amp; currTraversalCount &gt; 0) {
+				currTraversalState = this._traverseCIs(childSysIds, true, currTraversalCount, result, transientState);
+				childSysIds = currTraversalState[this.NEXT_CIS];
+				currTraversalCount -= currTraversalState[this.CURR_EDGE_COUNT];
+			}
+			if (parentSysIds.length &gt; 0 &amp;&amp; currTraversalCount &gt; 0) {
+				currTraversalState = this._traverseCIs(parentSysIds, false, currTraversalCount, result, transientState, -i);
+				parentSysIds = currTraversalState[this.NEXT_CIS];
+				currTraversalCount -= currTraversalState[this.CURR_EDGE_COUNT];
+			}
+			if ((parentSysIds.length == 0 &amp;&amp; childSysIds.length == 0) || (currTraversalCount &lt;= 0))
+				break;
+		}
+		// Replace rel type sys ids in edges with pretty names
+		if (transientState[this.REL_TYPE_IDS].length &gt; 0) {
+			this._replaceRelIdsWithNames(transientState[this.REL_TYPE_IDS], result);
+		}
+
+		// sanitize payload - get rid of dead edges
+		this._sanitizePayload(result);
+	},
+
+	_traverseCIs: function(querySysIds, children, currEdgeLimit, result, transientState, level) {
+		var output = {};
+		var arrayUtil = this.arrayUtil;
+		output[this.NEXT_CIS] = [];
+		output[this.CURR_EDGE_COUNT] = 0;
+		// Get reference data
+		var refData = this._getReferences(querySysIds, result, transientState);
+		// Update edge limit
+		currEdgeLimit = currEdgeLimit - refData[this.REF_EDGE_COUNT];
+		if (currEdgeLimit &gt; 0) {
+			var relData = this._nextHop(querySysIds, currEdgeLimit, children, transientState[this.EXCLUDE_REL_IDS], level);
+			// Massage this data
+			this._mergeGraph(result[this.EDGES], relData[this.EDGES]);
+
+			// Get rel ids to be excluded
+			arrayUtil.concat(transientState[this.EXCLUDE_REL_IDS], relData[this.IDS]);
+
+			// Gather rel type ids
+			arrayUtil.concat(transientState[this.REL_TYPE_IDS], relData[this.REL_TYPE_IDS]);
+
+			// Update edge count
+			currEdgeLimit = currEdgeLimit - relData[this.NEXT_CIS].length();
+			
+			// Get next list of CIs to query
+			arrayUtil.concat(output[this.NEXT_CIS], relData[this.NEXT_CIS].toArray());
+		}
+		if (refData[this.REF_CIS].length &gt; 0) {
+			arrayUtil.concat(output[this.NEXT_CIS], refData[this.REF_CIS]);
+		}
+		//count nodes &amp; fetch the details
+		if (output[this.NEXT_CIS].length &gt; 0 ) {
+			var pThis = this;
+			output[this.NEXT_CIS].forEach(function(ci){
+				if (!result[pThis.CI_NODE_INFO].hasOwnProperty(ci))
+					output[pThis.CURR_EDGE_COUNT] += 1;
+			});
+			var info = this._fetchAndValidateCis(refData[this.REF_CIS], level);
+			if (global.JSUtil.notNil(info) &amp;&amp; !this._isEmptyObj(info[this.CURR_NODE_INFO]))
+				this._mergeData(result[this.CI_NODE_INFO], info[this.CURR_NODE_INFO]);
+
+			this._mergeData(result[this.CI_NODE_INFO], relData[this.CURR_NODE_INFO]);
+		}
+		return output;
+	},
+	/**
+	 * Get the following relationships that the supplied collection of CIs has from the cmdb_rel_ci table.
+	 * @param {*} querySysIds = CI sysIds 
+	 * @param {*} currEdgeLimit = Limit of number of CIs to display on the map
+	 * @param {*} children = true get the children else parent Cis
+	 * @param {*} excludeRelIds = transientState, list of excluded relationship id.
+	 * @param {*} level = level at which next set of CIs and relationship will be fetch.
+	 * @returns 
+	 */
+	_nextHop: function(querySysIds, currEdgeLimit, children, excludeRelIds, level) {
+
+		var relData = this._getRelations(querySysIds, currEdgeLimit, excludeRelIds, children);
+		relData[this.CURR_NODE_INFO] = {};
+		if (relData[this.NEXT_CIS].length() &gt; 0) {
+			var tInfo = this._fetchAndValidateCis(relData[this.NEXT_CIS].toArray(), level);
+			relData[this.NEXT_CIS].clear();
+			var nodeInfo = tInfo[this.CURR_NODE_INFO];
+			var sysIds = tInfo[this.VALID_SYS_IDS];
+			if (sysIds.length &gt; 0) {
+				relData[this.NEXT_CIS].addAll(sysIds);
+				// Get rel ids to be excluded
+				this.arrayUtil.concat(excludeRelIds, relData[this.IDS]);
+				//filter endpoints
+				var epSysIds = this._getEndPoints(sysIds, nodeInfo);
+				if (epSysIds.length &gt; 0) {
+					var inputObj = this._formNextInput(epSysIds, currEdgeLimit, children, excludeRelIds, nodeInfo);
+					var mapEpCi = this._excludeEndPoints(inputObj, level);
+					this._mapEpCiAndClean(querySysIds, relData, nodeInfo, mapEpCi);
+				}
+				relData[this.CURR_NODE_INFO] = nodeInfo;
+			}
+		}
+		return relData;
+	},
+	/**
+	 * Hop recursively and continue exploring until a CI is discovered or the tree's end (leaf endpoint)
+	 */
+	_excludeEndPoints: function(traversalState, level) {
+		if (!this._isEmptyObj(traversalState) &amp;&amp; this._hasAllProperty(
+			[this.SYS_IDS, this.CURR_EDGE_LIMIT, this.CHILDREN, this.EXCLUDE_REL_IDS, this.NODE_INFO], traversalState)) {
+
+			var sysIds = traversalState[this.SYS_IDS];
+			var currEdgeLimit = traversalState[this.CURR_EDGE_LIMIT];
+			var children = traversalState[this.CHILDREN];
+			var excludeRelIds = traversalState[this.EXCLUDE_REL_IDS];
+			var nodeInfo = traversalState[this.NODE_INFO];
+
+			var epRelData = this._getRelations(sysIds, currEdgeLimit, excludeRelIds, children);
+			if (epRelData[this.NEXT_CIS].length() &gt; 0) {
+				var tInfo = this._fetchAndValidateCis(epRelData[this.NEXT_CIS].toArray(), level);
+				var _tmpTransientResult = null;
+				var _sysIds = tInfo[this.VALID_SYS_IDS];
+				var transientResult = {};
+				transientResult[this.BACKTRACK_MAP] = {};
+				transientResult[this.ORPHAN_EPS] = [];
+				transientResult[this.CI_NODE_INFO] = {};
+				
+				this._mergeData(nodeInfo, tInfo[this.CURR_NODE_INFO]);
+				// Get rel ids to be excluded
+				this.arrayUtil.concat(excludeRelIds, epRelData[this.IDS]);
+				//get endpoints
+				var epSysIds = this._getEndPoints(_sysIds, nodeInfo);
+
+				if (epSysIds.length &gt; 0) {
+					var inputObj = this._formNextInput(epSysIds, currEdgeLimit, children, excludeRelIds, nodeInfo);
+					_tmpTransientResult = this._excludeEndPoints(inputObj, level);
+
+					if (!this._isEmptyObj(_tmpTransientResult)) {
+						transientResult = _tmpTransientResult;
+					}
+				}
+				this._mergeData(transientResult[this.CI_NODE_INFO], nodeInfo);
+				this._populateCiEpMap(sysIds, epRelData, transientResult);
+				return transientResult;
+			}
+		}
+		return null;
+	},
+	/**
+	 * Fetch cmdb_rel_ci relationships for the given set of Cis and the next Cis to retrieve
+	 * @param {*} ciSysIds: Fetch the relationship for ciSysIds
+	 * @param {*} limit : max allowed limit.
+	 * @param {*} excludedRelIds : List of relationship to exclude.
+	 * @param {*} children :
+	 * 		true:  return all relationship where provided ciSysIds are parent. 
+	 * 		false: return all relationship where provided ciSysIds are child.
+	 * @returns : Following result Object
+	 * 	result = {
+	 *  	ids: [],
+	 * 		next_cis: [],
+	 * 		edges: [],
+	 * 		rel_type_ids: []
+	 * }
+	 */
+	_getRelations: function(ciSysIds, limit, excludedRelIds, children) {
+		
+		var result = {};
+		result[this.IDS] = [];
+		result[this.NEXT_CIS] = (new CMDBSet());
+		result[this.EDGES] = {};
+		result[this.REL_TYPE_IDS] = [];
+
+		if (!ciSysIds || ciSysIds.length == 0 || limit == null || limit &lt;= 0)
+			return result;
+		
+		var gr = new GlideRecordSecure(this.NODE_MAP_TABLE.CMDB_REL_CI);
+		gr.addNotNullQuery(this.COL_PARENT);
+		gr.addNotNullQuery(this.COL_CHILD);
+		gr.addNotNullQuery(this.TYPE);
+
+		(children ? gr.addQuery(this.COL_PARENT, this.IN_OP, ciSysIds) : gr.addQuery(this.COL_CHILD, this.IN_OP, ciSysIds));
+		
+		if (excludedRelIds &amp;&amp; excludedRelIds.length &gt; 0) {
+			gr.addQuery(this.COL_SYS_ID, this.NOTIN_OP, excludedRelIds);
+		}
+		gr.addQuery(this.TYPE, this.NOTIN_OP, Object.keys(this.REL_TYPE_EXCLUSION)); //filter all the rel type declared in REL_TYPE_EXCLUSION
+		
+		gr.setLimit(limit);
+		gr.query();
+		
+		var arrayUtil = this.arrayUtil;
+		var sysId = null, parentCi = null, childCi = null, relTypeId = null, port = null;
+		var edge = {};
+		
+		while (gr.next()) {
+			sysId = gr.getUniqueValue();
+			parentCi = gr.getValue(this.COL_PARENT);
+			childCi = gr.getValue(this.COL_CHILD);
+			relTypeId = gr.getValue(this.TYPE);
+			port = gr.getValue(this.PORT);
+			edge = this._newEdge(sysId, parentCi, childCi, relTypeId, port, false, []);
+
+			if (arrayUtil.contains(ciSysIds, parentCi)) {
+				if (!result[this.EDGES].hasOwnProperty(parentCi)) {
+					result[this.EDGES][parentCi] = {};
+					result[this.EDGES][parentCi][this.RELATIONS] = [];
+				}
+				result[this.EDGES][parentCi][this.RELATIONS].push(edge);
+			} else {
+				result[this.NEXT_CIS].add(parentCi);
+			}
+			if (arrayUtil.contains(ciSysIds, childCi) &amp;&amp; !arrayUtil.contains(ciSysIds, parentCi)) {
+				if (!result[this.EDGES].hasOwnProperty(childCi)) {
+					result[this.EDGES][childCi] = {};
+					result[this.EDGES][childCi][this.RELATIONS] = [];
+				}
+				result[this.EDGES][childCi][this.RELATIONS].push(edge);
+			} else {
+				result[this.NEXT_CIS].add(childCi);
+			}
+			// Collect cmdb_rel_ci sysIds, useful for exclusion clause in subsequent call
+			result[this.IDS].push(gr.getUniqueValue());
+			result[this.REL_TYPE_IDS].push(relTypeId);
+		}
+		return result;
+	},
+    /**
+	 * Fill in the backtrack maps for each of the Endpoints =&gt; CIs that were discovered.
+	 */
+	_populateCiEpMap: function(sysIds, relData, transientResult) {
+		var backtrackMap = transientResult[this.BACKTRACK_MAP];
+		var orphanEPs = transientResult[this.ORPHAN_EPS];
+		var nodeInfo = transientResult[this.CI_NODE_INFO];
+		var newEpCiMap = {};
+		// bare until ES6
+		var pThis = this;
+				
+		//make a map of Ep =&gt; Ci
+		var _createEpCiMap = function(map, ep, ci) {
+			if (!pThis._hasProperty(ep, map))
+				map[ep] = {};
+
+			map[ep][ci] = {};
+			map[ep][ci][pThis.EP] = [];
+			map[ep][ci][pThis.EP].push(ep);
+		};
+
+		//shift of Ep =&gt; Ci to the current level Ep (aka backtracking via changing key)
+		var _shuffleEpCiMap = function(map, fromEp, ciInfoMap) {
+			if (!pThis._hasProperty(fromEp, map))
+				map[fromEp] = {};
+			for (var ci in ciInfoMap) {
+				ciInfoMap[ci]['ep'].push(fromEp);
+			}
+			pThis._mergeData(map[fromEp], ciInfoMap);
+		};
+
+		sysIds.forEach(function(ci) {
+			if (relData[pThis.EDGES][ci] 
+				&amp;&amp; pThis._hasProperty(pThis.RELATIONS, relData[pThis.EDGES][ci])) {
+
+				var tmpRelations = relData[pThis.EDGES][ci][pThis.RELATIONS];
+				tmpRelations.forEach(function(edge) {
+
+					var start = ci;
+					var end = edge[pThis.CHILD] != ci ? edge[pThis.CHILD] : edge[pThis.PARENT];
+					var startNode = nodeInfo[start];
+					var endNode = nodeInfo[end];
+
+					// User may not have permission to access one of the endpoint of the edge.
+					// start/end node of edge could be missing in nodeInfo due to ACL.
+					if(gs.nil(startNode) || gs.nil(endNode))
+						return;
+
+					if (startNode.isEndpoint &amp;&amp; !endNode.isEndpoint) {
+						// type Ep -&gt; Ci
+						_createEpCiMap(newEpCiMap, start, end);
+					} else if (!startNode.isEndpoint &amp;&amp; endNode.isEndpoint){
+						// type Ci -&gt; Ep
+						_createEpCiMap(newEpCiMap, end, start);
+					} else {
+						// type Ep -&gt; Ep
+						if (pThis._hasProperty(start, backtrackMap)) {
+							_shuffleEpCiMap(newEpCiMap, end, backtrackMap[start]);
+							global.JSUtil.removeFromMap(backtrackMap, [start]);
+						} else if (pThis._hasProperty(end, backtrackMap)) {
+							_shuffleEpCiMap(newEpCiMap, start, backtrackMap[end]);
+							global.JSUtil.removeFromMap(backtrackMap, [end]);
+						} else {
+							orphanEPs.push(end);
+						}
+					}
+				});
+			}
+		});
+		
+		//merge newEpCiMap to backtrackMap
+		for (var newEp in newEpCiMap) {
+			if (!this._hasProperty(newEp, backtrackMap)) {
+				backtrackMap[newEp] = {};
+			}
+			this._mergeData(backtrackMap[newEp], newEpCiMap[newEp]);
+		}
+	},
+	/**
+	 * This method is in charge of creating an Endpoint edge from the original 
+	 * collection of Ci =&gt; Ep edges discovered, retrieving the relevant CI, and mapping it.
+     * From: Ci =&gt; Ep =&gt; Ep =&gt; Ci
+     * To: Ci =&gt; Ci
+	 */
+	_mapEpCiAndClean: function(sysIds, relData, nodeInfo, mapEpCi) {
+
+		var epTypeId = [];
+		var backTrackMap = {};
+		var orphanEPs = [];
+		if (!this._isEmptyObj(mapEpCi)) {
+			backTrackMap = mapEpCi[this.BACKTRACK_MAP];
+			orphanEPs = mapEpCi[this.ORPHAN_EPS];
+		}
+		// bare until ES6
+		var pThis = this;
+		var nameProp = this._getPropLabel(this.COL_NAME);
+		var populateEndpoints = function(epArr){
+			var epNames = [];
+			var _len = epArr.length;
+			var ep = null;
+			for (var i = _len - 1; i &gt;= 0; i -= 1) {
+				ep = epArr[i];
+				if (ep &amp;&amp; pThis._hasProperty(ep, nodeInfo)) {
+					epNames.push(nodeInfo[ep][nameProp]);
+				}
+			}
+			return epNames;
+		};
+		sysIds.forEach(function(fromCi) {
+			if (pThis._hasProperty(fromCi, relData[pThis.EDGES]) 
+				&amp;&amp; pThis._hasProperty(pThis.RELATIONS, relData[pThis.EDGES][fromCi])) {
+				var edges = relData[pThis.EDGES][fromCi][pThis.RELATIONS];
+				var tmpEdges = [];
+				edges.forEach(function(edge) {
+					var parent = edge[pThis.PARENT];
+					var child = edge[pThis.CHILD];
+					var ciMap = null, tEdge = null, epArr = null, tEdgeSysId = null;
+					var endpoint = ((pThis._hasProperty(parent, nodeInfo) &amp;&amp; nodeInfo[parent].isEndpoint) ? 
+									parent : (pThis._hasProperty(child, nodeInfo) &amp;&amp; nodeInfo[child].isEndpoint) ? child : null);
+					
+					if (pThis._hasProperty(endpoint, backTrackMap)) {
+						ciMap = backTrackMap[endpoint];
+						for (var toCi in ciMap) {
+							epArr = populateEndpoints(ciMap[toCi][pThis.EP]);
+							tEdge = null, tEdgeSysId = null;
+							if (parent == endpoint) {
+								tEdgeSysId = pThis._generateEdgeSysId(toCi, fromCi, edge[pThis.ID]);
+								tEdge = pThis._newEdge(tEdgeSysId, toCi, fromCi, pThis.VIR_CONNECTION, edge[pThis.PORT], true, epArr);
+							} else {
+								tEdgeSysId = pThis._generateEdgeSysId(fromCi, toCi, edge[pThis.ID]);
+								tEdge = pThis._newEdge(tEdgeSysId, fromCi, toCi, pThis.VIR_CONNECTION, edge[pThis.PORT], true, epArr);
+							}
+							relData[pThis.NEXT_CIS].add(toCi);
+							tmpEdges.push(tEdge);
+						}
+						//add the Cis for next iteration &amp; label the connection as virtual
+						epTypeId.push(edge[pThis.REL_TYPE]);
+					}
+					if (global.JSUtil.notNil(endpoint)){
+						orphanEPs.push(endpoint);
+					}
+				});
+				pThis.arrayUtil.concat(relData[pThis.EDGES][fromCi][pThis.RELATIONS], tmpEdges);
+			}
+		});
+		//remove Ci -&gt; Ep cmdb_rel IDs
+		relData['relTypeIds'] = relData['relTypeIds'].filter(function(typeId) {
+			return !pThis.arrayUtil.contains(epTypeId, typeId);
+		});
+		//remove Ep from nextCis list
+		relData[this.NEXT_CIS].forEach(function(nextCi) {
+			if (pThis.arrayUtil.contains(orphanEPs, nextCi)) {
+				relData[pThis.NEXT_CIS].remove(nextCi);
+			}
+		});
+		//remove Eps from nodeInfo
+		global.JSUtil.removeFromMap(nodeInfo, this.arrayUtil.concat(Object.keys(backTrackMap), orphanEPs));
+	},
+	
+	_getEndPoints: function(sysIds, nodeInfo) {
+		var epSysIds = sysIds.filter(function(sysId) {
+			return (nodeInfo.hasOwnProperty(sysId) &amp;&amp; nodeInfo[sysId]['isEndpoint']);
+		});
+		return epSysIds;
+	},
+
+	_formNextInput: function(sysIds, currEdgeLimit, children, excludeRelIds, nodeInfo){
+		var _tmpInput = {};
+		_tmpInput[this.SYS_IDS] = sysIds;
+		_tmpInput[this.CURR_EDGE_LIMIT] = currEdgeLimit;
+		_tmpInput[this.CHILDREN] = children;
+		_tmpInput[this.EXCLUDE_REL_IDS] = excludeRelIds;
+		_tmpInput[this.NODE_INFO] = nodeInfo;
+		return _tmpInput;
+	},
+
+	_isEndPoint: function(ciClass) {
+		return this.arrayUtil.contains(this.ENDPOINT_CLASSES, ciClass);
+	},
+
+	_fetchAndValidateCis: function(sysIds, level) {
+		if (global.JSUtil.nil(sysIds) || sysIds.length == 0)
+			return null;
+		var output = {};
+		var currNodeInfo = this._getCINodeInfo(sysIds, level);
+		var validSysIds = this._sanitizeCiSysIds(currNodeInfo, sysIds);
+		output[this.CURR_NODE_INFO] = currNodeInfo;
+		output[this.VALID_SYS_IDS] = validSysIds;
+		return output;
+	},
+
+	_sanitizePayload: function(result) {
+		var pScope = this;
+		var nodeInfo = result[this.CI_NODE_INFO];
+		var arrayUtil = this.arrayUtil;
+		//remove endpoints nodes || isEndpoint prop from node object
+		for(ci in result[this.CI_NODE_INFO]) {
+			if (result[this.CI_NODE_INFO][ci][this.IS_ENDPOINT])
+				global.JSUtil.removeFromMap(result[this.CI_NODE_INFO], [ci]);
+			else
+				global.JSUtil.removeFromMap(result[this.CI_NODE_INFO][ci], [this.IS_ENDPOINT]);
+		}
+		for (var ci in result[this.EDGES]) {
+			if (this._hasProperty(this.RELATIONS, result[this.EDGES][ci])) {
+				result[this.EDGES][ci][this.RELATIONS] = result[this.EDGES][ci][this.RELATIONS].filter(function(edge) {
+					return (pScope._hasProperty(edge[pScope.PARENT], nodeInfo) 
+							&amp;&amp; pScope._hasProperty(edge[pScope.CHILD], nodeInfo));
+				});
+				arrayUtil.concat(result[this.CI_NODE_INFO][ci][this.CONNECTIONS], 
+					result[this.EDGES][ci][this.RELATIONS]);
+			}  
+			if (result[this.EDGES][ci].hasOwnProperty(this.REFERENCES)){
+				arrayUtil.concat(result[this.CI_NODE_INFO][ci][this.CONNECTIONS], 
+					result[this.EDGES][ci][this.REFERENCES]);
+			}
+		}
+		global.JSUtil.removeFromMap(result, [this.EDGES]);
+	},
+
+	_getLocationInfo: function(sysIds) {
+		var result = {};
+		if (sysIds == null || sysIds.length === 0) {
+			return result;
+		}
+		var gr = new GlideRecordSecure(this.NODE_MAP_TABLE.CMN_LOCATION);
+		gr.addQuery(this.COL_SYS_ID, this.IN_OP, sysIds);
+		gr.query();
+		while(gr.next()) {
+			location = {};
+			location[this.COL_NAME] =  gr.getValue(this.COL_NAME);
+			location[this.CITY] =  gr.getValue(this.CITY);
+			result[gr.getUniqueValue()] = location;
+		}
+		return result;
+	},
+	
+	_getUserInfo: function(sysIds) {
+		return this._getCommon(sysIds, this.NODE_MAP_TABLE.SYS_USER);
+	},
+	
+	_getRelTypeInfo: function(sysIds) {
+		return this._getCommon(sysIds, this.NODE_MAP_TABLE.CMDB_REL_TYPE);
+	},
+	
+	_getCommon: function(sysIds, tableName) {
+		var result = {};
+        if (sysIds == null || sysIds.length === 0) {
+			return result;
+		}
+		var gr = new GlideRecordSecure(tableName);
+		gr.addQuery(this.COL_SYS_ID, this.IN_OP, sysIds);
+		gr.query();
+		while(gr.next()) {
+			result[gr.getUniqueValue()] = gr.getDisplayValue();
+		}
+		return result;
+	},
+	
+	// Merges data from arg2 into arg1. Please note that this is for the use case 
+	// when keys are unique, otherwise the key in arg1 will be overwritten
+	_mergeData: function(arg1, arg2) {
+		for (var name in arg2)
+			arg1[name] = arg2[name];
+	},
+	
+	_mergeGraph: function(endGraph, appendGraph) {
+		var arrayUtil = this.arrayUtil;
+		for(var ciSysId in appendGraph) {
+			if (endGraph.hasOwnProperty(ciSysId)) {
+				if (endGraph[ciSysId].hasOwnProperty(this.RELATIONS))
+					arrayUtil.concat(endGraph[ciSysId][this.RELATIONS], appendGraph[ciSysId][this.RELATIONS]);
+				else 
+					endGraph[ciSysId][this.RELATIONS] = appendGraph[ciSysId][this.RELATIONS];
+			} else {
+				endGraph[ciSysId] = {};
+				endGraph[ciSysId][this.RELATIONS] = appendGraph[ciSysId][this.RELATIONS];
+			}
+		}
+	},
+
+	_replaceRelIdsWithNames: function(relTypeIds, result) {
+		// Get Rel Type Data
+		// This is map of rel type ids to name {"guid1": "Runs on::Runs", "guid2": "Depends on::Used By"}
+		var cacheKey = "rel_type_id_name_map";
+		var strCachedMap = this._cacheGet(cacheKey);
+		var cachedMap = null, relTypeInfo = {};
+		var newRelIds = [];
+		var pThis = this;
+		//cache get &amp; put logic
+		if (global.JSUtil.nil(strCachedMap)) {
+			relTypeInfo =  this._getRelTypeInfo(relTypeIds);
+		} else {
+			cachedMap = JSON.parse(strCachedMap);
+			newRelIds = relTypeIds.filter(function(relTypeId) {
+				return !pThis._hasProperty(relTypeId, cachedMap);
+			});
+			if (newRelIds.length &gt; 0)
+				relTypeInfo =  this._getRelTypeInfo(newRelIds);
+			this._mergeData(relTypeInfo, cachedMap);
+		}
+		this._cachePut(cacheKey, JSON.stringify(relTypeInfo));
+		// Update results to replace with name
+		for (var ciId in result[this.EDGES]) {
+			if (result[this.EDGES][ciId].hasOwnProperty(this.RELATIONS)) {
+				
+				var relObjArray = result[this.EDGES][ciId][this.RELATIONS];
+				for (var relCount = 0; relCount &lt; relObjArray.length; relCount++) {
+					var relId = relObjArray[relCount][this.REL_TYPE];
+					var relName = relTypeInfo[relId];
+					if (!global.JSUtil.nil(relName))
+						relObjArray[relCount][this.REL_TYPE] = relName;
+				}
+				result[this.EDGES][ciId][this.RELATIONS] = relObjArray;
+			}
+		}
+		return result;
+	},
+
+	_replaceLocationAndUserNames: function(ciNodeInfo) {
+		// Append location and owner details
+		var locationSysIds = [];
+		var userSysIds = [];
+		var layerClasses = new CMDBSet();
+		var ciClass = '';
+		var locationPropKey = this._getPropLabel(this.COL_LOCATION);
+		var ownedByPropKey = this._getPropLabel(this.COL_OWNED_BY);
+		var tableName = this.PROPERTY_LABEL_MAP[this.SYS_CLASS_NAME];
+		var ciIconMap = this._getIconFromMappingTable();
+
+		for (var sysId in ciNodeInfo) {
+            locationSysIds.push(ciNodeInfo[sysId][this.PROPERTIES][locationPropKey]);
+            userSysIds.push(ciNodeInfo[sysId][this.PROPERTIES][ownedByPropKey]);
+            ciClass = ciNodeInfo[sysId][this.PROPERTIES][tableName];
+			var node = ciNodeInfo[sysId];
+            var nodeClass = node.properties.Class;
+
+            //add the Ci's &amp; its parent classes
+            if (!layerClasses.has(nodeClass))
+                layerClasses.addAll(new GlideTableHierarchy(ciClass).getTables());
+			
+			//add icon property to the node
+			if (ciIconMap[nodeClass] &amp;&amp; ciIconMap[nodeClass][this.ICON]) {
+                node.icon = ciIconMap[nodeClass][this.ICON];
+            } else {
+				node.icon = this._getClassDefaultIcon(ciClass); //default icon
+			}	
+        }
+		
+		var locationInfo = this._getLocationInfo(locationSysIds);
+		var userInfo = this._getUserInfo(userSysIds);
+		var classLayerMap = this._getClassLayers(layerClasses);
+		var location = '';
+		var ownedBy = '';
+		// Update CI node info with display names
+		for (var ciId in ciNodeInfo) {
+			location = locationInfo[ciNodeInfo[ciId][this.PROPERTIES][locationPropKey]];
+			ciNodeInfo[ciId][this.PROPERTIES][locationPropKey] = global.JSUtil.nil(location) ? {} : location;
+			
+			ownedBy = userInfo[ciNodeInfo[ciId][this.PROPERTIES][ownedByPropKey]];
+			ciNodeInfo[ciId][this.PROPERTIES][ownedByPropKey] = global.JSUtil.nil(ownedBy) ? '' : ownedBy;
+			ciNodeInfo[ciId][this.COL_LAYER] = classLayerMap[ciNodeInfo[ciId][this.PROPERTIES][tableName]];
+		}
+		return ciNodeInfo;
+	},
+
+	//fetches icons for CI classes by querying mapping tables.
+	_getIconFromMappingTable: function() {
+		var cacheKey = 'CI_ICON_DATA';
+		var iconData = this._cacheGet(cacheKey);
+		var classToIconMap = {};
+		if (global.JSUtil.nil(iconData)) {
+		var mappingGr = new GlideRecord(this.CMDB_CLASS_ICON_MAPPING);
+			mappingGr.query();
+			while (mappingGr.next()) {
+				var tableName = mappingGr.table_name.name;
+				var refRecord = mappingGr.icon.getRefRecord();
+				if (refRecord.getValue(this.ICON_NAME_COLUMN)){
+					classToIconMap[tableName] = {
+						'icon': refRecord.getValue(this.ICON_NAME_COLUMN)
+					};
+				}
+			}
+			this._cachePut(cacheKey, JSON.stringify(classToIconMap));
+		} else {
+			classToIconMap = JSON.parse(iconData);
+		}
+		return classToIconMap;
+	},
+
+	_getClassDefaultIcon: function(ciClass) {
+		//TODO: temp pre-release hack; will remove before GA
+		if (ciClass) {
+			switch (ciClass) {
+				case 'cmdb_ci_apache_web_server':
+				case 'cmdb_ci_app_server_websphere':
+				case 'cmdb_ci_microsoft_iis_web_server':
+					return 'globe-outline';
+				case 'cmdb_ci_app_server_ws_ear':
+					return 'puzzle-outline';
+				case 'cmdb_ci_appl_generic':
+				case 'cmdb_ci_appl_sp_service':
+					return 'gear-outline';
+				case 'cmdb_ci_appl_sharepoint':
+					return 'square-s-fill';
+				case 'cmdb_ci_application_cluster':
+					return 'grid-four-outline';
+				case 'cmdb_ci_business_app':
+					return 'bag-outline';
+				case 'cmdb_ci_db_mssql_instance':
+				case 'cmdb_ci_db_mssql_integration':
+					return 'database-outline';
+				case 'cmdb_ci_db_ora_instance':
+					return 'plug-outline';
+				case 'cmdb_ci_directory_ha':
+				case 'cmdb_ci_lb_service':
+					return 'tree-workflow-outline';
+				case 'cmdb_ci_exchange_frontend':
+					return 'envelope-outline';
+				case 'cmdb_ci_iisdirectory':
+					return 'folder-outline';
+				case 'cmdb_ci_linux_server':
+				case 'cmdb_ci_service_discovered':
+					return 'tree-outline';
+				case 'cmdb_ci_windows_server':
+					return 'tree-outline';
+				default:
+					return 'configuration-item-outline';
+			}
+		}
+	},
+	
+	_sanitizeCiSysIds: function(ciNodeInfo, querySysIds) {
+		var result = [];
+		for (var i = 0; i &lt; querySysIds.length; i++) {
+			var ci = querySysIds[i];
+			if (ciNodeInfo.hasOwnProperty(ci)) {
+				result.push(ci);
+			}
+		} 
+		return result;
+	},
+
+	_getClassLayers: function(layerClasses) {
+		var ciClassLayerMap = {};
+		var formClasLayer = function(ciClass, layer, includeChild) {
+			ciClassLayerMap[ciClass] = layer;
+			//if asked, add the child classes
+			if (includeChild == '1') {
+				var tables = new GlideTableHierarchy(ciClass);
+				tables.getTableExtensions().forEach(function (childClass) {
+					ciClassLayerMap[childClass] = layer;
+				});
+			}
+		};
+		var gr = new GlideRecordSecure(this.NODE_MAP_TABLE.CMDB_LAYER);
+		gr.addQuery(this.COL_CLASS, this.IN_OP, layerClasses.toArray());
+		gr.query();
+		while (gr.next()) {
+			formClasLayer(gr.getValue(this.COL_CLASS), gr.getElement(this.COL_LAYER).getChoiceValue(),
+							gr.getValue(this.COL_INCLUDE_CHILD));
+		}
+		return ciClassLayerMap;
+	},
+
+	_generateEdgeSysId: function(parent, child, edgeId){
+		var edgeSysId = parent + "_" + edgeId + "_" + child;
+		return this._generateMD5Hex(edgeSysId);
+	},
+
+	_getProfileData: function(inputTable, result){
+		
+		result[this.CI_PROFILE_INFO] = {}; //In case customer deletes all OOB records
+
+		var inputClassHierarchy = new GlideTableHierarchy(inputTable).getTables();
+		var profileInfo = {};
+		var gr = new GlideRecordSecure(this.NODE_MAP_TABLE.NODE_MAP_CI_PROFILE);
+		gr.addQuery(this.COL_CMDB_CI_CLASS, this.IN_OP, inputClassHierarchy.join(this.COMMA_DELIMITER));
+		gr.addActiveQuery();
+		gr.query();
+		while (gr.next()) {
+			var table = gr.getValue(this.COL_CMDB_CI_CLASS);
+			profileInfo[table] = {};
+			profileInfo[table][this.LAYERS] = gr.getDisplayValue(this.COL_LAYERS);
+			profileInfo[table][this.LAYOUT] = gr.getValue(this.COL_ORIENTATION);
+			
+			if(inputTable == table){
+				break;
+			}
+		}
+
+		for(var i=0; i&lt;inputClassHierarchy.length; i++) {
+			var sysClass = inputClassHierarchy[i];
+			if(global.JSUtil.notNil(profileInfo[sysClass])){
+				result[this.CI_PROFILE_INFO][sysClass] = {};
+				result[this.CI_PROFILE_INFO][sysClass][this.LAYOUT] = profileInfo[sysClass][this.LAYOUT];
+				result[this.CI_PROFILE_INFO][sysClass][this.LAYERS] = this._getDefaultLayerJson();
+
+				var selectedLayers = profileInfo[sysClass][this.LAYERS].split(',');
+				for(var j=0; j&lt;selectedLayers.length; j++){
+					result[this.CI_PROFILE_INFO][sysClass][this.LAYERS][selectedLayers[j].trim()] = true;
+				}
+				break;
+			}
+		}
+	},
+
+	_fixGroupEdges: function(result) {
+		var memberToGroupMap = {};
+		// Find groups and members
+		for( var id in result[this.CI_NODE_INFO]) {
+			if(result[this.CI_NODE_INFO][id][this.IS_GROUP])
+				this._getMemberToGroup(id, result[this.CI_NODE_INFO][id], memberToGroupMap);
+		}
+		
+		this._reparentRecursiveGroup(memberToGroupMap);
+		// Redirect incoming edges on members from other nodes to their respective groups
+		for( var id in result[this.CI_NODE_INFO]) {
+			var currConns = result[this.CI_NODE_INFO][id][this.CONNECTIONS];
+			for(var c in currConns) {
+				var memberId = currConns[c][this.CHILD];
+				if(memberToGroupMap.hasOwnProperty(memberId) &amp;&amp; this.VALID_GROUP_LABELS.indexOf(currConns[c][this.REL_TYPE].toLowerCase()) &lt; 0 )
+					currConns[c][this.CHILD] = memberToGroupMap[memberId];
+			}
+		}
+	},
+
+	_getMemberToGroup : function(groupId, groupNode, memberToGroupMap) {
+		for(var i=0; i &lt; groupNode[this.CONNECTIONS].length; i++) {
+			if(this.VALID_GROUP_LABELS.indexOf(groupNode[this.CONNECTIONS][i][this.REL_TYPE].toLowerCase()) &gt; -1)
+				memberToGroupMap[groupNode[this.CONNECTIONS][i][this.CHILD]] = groupId;
+		}
+	},
+
+	_reparentRecursiveGroup : function(memberToGroupMapLocal) {
+		if(!memberToGroupMapLocal)
+			return;
+		var replacements = {};
+		var groups = [];
+		for(var k in memberToGroupMapLocal)
+			groups.push(memberToGroupMapLocal[k]);
+			
+		groups.forEach(function(g) {
+			if(memberToGroupMapLocal.hasOwnProperty(g))
+				replacements[g] = memberToGroupMapLocal[g];
+		});
+
+		for (var g in memberToGroupMapLocal) {
+			if(replacements.hasOwnProperty(memberToGroupMapLocal[g]))
+				memberToGroupMapLocal[g] = replacements[memberToGroupMapLocal[g]];
+		}
+
+	},
+
+    type: 'MapService'
+});]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-08-26 17:11:33&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;64e010b153255110456dddeeff7b12e4&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;359&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;MapService&lt;/sys_name&gt;
+        &lt;sys_package display_value="CMDB Workspace" source="sn_cmdb_ws"&gt;c8ab76825371201032b7ddeeff7b1280&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="CMDB Workspace"&gt;c8ab76825371201032b7ddeeff7b1280&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_64e010b153255110456dddeeff7b12e4&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-07-05 19:03:59&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:37:57</sys_created_on>
+        <sys_id>0ed6b81d83f01210c6695855eeaad367</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>MapService</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_0ed6b81d83f01210c6695855eeaad367</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:37:57</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

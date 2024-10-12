@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>34c54f39ff18e110468365d7d3b8fee5</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_entitlement.SubscriptionService&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;SubscriptionService&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[/**
+ * Functions that calculate the derived values for subscriptions (e.g. unallocated users, unallocated groups, stats, etc)
+ */
+var SubscriptionService = Class.create();
+SubscriptionService.prototype = {
+    /**
+     * @param {bool} oobRolesOnly A boolean flag that filters the roles to out-of-box roles when true.
+     */
+    initialize: function(oobRolesOnly = false) {
+        this._oobRolesOnly = oobRolesOnly;
+
+        this._logSourceName = `sn_entitlement.${this.type}`;
+
+        this._userDao = new sn_entitlement.UserDao();
+        this._userGroupDao = new sn_entitlement.UserGroupDao();
+        this._contextFactory = new sn_entitlement.UnallocatedEntityCalculation_ContextFactory(oobRolesOnly);
+    },
+
+    /**
+     * Retrieves an array of objects containing all of the unallocated users for each active subscription
+     *
+     * @returns {stream} A stream of objects that contain the unallocated users per subscription
+     */
+    getUnallocatedUserCalculationsByAllSubscriptions: function() {
+        // Note: For performance reasons, it is better to calculate the global set of unallocated users
+        //    and then determine which subscriptions they are unallocated for than calling the 
+        //    getUnallocatedUsersBySubscriptionId(subscriptionId) as it has to calculate the unallocation
+        //    data for all users on each call.
+
+        const userIds = this._getUserIdsThatHaveARoleThatRequiresASubscription();
+        return this.getUnallocatedUserCalculationsByUserIds(userIds);
+    },
+
+    /**
+     * Retrieves an array of objects containing the unallocated users within the list of userIds provided
+     * 
+     * @param {array} An array of sys_user.sys_id values to process
+     * @returns {stream} A Stream of objects that contain the unallocated users provided in the userIds list
+     */
+    getUnallocatedUserCalculationsByUserIds: function(userIds) {
+        const subscriptionContext = this._contextFactory.createSubscriptionContext();
+
+        gs.info(`${this._logSourceName}: Calculating unallocated status for ${userIds.length} users`);
+
+        return global.Stream.fromArray(userIds)
+            .map(userId =&gt; this._contextFactory.createUserContext(userId, subscriptionContext))
+            .map(userContext =&gt; new sn_entitlement.UnallocatedEntityCalculation(subscriptionContext, userContext))
+            .map(calculation =&gt; calculation.calculateUnallocatedData())
+            .filter(calculation =&gt; this._hasAnAllocatedOrUnallocatedSubscriptionReference(calculation));
+    },
+
+    /**
+     * Retrieves an array of objects containing all of the unallocated groups for each active subscription
+     *
+     * @returns {stream} A stream of objects that contain the unallocated groups per subscription
+     */
+    getUnallocatedGroupCalculationsByAllSubscriptions: function() {
+        const groupIds = this._getGroupIdsThatHaveARoleThatRequiresASubscription();
+        return this.getUnallocatedGroupCalculationsByGroupIds(groupIds);
+    },
+
+    /**
+     * Retrieves an array of objects containing the unallocated groups within the list of groupIds provided
+     * 
+     * @param {array} An array of sys_user_group.sys_id values to process
+     * @returns {stream} A Stream of objects that contain the unallocated groups provided in the groupIds list
+     */
+    getUnallocatedGroupCalculationsByGroupIds: function(groupIds) {
+        const subscriptionContext = this._contextFactory.createSubscriptionContext();
+
+        gs.info(`${this._logSourceName}: Calculating unallocated status for ${groupIds.length} groups`);
+
+        return global.Stream.fromArray(groupIds)
+            .map(groupId =&gt; this._contextFactory.createGroupContext(groupId, subscriptionContext))
+            .map(groupContext =&gt; new sn_entitlement.UnallocatedEntityCalculation(subscriptionContext, groupContext))
+            .map(calculation =&gt; calculation.calculateUnallocatedData())
+            .filter(calculation =&gt; this._hasAnAllocatedOrUnallocatedSubscriptionReference(calculation));
+    },
+
+    /**
+     * Retrieves the number of users the subscription service will process when calling getUnallocatedUserCalculationsByAllSubscriptions()
+     */
+    getUserCountByNeedsToBeProcessed: function() {
+        return this._getUserIdsThatHaveARoleThatRequiresASubscription().length;
+    },
+
+    /**
+     * Retrieves the number of groups the subscription service will process when calling getUnallocatedGroupCalculationsByAllSubscriptions()
+     */
+    getGroupCountByNeedsToBeProcessed: function() {
+        return this._getGroupIdsThatHaveARoleThatRequiresASubscription().length;
+    },
+
+    /**
+     * Determines if the calculation results in at least one allocated or unallocated subscription.
+     * In normal scenarios, it is expected that unallocated calculations will always result in at least
+     * one subscription mapping (either allocated or unallocated) since a licensable role requires a subscription
+     * however, with the special cases of UU and Module behavior, we may process a user that has 100% of
+     * their licensable roles fulfilled by UU and/or Module and thus not produce a subscription relationship.
+     * These users/groups should be ignored.
+     */
+    _hasAnAllocatedOrUnallocatedSubscriptionReference: function(entityAllocationData) {
+        return entityAllocationData &amp;&amp;
+            (entityAllocationData.allocated_subscription_ids &amp;&amp; entityAllocationData.allocated_subscription_ids.length &gt; 0 ||
+                entityAllocationData.unallocated_subscription_ids &amp;&amp; entityAllocationData.unallocated_subscription_ids.length &gt; 0);
+    },
+
+    /**
+     * Retrieves an array of user ids (sys_user.sys_id) that have at least one role that requires
+     * a subscription.
+     *
+     * @returns {array} An array of sys_user.sys_id values
+     */
+    _getUserIdsThatHaveARoleThatRequiresASubscription: function() {
+        const roleIdsThatRequireASubscription = this._contextFactory
+            .createSubscriptionContext()
+            .getRoleIdsByRequiresASubscription();
+
+        gs.info(`${this._logSourceName}: ${roleIdsThatRequireASubscription.length} metered roleIds detected`);
+
+        return this._userDao.getUserIdsByActiveAndHasRole(roleIdsThatRequireASubscription);
+    },
+
+    /**
+     * Retrieves an array of group ids (sys_user_group.sys_id) that have at least one role that requires a subscription
+     *
+     * @returns {array} An array of sys_user_role.sys_id values
+     */
+    _getGroupIdsThatHaveARoleThatRequiresASubscription: function() {
+        const roleIdsThatRequireASubscription = this._contextFactory
+            .createSubscriptionContext()
+            .getRoleIdsByRequiresASubscription();
+
+        gs.info(`${this._logSourceName}: ${roleIdsThatRequireASubscription.length} metered roleIds detected`);
+
+        return this._userGroupDao.getGroupIdsByActiveAndHasRole(roleIdsThatRequireASubscription);
+    },
+
+    type: 'SubscriptionService'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-01-11 00:02:44&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;34c54f39ff18e110468365d7d3b8fee5&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;112&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;SubscriptionService&lt;/sys_name&gt;
+        &lt;sys_package display_value="Licensing Engine" source="sn_entitlement"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Licensing Engine"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_34c54f39ff18e110468365d7d3b8fee5&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;maint&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-07-18 21:18:29&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:35:41</sys_created_on>
+        <sys_id>c956b89983f01210c6695855eeaad3fa</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>SubscriptionService</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_c956b89983f01210c6695855eeaad3fa</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:35:41</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

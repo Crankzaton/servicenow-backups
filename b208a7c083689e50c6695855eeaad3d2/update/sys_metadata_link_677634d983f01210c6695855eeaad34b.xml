@@ -1,0 +1,350 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>44e487e753463010347cddeeff7b12d3</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.MIDServerProfile&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;This class contains utility functions for interacting with MID Server Profiles.&lt;/description&gt;
+        &lt;name&gt;MIDServerProfile&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var MIDServerProfile = Class.create();
+
+MIDServerProfile.prototype = {
+    initialize: function() {
+    },
+
+    getParams: function(table_name, profile_id) {
+		var result = [];
+		var gr = new GlideRecord(table_name);
+		gr.addQuery("profile", profile_id);
+		gr.query();
+		while (gr.next()) {
+			var param = {};
+			param["name"] = gr.getValue("name");
+			param["value"] = gr.getValue("value");
+			result.push(param); 
+		}
+		return result;
+    },
+
+    getProfile: function(profile_id) {
+		var gr = new GlideRecord('mid_server_profile');
+		if (!gr.get(profile_id))
+			return '{}';
+
+		var profile = {} ;
+		var configParms = this.getParams("mid_profile_config", profile_id);
+		// add the mid_profile_id config param
+		var param = {};
+		param["name"] = "mid_profile_id";
+		param["value"] = '' + profile_id;
+		configParams.push(param); 
+		profile["config"] = configParams;
+		profile["wrapper_config"] = this.getParams("mid_profile_wrapper_config", profile_id);
+		return JSON.stringify(profile);
+	},
+	
+	clone: function(oldProfileId, newProfileId) {
+		this._copyProfileM2MValues("mid_profile_application_m2m", "application", oldProfileId, newProfileId);
+		this._copyProfileM2MValues("mid_profile_capability_m2m", "capability", oldProfileId, newProfileId);
+		this._copyProfileM2MValues("mid_profile_cluster_m2m", "cluster", oldProfileId, newProfileId);
+		this._copyProfileM2MValues("mid_profile_ip_range_m2m", "ip_range", oldProfileId, newProfileId);
+		this._copyProfileValues("mid_profile_config", oldProfileId, newProfileId);
+		this._copyProfileValues("mid_profile_property", oldProfileId, newProfileId);
+		this._copyProfileValues("mid_profile_wrapper_config", oldProfileId, newProfileId);
+	},
+	
+	syncProfileToMids: function(profileId, syncStrategy) {	
+		var m2mTables = {
+			"capability" : {profileM2M: "mid_profile_capability_m2m", agentM2M: "ecc_agent_capability_m2m"},
+			"application": {profileM2M: "mid_profile_application_m2m", agentM2M: "ecc_agent_application_m2m"},
+			"cluster": {profileM2M: "mid_profile_cluster_m2m", agentM2M: "ecc_agent_cluster_member_m2m"},
+			"ip_range": {profileM2M: "mid_profile_ip_range_m2m", agentM2M: "ecc_agent_ip_range_m2m"}
+		};
+		var kvTables = {
+			"ecc_agent_config": {fieldName: "param_name", sourceTable: "mid_profile_config"}, 
+			"ecc_agent_property": {fieldName: "name", sourceTable: "mid_profile_property"}
+		};
+		
+		if (!this._validateProfile(profileId, syncStrategy)) {
+			gs.addErrorMessage(gs.getMessage("An error has occurred while trying to sync profile settings to MID servers."));
+			return;
+		}
+		
+		gs.log("Syncing profile to MID servers...", "MIDServerProfile");
+		
+		var profileM2MSettings = this._getProfileM2MSettings(profileId, m2mTables);
+		var profileKVSettings = this._getProfileKVSettings(profileId, kvTables);
+		var scu = new MIDServerSystemCommandUtil;
+		var gr = new GlideRecord('ecc_agent');
+		gr.query("profile_id", profileId);
+		while (gr.next()) {		
+			var isModified = false;
+			var table;
+			for (table in m2mTables)
+				isModified = this._updateAgentM2MSettings(gr.getUniqueValue(), table, profileM2MSettings[table], m2mTables[table].agentM2M, syncStrategy) || isModified;
+			
+			// M2M tables share the same system command, only send it once after all M2M tables are synced
+			if (isModified &amp;&amp; gs.getProperty("mid.com.snc.process_flow.integration.integration_hub_mid_caching_enabled", "false") == "true")
+				scu.issueSystemCommandToSpecificMID("environment_clear", gr.name);
+			
+			// System commands for kv tables are enqueued in ECCAgentSyncableChangesListener, don't enqueue here
+			for (table in kvTables) {
+				this._updateAgentKVSettings(gr.getUniqueValue(), table, profileKVSettings[table], kvTables[table].fieldName, syncStrategy);
+			}
+		}
+		gs.log("Finished syncing profile to MID servers", "MIDServerProfile");
+		gs.addInfoMessage(gs.getMessage("Profile settings successfully synced to MID servers."));
+	},
+	
+	_getProfileM2MSettings: function(profileId, tables) {
+		var settings = {}; // key: table name, value: array of sys Ids for each setting on table
+		// key is the field name of the corresponding table, e.g. cluster for ecc_agent_cluster_member_m2m	
+		for (var fieldName in tables) {
+			settings[fieldName] = [];
+			var tableName = tables[fieldName].profileM2M;
+			var gr = new GlideRecord(tableName);
+			gr.query("profile", profileId);
+			while (gr.next()) {
+				var setting = gr.getValue(fieldName);
+				settings[fieldName].push(setting);
+			}
+		}
+		return settings;
+	},
+	
+	_getProfileKVSettings: function(profileId, tables) {
+		var settings = {}; // key: table name, value: map of kv settings on table
+		for (var table in tables) {
+			settings[table] = {};
+			var tableName = tables[table].sourceTable;
+			var gr = new GlideRecord(tableName);
+			gr.query("profile", profileId);
+			while (gr.next()) {
+				var setting = gr.getValue("name");
+				var value = gr.getValue("value");
+				settings[table][setting] = value;
+			}
+		}
+		return settings;
+	},
+	
+	_validateProfile: function(profileId, syncStrategy) {
+		gs.log("Validating profile...", "MIDServerProfile");
+		
+		// Check does profile have cluster defined
+		// If so, validate the capabilities, if not then return as valid
+		var clusterGr = new GlideRecord("mid_profile_cluster_m2m");
+		clusterGr.query("profile", profileId);
+		if (!clusterGr.hasNext())
+			return true;
+		
+		// A cluster is defined for the profile so ensure that the profile has capabilities as well. Any capability will suffice.
+		var capabilityGr = new GlideRecord("mid_profile_capability_m2m"); 
+		capabilityGr.query("profile", profileId);
+		if (!capabilityGr.hasNext()){
+			if (syncStrategy == "override_ifexists") {
+				// If sync strategy is to keep non-default settings, check that each mid has some capability.
+				// If a MID is found without a capability then fail validation
+				var agentGr = new GlideRecord("ecc_agent");
+				agentGr.query("profile_id", profileId);
+				var capGr = new GlideRecord("ecc_agent_capability_m2m");
+				while (agentGr.next()) {
+					capGr.query("agent", agentGr.getUniqueValue());
+					if (!capGr.hasNext()) {
+						gs.addErrorMessage(gs.getMessage("Agent {0} has no capabilities and cannot be included with cluster. Please add capability to agent or remove agent from cluster.", agentGr.getValue("name")));
+						return false;	
+					}
+				}
+			} else {
+				gs.addErrorMessage(gs.getMessage("Profile has no capabilities and cannot be included with cluster. Please add capability or remove cluster from profile."));
+				return false;	
+			}
+		}
+		return true;
+	},
+	
+		// refFieldName is the other 'm' table in the m2m, e.g. 'profile' or 'agent'
+	_setProfileM2MValues: function(profileId, refFieldName, refSysId, sourceTable, destTable, fieldName, executeBRs, isNewRecord) {
+		var sourceGR = new GlideRecord(sourceTable);
+		sourceGR.addQuery("profile", profileId);
+		sourceGR.query();
+		var destGR = new GlideRecord(destTable);
+		while (sourceGR.next()) {
+			if (!isNewRecord) {
+				destGR.addQuery(refFieldName, refSysId);
+				destGR.addQuery(fieldName, sourceGR.getValue(fieldName));
+				destGR.query();
+			
+				// These M2M records only have the two fields already queried, so nothing to update
+				if (destGR.hasNext())
+					continue;
+			}		
+			destGR.initialize();
+			destGR.setWorkflow(executeBRs);
+			destGR.setValue(refFieldName, refSysId);
+			destGR.setValue(fieldName, sourceGR.getValue(fieldName));
+			destGR.insert();
+		}
+	},
+	
+	_copyProfileM2MValues: function(tableName, fieldName, oldProfileId, newProfileId) {
+		this._setProfileM2MValues(oldProfileId, "profile", newProfileId, tableName, tableName, fieldName, false, true);
+	},
+	
+	// settingsArr contains updated settings from profile. Ensure that agent has these M2M refs.
+	_updateAgentM2MSettings: function(agentSysId, settingName, settingsArr, tableName, syncStrategy) {
+		var isTableModified = false;
+		var gr = new GlideRecord(tableName);
+		gr.addQuery("agent", agentSysId);
+		gr.query();
+		while (gr.next()) {
+			var setting = gr.getValue(settingName);
+			var index = settingsArr.indexOf(setting);
+			if (index == -1) {
+				if (syncStrategy == "replace_all") {
+					gr.setWorkflow(false);
+					gr.deleteRecord();
+					isTableModified = true;
+				}
+			} else {
+				// remove setting from arr
+				// arr will contain only new settings afterwards which will be added
+				settingsArr.splice(index,1);
+			}
+		}
+		// Add in new settings
+		for (var i = 0; i &lt; settingsArr.length; i++) {
+			gr.initialize();
+			gr.setWorkflow(false);
+			gr.setValue("agent", agentSysId);
+			gr.setValue(settingName, settingsArr[i]);
+			gr.insert();
+			isTableModified = true;
+		}
+		return isTableModified;
+	},
+		
+	_updateAgentKVSettings: function(agentSysId, table, settingsMap, fieldName, syncStrategy){
+		var gr = new GlideRecord(table);
+		gr.query("ecc_agent", agentSysId);
+		while (gr.next()) {		
+			var name = gr.getValue(fieldName);
+			var value = gr.getValue("value");
+			// Ensure setting can be modified
+			if (table == "ecc_agent_config") {
+				var mcp = SncMIDConfigParameter.byName(name);
+				// Unlisted parameters don't appear in the UI and cannot be added to a profile.
+				// If one exists for the MID, then it was added by the MID server and shouldn't be modified. 
+				// Hidden params should be skipped as well since they should go in secrets file instead.
+				if (!mcp.isListed() || mcp.isHidden())
+					continue;
+			}
+			
+			if (settingsMap[name]) {
+				// If it's in settings map that means it's part of profile, see if value has changed
+				if (settingsMap[name] != value) {
+					if (this._isIgnoredParam(name)){
+						gs.log(gs.getMessage("Cannot sync parameter \"{0}\", skipping...", name), "MIDServerProfile");
+						delete settingsMap[name];
+						continue;
+					}
+					gr.setValue("value", settingsMap[name]);
+					gr.update();
+				}
+				delete settingsMap[name];
+			} else {
+				if (syncStrategy == "replace_all") {
+					if (this._isIgnoredParam(name)){
+						gs.log(gs.getMessage("Cannot sync parameter \"{0}\", skipping...", name), "MIDServerProfile");
+						continue;
+					}
+					gr.deleteRecord();
+				}
+			}
+		}
+		// All the elements remaining in settingsMap are new profile settings, add them in
+		for (var setting in settingsMap) {
+			if (this._isIgnoredParam(setting)){
+				gs.log(gs.getMessage("Cannot sync parameter \"{0}\", skipping...", name), "MIDServerProfile");
+				continue;
+			}
+			gr.initialize();
+			gr.setWorkflow(false);
+			gr.setValue("ecc_agent", agentSysId);
+			gr.setValue(fieldName, setting);
+			gr.setValue("value", settingsMap[setting]);
+			gr.insert();
+		}	
+	},
+		
+	_copyProfileValues: function(tableName, oldProfileId, newProfileId) {
+		var gr = new GlideRecord(tableName);
+		gr.addQuery("profile", oldProfileId);
+		gr.query();
+		var grNew = new GlideRecord(tableName);
+		while (gr.next()) {
+			// url config parameter should be updated as it was already inserted when the new profile record was created
+			var shouldUpdate = false;
+			if (tableName == 'mid_profile_config' &amp;&amp; gr.name == 'url') {
+				grNew.addQuery("profile", newProfileId);
+				grNew.addQuery('name', 'url');
+				grNew.query();
+				shouldUpdate = grNew.next();
+			}
+			
+			if (shouldUpdate) {
+				grNew.setValue("value", gr.getValue("value"));
+				grNew.update();
+			} else {
+				grNew.initialize();
+				grNew.setValue("profile", newProfileId);
+				grNew.setValue("name", gr.getValue("name"));
+				grNew.setValue("value", gr.getValue("value"));
+				grNew.insert();
+			}
+		}
+	},
+	
+	_isIgnoredParam: function(name) {
+		var IGNORED_PARAMS = ["mid.buildstamp", "mid_sys_id", "keypairs.mid_id", "home_dir", "url"];
+		return IGNORED_PARAMS.indexOf(name) != -1;
+	},
+
+    type: 'MIDServerProfile'
+};
+]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;cong.thieu&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-08-24 20:56:52&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;44e487e753463010347cddeeff7b12d3&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;15&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;MIDServerProfile&lt;/sys_name&gt;
+        &lt;sys_package display_value="MID Server" source="com.glideapp.agent"&gt;a6877ce83cb1311068bcf327dfe37f69&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_44e487e753463010347cddeeff7b12d3&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;joaquin.lunavillagran&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-08-24 18:44:03&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:36:25</sys_created_on>
+        <sys_id>677634d983f01210c6695855eeaad34b</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>MIDServerProfile</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_677634d983f01210c6695855eeaad34b</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:36:25</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>69ffbc6ec771211027e7678c95c26034</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_entitlement.SubscriptionUsageUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;SubscriptionUsageUtils&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var SubscriptionUsageUtils = Class.create();
+SubscriptionUsageUtils.prototype = {
+    initialize: function() {
+        this.logger = new LoggingUtil();
+        this.subscriptionTypePerUser = parseInt(sn_entitlement.LicensingEngineConstants.PER_USER_LICENSE);
+        this.subscriptionTypeCapacity = parseInt(sn_entitlement.LicensingEngineConstants.CAPACITY_LICENSE);
+        this.subscriptionTypeUnrestrictedUser = parseInt(sn_entitlement.LicensingEngineConstants.MAX_USER_LICENSE);
+        this.displayTypeDisplayOnly = parseInt(sn_entitlement.LicensingEngineConstants.DISPLAY_TYPE_DISPLAY_ONLY);
+        this.subscriptionTypeDisplay = parseInt(sn_entitlement.LicensingEngineConstants.DISPLAY_LICENSE);
+        this.subscriptionTypeUnlimitedUser = parseInt(sn_entitlement.LicensingEngineConstants.UNLIMITED_USER_LICENSE);
+        this._sss = new sn_entitlement.SubscriptionStatsService();
+        this._groupHasSubscription = new sn_entitlement.GroupHasSubscriptionDAO();
+        this._licenseGroupHasSubscription = new sn_entitlement.LicenseGroupHasSubscriptionDAO();
+        this._groupAllocationDataM2MSubscriptionDetail = new sn_entitlement.GroupAllocationDataM2MSubscriptionDetailDao();
+        this._userAllocationDataM2MSubscriptionDetail = new sn_entitlement.UserAllocationDataM2MSubscriptionDetailDao();
+    },
+
+    getQuotaDefinition: function(defId) {
+        return new sn_lef.EntitlementEngineUtils().getQuotaDefinition(defId);
+    },
+
+    calculateAllocation: function(defId, defConfigSysId) {
+        return new sn_lef.EntitlementEngineUtils().calculateAllocation(defId, defConfigSysId);
+    },
+
+    calculateStringAllocation: function(current) {
+        let allocatedCount;
+        const subscriptionType = parseInt(current.subscription.subscription_type);
+        const displayType = parseInt(current.subscription.display_type);
+        if (displayType === this.displayTypeDisplayOnly || subscriptionType === this.subscriptionTypeDisplay || subscriptionType === this.subscriptionTypeUnlimitedUser) {
+            // Allocated Count value is not tracked for display only type subscription
+            allocatedCount = '-';
+        } else {
+            allocatedCount = this.calculateRealtimeAllocation(current);
+        }
+
+        return String(allocatedCount);
+    },
+
+    calculateRealtimeAllocation: function(current) {
+        const subscriptionType = parseInt(current.subscription.subscription_type);
+        const customTableCount = parseInt(this._sss.getCustomTableAllocationCount(current.subscription.sys_id));
+
+        if (subscriptionType === this.subscriptionTypePerUser) {
+            if (current.is_latest) {
+                try {
+                    return this._sss.calculateAllocatedUserCount(current.subscription);
+                } catch (e) {
+                    this.logger.logWarn(this.type, "calculateRealtimeAllocation", `Cannot calculate realtime allocation for : ${current.subscription_name}. Message : ${e}`);
+                }
+            }
+
+            let allocatedCount = parseInt(current.allocated_user_count);
+            return Math.max(allocatedCount, 0);
+        }
+
+        if (customTableCount &gt; 0) {
+            //if there is any non-zero value in the allocated custom tables, it must be a custom table type
+            return customTableCount;
+        }
+
+        //otherwise return the default value of the quota count for unknown scenarios as it is more like an 'other' type may have a definition id defined
+        return parseInt(current.allocated_quota_count);
+    },
+
+    /**
+     * Calculates the number of groups that are allocated to the subscription detail record provided
+     * 
+     * @param {uuid} current The subscription_detail record the counts are being calculated for
+     * @returns The count of groups allocated to the license/subscription
+     */
+    calculateRealTimeGroupAllocation: function(current) {
+        if (!this._isPerUserSubscriptionDetailRecord(current) || !current.is_latest)
+            return 0;
+
+        return current.subscription ?
+            this._groupHasSubscription.getCountBySubscriptionId(current.subscription) :
+            this._licenseGroupHasSubscription.getCountByLicenseId(current.license);
+    },
+
+    /**
+     * Calculates the number of unconfirmed groups that are associated to the subscription detail record provided
+     * 
+     * @param {uuid} current The subscription_detail record the counts are being calculated for
+     * @returns The count of groups unconfirmed to the license/subscription
+     */
+    calculateRealTimeUnconfirmedGroups: function(current) {
+        if (!this._isPerUserSubscriptionDetailRecord(current) || !current.is_latest)
+            return current.unconfirmed_group_count;
+
+        return this._groupAllocationDataM2MSubscriptionDetail.getCountBySubscriptionDetailIdAndIsAllocated(current.sys_id, false);
+    },
+
+    /**
+     * Calculates the number of unconfirmed users that are associated to the subscription detail record provided
+     * 
+     * @param {uuid} current The subscription_detail record the counts are being calculated for
+     * @returns The count of users unconfirmed to the license/subscription
+     */
+    calculateRealTimeUnconfirmedUsers: function(current) {
+        if (!this._isPerUserSubscriptionDetailRecord(current) || !current.is_latest)
+            return current.unconfirmed_user_count;
+
+        return this._userAllocationDataM2MSubscriptionDetail.getCountBySubscriptionDetailIdAndIsAllocated(current.sys_id, false);
+    },
+
+    /**
+     * Calculates the custom table allocation count for the subscription
+     */
+    calculateRealTimeCustomTableAllocationCount: function(current) {
+        if (!current.subscription || !current.is_latest)
+            return current.allocated_custom_table_count; // Only calculate V2 and is_latest=true records, otherwise default to the full scan value
+
+        return this._sss.getCustomTableAllocationCount(current.subscription.sys_id);
+    },
+
+    /**
+     * Determines if the subscription_detail record is a per-user subscription
+     * 
+     * @param {GlideRecord} record A subscription_detail record
+     * @returns {bool} True if the associated subscription/license is per-user
+     */
+    _isPerUserSubscriptionDetailRecord: function(record) {
+        const type = record.subscription ?
+            parseInt(record.subscription.subscription_type) :
+            parseInt(record.license.license_type);
+        return type === this.subscriptionTypePerUser;
+    },
+
+    type: 'SubscriptionUsageUtils'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-03-28 11:00:36&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;69ffbc6ec771211027e7678c95c26034&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;44&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;SubscriptionUsageUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Licensing Engine" source="sn_entitlement"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Licensing Engine"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_69ffbc6ec771211027e7678c95c26034&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;maint&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-10-13 01:52:22&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:38:13</sys_created_on>
+        <sys_id>46e6305d83f01210c6695855eeaad3d0</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>SubscriptionUsageUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_46e6305d83f01210c6695855eeaad3d0</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:38:13</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

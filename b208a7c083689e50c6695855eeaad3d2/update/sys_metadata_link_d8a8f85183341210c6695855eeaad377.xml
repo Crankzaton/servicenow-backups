@@ -1,0 +1,392 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>948929a8538b4510d0f9ddeeff7b1254</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_appclient.AppPluginInstallation&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;AppPluginInstallation&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var AppPluginInstallation = Class.create();
+AppPluginInstallation.prototype = {
+    initialize: function() {
+        this.blockingDependencies = [];
+        this.conflictingDependencies = [];
+        this.installationResponse = {};
+        this.batchInstallMap = {};
+        this.productName = '';
+        this.INSTALLATION_WARNING_MESSAGE = gs.getMessage('These applications will not be part of the group installation because these applications have at least one dependent application that conflicts with the version you chose to install.');
+        this.INSTALLATION_ERROR_MESSAGE = gs.getMessage('One or more required dependencies for this application are not installed on your instance. Please install them first to install the application.');
+        this.UNABLE_TO_COMPLETE_INSTALL_MESSAGE = gs.getMessage('Unable to complete installation successfully');
+        this.ANOTHER_OPERATION_IS_RUNNING_MESSAGE = gs.getMessage('Application installation is unavailable because another operation is running: {0}');
+    },
+
+    /**
+	 * AppCustomization is not supported currently.
+
+	 ex. installationDetails = {
+	 "sys_id": "18e849d169284372d77ad961ee8fa009",
+	 "app_name": "AES Catalog Builder Wizard",
+	 "version": "21.1.3",
+	 "loadDemoData": false,
+	 "appScope": "sn_aes_catalog_wzd",
+	 "dependencies": "com.glide.uxbuilder:sys,com.devsnc_sn_gw_wrapper:sys,com.devsnc_sn_gw_page:sys,com.devsnc_sn_gw_info_summary:sys,com.servicenow_now_input:sys,com.servicenow_now_tooltip:sys"
+	 }
+
+	 ex. response = {
+	 "id":"INSTALLTION_STATUS",
+	 "installationAllowed":true,
+	 "installationSuccess":true,
+	 "progressId": null,
+	 "message":"Successfully installed &lt;app_name&gt;:&lt;version&gt;"
+	 }";"
+	 **/
+    validateAndInstallApps: function(installationDetails) {
+        var installationSuccess = false;
+
+        if (global.JSUtil.nil(installationDetails))
+            return this._getInstallationResponse("INVALID PAYLOAD", false, installationSuccess, null, "Invalid payload");
+
+        var dependencies = this._getAppDependencies(installationDetails.sys_id, installationDetails);
+
+        // Check if the system is busy, user correct role(s) and current domain is safe for installation
+        var isInstallationAllowed = this._isInstallationAllowed();
+        if (!isInstallationAllowed.installationAllowed)
+            return isInstallationAllowed;
+
+        if (dependencies) {
+            var dependencyList = new DependencyProcessor(installationDetails.appScope, false).processDependency(dependencies.split(","));
+            var inactiveDependency = false;
+            for (var depIndex = 0; depIndex &lt; dependencyList.length; depIndex++) {
+                if (!dependencyList[depIndex].active || dependencyList[depIndex].status === "Installation blocked") {
+                    inactiveDependency = true;
+                    break;
+                }
+            }
+
+            if (inactiveDependency)
+                return this._getInstallationResponse("BLOCKING_DEPENDENCY", false, false, null, gs.getMessage(this.INSTALLATION_ERROR_MESSAGE));
+        }
+
+        // Install app and dependencies
+        var appId = installationDetails.sys_id;
+        var version = installationDetails.version;
+        var customizedAppSelectedVersion = installationDetails.customizedAppSelectedVersion || '';
+        var loadDemoData = installationDetails.loadDemoData;
+        var msg = '';
+
+        try {
+            installationSuccess = new AppUpgrader().upgrade(appId, version, loadDemoData, customizedAppSelectedVersion);
+        } catch (ex) {
+            return this._getInstallationResponse("INSTALLATION_ERROR", true, installationSuccess, null, ex);
+        }
+
+        if (installationSuccess &amp;&amp; global.JSUtil.notNil(installationDetails.customizedAppSelectedVersion))
+            msg = gs.getMessage("Successfully installed customization version {0} for application {1}:{2}", customizedAppSelectedVersion, installationDetails.app_name, version);
+        else if (installationSuccess &amp;&amp; installationDetails.customizedAppSelectedVersion === undefined)
+            msg = gs.getMessage("Successfully installed application {0}:{1}", installationDetails.app_name, version);
+        else if (!installationSuccess)
+            msg = this.UNABLE_TO_COMPLETE_INSTALL_MESSAGE;
+
+        return this._getInstallationResponse("INSTALLATION_STATUS", true, installationSuccess, null, msg);
+    },
+
+    /**
+	 Customization version are not support currently
+
+	 ex. installationDetails = {
+	 "plugin_id": "com.glide.awa.test_data",
+	 "plugin_name": "Advanced Work Assignment Testing Tools",
+	 "loadDemoData": false
+	 };
+
+	 ex. response = {
+	 "id":"INSTALLTION_STATUS",
+	 "installationAllowed":true,
+	 "installationSuccess":null,
+	 "progressId":8632aa34530f8510d0f9ddeeff7b12d9,
+	 "message":"Successfully installed plugin &lt;plugin_name&gt;:&lt;version&gt;"
+	 }";"
+	 **/
+    validateAndInstallPlugins: function(installationDetails) {
+        // Check if the system is busy, user has correct role(s) and current domain is safe for installation
+        var isInstallationAllowed = this._isInstallationAllowed();
+        if (!isInstallationAllowed.installationAllowed)
+            return isInstallationAllowed;
+
+        var progressName = gs.getMessage("Installing plugin {0}", installationDetails.plugin_id);
+        var progressId = '';
+        var pluginName = installationDetails.plugin_name;
+        var pluginId = installationDetails.plugin_id;
+        var customizationVersion = installationDetails.customizationVersion || '';
+        var loadDemoData = installationDetails.loadDemoData;
+        var installationSuccess = false;
+        var msg = '';
+
+        try {
+            progressId = new global.PluginUpgrader().upgrade(pluginId, customizationVersion, progressName, loadDemoData, false);
+
+            if (progressId) {
+                installationSuccess = true;
+                // Refresh cache if plugin activation execution is triggered successfully
+                new global.AppManagerCacheHelper().refreshAppManagerCache();
+            }
+        } catch (ex) {
+            return this._getInstallationResponse("INSTALLATION_ERROR", true, installationSuccess, null, ex);
+        }
+
+        if (progressId &amp;&amp; global.JSUtil.notNil(installationDetails.customizationVersion))
+            msg = gs.getMessage("Started installing customization version {0} for plugin {1}", customizationVersion, pluginName);
+        else if (progressId &amp;&amp; installationDetails.customizationVersion === undefined)
+            msg = gs.getMessage("Started installing plugin {0}", pluginName);
+        else if (progressId === '')
+            msg = this.UNABLE_TO_COMPLETE_INSTALL_MESSAGE;
+
+        return this._getInstallationResponse("INSTALLATION_STATUS", true, installationSuccess, progressId, msg);
+    },
+
+    // API to batch install dependency applications/plugins
+    /**
+	 ex selectedApps = {
+	 "com.snc.financial_management_for_apm": {
+	 "plugin_id": "com.snc.financial_management_for_apm",
+	 "scope": "global",
+	 "app_name": "Financial Management For APM",
+	 "isPlugin": true
+	 },
+	 "d30787a873ac0010fe9978ba4cf6a763": {
+	 "sys_id": "d30787a873ac0010fe9978ba4cf6a763",
+	 "app_name": "Adobe Experience Platform Spoke",
+	 "versionObj": {
+	 "version": "2.0.0",
+	 //dependencies is option - fetch if not supplied
+	 "dependencies": "com.glide.cobject:sys,com.glide.hub.integration.runtime:sys,com.glide.hub.action_step.rest:sys,com.glide.hub.action_type.datastream:sys,com.glide.hub.dynamic_inputs:sys,com.glide.hub.dynamic_outputs:sys"
+	 },
+	 "isStoreApp": true,
+	 "appScope": "sn_adobe_exp_spoke"
+	 }
+	 };
+
+	 ex. response = {"batchInfo":{"execution_tracker_id":"8632aa34530f8510d0f9ddeeff7b12d9","batch_installation_id":"c232aa34530f8510d0f9ddeeff7b12d8"}}
+	 **/
+    validateAndBatchInstall: function(productName, selectedApps) {
+        this.productName = productName;
+        this._checkForDependenciesAndStartBatchInstall(selectedApps);
+
+        return this.installationResponse;
+    },
+
+    _checkForDependenciesAndStartBatchInstall: function(selectedApps) {
+        var apps = [];
+        for (var key in selectedApps) {
+            if (!selectedApps[key].isPlugin) {
+                if (selectedApps[key].versionObj)
+                    apps.push({
+                        "scope": selectedApps[key].appScope,
+                        "version": selectedApps[key].versionObj.version,
+                        "dependencies": this._getAppDependencies(selectedApps[key].sys_id, selectedApps[key].versionObj)
+                    });
+                this.batchInstallMap[selectedApps[key]['appScope']] = selectedApps[key]['app_name'];
+            }
+        }
+        if (apps.length == 0)
+            this._startBatchInstallProcess(selectedApps);
+        else {
+            var response = new DependencyProcessor(null, true).processBatchDependencies(apps);
+            if (response &amp;&amp; response.dependencies) {
+                var responsePayload = response.dependencies;
+                this._processDependencies(responsePayload.dependencies);
+                this._processConflicts(responsePayload.conflicts);
+                if (this.blockingDependencies.length &gt; 0)
+                    this.installationResponse.error = this.INSTALLATION_ERROR_MESSAGE;
+                else if (this.conflictingDependencies.length &gt; 0)
+                    this.installationResponse.warning = this.INSTALLATION_WARNING_MESSAGE;
+                else
+                    this._startBatchInstallProcess(selectedApps);
+            }
+        }
+    },
+
+    _getAppDependencies: function(sys_id, installationDetails) {
+        return global.JSUtil.nil(installationDetails.dependencies) ? new AppsData().getAppRecord(sys_id).getValue('dependencies') : installationDetails.dependencies;
+    },
+
+    _startBatchInstallProcess: function(selectedApps) {
+        var batchInfo;
+        try {
+            var installationPlan = this._getBatchInstallPayload(selectedApps);
+            if (installationPlan) {
+                if (installationPlan &amp;&amp; installationPlan.hasOwnProperty('name') &amp;&amp; installationPlan.hasOwnProperty('packages') &amp;&amp; installationPlan.packages.length &gt; 0) {
+                    batchInfo = new AppUpgrader().installBatch(JSON.stringify(installationPlan), false);
+                    if (batchInfo != null)
+                        this.installationResponse.batchInfo = JSON.parse(batchInfo);
+                    else
+                        this.installationResponse.error = gs.getMessage('Unknown error. Failed to install product');
+                } else {
+                    this.installationResponse.error = gs.getMessage('Invalid product payload');
+                }
+            }
+        } catch (e) {
+            this.installationResponse.error = gs.getMessage("Failed to process product Install: {0}", e);
+        }
+    },
+
+    _getBatchInstallPayload: function(selectedApps) {
+        var batchPayload = {
+            name: this.productName || 'Adminx batch install' + new GlideDateTime().getDisplayValue(),
+            packages: []
+        };
+        var payload;
+        for (var key in selectedApps) {
+            if (selectedApps[key].isPlugin)
+                payload = this._getPluginPayload(selectedApps[key]);
+            else
+                payload = this._getAppPayload(selectedApps[key]);
+
+            batchPayload.packages.push(payload);
+        }
+
+        return batchPayload;
+    },
+
+    _getAppPayload: function(app) {
+        var app_payload = {
+            id: app.sys_id,
+            type: 'application',
+            load_demo_data: app.loadDemoData,
+            requested_version: app.versionObj.version
+        };
+        if (app.customizedAppSelectedVersion)
+            app_payload.requested_customization_version = app.customizedAppSelectedVersion;
+
+        return app_payload;
+    },
+
+    _getPluginPayload: function(plugin) {
+        var plugin_payload = {
+            id: plugin.plugin_id,
+            type: 'plugin',
+            load_demo_data: plugin.loadDemoData
+        };
+        if (plugin.customizedAppSelectedVersion)
+            plugin_payload.requested_customization_version = plugin.customizedAppSelectedVersion;
+
+        return plugin_payload;
+    },
+
+    _processDependencies: function(dependencies) {
+        var childDependencies;
+        for (var batchItem in dependencies) {
+            childDependencies = dependencies[batchItem];
+            childDependencies = childDependencies.filter(function(childDependency) {
+                return !childDependency.active;
+            });
+            if (childDependencies.length &gt; 0)
+                this.blockingDependencies.push({
+                    "batchItemName": this.batchInstallMap[batchItem],
+                    "dependencies": childDependencies
+                });
+        }
+    },
+
+    _processConflicts: function(conflicts) {
+        for (var batchItem in conflicts) {
+            this.conflictingDependencies.push(conflicts[batchItem]);
+        }
+    },
+
+    _getInstallationResponse: function(id, installationAllowed, installationSuccess, progressId, msg) {
+        return {
+            id: id,
+            installationAllowed: installationAllowed,
+            installationSuccess: installationSuccess,
+            progressId: progressId,
+            message: msg
+        };
+    },
+
+    _isCurrentDomainSafe: function() {
+        if (gs.getProperty("glide.sys.domain.delegated_administration", "false") == "true")
+            return (global.JSUtil.nil(gs.getUser().getDomainID()) || gs.getUser().getDomainID() === 'global');
+
+        return true;
+    },
+
+    _isInstallationAllowed: function() {
+        if (GlidePluginManager.isUpgradeSystemBusy())
+            return {
+                id: "SYSTEM_BUSY",
+                installationAllowed: false,
+                message: gs.getMessage(this.ANOTHER_OPERATION_IS_RUNNING_MESSAGE, gs.getMessage("Upgrade system is busy running an upgrade"))
+            };
+        if (!sn_app_api.AppStoreAPI.isUpdateMutexAvailable())
+            return {
+                id: "SYSTEM_BUSY",
+                installationAllowed: false,
+                message: gs.getMessage(this.ANOTHER_OPERATION_IS_RUNNING_MESSAGE, gs.getMessage(this._getCurrentMutexMessage()))
+            };
+        if (!(gs.hasRole('admin') || gs.hasRole('sn_appclient.app_client_user')))
+            return {
+                id: "INSUFFICIENT_PRIVILEGE",
+                installationAllowed: false,
+                message: gs.getMessage("Insufficient privileges to install or update application packages.")
+            };
+        if (!this._isCurrentDomainSafe())
+            return {
+                id: "INCORRECT_DOMAIN",
+                installationAllowed: false,
+                message: gs.getMessage("You must be part of global domain to install or update application packages.")
+            };
+
+        return {
+            installationAllowed: true
+        };
+    },
+
+    _getCurrentMutexMessage: function() {
+        var gr = new GlideRecord('sys_status');
+        gr.addQuery('name', 'update_mutex_status_message');
+        gr.query();
+        gr.next();
+
+        var msg = gr.isValidRecord() ? gr.getValue('value') : '';
+
+        return global.JSUtil.nil(msg) ? "Unknown update operation" : msg;
+    },
+
+    type: 'AppPluginInstallation'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-04-20 19:53:08&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;948929a8538b4510d0f9ddeeff7b1254&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;5&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AppPluginInstallation&lt;/sys_name&gt;
+        &lt;sys_package display_value="Scoped App Client" source="sn_appclient"&gt;781f36a96fef21005be8883e6b3ee43d&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Scoped App Client"&gt;781f36a96fef21005be8883e6b3ee43d&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_948929a8538b4510d0f9ddeeff7b1254&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-04-20 21:11:06&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:45:45</sys_created_on>
+        <sys_id>d8a8f85183341210c6695855eeaad377</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AppPluginInstallation</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_d8a8f85183341210c6695855eeaad377</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:45:45</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

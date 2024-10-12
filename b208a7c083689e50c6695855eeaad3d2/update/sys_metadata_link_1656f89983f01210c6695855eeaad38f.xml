@@ -1,0 +1,199 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>36acdce2879929905199c957cebb3550</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.WF_NonMajorProblemUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;true&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;WF_NonMajorProblemUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var WF_NonMajorProblemUtil = Class.create();
+WF_NonMajorProblemUtil.prototype = Object.extendsObject(AbstractAjaxProcessor, {
+    // LGWH-21774-Auto create problem and problem task with single call to function
+    // LGWH-21873- Auto create problem task to already created problem by passing problem sysid as input 
+    createProblemfromCHG: function(objChg, objChgtask, serviceSysid, cmdb_ciSysid) {
+        var transactionprb = {
+            "status": "",
+            "message": ""
+        };
+        var prbnum;
+        try {
+            if (global.JSUtil.nil(objChg)) {
+                throw "Error: Invalid Change Record Object.";
+            }
+            if (global.JSUtil.nil(objChgtask)) {
+                throw "Error: Invalid Change Task Record Object.";
+            }
+            if (global.JSUtil.nil(objChgtask.assignment_group)) {
+                throw "Error: Assignment Group is required.";
+            }
+            if (global.JSUtil.nil(objChgtask.assigned_to)) {
+                throw "Error: Assigned To is required.";
+            }
+            // Create problem ticket
+            var crPRB = new GlideRecord("problem");
+            crPRB.initialize();
+            crPRB.first_reported_by_task = objChg;
+            crPRB.category = 'technology processing';
+            crPRB.subcategory = 'non-compliant';
+            crPRB.short_description = "This record has been generated as a result of identified unauthorized activity.";
+            crPRB.description = "Implementation ctask was closed after the planned end date and time on the implementation task. Change activity extended past the approved task window.";
+            crPRB.impact = '3';
+            crPRB.urgency = '3';
+            crPRB.u_cause = 'Unauthorized Change';
+			crPRB.u_sub_cause = 'Deviation from approved Plan';
+			crPRB.u_caused_by_change = objChg;     //Added line 35 and 36 as part of LGWH-26300
+            crPRB.state = '101';
+            crPRB.major_problem = 'false';
+
+            if (global.JSUtil.nil(serviceSysid))
+                crPRB.business_service = gs.getProperty('wf.prb.autocreate.default.service'); //OSP TechnologyGroupOther
+            else
+                crPRB.business_service = serviceSysid;
+
+            if (cmdb_ciSysid) {
+                crPRB.cmdb_ci = cmdb_ciSysid;
+            } else {
+                crPRB.cmdb_ci = '';
+            }
+            crPRB.insert();
+            prbnum = crPRB.getValue('sys_id');
+			
+            //Checking if action is aborted during creation
+            if (crPRB.isActionAborted()) {
+                throw new Error("Problem was not created. Error: " + crPRB.getLastErrorMessage());
+            }
+			
+            //Mapping assignment group directly overrides by the assignment group rules populated by CI/Service based support group
+            var prupdate = new GlideRecord('problem');
+            prupdate.addQuery('sys_id', prbnum);
+            prupdate.query();
+            if (prupdate.next()) {
+                prupdate.setValue('assignment_group', gs.getProperty('change.management.group')); //Technology Change Management (TCM)
+                prupdate.update();
+            }
+            transactionprb.status = "success";
+            transactionprb.message = crPRB.getValue('number') + " Created";
+            transactionprb[1] = this.createProblemTaskfromCHGTASK(objChgtask, prbnum);
+        } catch (prb) {
+            transactionprb.status = "failure";
+            transactionprb.message = prb;
+        }
+        return transactionprb;
+    },
+    // Create problem task 
+    createProblemTaskfromCHGTASK: function(objCtask, prbSysid) {
+        var transactionprbTask = {
+            "status": "",
+            "message": ""
+        };
+        try {
+            if (global.JSUtil.nil(objCtask)) {
+                throw "Error: Invalid Change Task Record Object.";
+            }
+            if (global.JSUtil.nil(prbSysid)) {
+                throw "Error: Invalid Problem Sys Id.";
+            }
+            if (global.JSUtil.nil(objCtask.assignment_group)) {
+                throw "Error: Assignment Group is required.";
+            }
+            if (global.JSUtil.nil(objCtask.assigned_to)) {
+                throw "Error: Assigned To is required.";
+            }
+            //LGWH-22714 - Validating assignment group manager is member of group
+            var CTASKgroup = objCtask.assignment_group;
+            var groupmanager = objCtask.assignment_group.manager;
+            var groupMember = new GlideRecord('sys_user_grmember');
+            groupMember.addQuery('group', CTASKgroup);
+            groupMember.addQuery('user', groupmanager);
+            groupMember.query();
+            if (!groupMember.next()) {
+                throw "Error: The assignment group manager is not a member of the assignment group. The Problem Task was not created";
+            }
+            var gdt = new GlideDateTime();
+            gdt.addDaysLocalTime(7);
+            var crPRBTask = new GlideRecord('problem_task');
+            crPRBTask.initialize();
+            crPRBTask.problem_task_type = 'review';
+            crPRBTask.u_problem_task_subtype = 'Unauthorized Change';
+            crPRBTask.cmdb_ci = objCtask.change_request.cmdb_ci;
+            crPRBTask.short_description = 'Action Required Unauthorized Change Mitigation' + ' ' + objCtask.getValue('number') + ' ' + 'was closed after the planned end date and time of the implementation task.';
+            crPRBTask.description = "Change activity extended past the approved task window.\n\nAs the assigned to/manager of the implementing group, the following is needed from you: \n\n1. Provide confirmation the unauthorized activity has been reviewed for prevent of reoccurrence and steps taken.\n2. Provide approval for the change to remain in production or initiate a backout if needed due to potential risk to the system.";
+            crPRBTask.due_date = gdt;
+            crPRBTask.priority = '3';
+            crPRBTask.assignment_group = objCtask.getValue('assignment_group');
+            crPRBTask.assigned_to = objCtask.assignment_group.manager;
+            crPRBTask.problem = prbSysid;
+            crPRBTask.insert();
+            var pTaskNum = crPRBTask.getValue('sys_id');
+			
+            //Checking if action is aborted during creation
+            if (crPRBTask.isActionAborted()) {
+                throw new Error("Problem task was not created. Error: " + crPRBTask.getLastErrorMessage());
+            }
+            transactionprbTask.status = "success";
+            transactionprbTask.message = crPRBTask.getValue('number') + " Created";
+        } catch (ptask) {
+            transactionprbTask.status = "failure";
+            transactionprbTask.message = ptask;
+        }
+        return transactionprbTask;
+
+    },
+
+    defaultDueDate: function() {
+
+        var subType = this.getParameter('sysparm_subType');
+        var opened = this.getParameter('sysparm_opened');
+
+        var gdt = new GlideDateTime(opened);
+        gdt.addDaysUTC(7);
+        var changeDate = gdt.getDisplayValue();
+
+        var gdt1 = new GlideDateTime(opened);
+        gdt1.addDaysUTC(90);
+        var otherDueDate = gdt1.getDisplayValue();
+
+        if (subType == 'Unauthorized Change') {
+            return changeDate;
+        } else
+            return otherDueDate;
+
+    },
+	
+    type: 'WF_NonMajorProblemUtil'
+});]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;K035189&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-03-03 12:01:18&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;36acdce2879929905199c957cebb3550&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;153&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;WF_NonMajorProblemUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Global" source="global"&gt;global&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_36acdce2879929905199c957cebb3550&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-02-04 17:23:49&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:35:47</sys_created_on>
+        <sys_id>1656f89983f01210c6695855eeaad38f</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>WF_NonMajorProblemUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_1656f89983f01210c6695855eeaad38f</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:35:47</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

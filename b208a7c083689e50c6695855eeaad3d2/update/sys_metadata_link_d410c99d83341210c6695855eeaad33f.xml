@@ -1,0 +1,282 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>b2ac65b50735011021a0b7ec3dd300f8</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.VATeamsBotUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;VATeamsBotUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[/**
+ * This API will mainly clear the proxy mapping record and teams configuration in instance.
+ * Error Codes
+ *   1 : Please check for any of these missing system properties and  its value : glide.channelproxy.dc_url,     glide.channelproxy.dc_delete_endpoint, instance_id, glide.customurl.datacenter.instance.password
+ *   2 : Error while removing the proxy mapping , Please check system logs for more info
+ *   3 : Could not find record in sys_cs_provider_application
+ *.  4 : Some dependent records are missing, could not uninstall
+ */
+
+var VATeamsBotUtil = Class.create();
+
+var DC_URL = 'https://chnlpxymapping.service-now.com';
+var DC_DELETE_MAPPING = '/api/x_snc_collab_proxy/v1/mapping_rule';
+
+VATeamsBotUtil.prototype = {
+    initialize: function() {},
+
+    deleteEntity: function(entityGr) {
+        entityGr.deleteRecord();
+    },
+
+    deleteMultipleEntity: function(entityGr) {
+        entityGr.deleteMultiple();
+    },
+
+    setValue: function(entityGr, columnName, value) {
+        entityGr.setValue(columnName, value);
+    },
+
+    insertEntity: function(entityGr) {
+        entityGr.insert();
+    },
+
+    updateEntity: function(entityGr) {
+        entityGr.update();
+    },
+
+    /**
+     *  this method will remove the teams configuration from service now instance
+     *  @input
+     *.  teamProviderAppName : this should be your bot name , you will find under sys_cs_provider_application record.
+     *. Error
+     *.   4 : Some dependent records are missing, could not uninstall
+     */
+    removeTeamsConfiguration: function(teamProviderAppName) {
+
+        var isSuccess = true;
+        var providerApp = null;
+        var message_auth = null;
+		var tenant_id = null;
+		var type = "teams_va";
+
+        // Get the providerApp id
+        var gr = new GlideRecord('sys_cs_provider_application');
+        gr.addQuery('name', teamProviderAppName);
+        gr.query();
+        if (gr.next()) {
+            providerApp = gr.getValue('sys_id');
+            message_auth = gr.getValue('message_auth');
+			tenant_id = gr.getValue('inbound_id');
+
+            //assign variables
+            var inbound_message_verification = null;
+            var outbound_message_creation = null;
+
+            //Delete the provider auth record
+            var ma = new GlideRecord('message_auth');
+            ma.addQuery('sys_id', message_auth);
+            ma.query();
+            if (ma.next()) {
+
+                inbound_message_verification = ma.getValue('inbound_message_verification');
+                outbound_message_creation = ma.getValue('outbound_message_creation');
+
+                var oauth_oidc_entity = null;
+
+                //Delete the oidc token record
+                var otv = new GlideRecord('oidc_token_verification');
+                otv.addQuery('sys_id', inbound_message_verification);
+                otv.query();
+                if (otv.next()) {
+                    oauth_oidc_entity = otv.getValue('oauth_oidc_entity');
+
+                    //Delete the oidc entity record
+                    var ooe = new GlideRecord('oauth_oidc_entity');
+                    ooe.addQuery('sys_id', oauth_oidc_entity);
+                    ooe.query();
+                    if (ooe.next()) {
+                        var client_id = ooe.client_id;
+                        var isProdBot = new sn_va_teams.VATeamsMultiInstanceBotInstall().isProdBot(client_id);
+                        if (isProdBot) {
+                            gs.info("Client id matches with production bot id, calling to delete proxy mapping , client id - "+client_id);
+                            // Need to pass tenant is as input.
+                            var collab_proxy_response = this.removeDCMapping(teamProviderAppName, tenant_id, type);
+                            if (!collab_proxy_response.success)
+                                return collab_proxy_response;
+                        }
+
+			// if it is shared record will not delete it.
+			if (!this.isAuthOIDCEntityShared(oauth_oidc_entity)) {
+				this.deleteEntity(ooe);
+				gs.info("Deleted the oidc entity record " + oauth_oidc_entity);
+			} else
+				gs.info("Skipped Deleting the oidc entity record as it is shared record " + oauth_oidc_entity);
+		    }
+
+                    this.deleteEntity(otv);
+                }
+
+                //Delete the outbound token verification record
+                var tv = new GlideRecord('token_verification');
+                tv.addQuery('sys_id', outbound_message_creation);
+                tv.query();
+                if (tv.next()) {
+                    this.deleteEntity(tv);
+                }
+
+                this.deleteEntity(ma);
+            }
+
+            // Delete the configuration messages
+            var ac = new GlideRecord('sys_cs_bot_messages');
+            ac.addQuery('sys_cs_provider_application', providerApp);
+            ac.query();
+            this.deleteMultipleEntity(ac);
+
+        }
+        this.deleteEntity(gr);
+
+        // Will be handling error cases in next check in.
+        var response = {};
+        if (isSuccess) {
+            response.success = true;
+            response.botName = teamProviderAppName;
+        } else {
+            response.success = false;
+            response.botName = teamProviderAppName;
+            response.errorMsg = 'Some dependent records are missing, could not uninstall';
+            response.errorCode = 4;
+            gs.error(response.errorMsg + "" + response.botName);
+        }
+        return response;
+    },
+
+	/**
+	* Will be checking if outh_oidc_entity record is shared or not.
+	* if shared it will be returning true , else false.
+	*/
+	isAuthOIDCEntityShared : function (oidc_entity_id) {
+		var otv = new GlideRecord('oidc_token_verification');
+		otv.addQuery('oauth_oidc_entity', oidc_entity_id);
+		otv.query();
+		var rowCount = otv.getRowCount();
+		if (rowCount &gt; 1)
+			return true;
+		return false;
+	},
+
+    /**
+     *. This will delete the mapping available in proxy server
+     *   @input
+     *.  teamProviderAppName : this should be your bot name , you will find under sys_cs_provider_application record.
+     *   Error Codes
+     *   1 : Please check for any of these missing system properties and  its value : glide.channelproxy.dc_url,     glide.channelproxy.dc_delete_endpoint, instance_id, glide.customurl.datacenter.instance.password
+     *   2 : Error while removing the proxy mapping , Please check system logs for more info
+     *   3 : Could not find record in sys_cs_provider_application
+     */
+    removeDCMapping: function(teamProviderAppName, inbound_id, type) {
+		var api_response = {
+            success: false,
+            botName: teamProviderAppName
+        };
+		var dc_url = gs.getProperty("glide.channelproxy.dc_url");
+		if (gs.nil(dc_url)) {
+			dc_url = DC_URL;
+		}
+
+		var instance_id = gs.getProperty("instance_id");
+		if (gs.nil(instance_id)) {
+			gs.setProperty('instance_id');
+			instance_id = gs.getProperty("instance_id");
+		}
+
+		var pwd = gs.getProperty("glide.customurl.datacenter.instance.password");
+		if (gs.nil(pwd)) {
+			gs.setProperty('glide.customurl.datacenter.instance.password');
+			pwd = gs.getProperty("glide.customurl.datacenter.instance.password");
+		}
+
+		var api = gs.getProperty("glide.channelproxy.dc_delete_endpoint");
+		if (gs.nil(api)) {
+			api = DC_DELETE_MAPPING;
+		}
+
+        if (gs.nil(dc_url) || gs.nil(api) || gs.nil(instance_id) || gs.nil(pwd)) {
+
+            api_response.errorMsg = gs.getMessage("Please check for any of these missing system properties and  its value : glide.channelproxy.dc_url, glide.channelproxy.dc_delete_endpoint, instance_id");
+            api_response.errorCode = 1;
+            gs.error(api_response.errorMsg);
+            gs.error("Please check system properties values : glide.channelproxy.dc_url = " + dc_url + ", glide.channelproxy.dc_delete_endpoint = " + api + ", instance_id" + instance_id );
+
+            return api_response;
+        }
+
+        var instance_url = this.getInstanceURL();
+		
+        var query_param = "?id=" + inbound_id + "&amp;type=" + type + "&amp;url=" + instance_url;
+        var request = new sn_ws.RESTMessageV2();
+        request.setEndpoint(dc_url + api + query_param);
+        request.setHttpMethod('DELETE');
+        request.setBasicAuth(instance_id, pwd);
+        request.setRequestBody("{}");
+
+        request.setRequestHeader("Accept", "application/json");
+        var response = request.execute();
+		var responseCode = response.getStatusCode();
+        if (responseCode == 204 || responseCode == 200 || (responseCode &gt;= 200 &amp;&amp; responseCode &lt; 300)) {
+            api_response.success = true;
+            gs.info("Removed proxy mapping for - " + teamProviderAppName );
+        } else {
+            api_response.errorMsg = response.getErrorMessage();
+            api_response.errorCode = 2;
+            gs.error(api_response.errorMsg);
+        }
+
+        return api_response;
+    },
+    
+    getInstanceURL: function() {
+        
+        var instanceName = gs.getProperty("instance_name");
+        var domainSuffix = gs.getProperty('glide.channelproxy.instance_domain_suffix', 'service-now.com');
+        var setScheme = 'https://';
+        var instanceUrl = setScheme + instanceName + '.' + domainSuffix;
+        return instanceUrl;
+    },
+
+    type: 'VATeamsBotUtil'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-02-21 13:57:05&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;b2ac65b50735011021a0b7ec3dd300f8&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;47&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;VATeamsBotUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Conversational Custom Chat Integration Utilities" source="com.glide.ccci.clients.utils"&gt;ac9d7c203c75311068bcf327dfe37f6e&lt;/sys_package&gt;
+        &lt;sys_policy&gt;protected&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_b2ac65b50735011021a0b7ec3dd300f8&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-10-06 12:18:42&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 09:18:15</sys_created_on>
+        <sys_id>d410c99d83341210c6695855eeaad33f</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>VATeamsBotUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_d410c99d83341210c6695855eeaad33f</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 09:18:15</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

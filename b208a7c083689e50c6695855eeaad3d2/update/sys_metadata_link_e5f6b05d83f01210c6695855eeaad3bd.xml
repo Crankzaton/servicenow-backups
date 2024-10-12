@@ -1,0 +1,2653 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>6ec620b25ba53010461b52380a81c737</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.DynamicSchedulingResourceEntity&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;DynamicSchedulingResourceEntity&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var DynamicSchedulingResourceEntity = Class.create();
+var DEBUG_PROPERTY = "glide.autodispatch.debug";
+var DEFAULT_WORK_DURATION = 3600;
+var DEFAULT_SCHEDULE = "08fcd0830a0a0b2600079f56b1adb9ae";
+var EARTH_RADIUS = 7926.0/2;
+var MAX_RATING = 1.0;
+var INVALID_RATING = -100.0;
+var SCHEDULE_THRESHOLD = 0.85;
+var NOT_VALID_TASK = gs.getMessage("Operation not supported on this task");
+var NO_GROUPS = gs.getMessage("No dispatch group or assignment group is defined");
+var NO_ASSIGNMENT_GROUPS_COVERED = gs.getMessage("The selected dispatch group does not cover any assignment groups");
+var NO_RESOURCE_AVAILABLE = gs.getMessage("No resource is available at specified time(s)");
+var TOO_MANY_AGENTS = gs.getMessage("There are too many resources covered by this dispatch group to dispatch the task.");
+var UPSTREAM_DEPENDENCY = gs.getMessage("Cannot auto-dispatch because of upstream dependency.");
+var INVALID_GOOGLE_KEY = gs.getMessage("Invalid Google Key. Falling back to Crow Distance to calculate travel duration.");
+var WINDOW_TOO_SMALL = gs.getMessage("The usable work window is too small for the task.");
+var CONFLICTING_DEPENDENCIES = gs.getMessage("There are conflicting task dependencies for the specified time(s).");
+var WINDOW_END_PAST = gs.getMessage("Window End is in the past");
+var NO_MATCHING_RULE = gs.getMessage("No task filter configured for this task");
+var WM_WORK_TYPE = '87245e061b13200050fdfbcd2c0713cc';
+var EIGHT_HOURS = 60 * 60 * 8;
+
+DynamicSchedulingResourceEntity.prototype = {
+    initialize: function() {
+
+        var showLogs = gs.getProperty("com.snc.dynamic.scheduling.showlogs");
+        if(showLogs == 'true'){
+            this.logLevel = 'DEBUG';   //Change level if you want to
+            this.useLogger = true;
+        }else{
+            this.logLevel = 'OFF';
+            this.useLogger = false;
+        }
+        
+        this.resourceWorkBlockMap = {};
+        this.invalidLocations = {};
+        this.isResourceHomeLocationMap = {};
+        this.locationMap = {};
+        this.resourceHomeLocation = {};
+        this.workScheduleMap = {};
+        this.workBlockMap = {};
+        this.timeOffMap = {};
+        this.resourceTZMap = {};
+        this.resourcesTaskMap = {};
+        this.unAssignChangeResourceList = {};
+        this.resourceWorkDuration = {};
+        this.resourceInfo = {};
+        this.resourceWorkParamater = {};
+        this.resourceGeoHistoryLocation = {};
+        this.taskLocationMap = {};
+
+        this.taskExclusions = [];
+        this.taskMaintMap = {};
+        this.isTaskLocationMap = {};
+        
+        this.geoLatLongLocationsArray = [];
+        this.geoLatLongLocationsResourceArray = [];
+        this.geoLatLongLocationsTaskArray = [];
+        this.geoLatLongLocationsResourceArrayId = [];
+        this.geoLatLongLocationsTaskArrayId = [];
+        
+        this.isCapacityPluginActive = false;
+        this.capacityUsageMap = {};
+        this.isAccessHoursActive = new FSMGeneralUtil().isAccessHoursAppActive();
+        this.isFSMTerritoryPlanningActive = new WMFilters().isTerritoryPlanningActive();
+        this.territoryMembershipOverrideMap = {};
+        this.territoryGroupMembershipMap = {};
+        this.considerTerritoryMembershipforAssignment = this._considerTerritoryMembership();
+		this.isFSMWFOEnabled = new global.FSMWFOUtil().enableFsmWfoLogic();
+        this.isOnsiteEnabled = new global.FSMOnsiteUtil().isOnsiteEnabled('wm_task');
+    },
+
+    /***************** DynamicSchedulingProcessor *****************/
+
+    //Returns all candidates eligible for tasks selected
+    //Candidates are passed to DynamicSchedulingOptimization to create initial workblocks
+    //Current Implementation name - DynamicSchedulingProcessor._getUsersFromTasks()
+    _getResourcesFromTasks: function(taskIDs, config, taskGR) {
+        var groups = this._getGroups(taskIDs, config, taskGR);
+        var resources = this._getResourcesFromGroups(groups);
+        return resources;
+    },
+
+    //Returns groups based on taskIDs and config
+    //This can be COMMON across resources.
+    _getGroups: function(taskIDs, config, taskGR) {
+        var groups = new DynamicSchedulingProcessor()._getGroups(taskIDs, config, taskGR);
+        return groups;
+    },
+    
+    _getTerritoryGroups: function(territory) {
+        var territoryGroups = {};
+        var gr = new GlideRecord('sn_tp_territory_group');
+        gr.addQuery('active', true);
+        gr.addQuery('territory', territory);
+        gr.addQuery('group.type', 'CONTAINS', WM_WORK_TYPE);
+        gr.addQuery('group.active', true);
+        gr.query();
+        while (gr.next()) {
+            var groupObj = {};
+            groupObj.group = gr.group.getValue();
+            groupObj.active = true;
+            groupObj.membershipType = gr.membershiptype.toString();
+            territoryGroups[gr.group.getValue()] = groupObj;
+        }
+        if (GlidePluginManager.isActive("com.snc.fsm_crew_scheduling")) {
+            var territoryCrews = new GlideRecord("sn_tp_territory_membership_override");
+            territoryCrews.addEncodedQuery("crewISNOTEMPTY");
+            territoryCrews.addQuery("territory", territory);
+            territoryCrews.addQuery("active", true);
+            territoryCrews.query()
+            while (territoryCrews.next()) {
+                var crewGr = new GlideRecord('wm_crew_group');
+                crewGr.addQuery('crew', territoryCrews.getValue("crew"));
+                crewGr.addQuery('group.active', true);
+                crewGr.addQuery('group.type', 'CONTAINS', WM_WORK_TYPE);
+                crewGr.query();
+                while (crewGr.next()) {
+                    var groupObj1 = {};
+                    groupObj1.group = crewGr.group.getValue();
+                    groupObj1.active = true;
+                    groupObj1.membershipType = territoryCrews.membershiptype.toString();
+                    if (!territoryGroups[crewGr.group.getValue()])
+                        territoryGroups[crewGr.group.getValue()] = groupObj1;
+                }
+            }
+        } 
+            var territoryAgents = new GlideRecord("sn_tp_territory_membership_override");
+            territoryAgents.addEncodedQuery("userISNOTEMPTY");
+            territoryAgents.addQuery("territory", territory);
+            territoryAgents.addQuery("active", true);
+            territoryAgents.query()
+            while (territoryAgents.next()) {
+                var userGr = new GlideRecord('sys_user_grmember');
+                userGr.addQuery('user', territoryAgents.getValue("user"));
+                userGr.addQuery('group.active', true);
+                userGr.addQuery('group.type', 'CONTAINS', WM_WORK_TYPE);
+                userGr.query();
+                while (userGr.next()) {
+                    var groupObj2 = {};
+                    groupObj2.group = userGr.group.getValue();
+                    groupObj2.active = true;
+                    groupObj2.membershipType = territoryAgents.membershiptype.toString();
+                    if (!territoryGroups[userGr.group.getValue()])
+                        territoryGroups[crewGr.group.getValue()] = groupObj2;
+                }
+            }
+        return territoryGroups;
+    },
+    
+    _considerTerritoryMembership: function(){
+        var territorymembership = true;
+        if(!this.isFSMTerritoryPlanningActive){
+            return false;
+        }
+        var gr = new GlideRecord('dynamic_scheduling_config');
+        gr.addQuery('task_table','wm_task');
+        gr.setLimit(1);
+        gr.query();
+        if(gr.next()){
+            territorymembership = (gr.territorymembershiptype == 'consider');
+        }
+        return territorymembership;
+    },
+    
+
+    //Returns resources based on the assignment groups.
+    //Custom implementation required
+    _getResourcesFromGroups: function(groups) {
+        return [];
+    },
+    
+    //Returns workblock response for each agent
+    //Custom implementation required
+    _getResponseFromWorkBlocks : function(task, workBlocks) {
+        return {};
+    },
+
+    /***************** DynamicSchedulingAgentRecommendationNew *****************/
+
+    /***************** getting agent recommendation *****************/
+
+    //Return Group Response along with resources(Agent/Crew) based on the Dispatch &amp; Assignment group
+    //Requires Resource_Group table to get Data(sys_user_grmember/wm_crew_group)
+    //Current Implementation name - DynamicSchedulingAgentRecommendationNew._getAgentGroups()
+    //Breaking this into two functions, one is common and other can be specific
+    _getResourceGroups: function(task, dispatch_group, assignment_group) {
+        if ((JSUtil.nil(assignment_group)) &amp;&amp; JSUtil.nil(dispatch_group) &amp;&amp; !this.isFSMTerritoryPlanningActive) {
+            return this._generateErrorResponse(NO_GROUPS, "NO_GROUPS", this.current);
+        }
+		if (this.isCapacityPluginActive &amp;&amp; this.isFSMTerritoryPlanningActive) {
+			if(!this._checkIfTerritoryHasCapacity(task,this.capacityUsageMap, this.config)){
+				return this._generateErrorResponse(NO_GROUPS, "NO_GROUPS", this.current);
+			}
+		}
+        
+        var groupIDs = [];
+        if (JSUtil.nil(assignment_group)) {
+            var wf = new global.WMFilters();
+            var preferredGrp = "internal";
+            if(this.isFSMTerritoryPlanningActive){
+                var gr = new GlideRecord('sn_tp_territory_group');
+                gr.addQuery('active', true);
+                gr.addQuery('territory', task.territory);
+                gr.addQuery('group.type','CONTAINS', WM_WORK_TYPE);
+                gr.addQuery('group.active', true);
+                gr.query();
+                while(gr.next()){
+                    groupIDs.push(gr.group.getValue());
+                }
+                if(groupIDs.length &gt; 0){
+                    var finalGroups = "sys_idIN" + groupIDs.join(','); //getGroupsForProductModelsAndSkills method expects the parameter in this format
+                    groupIDs = wf.getGroupsForProductModelsAndSkills(task,finalGroups,groupIDs,preferredGrp);
+                    if (groupIDs &amp;&amp; groupIDs.length &gt; 8)
+                        groupIDs = groupIDs.substring(8).split(",");
+                }                                               
+            }else{
+                
+                
+                groupIDs = wf.filterGroupsBasedOnConfiguration(task, preferredGrp);
+                if (groupIDs &amp;&amp; groupIDs.length &gt; 8)
+                    groupIDs = groupIDs.substring(8).split(",");
+                else {
+                    var internalGroups = wf.getAllInternalGroups(task);
+                    if (internalGroups &amp;&amp; internalGroups.length &gt; 8)
+                        groupIDs = internalGroups.substring(8).split(",");
+                    else
+                        groupIDs = [];
+                }   
+            }
+
+        } else
+            groupIDs.push(assignment_group);
+        if (!groupIDs &amp;&amp; !this.isFSMTerritoryPlanningActive)
+            return this._generateErrorResponse(NO_ASSIGNMENT_GROUPS_COVERED, "NO_ASSIGNMENT_GROUPS_COVERED", this.current);
+            
+        if (groupIDs.length == 0 &amp;&amp; !this.isFSMTerritoryPlanningActive)
+            return this._generateErrorResponse(NO_GROUPS, "NO_GROUPS", this.current);
+        if (this.isCapacityPluginActive &amp;&amp; !this.isFSMTerritoryPlanningActive) {
+            groupIDs = this._getGroupsWithCapacity(task, groupIDs, this.capacityUsageMap, this.config);
+        }
+        if(this.useLogger == true){
+            this.loggerUtil.logAgentGroup(groupIDs);
+        }
+        return this._getResourceGroupResponse(groupIDs, this.config, task);
+    },
+    
+    //Specific implementation
+    //Returns group response with user data
+    //Custom implementation required
+    _getResourceGroupResponse: function(groupIDs, config, task) {
+        return {};
+    },
+
+    //Returns users object from the groupResponse and updates agentInfo
+    //agentInfo is used to log details of agent - will work with other resources but just need to update name
+    //Current Implementation name - DynamicSchedulingAgentRecommendationNew._getGroupUsers()
+    //Custom implementation required
+    _getGroupResources: function(groupResponse, task) {
+        return [];
+    },
+
+    //Currently gets agent schedule from AgentScheduleUtil. Needs to be generalised for all resources - Another interface
+    //Current Implementation name - DynamicSchedulingAgentRecommendationNew._noScheduleRecommendation()
+    _noScheduleRecommendation: function(candidates, task, sortedUsers, overallRating,ignoreTravelTimeCalculation, windowTimes) {
+        return {};
+    },
+
+    /***************** DynamicSchedulingOptimization *****************/
+
+    /***************** Initialisation *****************/
+
+    //Need to get home location for all resources
+    //Currently table is hardcoded to sys_user
+    //Populates locationMap, agentHomeLocation, isAgentHomeLocationMap
+    //Current Implementation name - DynamicSchedulingOptimization._getAgentHomeLocation()
+    _getResourceHomeLocation: function(resources) {},
+
+    //Populates locationMap, agentHomeLocation, isAgentHomeLocationMap
+    //Current Implementation name - DynamicSchedulingOptimization._getAgentGeoHistoryLocation()
+    //Custom Implementation required
+    _getResourceGeoHistoryLocation: function(resources) {},
+
+    //Populates userTZMap, workScheduleMap, timeOffMap, agentsTaskMap
+    //All these have to be updated to get the resource data
+    //Current Implementation name - DynamicSchedulingOptimization._generateAgentMaps()
+    _generateResourceMaps: function(resources, rangeStart, rangeEnd, tasks) {
+        var rangeStartForTravel = new GlideDateTime(rangeStart);
+        var rangeStartForTravelWFO = new GlideDateTime(rangeStart);
+        rangeStartForTravel.addDaysUTC(-1);
+        var rangeEndForTravel = new GlideDateTime(rangeEnd);
+        var rangeEndForTravelWFO = new GlideDateTime(rangeEnd);
+        rangeEndForTravel.addDaysUTC(1);
+
+        var resourceTZMap = this._getResourceTZMap(resources);
+    var resourceTimeMap = {};
+
+      
+        var isFSMWFOEnabled = new global.FSMWFOUtil().enableFsmWfoLogic();
+        if (isFSMWFOEnabled) {
+          var qualifierMap = {};
+          qualifierMap["territory"] = this.getTerritoryForTask(tasks);
+          resourceTimeMap = this._getResourceWorkScheduleWFO(resources, rangeStartForTravelWFO.getDisplayValue(), rangeEndForTravelWFO.getDisplayValue(), qualifierMap, rangeStartForTravel, rangeEndForTravel);
+        }else{
+          resourceTimeMap = this._getResourceWorkSchedule(resources, rangeStartForTravel, rangeEndForTravel);
+        }
+
+        //get work schedule map and convert to array of spans
+        var workScheduleMap = this._getSpanArrayMapFromTimeMap(resourceTimeMap, resources, resourceTZMap, rangeStartForTravel, rangeEndForTravel);
+
+        //get agent timeoffs
+        try {
+            // note: if customer has extended the "getTimeOffSpansForUsers" method using ext point, the timeOffMap calculation logic will honor the custom code
+       
+            var timeOffMap = {};
+            var isFSMWFOEnabled = new global.FSMWFOUtil().enableFsmWfoLogic();
+            if (isFSMWFOEnabled) {
+              timeOffMap  = this._getTimeOffMapWFO(resources, rangeStartForTravelWFO.getDisplayValue(), rangeEndForTravelWFO.getDisplayValue(), rangeStartForTravel, rangeEndForTravel);
+            } else {
+              timeOffMap  = this._getTimeOffMap(resources, rangeStartForTravel, rangeEndForTravel);
+            }
+        } catch (err) {
+            gs.info(err);
+        }
+
+        //get agent tasks
+        var resourcesTaskMap = this._getTasksForResources(resources, rangeStartForTravel, rangeEndForTravel, tasks);
+
+        for (var i = 0; i &lt; resources.length; i++) {
+            var resource = resources[i];
+            if (!gs.nil(resourceTZMap[resource]))
+                this.resourceTZMap[resource] = resourceTZMap[resource];
+
+            if (!gs.nil(workScheduleMap[resource]))
+                this.workScheduleMap[resource] = workScheduleMap[resource];
+
+            if (!gs.nil(timeOffMap[resource]))
+                this.timeOffMap[resource] = timeOffMap[resource];
+
+            if (!gs.nil(resourcesTaskMap[resource]))
+                this.resourcesTaskMap[resource] = resourcesTaskMap[resource];
+        }
+
+    },
+
+    //Custom implementation required
+    _getResourceTZMap: function(resources) {
+        return {};
+    },
+
+    //Custom implementation required
+    _getResourceWorkSchedule: function(resources) {
+        return {};
+    },
+
+	_getResourceWorkScheduleWFO: function(resources, rangeStartForTravelWFO, rangeEndForTravelWFO, qualifierMap, rangeStartForTravel, rangeEndForTravel) {
+		return this._getResourceWorkSchedule(resources, rangeStartForTravel, rangeEndForTravel); //Fall back to default resource work schedule implementation
+    },
+
+    _getSpanArrayMapFromTimeMap: function(resourceTimeMap, resources, resourceTZMap, rangeStart, rangeEnd) {
+        var resourceSpanMap = {};
+        for (var i = 0; i &lt; resources.length; i++) {
+            var resource = resources[i];
+            var timeMap = resourceTimeMap[resource];
+            if (!timeMap || timeMap == null) {
+                var defaultResourceSchedule = new GlideSchedule(this.default_work_schedule);
+                defaultResourceSchedule.setTimeZone(resourceTZMap[resource]);
+                timeMap = defaultResourceSchedule.getTimeMap(rangeStart, rangeEnd);
+            }
+            var spans = [];
+            while (timeMap.hasNext()) {
+                var span = timeMap.next();
+                spans.push(span);
+            }
+
+            resourceSpanMap[resource] = spans;
+        }
+
+        return resourceSpanMap;
+    },
+
+    //Custom implementation required
+    _getTimeOffMap: function(resources, rangeStartForTravel, rangeEndForTravel) {
+        return {};
+    },
+
+	_getTimeOffMapWFO: function(resources, rangeStartForTravelWFO, rangeEndForTravelWFO, rangeStartForTravel, rangeEndForTravel) {
+        return this._getTimeOffMap(resources, rangeStartForTravel, rangeEndForTravel);
+    },
+	
+	_getTerritoryMembershipOverrideMap: function(territory, agents, windowStart, windowEnd) {
+		return this.getTerritoryOverrideMembers(territory, agents, windowStart, windowEnd);
+	},
+
+    //Query is on the assigned_to field, need to update it to accomodate other resources
+    //Current Implementation name - DynamicSchedulingOptimization._getTasksForAgents()
+    //Custom implementation required
+    _getTasksForResources: function(resources, rangeStart, rangeEnd, tasks) {
+        return {};
+    },
+
+
+    //Return agentTimeMaps object with workBlockTimeMap, workScheduleTimeMap, fullScheduleTimeMap
+    //Not hardcoded, so same code should work for other resources also
+    //Current Implementation name - DynamicSchedulingOptimization._getAgentTimeMaps()
+    _getResourceTimeMaps: function(resource, resourceTZMap, workScheduleMap, timeOffMap, resourcesTaskMap, unAssign, unAssignData, currentTask, ignoreTaskMaintMap) {
+        var resourceTimeMaps = {};
+        var timeMap = new GlideScheduleTimeMap();
+        var workTimeMap = new GlideScheduleTimeMap();
+        var scheduleTimeMap = new GlideScheduleTimeMap();
+        var resourceScheduleMap = workScheduleMap[resource];
+        var resourceTimeOffs = timeOffMap[resource];
+        var resourceTasks = resourcesTaskMap[resource];
+        var taskExclusions = this.taskExclusions;
+
+        if (!ignoreTaskMaintMap) {
+            if (Object.keys(this.taskMaintMap).length &gt; 0) {
+                //Maintenance windows exist for this task
+                resourceScheduleMap = this.taskMaintMap[resource];
+            }
+        }
+
+        //workschedule
+        for (var i = 0; i &lt; resourceScheduleMap.length; i++) {
+            var span = new GlideScheduleDateTimeSpan(resourceScheduleMap[i].getStart(), resourceScheduleMap[i].getEnd());
+            workTimeMap.addInclude(span);
+            scheduleTimeMap.addInclude(span);
+            var span1 = new GlideScheduleDateTimeSpan(resourceScheduleMap[i].getStart(), resourceScheduleMap[i].getEnd());
+            timeMap.addInclude(span1);
+        }
+
+        //timeoff exclusions
+        if (resourceTimeOffs) {
+            for (var i = 0; i &lt; resourceTimeOffs.length; i++) {
+                var timeOffObj = resourceTimeOffs[i];
+                if (timeOffObj.show_as == "busy") {
+                    timeMap.addExclude(timeOffObj.span);
+                    workTimeMap.addExclude(timeOffObj.span);
+                    scheduleTimeMap.addExclude(timeOffObj.span);
+                }
+            };
+        }
+
+        if (taskExclusions) {
+            for (var i = 0; i &lt; taskExclusions.length; i++) {
+                var exclusionTimeSpan = taskExclusions[i];
+                timeMap.addExclude(exclusionTimeSpan);
+            }
+        }
+
+        //resource tasks exclusions
+        if (resourceTasks) {
+            for (var i = 0; i &lt; resourceTasks.length; i++) {
+                var resourceTask = resourceTasks[i];
+                if (unAssign &amp;&amp; JSUtil.notNil(unAssignData)) {
+				
+                    var taskUnAssignData = unAssignData[currentTask.sys_id];
+                    if (JSUtil.notNil(taskUnAssignData) &amp;&amp; taskUnAssignData[resourceTask.taskID]) {
+                        // This means that some resource task can be unassigned. Hence this set of workblocks will be different
+                        resourceTimeMaps.unAssignChange = true;
+                        if (!(resource in this.unAssignChangeResourceList))
+                            this.unAssignChangeResourceList[resource] = [];
+                        continue;
+                    }
+                }
+                var taskSpan = new GlideScheduleDateTimeSpan(resourceTask.startDate, resourceTask.endDate);
+                timeMap.addExclude(taskSpan);
+                workTimeMap.addExclude(taskSpan);
+            };
+        }
+
+        //build availability time map
+        timeMap.buildMap("gmt");
+
+        //build work schedule time map - so we can map available work blocks to work schedule spans to check if travel is within work schedule
+        workTimeMap.buildMap("gmt");
+        scheduleTimeMap.buildMap("gmt");
+
+        resourceTimeMaps.workBlockTimeMap = timeMap;
+        resourceTimeMaps.workScheduleTimeMap = workTimeMap;
+        resourceTimeMaps.fullScheduleTimeMap = scheduleTimeMap;
+        return resourceTimeMaps;
+    },
+
+	_getWorkScheduleStartEndByWorkBlock: function(resourceScheduleMap, workBlock){
+		var workblockStartMS = workBlock.startDateMS;
+		var workblockEndMS = workBlock.endDateMS;
+		var timeWindow =null;
+        for (var i = 0; i &lt; resourceScheduleMap.length; i++) {
+            var start = resourceScheduleMap[i].getStart().getMS();
+			var end = resourceScheduleMap[i].getEnd().getMS();
+			//a workblock should never overlap with multiple schedules
+            if(workblockStartMS&lt;= end &amp;&amp; start &lt;=workblockEndMS){
+				timeWindow={startMS: start,
+				endMS: end}
+				break;
+			}
+        }
+		return timeWindow;
+	},
+     _getResourceActiveTaskAtCurrentTaskLocation: function(resources, rangeStart, rangeEnd, location){
+		 var resourceSameLocationTasks ={}
+		 var resourceTasks = new global.FSMTaskQueryHelper().getTaskHelper(resources, rangeStart.getNumericValue(), rangeEnd.getNumericValue(), "assigned_to");
+		 for(i = 0; i&lt;resourceTasks.length; i++){
+			 var task = resourceTasks[i];
+			 if(task.location == location){
+				 if(gs.nil(resourceSameLocationTasks[task.user])){
+					 resourceSameLocationTasks[task.user]=[];
+				 }
+				resourceSameLocationTasks[task.user].push(task);
+			 }
+		 }
+		 return resourceSameLocationTasks;
+	 },
+	 _populateWorkBlockWithSameTaskLocation: function(rangeStart, rangeEnd, location){
+		var agentsWithWorkBlocks = Object.keys(this.resourceWorkBlockMap);
+		var resourceActiveTaskAtCurrentTaskLocation = this._getResourceActiveTaskAtCurrentTaskLocation(agentsWithWorkBlocks, rangeStart, rangeEnd, location);
+		for(var a in resourceActiveTaskAtCurrentTaskLocation){
+		    var agentTasksAtLocation = resourceActiveTaskAtCurrentTaskLocation[a];
+		    /* could sort agentTasksAtLocation and use prev j when prev workblock.sameLocationTaskAssigned = true
+		       agentTasksAtLocation.sort(function (e1, e2) {
+                 return e1.end_time - e2.end_time;
+               });
+
+               add logic after loop on j end
+               var k = 0;
+               var j = 0;
+               for(;j&lt;agentTasksAtLocation.length; j++){
+               }
+
+		       if (j == agentTasksAtLocation.length)
+		       {
+		           j = k;
+		       }else{
+		           k = j;//found a task in schedule
+		       }
+
+		    */
+			var agentWorkBlocks = this.resourceWorkBlockMap[a];
+			var resourceScheduleMap = this.workScheduleMap[a];
+			for(var i= 0; i &lt; agentWorkBlocks.length; i++){
+				var workBlock = agentWorkBlocks[i];
+				if(workBlock.type!="wb"){
+					continue;
+				}
+				var scheduleRange = this._getWorkScheduleStartEndByWorkBlock(resourceScheduleMap, workBlock);
+				var scheduleStart = scheduleRange.startMS;
+				var scheduleEnd = scheduleRange.endMS;
+				for(var j=0;j&lt;agentTasksAtLocation.length; j++){
+					var agentTask = agentTasksAtLocation[j];
+					var taskStart = agentTask.start_time;
+					var taskEnd = agentTask.end_time;
+					if(taskStart &lt;= scheduleEnd &amp;&amp; taskEnd&gt;= scheduleStart){
+						workBlock.sameLocationTaskAssigned = true;
+						break;
+					}
+				}
+			}
+		}
+	 },
+
+    //Currently uses _getAgentTimeMaps &amp; agentsTaskMap to create workblockMap for each agent
+    //Current Implementation name - DynamicSchedulingOptimization._generateWorkblocks()
+    _generateWorkblocks: function(resources, rangeStart, rangeEnd, unAssign, unAssignData, currentTask, sourceMap, ignoreTaskMaintMap) {
+        var workBlockMap = {};
+		if(this.isFSMTerritoryPlanningActive){
+			var territoryId = currentTask.territory.toString();
+			if(!this.territoryMembershipOverrideMap[territoryId]){
+				var overrideMembers = this._getTerritoryMembershipOverrideMap(territoryId, resources, rangeStart, rangeEnd);
+				if(Object.keys(overrideMembers).length &gt; 0){
+					this.territoryMembershipOverrideMap[territoryId] = overrideMembers;
+				}
+			}
+			
+			if(!this.territoryGroupMembershipMap[territoryId]){
+				var territoryGroups = this._getTerritoryGroups(territoryId);
+				if(Object.keys(territoryGroups).length &gt; 0){
+					this.territoryGroupMembershipMap[territoryId] = territoryGroups;
+				}
+			}
+}
+
+        for (var i = 0; i &lt; resources.length; i++) {
+            var resource = resources[i];
+
+            var resourceTimeMaps = this._getResourceTimeMaps(resource, this.resourceTZMap, this.workScheduleMap, this.timeOffMap, this.resourcesTaskMap, unAssign, unAssignData, currentTask, ignoreTaskMaintMap);
+            if (unAssign &amp;&amp; !resourceTimeMaps.unAssignChange) {
+
+                var workBlockArray = sourceMap[resource];
+                if (JSUtil.notNil(workBlockArray)) {
+                    workBlockMap[resource] = workBlockArray;
+                    continue;
+                }
+            }
+            if (resourceTimeMaps.workBlockTimeMap &amp;&amp; resourceTimeMaps.workScheduleTimeMap) {
+                var resourceTimeMap = resourceTimeMaps.workBlockTimeMap;
+                var workScheduleTimeMap = resourceTimeMaps.workScheduleTimeMap;
+                while (resourceTimeMap.hasNext()) {
+                    var openSpan = resourceTimeMap.next();
+                    //gs.log(openSpan);
+                    var spanStart = new GlideDateTime(openSpan.toString().substring(0, 19));
+                    var spanEnd = new GlideDateTime(openSpan.toString().substring(21, 41));
+                    //gs.log("spanStart=" + spanStart.getDisplayValue());
+                    //gs.log("spanEnd=" + spanEnd.getDisplayValue());
+                    //reject if spanStart and spanEnd is lesser than rangeStart
+                    if (spanStart.getNumericValue() &lt; rangeStart.getNumericValue() &amp;&amp; spanEnd.getNumericValue() &lt;= rangeStart.getNumericValue()) {
+                        continue;
+                    }
+                    //reject if spanStart and spanEnd is greater than rangeEnd
+                    if (spanStart.getNumericValue() &gt;= rangeEnd.getNumericValue() &amp;&amp; spanEnd.getNumericValue() &gt; rangeEnd.getNumericValue()) {
+                        continue;
+                    }
+
+                    //if spanStart &lt; rangeStart and spanStart &lt; rangeEnd then spanStart = rangeStart
+                    if (spanStart.getNumericValue() &lt;= rangeStart.getNumericValue() &amp;&amp; spanStart.getNumericValue() &lt;= rangeEnd.getNumericValue()) {
+                        spanStart = new GlideDateTime(rangeStart);
+                    }
+
+                    //if spanStart &gt; rangeStart and spanStart &lt; rangeEnd then spanStart = spanStart
+
+                    //if spanEnd &gt; rangeStart and spanEnd &lt; rangeEnd then spanEnd = spanEnd
+
+                    //if spanEnd &gt; rangeStart and spanEnd &gt; rangeEnd then spanEnd = rangeEnd
+                    if (spanEnd.getNumericValue() &gt;= rangeStart.getNumericValue() &amp;&amp; spanEnd.getNumericValue() &gt;= rangeEnd.getNumericValue()) {
+                        spanEnd = rangeEnd;
+                    }
+
+
+                    var workBlock = {};
+                    workBlock.resource = resource;
+                    workBlock.resourceTZ = this.resourceTZMap[resource];
+                    workBlock.id = this._generateID();
+                    workBlock.startDate = spanStart;
+                    workBlock.endDate = spanEnd;
+                    workBlock.startDateMS = spanStart.getNumericValue();
+                    workBlock.endDateMS = spanEnd.getNumericValue();
+                    workBlock.type = "wb";
+
+                    if (workScheduleTimeMap.hasNext()) {
+                        var workSpan = workScheduleTimeMap.next();
+                        var workSpanStart = new GlideDateTime(workSpan.toString().substring(0, 19));
+                        var workSpanEnd = new GlideDateTime(workSpan.toString().substring(21, 41));
+
+
+                        //if spanStart and spanEnd before workSpanStart and workSpanEnd - should never happen
+                        if (spanStart.getNumericValue() &lt; workSpanStart.getNumericValue() &amp;&amp; spanEnd.getNumericValue() &lt; workSpanEnd.getNumericValue())
+                            continue;
+
+                        //if spanStart and spanEnd after workSpanStart and workSpanEnd - keep going to next workSPan until it falls in between
+                        while (spanStart.getNumericValue() &gt; workSpanEnd.getNumericValue() &amp;&amp; spanEnd.getNumericValue() &gt; workSpanEnd.getNumericValue() &amp;&amp; workScheduleTimeMap.hasNext()) {
+                            workSpan = workScheduleTimeMap.next();
+                            workSpanStart = new GlideDateTime(workSpan.toString().substring(0, 19));
+                            workSpanEnd = new GlideDateTime(workSpan.toString().substring(21, 41));
+                        }
+
+                        //if spanStart and spanEnd between workSpanStart and workSpanEnd - map workBlock to workSpan
+                        if (spanStart.getNumericValue() &gt;= workSpanStart.getNumericValue() &amp;&amp; spanEnd.getNumericValue() &lt;= workSpanEnd.getNumericValue()) {
+                            workBlock.workSpanStart = workSpanStart;
+                            workBlock.workSpanEnd = workSpanEnd;
+                        }
+
+                    }
+
+                    if (!(resource in workBlockMap))
+                        workBlockMap[resource] = [];
+                    var workBlockArray = workBlockMap[resource];
+                    var position = this.insertObjToSortedArray(workBlock, workBlockArray, "startDateMS");
+                    this.workBlockMap[workBlock.id] = workBlock;
+                }
+
+                //Need to verify how it works for crew or should it be seperated out
+                if (this.isCapacityPluginActive &amp;&amp; resourceTimeMaps.fullScheduleTimeMap.hasNext()) {
+                    var qualifierMap = {};
+					if(!gs.nil(currentTask) &amp;&amp; !gs.nil(currentTask.territory)){
+						qualifierMap["territory"] = currentTask.territory;	
+					}
+                    this._getScheduleDurationForAgent(resourceTimeMaps.fullScheduleTimeMap, resource, rangeStart, rangeEnd, this.resourceWorkDuration, qualifierMap);
+                }
+            }
+            this.resourceWorkBlockMap[resource] = workBlockMap[resource];
+        }
+        if(this.optimizeTravel== true &amp;&amp; !gs.nil(currentTask)){
+			 this._populateWorkBlockWithSameTaskLocation(rangeStart, rangeEnd, currentTask.location)
+		}
+        var arrayUtil = new ArrayUtil();
+        for (var resource in this.resourcesTaskMap) {
+            if (!(resource in workBlockMap))
+                continue;
+            //gs.log(Object.keys(this.unAssignChangeResourceList));
+            if (unAssign &amp;&amp; (!resource in this.unAssignChangeResourceList))
+                continue;
+            var resourceTasks = this.resourcesTaskMap[resource];
+            for (var i = 0; i &lt; resourceTasks.length; i++) {
+                var resourceTask = resourceTasks[i];
+                //Skip if it can be unassigned
+                if (unAssign) {
+                    var taskUnAssignData = unAssignData[currentTask.sys_id];
+                    if (JSUtil.notNil(taskUnAssignData) &amp;&amp; taskUnAssignData[resourceTask.taskID]) {
+                        continue;
+                    }
+                }
+                var workBlock = {};
+                workBlock.id = resourceTask.taskID;
+                workBlock.resource = resource;
+                workBlock.resourceTZ = this.resourceTZMap[resource];
+                workBlock.startDate = resourceTask.startDate.getGlideDateTime();
+                workBlock.endDate = resourceTask.endDate.getGlideDateTime();
+                workBlock.startDateMS = workBlock.startDate.getNumericValue();
+                workBlock.endDateMS = workBlock.endDate.getNumericValue();
+                workBlock.location = resourceTask.location;
+                workBlock.type = "task";
+
+                var workBlockArray = workBlockMap[resource];
+                var position = this.insertObjToSortedArray(workBlock, workBlockArray, "startDateMS");
+                this.workBlockMap[workBlock.id] = workBlock;
+            }
+        }
+
+        return workBlockMap;
+    },
+    
+  isActiveWorkBlock: function(resourceOverride, workBlock, agent, task) {
+     if (this.isFSMTerritoryPlanningActive) {
+         var isResourceAdhoc = this.isResourceAdhoc(task, agent);
+         // is resource is adhoc and doesnot have override membership - workblock is not eligible 
+         if (isResourceAdhoc &amp;&amp; resourceOverride == undefined)
+             return false;
+         if (resourceOverride != undefined &amp;&amp; resourceOverride.length != 0) {
+             var result = true;
+             for (var i = 0; i &lt; resourceOverride.length; i++) {
+                 var override = resourceOverride[i];
+                 // check if workblock is partially covered by override membership
+                 if (this.isWBPartiallyOverlapped(workBlock, override))
+                     return true;
+                 // if workblock is totally covered by override membership - then eligibility depends on the active status
+                 if (workBlock.startDate.getNumericValue() &gt;= override.from.getNumericValue() &amp;&amp; workBlock.endDate.getNumericValue() &lt;= override.to.getNumericValue()) {
+                     if (!override.active) {
+                         result = false;
+                     } else if (override.active &amp;&amp; isResourceAdhoc) {
+                         return true;
+                     }
+                 } else if (isResourceAdhoc)
+                     result = false;
+             }
+             return result;
+         }
+     }
+     return true;
+ },
+    
+    //check if override dates are partially overlapped with workblock dates
+    isWBPartiallyOverlapped : function(workBlock,override){
+			var isLeftOverlapping = override.from.getNumericValue() &lt;= workBlock.startDate.getNumericValue() &amp;&amp; (override.to.getNumericValue() &lt; workBlock.endDate.getNumericValue() &amp;&amp; override.to.getNumericValue() &gt; workBlock.startDate.getNumericValue());
+			var isRightOverlapping = override.from.getNumericValue() &gt; workBlock.startDate.getNumericValue() &amp;&amp; override.from.getNumericValue() &lt; workBlock.endDate.getNumericValue()  &amp;&amp; override.to.getNumericValue() &gt;= workBlock.endDate.getNumericValue() ;
+			var isIncluded = override.from.getNumericValue() &gt; workBlock.startDate.getNumericValue() &amp;&amp; override.to.getNumericValue() &lt; workBlock.endDate.getNumericValue();
+			var isPartiallyOverlapped =  isLeftOverlapping || isRightOverlapping || isIncluded ;
+			return isPartiallyOverlapped;
+	},
+	
+    isResourceAdhoc: function(task, resource) {	
+        return null;	
+    },
+
+    //get the territory for selected tasks
+    getTerritoryForTask: function(tasks){
+        if (this.isFSMTerritoryPlanningActive){
+            var taskGr = new GlideRecord('wm_task');
+            taskGr.addQuery('sys_id', 'IN', tasks.join());
+            taskGr.query();
+            if(taskGr.next())
+                return taskGr.territory;
+        }
+        return null;
+    },
+
+    // Skeleton method for fetching override agents/crews of a territory
+    // Need to be implemented separately for agent and crew
+    getTerritoryOverrideMembers: function(territory, agents, windowStart, windowEnd) {
+        return {};
+    },
+    
+    //Updates agentWorkBlockMap with before and after location
+    //No major change required as it uses the agentWorkBlockMap, which should already updated with resourceWorkBlockMap
+    //Current Implementation name - DynamicSchedulingOptimization._populateBeforeAfterLocationForWorkBlocks()
+    _populateBeforeAfterLocationForWorkBlocks: function(resources, resourceWorkBlockMap) {
+        for (var j = 0; j &lt; resources.length; j++) {
+            var resource = resources[j];
+            var workblocks = resourceWorkBlockMap[resource];
+            for (var i = 0; i &lt; workblocks.length; i++) {
+                var workBlock = workblocks[i];
+                this._populateBeforeAfterLocationForWorkBlock(workBlock, workblocks, i);
+            };
+        }
+    },
+
+    //Current Implementation name - DynamicSchedulingOptimization._populateBeforeAfterLocationForWorkBlock()
+    _populateBeforeAfterLocationForWorkBlock: function(workBlock, workblocks, startIndex) {
+        if (workBlock.type == "wb") {
+            var resource = workBlock.resource;
+            var beforeTaskWB = this._findFirstTaskInWorkBlocks(workblocks, startIndex, true, workBlock.workSpanStart.getNumericValue(), true);
+            var afterTaskWB = this._findFirstTaskInWorkBlocks(workblocks, startIndex, false, workBlock.workSpanEnd.getNumericValue(), true);
+            var beforeLocation = this.resourceHomeLocation[resource];
+            var afterLocation = this.resourceHomeLocation[resource];
+
+            if (beforeTaskWB) {
+                beforeLocation = beforeTaskWB.location;
+            }
+            if (afterTaskWB) {
+                afterLocation = afterTaskWB.location;
+            }
+            workBlock.beforeLatitude = this.locationMap[beforeLocation].latitude;
+            workBlock.beforeLongitude = this.locationMap[beforeLocation].longitude;
+            workBlock.beforeTask = beforeTaskWB;
+            workBlock.beforeLocation = beforeLocation;
+
+            workBlock.afterLatitude = this.locationMap[afterLocation].latitude;
+            workBlock.afterLongitude = this.locationMap[afterLocation].longitude;
+            workBlock.afterTask = afterTaskWB;
+            workBlock.afterLocation = afterLocation;
+        }
+    },
+
+
+    //Gets workParams allow_work_overtime, max_work_overtime_hours, travel_outside_work_hours from wm_agent_work_configuration for the users
+    //Not sure if this is applicable for CREW or others. Or Default values have to returned if null
+    //Current Implementation name - DynamicSchedulingOptimization._getUserWorkParameter()
+    //Custom implementation required
+    _getResourceWorkParameter: function(resources) {
+        return {};
+    },
+
+
+    /***************** Get Agent Workblocks called from DynamicSchedulingAgentRecommendationNew.scheduleRecommendation *****************/
+    //Depends on agentWorkBlockMap, which if has the correct and generalised data then it does not require any change
+    //Current Implementation name - DynamicSchedulingOptimization._getBestBlockForAgent()
+    //Custom implementation required
+    _getBestBlockForResource: function(task, resource, windowStart, windowEnd, overallRating, resourceWorkBlockMap) {
+        return null;
+    },
+
+    //Depends on workBlock, which if has the correct and generalised data then it does not require any change
+    //Current Implementation name - DynamicSchedulingOptimization._evaluateWorkBlock()
+    _evaluateWorkBlock: function(workBlock, task, bestWorkBlock, windowStart, windowEnd, overallRating, workBlockIndex, resource, resourceOverride, unAssignData) {
+        var beforeTime = 0,
+            beforeDistance = null;
+        var afterTime = 0,
+            afterDistance = null;
+        var totalTime = 0;
+        var workDuration = this._getTaskDuration(task);
+        var travelOutside = false,
+            canResourceTravelOutside = false,
+            isFirstTaskOfDay = false,
+            isLastTaskOfDay = false;
+
+        if (this.resourceWorkParamater[resource])
+            canResourceTravelOutside = this.resourceWorkParamater[resource]["travel_outside_work_hours"]; // checking if the resource can travel outside work hours
+
+        isFirstTaskOfDay = (workBlock.beforeLocation == this.resourceHomeLocation[resource]); // checking for first task of the day
+        isLastTaskOfDay = (workBlock.afterLocation == this.resourceHomeLocation[resource]); // checking for last task of the day
+
+        if (canResourceTravelOutside &amp;&amp; (isFirstTaskOfDay || isLastTaskOfDay))
+            travelOutside = true;
+
+        var resourceWorkOverTimeHours = this._retrieveResourceMaxWorkOverTimeHour(task, resource);
+
+        if (task.getValue('allow_work_overtime') == true &amp;&amp; resourceWorkOverTimeHours &gt; 0 &amp;&amp; isLastTaskOfDay) {
+            var canExtendOverTime = this._canExtendOverTime(workBlock, resource);
+            if (canExtendOverTime) {
+                var overTime = resourceWorkOverTimeHours * 60 * 60 * 1000;
+                var newEndDate = new GlideDateTime(workBlock.endDate);
+                newEndDate.addSeconds(overTime / 1000);
+                var newWorkSpanEnd = new GlideDateTime(workBlock.workSpanEnd);
+                newWorkSpanEnd.addSeconds(overTime / 1000);
+                workBlock.endDate = newEndDate;
+                workBlock.workSpanEnd = newWorkSpanEnd;
+            }
+        }
+
+		if (isLastTaskOfDay) {
+			this._checkOverLapWithOffScheduleTask(resource,workBlock);
+		}
+
+        if ((workBlock.endDate.getNumericValue() - workBlock.startDate.getNumericValue()) &lt; workDuration)
+            return bestWorkBlock;
+        
+      	if (this.isFSMTerritoryPlanningActive) { //When FSM Territory Planning is active
+		    var isResourceAdhoc = this.isResourceAdhoc(task, resource);
+			var eligibleOverride;
+		    var isEligibleWBPresent = true;
+			var isWbDateUpdated = false;
+		    for (var i = 0; i &lt; resourceOverride.length; i++) {
+		        var override = resourceOverride[i];
+				eligibleOverride = override;
+				if(workBlock.startDate.getNumericValue() &gt;= override.from.getNumericValue() &amp;&amp; workBlock.endDate.getNumericValue() &lt;= override.to.getNumericValue()){
+					if(override.active) {isEligibleWBPresent = true; break;}
+				}
+		        if (isResourceAdhoc &amp;&amp; !override.active) {
+		            isEligibleWBPresent = false;
+		        }
+		        //Check for overlapping overrides
+		        //CASE 1:If override.start &gt; work block span start and overide.end =&gt; work block end then manipulate workblockend = override.start
+		        if (override.from.getNumericValue() &gt; workBlock.startDate.getNumericValue() &amp;&amp; override.from.getNumericValue() &lt; workBlock.endDate.getNumericValue() &amp;&amp; override.to.getNumericValue() &gt;= workBlock.endDate.getNumericValue()) {
+		            if (override.active &amp;&amp; isResourceAdhoc) {
+						if(workBlock.endDate.getNumericValue() - override.from.getNumericValue() &gt; workDuration){
+		                workBlock.startDate = override.from;
+						isWbDateUpdated = true;
+		                break;
+						}
+						else
+						isEligibleWBPresent = false;
+		            }
+		            if (!override.active &amp;&amp; !isResourceAdhoc) {
+						if(workBlock.startDate.getNumericValue() - override.from.getNumericValue() &gt; workDuration)
+		                workBlock.endDate = override.from;
+						else
+						isEligibleWBPresent = false;
+		            }
+		        }
+		        //CASE 2:If override.start &lt;= work block span start and overide.end &lt; work block end then manipulate workblockstart = override.end
+		        else if (override.from.getNumericValue() &lt;= workBlock.startDate.getNumericValue() &amp;&amp; (override.to.getNumericValue() &lt; workBlock.endDate.getNumericValue() &amp;&amp; override.to.getNumericValue() &gt; workBlock.startDate.getNumericValue())) {
+		            if (override.active &amp;&amp; isResourceAdhoc) {
+						if((override.to.getNumericValue() - workBlock.startDate.getNumericValue() &gt; workDuration)){
+		                workBlock.endDate = override.to;
+						isWbDateUpdated = true;
+		                break;
+						}
+						else
+						isEligibleWBPresent = false;
+		            }
+		            if (!override.active &amp;&amp; !isResourceAdhoc) {
+						if((workBlock.endDate.getNumericValue() - override.to.getNumericValue() &gt; workDuration))
+		                workBlock.startDate = override.to;
+						else 
+						isEligibleWBPresent = false;
+		            }
+		        }
+		        //CASE 3:If override.start &gt; work block span start and overide.end &lt; work block end then divide into 2 work blocks 
+		        //wb1: a: override is active and resource is adhoc 
+		        //wb2: a: override is inactive and resource is not adhoc
+		        else if (override.from.getNumericValue() &gt; workBlock.startDate.getNumericValue() &amp;&amp; override.to.getNumericValue() &lt; workBlock.endDate.getNumericValue()) {
+		            if (override.active &amp;&amp; isResourceAdhoc) {
+						if((override.to.getNumericValue() - override.from.getNumericValue() &gt; workDuration)){
+		                workBlock.startDate = override.from;
+		                workBlock.endDate = override.to;
+						isWbDateUpdated = true;
+		                break;
+						}
+						else 
+						isEligibleWBPresent = false;
+		            }
+		            if (!override.active &amp;&amp; !isResourceAdhoc) {
+		                if (override.from.getNumericValue() - workBlock.startDate.getNumericValue() &gt; workDuration) {
+		                    workBlock.endDate = override.from;
+							isWbDateUpdated = true;
+		                    break;
+		                } else if (workBlock.endDate.getNumericValue() - override.to.getNumericValue() &gt; workDuration) {
+		                    workBlock.startDate = override.to;
+							isWbDateUpdated = true;
+		                    break;
+		                } else {
+		                    isEligibleWBPresent = false;
+		                }
+		            }
+		        }
+
+		    }
+		    if (!isEligibleWBPresent &amp;&amp; !isWbDateUpdated) return bestWorkBlock;
+		} 
+        
+        
+        if (this.useGeoLoc &amp;&amp; JSUtil.notNil(task.getValue("location"))) {
+            var windowStartTask = task.getDisplayValue("window_start");
+            var taskLocation = this.taskLocationMap[task.getValue("sys_id")];
+            var taskLatitude;
+            var taskLongitude;
+
+            if (JSUtil.nil(taskLocation) || !this.locationMap[taskLocation] || JSUtil.nil(this.locationMap[taskLocation].latitude) || JSUtil.nil(this.locationMap[taskLocation].longitude)) {
+                taskLatitude = 0.0;
+                taskLongitude = 0.0;
+            } else {
+                taskLatitude = this.locationMap[taskLocation].latitude;
+                taskLongitude = this.locationMap[taskLocation].longitude;
+            }
+            var timeToConsiderForTravel = new GlideScheduleDateTime(workBlock.startDate);
+            timeToConsiderForTravel.setTimeZone(workBlock.resourceTZ);
+
+            // fetching the time and distance between resource and task
+            if ((!workBlock.beforeTask &amp;&amp; this.resourceGeoHistoryLocation[resource]) ||
+                (workBlock.beforeTask &amp;&amp; this.resourceGeoHistoryLocation[resource].updatedOn.getNumericValue() &gt;= workBlock.beforeTask.endDate.getNumericValue())) {
+                // 1. no previous task assigned to the resource before the work block, however there was a geo latlong update for the resource
+                // 2. task assigned to the resource before the work block, however the geo latlong update was more recent than the task end date
+                beforeTime = this._getTravelTime(resource, taskLocation, timeToConsiderForTravel);
+                beforeDistance = this._getTravelDistance(resource, taskLocation);
+            } else {
+                beforeTime = this._getTravelTime(workBlock.beforeLocation, taskLocation, timeToConsiderForTravel);
+                beforeDistance = this._getTravelDistance(workBlock.beforeLocation, taskLocation);
+            }
+
+            var estimatedWorkEnd = new GlideDateTime(workBlock.startDate);
+            estimatedWorkEnd.addSeconds(workDuration / 1000);
+
+            afterTime = this._getTravelTime(taskLocation, workBlock.afterLocation, timeToConsiderForTravel);
+            afterDistance = this._getTravelDistance(taskLocation, workBlock.afterLocation);
+        } else
+            beforeTime = (new GlideDateTime(task.getValue("estimated_travel_duration")).getNumericValue()) / 1000;
+
+        if (beforeTime == null || afterTime == null) {
+            //Something went wrong with the duration. Skip the workblock.
+            return bestWorkBlock;
+        }
+
+        var onsiteBufferDuration = 0;
+        if(this.isOnsiteEnabled){ 
+           onsiteBufferDuration = (new GlideDateTime(task.getValue("estimated_onsite_arrival_buffer_duration")).getNumericValue()) / 1000;
+		   beforeTime = beforeTime + onsiteBufferDuration;  
+		} 
+
+        totalTime = beforeTime * 1000 + workDuration + afterTime * 1000;        
+
+        var rangeStart = workBlock.startDate;
+        if (workBlock.startDate.getNumericValue() &lt;= windowStart.getNumericValue() &amp;&amp; workBlock.endDate.getNumericValue() &gt;= windowStart.getNumericValue())
+            rangeStart = new GlideDateTime(windowStart);
+        var rangeEnd = workBlock.endDate;
+        if (workBlock.endDate.getNumericValue() &gt;= windowEnd.getNumericValue() &amp;&amp; workBlock.startDate.getNumericValue() &lt;= windowEnd.getNumericValue())
+            rangeEnd = new GlideDateTime(windowEnd);
+
+        var possibleStart = new GlideDateTime(rangeStart);
+
+        if (!(canResourceTravelOutside &amp;&amp; isFirstTaskOfDay)) { // do not shift the possible start when resource can travel outside work hours
+            if (workBlock.workSpanStart.getNumericValue() == rangeStart.getNumericValue())
+                possibleStart.addSeconds(beforeTime);                                              
+            else if ((rangeStart.getNumericValue() - workBlock.workSpanStart.getNumericValue()) &lt; (beforeTime * 1000)) {
+                possibleStart = new GlideDateTime(workBlock.workSpanStart);
+                possibleStart.addSeconds(beforeTime);                
+            }
+        }
+
+        // If the resource can travel outside and the travel time conflict with a busy personal schedule, shift the possible start to right after the busy personal schedule
+        if (canResourceTravelOutside &amp;&amp; isFirstTaskOfDay) {
+            var resourceTimeOffs = this.timeOffMap[resource];
+            var potentialTravelStart = new GlideDateTime(possibleStart);
+            potentialTravelStart.subtract(beforeTime * 1000);
+            var potentialTravelEnd = new GlideDateTime(possibleStart);            
+            
+            var foundOverlapEvent = false;
+            var lastestTimeOffEndNumeric = null;
+            for (var i = 0; i &lt; resourceTimeOffs.length; i++) {
+                var localTimeOffEnd = new GlideDateTime();
+                var localTimeZone = workBlock.resourceTZ;
+                var tz = Packages.java.util.TimeZone.getTimeZone(localTimeZone);
+                localTimeOffEnd.setTZ(tz);
+                localTimeOffEnd.setDisplayValue(resourceTimeOffs[i].span.toString().substring(21, 41));
+
+                if (localTimeOffEnd.getNumericValue() &gt; potentialTravelStart.getNumericValue() &amp;&amp;
+                    localTimeOffEnd.getNumericValue() &lt;= potentialTravelEnd.getNumericValue()) {
+                    foundOverlapEvent = true;
+                    lastestTimeOffEndNumeric = localTimeOffEnd.getNumericValue();
+                }
+
+                //If overlap event has been recorded, break when a timeoff event occurs after potentialTravelEnd 
+                if (foundOverlapEvent &amp;&amp; (localTimeOffEnd.getNumericValue() &gt; potentialTravelEnd.getNumericValue())) {
+                    break;
+                }
+            }
+
+            if (foundOverlapEvent) {
+                var offSet = (lastestTimeOffEndNumeric - potentialTravelStart.getNumericValue()) / 1000;
+                possibleStart.addSeconds(offSet);
+                gs.info('DynamicSchedulingOptimization _evaluateWorkBlock: update possibleStart due to conflict time off schedule: ' + possibleStart);
+            }
+        }
+
+        if (this.isCapacityPluginActive) {
+            var capacityArgs = {};
+            capacityArgs.ignoreTravel = (canResourceTravelOutside &amp;&amp; isFirstTaskOfDay);
+            if (possibleStart.getNumericValue() &lt; rangeEnd.getNumericValue()) {
+                    this.capacityEvaluated = true;
+                    var res = this._getPossibleStartByCapacity(task, possibleStart, rangeEnd, resource, this.capacityUsageMap, this.resourceWorkDuration[resource], this.resourceInfo[resource], beforeTime, capacityArgs);
+                    if(res &amp;&amp; res.getNumericValue())
+                        possibleStart = res;
+            }
+
+            if (possibleStart.getNumericValue() &lt; rangeEnd.getNumericValue()) {
+                this.foundWBWithCapacity = true;
+            }
+        }
+
+        // If the possible start is before now, shift the range forward in time by the difference between now and possible start
+        //DEF0178443: if possible start - beforeTime *1000 in the past, shift amount should include beforeTime, possibleEnd should be calculated after finalize possibleStart        
+        var now = new GlideDateTime(GlideSystemDateUtil.nowNoTZ());
+        if (now.getNumericValue() &gt; possibleStart.getNumericValue() - beforeTime * 1000) {
+            var shiftAmount = (now.getNumericValue() - possibleStart.getNumericValue() + beforeTime * 1000) / 1000;
+            possibleStart.addSeconds(shiftAmount);
+        }
+
+        if (this.isAccessHoursActive &amp;&amp; JSUtil.notNil(task.access_hours)) {
+            var accessHourUtil = new sn_fsm_access_hour.FSMAccessHourUtils();
+            var accessHour = accessHourUtil.findEarliestAccessHourStartsFromPossibleStart(task.accessHoursSpanArray, possibleStart.getNumericValue(), workBlock.endDateMS, workDuration);
+            this.logAccessHour(this.loggerUtil, workBlock, possibleStart, accessHour, this.resourceInfo);
+            if (!accessHour) {
+                //task has access hour but no valid entry found between possible start and WB end
+                return bestWorkBlock;
+            }
+            if (accessHour.startTime.getNumericValue() &gt; possibleStart.getNumericValue()) {
+                possibleStart = accessHour.startTime;
+            }
+        }
+        var possibleEnd = new GlideDateTime(possibleStart);
+        possibleEnd.add(workDuration);
+
+        if (possibleStart.compareTo(possibleEnd) &gt; 0) {
+            return bestWorkBlock;
+        } else if (workBlock.workSpanStart.getNumericValue() &gt; windowEnd.getNumericValue()) {
+            //Reject work block if work block start &gt; window end
+            return bestWorkBlock;
+        } else if (possibleStart.getNumericValue() &lt; rangeStart.getNumericValue() || possibleStart.getNumericValue() &gt; rangeEnd.getNumericValue())
+            return bestWorkBlock;
+        else if (possibleEnd.getNumericValue() &lt; rangeStart.getNumericValue() || possibleEnd.getNumericValue() &gt; rangeEnd.getNumericValue())
+            return bestWorkBlock;
+        else {
+            var isPossibleStartAfterWorkSpanStart = (possibleStart.getNumericValue() - (beforeTime * 1000)) &gt;= workBlock.workSpanStart.getNumericValue();
+            var isPossibleEndBeforeWorkSpanEnd = possibleEnd.getNumericValue() + (afterTime * 1000) &lt;= workBlock.workSpanEnd.getNumericValue();
+            if (!travelOutside &amp;&amp; workBlock.workSpanEnd.getNumericValue() - workBlock.workSpanStart.getNumericValue() &lt; (totalTime)) {
+                return bestWorkBlock;
+            } else if (travelOutside &amp;&amp; workBlock.workSpanEnd.getNumericValue() - workBlock.workSpanStart.getNumericValue() &lt; (workDuration)) {
+                // Resource can travel outside work hours =&gt; check if the work block span is sufficent (&gt;= work duration) for completing the work irrespective of travel time
+                return bestWorkBlock;
+            } else if (!travelOutside &amp;&amp; (beforeTime + afterTime) &gt; EIGHT_HOURS) { // checking for 8 hour travel limit when resource do not travel outside work hours
+                //return if sum of before time and after time &gt; 8 hours
+                return bestWorkBlock;
+            }
+            /* STRY50035205 - to support resource traveling outside work hours, we always assume that the resource will go to the first task location from his or her home location 
+             * and the resource will go to his or her home location once done with the last task of the day 
+             */
+            else if (((canResourceTravelOutside &amp;&amp; isFirstTaskOfDay) || isPossibleStartAfterWorkSpanStart) &amp;&amp; ((canResourceTravelOutside &amp;&amp; isLastTaskOfDay) || isPossibleEndBeforeWorkSpanEnd)) {
+				//agent schedule [8-17]
+				//{prevLocation,  [(8-10: free), (10-12: T1), (12-13: free), (13-15: T2), (15-15:30: free), (15:30-16:30:T3),(16:30-17: free)], nextLocation}
+				//if t2, t2, t3 are all unAssignble, wb will be {prevLocation, [8-17], nextLocation}
+				//beforeTime so far is prevLocation to currentTask. Nearest could be from T2 to currentTask and T2End to 17 is big enough
+				var optimizeTravel = this.optimizeTravel;
+				var threshold = new global.DynamicSchedulingAgentRecommendationUtil().getIntProperty("travel.time.threshold.minutes", 5, 0, 30,"work.management.");
+				if(optimizeTravel == true &amp;&amp; isPossibleEndBeforeWorkSpanEnd &amp;&amp; beforeTime &gt; threshold *60
+				&amp;&amp;!gs.nil(unAssignData) &amp;&amp; !gs.nil(unAssignData[task.sys_id])){
+					var nearestWorkBlock = this._findNearestWorkblock(workBlock, task, windowStart, windowEnd, overallRating, workBlockIndex, resource, resourceOverride, unAssignData[task.sys_id], beforeTime);
+				    if(!gs.nil(nearestWorkBlock)){
+						if(this.useLogger == true){							
+                            this.loggerUtil.logNearestWorkblock(nearestWorkBlock, possibleStart, beforeTime)
+                        }
+						possibleStart = nearestWorkBlock.spanStart;
+						possibleEnd = nearestWorkBlock.spanEnd;
+						beforeTime = nearestWorkBlock.beforeTime;
+						beforeDistance = nearestWorkBlock.beforeDistance;
+						afterDistance = nearestWorkBlock.afterDistance;
+						isFirstTaskOfDay = false;
+					}
+				}
+
+                var optimizeTravelTime = new global.FSMExtPointUtil().loadExtension("global.DynamicSchedulingOptimizationUtil").optimizeTravelTime(task);
+                var rating = overallRating[workBlock.resource];
+                // Value choices from DynamicSchedulingOptimizationUtil.optimizeTravelTime are: include_travel_to_task,include_travel_after_task,include_all_travel,include_no_travel
+                if (optimizeTravelTime == 'include_all_travel') {
+                    rating = 1.0 - ((beforeTime + afterTime) * 1.0 / EIGHT_HOURS);
+                    rating = (rating + overallRating[workBlock.resource]) / 2;
+                } else if (optimizeTravelTime == 'include_travel_to_task') {
+                    rating = 1.0 - ((beforeTime) * 1.0 / EIGHT_HOURS);
+                    rating = (rating + overallRating[workBlock.resource]) / 2;
+                } else if (optimizeTravelTime == 'include_travel_after_task') {
+                    rating = 1.0 - ((afterTime) * 1.0 / EIGHT_HOURS);
+                    rating = (rating + overallRating[workBlock.resource]) / 2;
+                } else {
+                    //rating would be defaut to value from overallRating
+                }
+                
+                if(this.isFSMTerritoryPlanningActive &amp;&amp; eligibleOverride &amp;&amp; eligibleOverride.active &amp;&amp; eligibleOverride.membershiptype != workBlock.membershiptype){
+                        if(eligibleOverride.from &lt;= possibleStart &amp;&amp; eligibleOverride.to &gt; possibleEnd){
+                            workBlock.membershiptype = eligibleOverride.membershiptype;
+                        }
+                }
+                
+                if (this._isBetterWorkBlock(workBlock, bestWorkBlock, rating, beforeTime, task)) {
+                    // gs.log("Found workBlock: new rating " + rating +" beforeTime: " + beforeTime);
+                    bestWorkBlock = this._cloneWorkBlock(workBlock);
+                    bestWorkBlock.rating = rating;
+                    var travelStart = new GlideDateTime(possibleStart);
+                    travelStart.addSeconds(-beforeTime);                    
+                    bestWorkBlock.travelStart = travelStart;
+                    bestWorkBlock.spanStart = possibleStart;
+                    bestWorkBlock.spanEnd = possibleEnd;
+                    bestWorkBlock.beforeTime = beforeTime;
+                    bestWorkBlock.afterTime = afterTime;
+                    bestWorkBlock.beforeDistance = beforeDistance;
+                    bestWorkBlock.afterDistance = afterDistance;
+                    bestWorkBlock.workBlockIndex = workBlockIndex;
+                    bestWorkBlock.allowResourceTravelOutsideBefore = (canResourceTravelOutside &amp;&amp; isFirstTaskOfDay);
+                    if(this.isFSMTerritoryPlanningActive){
+                        bestWorkBlock.membershiptype = workBlock.membershiptype;
+                    }
+                }
+            } else {
+                return bestWorkBlock;
+            }
+        }
+        return bestWorkBlock;
+    },
+    
+	_checkOverLapWithOffScheduleTask: function (resource, workBlock) {
+		var wmTask = new GlideRecord('wm_task');
+		wmTask.addQuery('assigned_to', resource);
+      	wmTask.addQuery("expected_travel_start", "&gt;=", workBlock.startDate);
+        wmTask.addQuery("expected_travel_start", "&lt;=", workBlock.endDate);
+		wmTask.addQuery("expected_start", "&gt;=", workBlock.endDate);
+		wmTask.orderBy('expected_travel_start');
+		wmTask.addActiveQuery();
+		wmTask.setLimit(1);
+		wmTask.query();
+		if (wmTask.next()) {
+			var travelstart = new GlideDateTime(wmTask.expected_travel_start);
+			workBlock.workSpanEnd = travelstart;
+			workBlock.afterLocation = wmTask.location;
+		}
+	},
+    
+	 _findNearestWorkblock: function(workBlock, task, windowStart, windowEnd, overallRating, workBlockIndex, resource, resourceOverride, taskUnassignData, beforeTime ){
+		var nearestWorkBlock = null;
+		var agentTaskInWorkBlock = [];
+		for(var tId in taskUnassignData ){
+			var taskData = taskUnassignData[tId];
+			var taskStartMS = new GlideDateTime(taskData.expected_start).getNumericValue();
+			var taskEndMS = new GlideDateTime(taskData.estimated_end).getNumericValue();
+			//agent tasks overlapps with workblock. 
+			if(taskData.assigned_to == resource &amp;&amp; taskStartMS&lt;= workBlock.endDateMS &amp;&amp; taskEndMS &gt;=  workBlock.startDateMS){
+				agentTaskInWorkBlock.push(taskData);
+			}
+		}
+		//no agent task found
+		if(agentTaskInWorkBlock.length ==0){
+			return nearestWorkBlock;
+		}
+		agentTaskInWorkBlock.sort(function(a, b){
+			return  new GlideDateTime(a.expected_start).getNumericValue() -  new GlideDateTime(b.expected_start).getNumericValue();;
+		});
+		var minBeforeTime = beforeTime;
+		var threshold = new global.DynamicSchedulingAgentRecommendationUtil().getIntProperty("travel.time.threshold.minutes", 5, 0, 30,"work.management.");
+		for(var i = 0; i&lt; agentTaskInWorkBlock.length; i++){
+			var agentTask = agentTaskInWorkBlock[i];
+			var updatedWorkblock = this._cloneWorkBlock(workBlock);
+			updatedWorkblock.beforeLocation = agentTask.location;
+			updatedWorkblock.beforeTask = agentTask;
+			//update workblock start time as task end time
+			updatedWorkblock.startDateMS = new GlideDateTime(agentTask.estimated_end).getNumericValue();
+			updatedWorkblock.startDate = new GlideDateTime(agentTask.estimated_end);
+			//do not extend overTime. Already extended
+			updatedWorkblock.canExtendOverTime = false;
+			var validWorkblock = this._evaluateWorkBlock(updatedWorkblock, task, nearestWorkBlock, windowStart, windowEnd, overallRating, workBlockIndex, resource, resourceOverride);
+			//do not continue once invalid, wb becomes smaller and smaller
+			if(gs.nil(validWorkblock)){
+				return nearestWorkBlock;
+			}
+			validWorkblock.taskId = agentTask.sys_id;
+			if(validWorkblock.beforeTime &lt;= threshold *60){
+			    return validWorkblock;
+			}
+            if(validWorkblock.beforeTime &lt; minBeforeTime){
+				nearestWorkBlock = validWorkblock;
+				minBeforeTime = validWorkblock.beforeTime;
+			}
+		}
+		return nearestWorkBlock;
+
+	},
+    _isBetterWorkBlock: function(currentWb, bestWb, rating, beforeTime, task){
+        if(!bestWb){
+            return true;
+        }
+        
+        if(this.isFSMTerritoryPlanningActive){
+            var bestWbType = bestWb.membershiptype;
+            var currentWbType = currentWb.membershiptype;
+            if(bestWbType == 'secondary' &amp;&amp; currentWbType == 'primary'){
+                return true;
+            }
+            if(bestWbType == 'primary' &amp;&amp; currentWbType == 'secondary'){
+                return false;
+            }           
+        }
+        //for non eta task, for the same agent, bestWB should be the one with the day agent already has the same location task
+        if(task.scheduling_preference != "prioritize_eta" &amp;&amp; this.optimizeTravel == true){
+			if(currentWb.sameLocationTaskAssigned == true &amp;&amp; bestWb.sameLocationTaskAssigned == false){
+				return true;
+			}
+			if(currentWb.sameLocationTaskAssigned == false &amp;&amp; bestWb.sameLocationTaskAssigned == true){
+				return false;
+			}
+		}
+		if(task.scheduling_preference == "prioritize_nearest" &amp;&amp; beforeTime != bestWb.beforeTime){
+			return beforeTime &lt; bestWb.beforeTime;
+		}
+        return rating &gt; bestWb.rating;      
+    },
+
+    _evaluateWorkBlockMultiDay: function(workBlock, task, bestWorkBlock, windowStart, windowEnd, overallRating, workBlockIndex, resource, totalWorkDuration, minimumBookingDuration, resourceOverride) {
+        var beforeTime = 0,
+            beforeDistance = null;
+        var afterTime = 0,
+            afterDistance = null;
+        var totalTime = 0;
+        var workDuration = totalWorkDuration;
+        var travelOutside = false,
+            canResourceTravelOutside = false,
+            isFirstTaskOfDay = false,
+            isLastTaskOfDay = false;
+        var isFirstWorkBlock = bestWorkBlock == null;
+        
+
+
+        if (this.resourceWorkParamater[resource])
+            canResourceTravelOutside = this.resourceWorkParamater[resource]["travel_outside_work_hours"]; // checking if the resource can travel outside work hours
+
+        isFirstTaskOfDay = (workBlock.beforeLocation == this.resourceHomeLocation[resource]); // checking for first task of the day
+        isLastTaskOfDay = (workBlock.afterLocation == this.resourceHomeLocation[resource]); // checking for last task of the day
+
+        if (canResourceTravelOutside &amp;&amp; (isFirstTaskOfDay || isLastTaskOfDay) &amp;&amp; isFirstWorkBlock)
+            travelOutside = true;
+
+        var resourceWorkOverTimeHours = this._retrieveResourceMaxWorkOverTimeHour(task, resource);
+
+        if (task.getValue('allow_work_overtime') == true &amp;&amp; resourceWorkOverTimeHours &gt; 0) {
+            var canExtendOverTime = this._canExtendOverTime(workBlock, resource);
+            if (canExtendOverTime) {
+                var overTime = resourceWorkOverTimeHours * 60 * 60 * 1000;
+                var newEndDate = new GlideDateTime(workBlock.endDate);
+                newEndDate.addSeconds(overTime / 1000);
+                var newWorkSpanEnd = new GlideDateTime(workBlock.workSpanEnd);
+                newWorkSpanEnd.addSeconds(overTime / 1000);
+                workBlock.endDate = newEndDate;
+                workBlock.workSpanEnd = newWorkSpanEnd;
+            }
+        }
+
+
+       if (this.isFSMTerritoryPlanningActive) { //When FSM Territory Planning is active
+            var isResourceAdhoc = this.isResourceAdhoc(task, resource);
+            var eligibleOverride;
+            var isEligibleWBPresent = true;
+            var isWbDateUpdated = false;
+            for (var i = 0; i &lt; resourceOverride.length; i++) {
+                var override = resourceOverride[i];
+                eligibleOverride = override;
+                if(workBlock.startDate.getNumericValue() &gt;= override.from.getNumericValue() &amp;&amp; workBlock.endDate.getNumericValue() &lt;= override.to.getNumericValue()){
+                    if(override.active) {isEligibleWBPresent = true; break;}
+                }
+                if (isResourceAdhoc &amp;&amp; !override.active) {
+                    isEligibleWBPresent = false;
+                }
+                //Check for overlapping overrides
+                //CASE 1:If override.start &gt; work block span start and overide.end =&gt; work block end then manipulate workblockend = override.start
+                if (override.from.getNumericValue() &gt; workBlock.startDate.getNumericValue() &amp;&amp; override.from.getNumericValue() &lt; workBlock.endDate.getNumericValue() &amp;&amp; override.to.getNumericValue() &gt;= workBlock.endDate.getNumericValue()) {
+                    if (override.active &amp;&amp; isResourceAdhoc) {
+                        if(workBlock.endDate.getNumericValue() - override.from.getNumericValue() &gt; workDuration || isFirstWorkBlock){
+                        workBlock.startDate = override.from;
+                        isWbDateUpdated = true;
+                        break;
+                        }
+				    else
+                        isEligibleWBPresent = false;
+                    }
+                    if (!override.active &amp;&amp; !isResourceAdhoc) {
+                        if(workBlock.startDate.getNumericValue() - override.from.getNumericValue() &gt; workDuration)
+                        workBlock.endDate = override.from;
+                        else
+                        isEligibleWBPresent = false;
+                    }
+                }
+                //CASE 2:If override.start &lt;= work block span start and overide.end &lt; work block end then manipulate workblockstart = override.end
+                else if (override.from.getNumericValue() &lt;= workBlock.startDate.getNumericValue() &amp;&amp; (override.to.getNumericValue() &lt; workBlock.endDate.getNumericValue() &amp;&amp; override.to.getNumericValue() &gt; workBlock.startDate.getNumericValue())) {
+                    if (override.active &amp;&amp; isResourceAdhoc) {
+                        if((override.to.getNumericValue() - workBlock.startDate.getNumericValue() &gt; workDuration)){
+                        workBlock.endDate = override.to;
+                        isWbDateUpdated = true;
+                        break;
+                        }
+                        else
+                        isEligibleWBPresent = false;
+                    }
+                    if (!override.active &amp;&amp; !isResourceAdhoc) {
+                        if((workBlock.endDate.getNumericValue() - override.to.getNumericValue() &gt; workDuration) || isFirstWorkBlock)
+                        workBlock.startDate = override.to;
+                        else 
+                        isEligibleWBPresent = false;
+                    }
+                }
+                //CASE 3:If override.start &gt; work block span start and overide.end &lt; work block end then divide into 2 work blocks 
+			 	//wb1: a: override is active and resource is adhoc 
+                //wb2: a: override is inactive and resource is not adhoc
+                else if (override.from.getNumericValue() &gt; workBlock.startDate.getNumericValue() &amp;&amp; override.to.getNumericValue() &lt; workBlock.endDate.getNumericValue()) {
+                    if (override.active &amp;&amp; isResourceAdhoc) {
+                        if((override.to.getNumericValue() - override.from.getNumericValue() &gt; workDuration)){
+                        workBlock.startDate = override.from;
+                        workBlock.endDate = override.to;
+                        isWbDateUpdated = true;
+                        break;
+                        }
+                        else 
+                        isEligibleWBPresent = false;
+                    }
+                    if (!override.active &amp;&amp; !isResourceAdhoc) {
+                        if (override.from.getNumericValue() - workBlock.startDate.getNumericValue() &gt; workDuration) {
+                            workBlock.endDate = override.from;
+                            isWbDateUpdated = true;
+                            break;
+                        } else if (isFirstWorkBlock) {
+                            workBlock.startDate = override.to;
+                            isWbDateUpdated = true;
+                            break;
+                        } else {
+                            isEligibleWBPresent = false;
+                        }
+                    }
+                }
+            }
+            if (!isEligibleWBPresent &amp;&amp; !isWbDateUpdated) return null;
+        } 
+        
+        
+        if (this.useGeoLoc &amp;&amp; JSUtil.notNil(task.getValue("location")) &amp;&amp; isFirstWorkBlock) {
+            var windowStartTask = task.getDisplayValue("window_start");
+            var taskLocation = this.taskLocationMap[task.getValue("sys_id")];
+            var taskLatitude;
+            var taskLongitude;
+
+            if (JSUtil.nil(taskLocation) || !this.locationMap[taskLocation] || JSUtil.nil(this.locationMap[taskLocation].latitude) || JSUtil.nil(this.locationMap[taskLocation].longitude)) {
+                taskLatitude = 0.0;
+                taskLongitude = 0.0;
+            } else {
+                taskLatitude = this.locationMap[taskLocation].latitude;
+                taskLongitude = this.locationMap[taskLocation].longitude;
+            }
+            var timeToConsiderForTravel = new GlideScheduleDateTime(workBlock.startDate);
+            timeToConsiderForTravel.setTimeZone(workBlock.resourceTZ);
+
+            // fetching the time and distance between resource and task
+            if ((!workBlock.beforeTask &amp;&amp; this.resourceGeoHistoryLocation[resource]) ||
+                (workBlock.beforeTask &amp;&amp; this.resourceGeoHistoryLocation[resource].updatedOn.getNumericValue() &gt;= workBlock.beforeTask.endDate.getNumericValue())) {
+                // 1. no previous task assigned to the resource before the work block, however there was a geo latlong update for the resource
+                // 2. task assigned to the resource before the work block, however the geo latlong update was more recent than the task end date
+                beforeTime = this._getTravelTime(resource, taskLocation, timeToConsiderForTravel);
+                beforeDistance = this._getTravelDistance(resource, taskLocation);
+            } else {
+                beforeTime = this._getTravelTime(workBlock.beforeLocation, taskLocation, timeToConsiderForTravel);
+                beforeDistance = this._getTravelDistance(workBlock.beforeLocation, taskLocation);
+            }
+
+
+            afterTime = this._getTravelTime(taskLocation, workBlock.afterLocation, timeToConsiderForTravel);
+            afterDistance = this._getTravelDistance(taskLocation, workBlock.afterLocation);
+        } else
+            beforeTime = (new GlideDateTime(task.getValue("estimated_travel_duration")).getNumericValue()) / 1000;
+
+         var rangeStart = workBlock.startDate;
+        if (workBlock.startDate.getNumericValue() &lt;= windowStart.getNumericValue() &amp;&amp; workBlock.endDate.getNumericValue() &gt;= windowStart.getNumericValue())
+            rangeStart = new GlideDateTime(windowStart);
+        var rangeEnd = workBlock.endDate;
+        if (workBlock.endDate.getNumericValue() &gt;= windowEnd.getNumericValue() &amp;&amp; workBlock.startDate.getNumericValue() &lt;= windowEnd.getNumericValue())
+            rangeEnd = new GlideDateTime(windowEnd);
+
+        var possibleStart = new GlideDateTime(rangeStart);
+
+
+        if (!(canResourceTravelOutside &amp;&amp; isFirstTaskOfDay) &amp;&amp; isFirstWorkBlock) { // do not shift the possible start when resource can travel outside work hours
+            if (workBlock.workSpanStart.getNumericValue() == rangeStart.getNumericValue()){
+                possibleStart.addSeconds(beforeTime);               
+            }            
+            else if ((rangeStart.getNumericValue() - workBlock.workSpanStart.getNumericValue()) &lt; (beforeTime * 1000)) {                
+                possibleStart = new GlideDateTime(workBlock.workSpanStart);
+                possibleStart.addSeconds(beforeTime);
+                var offset = rangeStart.getNumericValue() - workBlock.workSpanStart.getNumericValue();              
+            }
+            
+        }
+
+        // If the resource can travel outside and the travel time conflict with a busy personal schedule, shift the possible start to right after the busy personal schedule
+        if (canResourceTravelOutside &amp;&amp; isFirstTaskOfDay &amp;&amp; isFirstWorkBlock) {
+            var resourceTimeOffs = this.timeOffMap[resource];
+            var potentialTravelStart = new GlideDateTime(possibleStart);
+            potentialTravelStart.subtract(beforeTime * 1000);
+            var potentialTravelEnd = new GlideDateTime(possibleStart);
+
+            var foundOverlapEvent = false;
+            var lastestTimeOffEndNumeric = null;
+            for (var i = 0; i &lt; resourceTimeOffs.length; i++) {
+                var localTimeOffEnd = new GlideDateTime();
+                var localTimeZone = workBlock.resourceTZ;
+                var tz = Packages.java.util.TimeZone.getTimeZone(localTimeZone);
+                localTimeOffEnd.setTZ(tz);
+                localTimeOffEnd.setDisplayValue(resourceTimeOffs[i].span.toString().substring(21, 41));
+
+                if (localTimeOffEnd.getNumericValue() &gt; potentialTravelStart.getNumericValue() &amp;&amp;
+                    localTimeOffEnd.getNumericValue() &lt;= potentialTravelEnd.getNumericValue()) {
+                    foundOverlapEvent = true;
+                    lastestTimeOffEndNumeric = localTimeOffEnd.getNumericValue();
+                }
+
+                //If overlap event has been recorded, break when a timeoff event occurs after potentialTravelEnd 
+                if (foundOverlapEvent &amp;&amp; (localTimeOffEnd.getNumericValue() &gt; potentialTravelEnd.getNumericValue())) {
+                    break;
+                }
+            }
+
+            if (foundOverlapEvent) {
+                var offSet = (lastestTimeOffEndNumeric - potentialTravelStart.getNumericValue()) / 1000;
+                possibleStart.addSeconds(offSet);
+                gs.info('DynamicSchedulingOptimization _evaluateWorkBlock: update possibleStart due to conflict time off schedule: ' + possibleStart);
+            }
+        }
+
+        if (this.isCapacityPluginActive) {
+            var capacityArgs = {};
+            capacityArgs.ignoreTravel = (canResourceTravelOutside &amp;&amp; isFirstTaskOfDay &amp;&amp; isFirstWorkBlock);
+            if (possibleStart.getNumericValue() &lt; rangeEnd.getNumericValue()) {
+                this.capacityEvaluated = true;
+                possibleStart = this._getPossibleStartByCapacity(task, possibleStart, rangeEnd, resource, this.capacityUsageMap, this.resourceWorkDuration[resource], this.resourceInfo[resource], beforeTime, capacityArgs);
+            }
+
+            if (possibleStart.getNumericValue() &lt; rangeEnd.getNumericValue()) {
+                this.foundWBWithCapacity = true;
+            }
+        }
+
+       
+        var now = new GlideDateTime(GlideSystemDateUtil.nowNoTZ());
+        if (now.getNumericValue() &gt; possibleStart.getNumericValue() - beforeTime * 1000) {
+            var shiftAmount = (now.getNumericValue() - possibleStart.getNumericValue() + beforeTime * 1000) / 1000;
+            possibleStart.addSeconds(shiftAmount);
+        }
+
+        if (this.isAccessHoursActive &amp;&amp; JSUtil.notNil(task.access_hours) &amp;&amp; isFirstWorkBlock) {
+            var accessHourUtil = new sn_fsm_access_hour.FSMAccessHourUtils();
+            var accessHour = accessHourUtil.findEarliestAccessHourStartsFromPossibleStart(task.accessHoursSpanArray, possibleStart.getNumericValue(), workBlock.endDateMS, workDuration);
+            accessHourUtil.logAccessHour(this.loggerUtil, workBlock, possibleStart, accessHour, this.resourceInfo);
+            if (!accessHour) {
+                //task has access hour but no valid entry found between possible start and WB end
+                return bestWorkBlock;
+            }
+            if (accessHour.startTime.getNumericValue() &gt; possibleStart.getNumericValue()) {
+                possibleStart = accessHour.startTime;
+            }
+        }
+        
+        
+        
+        var availableTime = workBlock.endDate.getNumericValue() - possibleStart.getNumericValue();
+        
+        if (availableTime &lt; workDuration) {
+            workDuration = availableTime;
+        }
+        
+        if (isFirstWorkBlock &amp;&amp; workDuration &lt; minimumBookingDuration) {
+            return null;
+        }
+        
+        var possibleEnd = new GlideDateTime(possibleStart);
+        possibleEnd.add(workDuration);
+        totalWorkDuration -= workDuration;
+        if (possibleStart.compareTo(possibleEnd) &gt; 0) {
+            return bestWorkBlock;
+        } else if (workBlock.workSpanStart.getNumericValue() &gt; windowEnd.getNumericValue()) {
+            //Reject work block if work block start &gt; window end
+            return null;
+        } else if (possibleStart.getNumericValue() &lt; rangeStart.getNumericValue() || possibleStart.getNumericValue() &gt; rangeEnd.getNumericValue())
+            return null;
+        else if (possibleEnd.getNumericValue() &lt; rangeStart.getNumericValue() || possibleEnd.getNumericValue() &gt; rangeEnd.getNumericValue())
+            return null;
+        else {
+            var isPossibleStartAfterWorkSpanStart = (possibleStart.getNumericValue() - (beforeTime * 1000)) &gt;= workBlock.workSpanStart.getNumericValue();
+            var isPossibleEndBeforeWorkSpanEnd = possibleEnd.getNumericValue() + (afterTime * 1000) &lt;= workBlock.workSpanEnd.getNumericValue();
+            if (!travelOutside &amp;&amp; isFirstWorkBlock &amp;&amp; workBlock.workSpanEnd.getNumericValue() - workBlock.workSpanStart.getNumericValue() &lt; workDuration + beforeTime) {
+                return null;
+            }
+
+            //Check if last block can fit afterTime
+            var rating = overallRating[workBlock.resource];
+            if (totalWorkDuration == 0) {
+                    if (!travelOutside &amp;&amp; workBlock.workSpanEnd.getNumericValue() - workBlock.workSpanStart.getNumericValue() &lt; workDuration + afterTime) {
+                    return null;
+                }
+                if((canResourceTravelOutside || isPossibleStartAfterWorkSpanStart) &amp;&amp; (canResourceTravelOutside || isPossibleEndBeforeWorkSpanEnd)) {               
+                // Value choices from DynamicSchedulingOptimizationUtil.optimizeTravelTime are: include_travel_to_task,include_travel_after_task,include_all_travel,include_no_travel
+                    var optimizeTravelTime = new global.FSMExtPointUtil().loadExtension("global.DynamicSchedulingOptimizationUtil").optimizeTravelTime(task);
+                    if (optimizeTravelTime == 'include_all_travel') {
+                        rating = 1.0 - ((beforeTime + afterTime) * 1.0 / EIGHT_HOURS);
+                        rating = (rating + overallRating[workBlock.resource]) / 2;
+                    } else if (optimizeTravelTime == 'include_travel_to_task') {
+                        rating = 1.0 - ((beforeTime) * 1.0 / EIGHT_HOURS);
+                        rating = (rating + overallRating[workBlock.resource]) / 2;
+                    } else if (optimizeTravelTime == 'include_travel_after_task') {
+                        rating = 1.0 - ((afterTime) * 1.0 / EIGHT_HOURS);
+                        rating = (rating + overallRating[workBlock.resource]) / 2;
+                    } else {
+                    //rating would be defaut to value from overallRating
+                    }
+                }
+            }
+            
+           if(this.isFSMTerritoryPlanningActive &amp;&amp; eligibleOverride &amp;&amp; eligibleOverride.active &amp;&amp; eligibleOverride.membershipType != workBlock.membershipType &amp;&amp; isFirstWorkBlock){
+                        if(eligibleOverride.from &lt;= possibleStart &amp;&amp; eligibleOverride.to &gt; possibleEnd){
+                            workBlock.membershipType = eligibleOverride.membershipType;
+                        }
+                }
+
+            if (!bestWorkBlock) {
+                bestWorkBlock = this._cloneWorkBlock(workBlock);
+                bestWorkBlock.rating = rating;
+                var travelStart = new GlideDateTime(possibleStart);
+                
+                travelStart.addSeconds(-beforeTime);
+                bestWorkBlock.travelStart = travelStart;
+                bestWorkBlock.spanStart = possibleStart;
+                bestWorkBlock.spanEnd = possibleEnd;
+                bestWorkBlock.beforeTime = beforeTime;
+                bestWorkBlock.afterTime = afterTime;
+                bestWorkBlock.beforeDistance = beforeDistance;
+                bestWorkBlock.afterDistance = afterDistance;
+                bestWorkBlock.workBlockIndex = workBlockIndex;
+                bestWorkBlock.allowResourceTravelOutsideBefore = (canResourceTravelOutside &amp;&amp; isFirstTaskOfDay);
+                if(this.isFSMTerritoryPlanningActive){
+                    bestWorkBlock.membershipType = workBlock.membershipType;
+                }
+            }
+            bestWorkBlock.workBlocks.push(workBlock);
+            bestWorkBlock.taskType = bestWorkBlock.workBlocks.length &gt; 1 ? 'multiday' : '';
+            bestWorkBlock.remainingTime = totalWorkDuration;
+            bestWorkBlock.previousWorkBlock = workBlock;
+            bestWorkBlock.spanEnd = possibleEnd;
+            bestWorkBlock.workSpanEnd = possibleEnd;
+
+        }
+
+        return bestWorkBlock;
+    },
+
+
+    _cloneWorkBlock: function(workBlock) {
+        var clonedWorkBlock = {};
+        clonedWorkBlock.resource = workBlock.resource;
+        clonedWorkBlock.resourceTZ = workBlock.resourceTZ;
+
+        clonedWorkBlock.startDate = new GlideDateTime(workBlock.startDate);
+        clonedWorkBlock.endDate = new GlideDateTime(workBlock.endDate);
+        clonedWorkBlock.startDateMS = workBlock.startDateMS;
+        clonedWorkBlock.endDateMS = workBlock.endDateMS;
+        clonedWorkBlock.type = workBlock.type;
+        clonedWorkBlock.workBlocks = [];
+
+        //var workBlockKeys = Object.keys(workBlock);
+        for (var key in workBlock) {
+            if (!(key in clonedWorkBlock))
+                clonedWorkBlock[key] = workBlock[key];
+        }
+        return clonedWorkBlock;
+    },
+    
+    _populateLocationMapByID: function(locationId) {
+        var locationGR = new GlideRecord("cmn_location");
+        locationGR.addQuery("sys_id", locationId);
+		locationGR.setCategory("field_service");
+        locationGR.query();
+
+        while (locationGR.next()) {
+            var locationObj = {};
+            locationObj.name = locationGR.getDisplayValue();
+            locationObj.sys_id = locationGR.getValue("sys_id");
+            locationObj.latitude = locationGR.getValue("latitude");
+            locationObj.longitude = locationGR.getValue("longitude");
+            locationObj.isValid = false;
+            if (JSUtil.notNil(locationObj.latitude) &amp;&amp; JSUtil.notNil(locationObj.longitude))
+                locationObj.isValid = true;
+            if (JSUtil.notNil(locationObj.latitude))
+                locationObj.latitude = Number(locationObj.latitude);
+            if (JSUtil.notNil(locationObj.longitude))
+                locationObj.longitude = Number(locationObj.longitude);
+            this.locationMap[locationObj.sys_id] = locationObj;
+            var geoLatLong = null;
+            if (!gs.nil(locationObj) &amp;&amp; !gs.nil(locationObj.latitude) &amp;&amp; !gs.nil(locationObj.longitude)) {
+                geoLatLong = {latitude: locationObj.latitude, longitude : locationObj.longitude, id:locationObj.sys_id};
+                this.geoLatLongLocationsArray.push(geoLatLong);
+            } else {
+                this.invalidLocations[locationObj.sys_id] = {};
+                gs.log("DynamicSchedulingOptimization: the following locations have invalid latitude and longitude:" + locationId);
+            }
+
+            //For map int api
+            if (this.isResourceHomeLocationMap[locationObj.sys_id]) {
+                this.geoLatLongLocationsResourceArray.push(geoLatLong);
+                this.geoLatLongLocationsResourceArrayId.push(locationObj.sys_id);
+            }
+            if (this.isTaskLocationMap[locationObj.sys_id]) {
+                this.geoLatLongLocationsTaskArray.push(geoLatLong);
+                this.geoLatLongLocationsTaskArrayId.push(locationObj.sys_id);
+            }
+        }
+    },    
+    
+    _populateLocationMap: function() {
+        var locations = Object.keys(this.locationMap);
+        var locationGR = new GlideRecord("cmn_location");
+        locationGR.addEncodedQuery("sys_idIN" + locations.join());
+		locationGR.setCategory("field_service");
+        locationGR.query();
+
+        while (locationGR.next()) {
+            var locationObj = {};
+            locationObj.name = locationGR.getDisplayValue();
+            locationObj.sys_id = locationGR.getValue("sys_id");
+            locationObj.latitude = locationGR.getValue("latitude");
+            locationObj.longitude = locationGR.getValue("longitude");
+            locationObj.isValid = false;
+            if (JSUtil.notNil(locationObj.latitude) &amp;&amp; JSUtil.notNil(locationObj.longitude))
+                locationObj.isValid = true;
+            if (JSUtil.notNil(locationObj.latitude))
+                locationObj.latitude = Number(locationObj.latitude);
+            if (JSUtil.notNil(locationObj.longitude))
+                locationObj.longitude = Number(locationObj.longitude);
+            this.locationMap[locationObj.sys_id] = locationObj;
+            var geoLatLong = null;
+            if (!gs.nil(locationObj) &amp;&amp; !gs.nil(locationObj.latitude) &amp;&amp; !gs.nil(locationObj.longitude)) {
+                geoLatLong = {latitude: locationObj.latitude, longitude : locationObj.longitude, id:locationObj.sys_id};
+                this.geoLatLongLocationsArray.push(geoLatLong);
+            } else {
+                this.invalidLocations[locationObj.sys_id] = {};
+            }
+
+            //For map int api
+            if (this.isResourceHomeLocationMap[locationObj.sys_id]) {
+                this.geoLatLongLocationsResourceArray.push(geoLatLong);
+                this.geoLatLongLocationsResourceArrayId.push(locationObj.sys_id);
+            }
+            if (this.isTaskLocationMap[locationObj.sys_id]) {
+                this.geoLatLongLocationsTaskArray.push(geoLatLong);
+                this.geoLatLongLocationsTaskArrayId.push(locationObj.sys_id);
+            }
+        }
+        var invalidLocations = [];
+        for (var key in this.invalidLocations)
+            invalidLocations.push(key);
+        if (invalidLocations.length &gt; 0)
+            gs.log("DynamicSchedulingOptimization: the following locations have invalid latitude and longitude:" + invalidLocations.join());
+    },
+    
+    _populateGeoHistoryLocationMap: function() {
+        for (var resource in this.resourceGeoHistoryLocation) {
+			var geoLatLong = {latitude: this.resourceGeoHistoryLocation[resource].latitude, longitude : this.resourceGeoHistoryLocation[resource].longitude, id:resource};
+            this.geoLatLongLocationsArray.push(geoLatLong);
+            //For map int api
+            this.geoLatLongLocationsResourceArray.push(geoLatLong);
+        }
+    },
+    /***************** Updating Workblocks after best workblock is found *****************/
+
+    //Updates agentsTaskMap, agentWorkBlockMap and calls _populateBeforeAfterLocationForWorkBlocks, all of which should be updated
+    //Should update to resource maps for all these variables
+    //Current Implementation name - DynamicSchedulingOptimization.removeAndAddTasksForAgent()
+    removeAndAddTasksForResource: function(unAssignedTasks, unAssignData, taskToAdd, taskUpdates, resource) {
+        var rangeStart = this.rangeStart;
+        var rangeEnd = this.rangeEnd;
+        for (var i = 0; i &lt; unAssignedTasks.length; i++) {
+            var unAssignTask = unAssignedTasks[i];
+            var taskUnAssignData = unAssignData[taskToAdd.getValue("sys_id")];
+            var position = this.getPositionOfKeyInArray(taskUnAssignData[unAssignTask].expected_start.getNumericValue(), this.resourcesTaskMap[resource], "startDateMS", "endDateMS");
+            this.resourcesTaskMap[resource].splice(position, 1);
+
+        }
+
+        var taskObj = this._getTaskObjectFromTaskUpdates(taskToAdd, resource, taskUpdates);
+
+        if (!(taskObj.assigned_to in this.resourcesTaskMap))
+            this.resourcesTaskMap[resource] = [];
+
+        this.insertObjToSortedArray(taskObj, this.resourcesTaskMap[resource], "startDateMS");
+        //TODO: correct to use rangestart and range end?
+        var workBlockMapForResource = this._generateWorkblocks([resource], rangeStart, rangeEnd, null, null, null, null, true);
+        this.resourceWorkBlockMap[resource] = workBlockMapForResource[resource];
+        this._populateBeforeAfterLocationForWorkBlocks([resource], this.resourceWorkBlockMap);
+
+        if (this.isCapacityPluginActive) {
+            this._updateUsageMapForTask(taskToAdd, resource, this.capacityUsageMap, false, taskObj.startDateMS, taskUpdates);
+        }
+    },
+    
+    getBestWorkBlock: function(task, resource, bestWorkBlock){
+        return bestWorkBlock;
+    },
+    
+    //Updates agentsTaskMap, agentWorkBlockMap and calls _populateBeforeAfterLocationForWorkBlocks, all of which should be updated
+    //Should update to resource maps for all these variables
+    //Current Implementation name - DynamicSchedulingOptimization.addTaskForAgent()
+    addTaskForResource: function(task, resource, bestWorkBlock, taskUpdates) {
+        
+        if(bestWorkBlock.taskType == 'multiday'){
+                this.addTaskForResourceMultiDay(task, resource, bestWorkBlock, taskUpdates);
+                return;
+        }
+        
+        var workBlock = this.getBestWorkBlock(task, resource, bestWorkBlock);
+        var workBlockArray = this.resourceWorkBlockMap[resource];
+
+        if (workBlock &amp;&amp; workBlockArray) {                        
+            
+            var taskObj = this._getTaskObjectFromTaskUpdates(task, resource, taskUpdates);
+
+            if (!(resource in this.resourcesTaskMap))
+                this.resourcesTaskMap[resource] = [];
+
+            this.insertObjToSortedArray(taskObj, this.resourcesTaskMap[resource], "startDateMS");
+
+            workBlockArray.splice(workBlock.workBlockIndex, 1);
+
+            var timeMap = new GlideScheduleTimeMap();
+            var scheduleTimeMap = new GlideScheduleTimeMap();
+
+            var span = new GlideScheduleDateTimeSpan(new GlideScheduleDateTime(workBlock.startDate), new GlideScheduleDateTime(workBlock.endDate));
+            timeMap.addInclude(span);
+
+            var scheduleSpan = new GlideScheduleDateTimeSpan(new GlideScheduleDateTime(workBlock.workSpanStart), new GlideScheduleDateTime(workBlock.workSpanEnd));
+            scheduleTimeMap.addInclude(scheduleSpan);
+
+            var taskWB = this._getTaskWBFromTaskUpdates(task, resource, taskUpdates);
+            var position = this.insertObjToSortedArray(taskWB, workBlockArray, "startDateMS");
+
+
+            var taskSpan = new GlideScheduleDateTimeSpan(new GlideScheduleDateTime(taskWB.startDate), new GlideScheduleDateTime(taskWB.endDate));
+            timeMap.addExclude(taskSpan);
+            scheduleTimeMap.addExclude(taskSpan);
+
+            timeMap.buildMap("gmt");
+            scheduleTimeMap.buildMap("gmt");
+
+            while (timeMap.hasNext()) {
+                var openSpan = timeMap.next();
+                //gs.log(openSpan);
+                var spanStart = new GlideDateTime(openSpan.toString().substring(0, 19));
+                var spanEnd = new GlideDateTime(openSpan.toString().substring(21, 41));
+
+                var newWB = {};
+                newWB.resource = resource;
+                newWB.resourceTZ = this.resourceTZMap[resource];
+                newWB.id = this._generateID();
+                newWB.startDate = spanStart;
+                newWB.endDate = spanEnd;
+                newWB.startDateMS = spanStart.getNumericValue();
+                newWB.endDateMS = spanEnd.getNumericValue();
+                if (scheduleTimeMap.hasNext()) {
+                    var workSpan = scheduleTimeMap.next();
+                    var workSpanStart = new GlideDateTime(workSpan.toString().substring(0, 19));
+                    var workSpanEnd = new GlideDateTime(workSpan.toString().substring(21, 41));
+
+
+                    //if spanStart and spanEnd before workSpanStart and workSpanEnd - should never happen
+                    if (spanStart.getNumericValue() &lt; workSpanStart.getNumericValue() &amp;&amp; spanEnd.getNumericValue() &lt; workSpanEnd.getNumericValue())
+                        continue;
+
+                    //if spanStart and spanEnd after workSpanStart and workSpanEnd - keep going to next workSPan until it falls in between
+                    while (spanStart.getNumericValue() &gt; workSpanEnd.getNumericValue() &amp;&amp; spanEnd.getNumericValue() &gt; workSpanEnd.getNumericValue() &amp;&amp; scheduleTimeMap.hasNext()) {
+                        workSpan = scheduleTimeMap.next();
+                        workSpanStart = new GlideDateTime(workSpan.toString().substring(0, 19));
+                        workSpanEnd = new GlideDateTime(workSpan.toString().substring(21, 41));
+                    }
+
+                    //if spanStart and spanEnd between workSpanStart and workSpanEnd - map workBlock to workSpan
+                    if (spanStart.getNumericValue() &gt;= workSpanStart.getNumericValue() &amp;&amp; spanEnd.getNumericValue() &lt;= workSpanEnd.getNumericValue()) {
+                        newWB.workSpanStart = workSpanStart;
+                        newWB.workSpanEnd = workSpanEnd;
+                    }
+
+                }
+                //newWB.workSpanStart = new GlideDateTime(workBlock.workSpanStart);
+                //newWB.workSpanEnd = new GlideDateTime(workBlock.workSpanEnd);
+                newWB.type = "wb";
+
+                var position = this.insertObjToSortedArray(newWB, workBlockArray, "startDateMS");
+            }
+
+            var backIndex = workBlock.workBlockIndex;
+            var frontIndex = workBlock.workBlockIndex + 1;
+            while (backIndex &gt;= 0 &amp;&amp; workBlockArray[backIndex].endDateMS &gt;= workBlock.workSpanStart.getNumericValue()) {
+                this._populateBeforeAfterLocationForWorkBlock(workBlockArray[backIndex], workBlockArray, backIndex);
+                backIndex--;
+            }
+
+            while (frontIndex &lt; workBlockArray.length &amp;&amp; workBlockArray[frontIndex].startDateMS &lt;= workBlock.workSpanEnd.getNumericValue()) {
+                this._populateBeforeAfterLocationForWorkBlock(workBlockArray[frontIndex], workBlockArray, frontIndex);
+                frontIndex++;
+            }
+            //this.printWorkblocks();
+
+            if (this.isCapacityPluginActive) {
+                this._updateUsageMapForTask(task, resource, this.capacityUsageMap, false, taskWB.startDateMS, taskUpdates);
+            }
+        }
+    },
+    
+    addTaskForResourceMultiDay: function(task, resource, workBlock, taskUpdates) {
+        var workBlockArray = this.resourceWorkBlockMap[resource];
+
+            //var taskObj = this._getTaskObjectFromTaskUpdates(task, resource, taskUpdates);
+
+            if (!(resource in this.resourcesTaskMap))
+                this.resourcesTaskMap[resource] = [];
+
+            //this.insertObjToSortedArray(taskObj, this.resourcesTaskMap[resource], "startDateMS");
+
+            workBlockArray.splice(workBlock.workBlockIndex, workBlock.workBlocks.length);
+
+            var timeMap = new GlideScheduleTimeMap();
+            var scheduleTimeMap = new GlideScheduleTimeMap();
+        
+            var length = workBlock.workBlocks.length;
+        
+            var firstBlockStart = workBlock.workBlocks[0].startDate;
+            var lastBlockEnd = workBlock.workBlocks[length-1].endDate;
+
+            //var span = new GlideScheduleDateTimeSpan(new GlideScheduleDateTime(firstBlockStart), new GlideScheduleDateTime(lastBlockEnd));
+            //timeMap.addInclude(span);
+
+            var scheduleSpan = new GlideScheduleDateTimeSpan(new GlideScheduleDateTime(workBlock.workSpanStart), new GlideScheduleDateTime(workBlock.workSpanEnd));
+            scheduleTimeMap.addInclude(scheduleSpan);
+
+            
+        
+            for(var i = 0;i &lt; workBlock.workBlocks.length;i++){
+
+                
+                var wb = workBlock.workBlocks[i];
+                var start = wb.startDate;
+                var end = wb.endDate.getNumericValue() &gt; workBlock.workSpanEnd.getNumericValue() ? workBlock.workSpanEnd : wb.endDate;
+                
+                var taskWB = this._getTaskWB(task, resource, taskUpdates, start, end);
+                var position = this.insertObjToSortedArray(taskWB, workBlockArray, "startDateMS");
+                var blockSpan = new GlideScheduleDateTimeSpan(new GlideScheduleDateTime(wb.startDate), new GlideScheduleDateTime(wb.endDate));
+                timeMap.addInclude(blockSpan);
+                
+                var taskSpan = new GlideScheduleDateTimeSpan(new GlideScheduleDateTime(start), new GlideScheduleDateTime(end));
+                timeMap.addExclude(taskSpan);
+                
+                scheduleTimeMap.addExclude(blockSpan);
+            }
+        
+            timeMap.buildMap("gmt");
+            scheduleTimeMap.buildMap("gmt");
+
+            while (timeMap.hasNext()) {
+                var openSpan = timeMap.next();
+                //gs.log(openSpan);
+                var spanStart = new GlideDateTime(openSpan.toString().substring(0, 19));
+                var spanEnd = new GlideDateTime(openSpan.toString().substring(21, 41));
+
+                var newWB = {};
+                newWB.resource = resource;
+                newWB.resourceTZ = this.resourceTZMap[resource];
+                newWB.id = this._generateID();
+                newWB.startDate = spanStart;
+                newWB.endDate = spanEnd;
+                newWB.startDateMS = spanStart.getNumericValue();
+                newWB.endDateMS = spanEnd.getNumericValue();
+                if (scheduleTimeMap.hasNext()) {
+                    var workSpan = scheduleTimeMap.next();
+                    var workSpanStart = new GlideDateTime(workSpan.toString().substring(0, 19));
+                    var workSpanEnd = new GlideDateTime(workSpan.toString().substring(21, 41));
+
+
+                    //if spanStart and spanEnd before workSpanStart and workSpanEnd - should never happen
+                    if (spanStart.getNumericValue() &lt; workSpanStart.getNumericValue() &amp;&amp; spanEnd.getNumericValue() &lt; workSpanEnd.getNumericValue())
+                        continue;
+
+                    //if spanStart and spanEnd after workSpanStart and workSpanEnd - keep going to next workSPan until it falls in between
+                    while (spanStart.getNumericValue() &gt; workSpanEnd.getNumericValue() &amp;&amp; spanEnd.getNumericValue() &gt; workSpanEnd.getNumericValue() &amp;&amp; scheduleTimeMap.hasNext()) {
+                        workSpan = scheduleTimeMap.next();
+                        workSpanStart = new GlideDateTime(workSpan.toString().substring(0, 19));
+                        workSpanEnd = new GlideDateTime(workSpan.toString().substring(21, 41));
+                    }
+
+                    //if spanStart and spanEnd between workSpanStart and workSpanEnd - map workBlock to workSpan
+                    if (spanStart.getNumericValue() &gt;= workSpanStart.getNumericValue() &amp;&amp; spanEnd.getNumericValue() &lt;= workSpanEnd.getNumericValue()) {
+                        newWB.workSpanStart = workSpanStart;
+                        newWB.workSpanEnd = workSpanEnd;
+                    }
+
+                }
+                //newWB.workSpanStart = new GlideDateTime(workBlock.workSpanStart);
+                //newWB.workSpanEnd = new GlideDateTime(workBlock.workSpanEnd);
+                newWB.type = "wb";
+
+                var position = this.insertObjToSortedArray(newWB, workBlockArray, "startDateMS");
+            }
+
+            var backIndex = workBlock.workBlockIndex;
+            var contributingBlocks = workBlock.workBlocks.length;
+            frontIndex = workBlock.workBlocks[contributingBlocks-1].workBlockIndex;
+            
+            while (backIndex &gt;= 0 &amp;&amp; workBlockArray[backIndex].endDateMS &gt;= workBlock.workSpanStart.getNumericValue()) {
+                this._populateBeforeAfterLocationForWorkBlock(workBlockArray[backIndex], workBlockArray, backIndex);
+                backIndex--;
+            }
+
+            while (frontIndex &lt; workBlockArray.length &amp;&amp; workBlockArray[frontIndex].startDateMS &lt;= workBlock.workSpanEnd.getNumericValue()) {
+                this._populateBeforeAfterLocationForWorkBlock(workBlockArray[frontIndex], workBlockArray, frontIndex);
+                frontIndex++;
+            }
+            //this.printWorkblocks();
+
+            if (this.isCapacityPluginActive) {
+                //this._updateUsageMapForTask(task, resource, this.capacityUsageMap, false, taskWB.startDateMS, taskUpdates);
+            }
+        
+    },
+
+    _getTaskWBFromTaskUpdates: function(task, resource, taskUpdates) {
+        var workBlock = {};
+        workBlock.id = task.getValue("sys_id");
+        workBlock.resource = resource;
+        workBlock.resourceTZ = this.resourceTZMap[resource];
+        // workBlock.startDate = agentTask.startDate.getGlideDateTime();
+        // workBlock.endDate = agentTask.endDate.getGlideDateTime();
+        // workBlock.startDateMS = workBlock.startDate.getNumericValue();
+        // workBlock.endDateMS = workBlock.endDate.getNumericValue();
+        workBlock.location = task.getValue("location");
+        workBlock.type = "task";
+
+        //var workBlockArray = workBlockMap[agent];
+        //var position = this.insertObjToSortedArray(workBlock, workBlockArray, "startDateMS");
+        //this.workBlockMap[workBlock.id] = workBlock;
+
+        if (!this.useGeoLoc) {
+            var gdt = new GlideDateTime();
+            if (taskUpdates &amp;&amp; taskUpdates["expected_travel_start"]) {
+                gdt.setDisplayValue(taskUpdates["expected_travel_start"]);
+            } else {
+                gdt.setValue(task.getValue("expected_travel_start"));
+            }
+        } else {
+            var gdt = new GlideDateTime();
+            if (taskUpdates &amp;&amp; taskUpdates["expected_start"]) {
+                gdt.setDisplayValue(taskUpdates["expected_start"]);
+            } else {
+                gdt.setValue(task.getValue("expected_start"));
+            }
+        }
+        gdt.addSeconds(-1 * this.taskSpacing)
+            workBlock.startDate = gdt;
+
+        var gdtEnd = new GlideDateTime();
+        if (taskUpdates &amp;&amp; taskUpdates["estimated_end"]) {
+            gdtEnd.setDisplayValue(taskUpdates["estimated_end"]);
+        } else {
+            gdtEnd.setValue(task.getValue("estimated_end"));
+        }
+        gdtEnd.addSeconds( this.taskSpacing);
+        workBlock.endDate = gdtEnd;
+
+        workBlock.startDateMS = workBlock.startDate.getNumericValue();
+        workBlock.endDateMS = workBlock.endDate.getNumericValue();
+
+        return workBlock;
+    },
+    
+    _getTaskWB: function(task, resource, taskUpdates, start, end) {
+        var workBlock = {};
+        workBlock.id = task.getValue("sys_id");
+        workBlock.resource = resource;
+        workBlock.resourceTZ = this.resourceTZMap[resource];
+        workBlock.location = task.getValue("location");
+        workBlock.type = "task";
+
+        
+        if (!this.useGeoLoc) {
+            var gdt = new GlideDateTime();
+            if (taskUpdates &amp;&amp; taskUpdates["expected_travel_start"]) {
+                gdt.setDisplayValue(taskUpdates["expected_travel_start"]);
+            } else {
+                gdt.setValue(task.getValue("expected_travel_start"));
+            }
+
+            workBlock.startDate = gdt;
+        } else {
+            var gdt = new GlideDateTime();
+            gdt.setValue(start);
+            
+
+            workBlock.startDate = gdt;
+        }
+
+        var gdtEnd = new GlideDateTime();
+        gdtEnd.setValue(end);
+        
+
+        workBlock.endDate = gdtEnd;
+
+        workBlock.startDateMS = workBlock.startDate.getNumericValue();
+        workBlock.endDateMS = workBlock.endDate.getNumericValue();
+
+        return workBlock;
+    },
+
+    /**************** Capacity Management *****************/
+    _updateUsageMapForTask: function(taskToAdd, agent, capacityUsageMap, isUnassign, startDateMS, taskUpdates){},
+    
+    //Returns the groupIDs with capacity from the FSM Capacity module
+    //Custom implementation required
+    _getGroupsWithCapacity: function(task, groupIDs, capacityUsageMap, config){
+        return groupIDs;
+    },
+
+	_checkIfTerritoryHasCapacity: function(task, capacityUsageMap, config){
+    },
+    
+    _getScheduleDurationForAgent: function(fullScheduleTimeMap, resource, rangeStart, rangeEnd, resourceWorkDuration, qualifierMap){},
+    
+    _getPossibleStartByCapacity: function(task, possibleStart, rangeEnd, resource, capacityUsageMap, resourceWorkDuration, resourceInfo, beforeTime, capacityArgs){
+        return possibleStart;
+    },
+    
+    _updateUsageMapUnassign: function(unAssignData, task){},
+    
+    getTasksWithCapacity: function(taskUpdates){
+        return taskUpdates;
+    },
+    
+    getResourceSkills: function(skills, resourceId){
+        return new GlideRecord();
+    },
+    
+    getResourceParts: function(resourceId, modelsArr, reservedAssetsForTask){
+        return new GlideRecord();
+    },
+    
+    /**************** UTIL FUNCTIONS *********************/
+    getResourceType: function(){
+        return "sys_user";
+    },
+    
+    getResourceFieldInTask: function() {
+        return "assigned_to";
+    },
+    
+    /*
+     * The purpose of this function is to check if the work_over time can be extended to the given workblock. Only if the workblock's endDate is same as the end date from the workschedule for current user, the work_over time can be safely extended. 
+     */
+    _retrieveResourceMaxWorkOverTimeHour: function(task, resource) {
+        var taskAllowWorkOverTime = task.getValue('allow_work_overtime');
+        if (taskAllowWorkOverTime != true) {
+            return 0;
+        }
+
+        if (!this.resourceWorkParamater[resource]) {
+            return 0;
+        }
+        var allowWorkOverTime = this.resourceWorkParamater[resource]["allow_work_overtime"];
+        var maxHour = 0;
+        if (allowWorkOverTime) {
+            maxHour = this.resourceWorkParamater[resource]["max_work_overtime_hours"];
+        }
+        return maxHour;
+    },
+
+    _canExtendOverTime: function(workBlock, agent) {
+		if(!gs.nil(workBlock.canExtendOverTime) &amp;&amp;workBlock.canExtendOverTime == false ){
+			return false;
+		}
+        var timeZone = workBlock.resourceTZ;
+        var endDateTime = workBlock.endDate;
+        var canUpdateEndTime = false;
+        var endTime = new GlideDateTime();
+        var tz = Packages.java.util.TimeZone.getTimeZone(timeZone);
+        endTime.setTZ(tz);
+        endTime.setValue(endDateTime.getNumericValue());
+
+        var endTimeCheck = new GlideDateTime(endTime.getDisplayValue());
+        var scheduleItems = this.workScheduleMap[agent];
+        for (var j = 0; j &lt; scheduleItems.length; j++) {
+            var scheduleStart = new GlideDateTime(scheduleItems[j].getStart());
+            var scheduleEnd = new GlideDateTime(scheduleItems[j].getEnd());
+            if (scheduleStart.getNumericValue() &lt; endTimeCheck.getNumericValue() &amp;&amp;
+                endTimeCheck.getNumericValue() &lt;= scheduleEnd.getNumericValue()) {
+                if (endTimeCheck.getNumericValue() == scheduleEnd.getNumericValue()) {
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+        }
+        return false;
+    },
+
+    //Return users with the count, common based on tablename.
+    _getQueryRowCount: function(tableName, filterQuery) {
+        var count = new GlideAggregate(tableName);
+        count.addAggregate('COUNT');
+        if (filterQuery &amp;&amp; filterQuery.length != 0)
+            count.addEncodedQuery(filterQuery);
+        count.query();
+        if (count.next())
+            return count.getAggregate('COUNT');
+        return 0;
+    },
+
+    insertObjToSortedArray: function(element, array, key) {
+        var position = this._locationOfObjInArray(element, array, 0, array.length, key) + 1;
+        //gs.log("position = " + position + " length = " + array.length);
+        array.splice(position, 0, element);
+        return (position &gt; array.length) ? 0 : position;
+    },
+
+    _locationOfObjInArray: function(element, array, start, end, key) {
+        start = start || 0;
+        end = end || array.length;
+        if (end == 0)
+            return 0;
+        var pivot = parseInt(start + (end - start) / 2, 10);
+        if (array[pivot][key] === element[key])
+            return pivot;
+        if (end - start &lt;= 1)
+            return array[pivot][key] &gt; element[key] ? pivot - 1 : pivot;
+        if (array[pivot][key] &lt; element[key]) {
+            return this._locationOfObjInArray(element, array, pivot, end, key);
+        } else {
+            return this._locationOfObjInArray(element, array, start, pivot, key);
+        }
+    },
+
+    _findFirstTaskInWorkBlocks: function(workblocks, startIndex, before, cutoffTimeMS, mandatoryLocation) {
+        var workBlock = workblocks[startIndex];
+        //gs.log("workSpanStart = " + workBlock.workSpanStart.getDisplayValue());
+        //gs.log("workSpanEnd = " + workBlock.workSpanEnd.getDisplayValue());
+        if (before) {
+            for (var i = startIndex - 1; i &gt;= 0; i--) {
+                var taskWB = workblocks[i];
+                if (taskWB.endDateMS &lt; cutoffTimeMS)
+                    break;
+                if (taskWB.type == "task") {
+                    if (taskWB.endDateMS &gt;= cutoffTimeMS) {
+                        if (mandatoryLocation) {
+                            var location = taskWB.location;
+                            if (JSUtil.notNil(location) &amp;&amp; (location in this.locationMap) &amp;&amp; this.locationMap[location].isValid)
+                                return taskWB;
+                        } else if (!mandatoryLocation)
+                            return taskWB;
+                    }
+                } else
+                    continue;
+            };
+        } else {
+            for (var i = startIndex + 1; i &lt; workblocks.length; i++) {
+                var taskWB = workblocks[i];
+                if (taskWB.startDateMS &gt; cutoffTimeMS)
+                    break;
+                if (taskWB.type == "task") {
+                    if (taskWB.startDateMS &lt;= cutoffTimeMS) {
+                        if (mandatoryLocation) {
+                            var location = taskWB.location;
+                            if (JSUtil.notNil(location) &amp;&amp; (location in this.locationMap) &amp;&amp; this.locationMap[location].isValid)
+                                return taskWB;
+                        } else if (!mandatoryLocation)
+                            return taskWB;
+                    }
+                } else
+                    continue;
+            };
+        }
+        return null;
+    },
+
+    getPositionOfKeyInArray: function(keyValue, array, startKey, endKey) {
+        //gs.log(keyValue)
+        var position = this._locationOfKeyInArray(keyValue, array, 0, array.length, startKey, endKey);
+        //gs.log(position)
+        if (position &lt; 0)
+            return 0;
+        return (position &gt; array.length) ? 0 : position;
+        //return position;
+    },
+
+    _locationOfKeyInArray: function(keyValue, array, start, end, startKey, endKey) {
+        start = start || 0;
+        end = end || array.length;
+        if (end == 0)
+            return 0;
+        var pivot = parseInt(start + (end - start) / 2, 10);
+        if (array[pivot][startKey] == keyValue)
+            return pivot;
+        if (end - start &lt;= 1) {
+            if (array[pivot][startKey] &lt;= keyValue &amp;&amp; array[pivot][endKey] &gt; keyValue)
+                return pivot;
+            if (array[pivot][startKey] &lt; keyValue &amp;&amp; array[pivot][endKey] &lt;= keyValue)
+                return pivot + 1;
+            if (array[pivot][startKey] &gt; keyValue &amp;&amp; array[pivot][endKey] &gt; keyValue)
+                return pivot - 1;
+
+            //gs.log("should not happen: " + keyValue + " -- " + array[pivot][startKey] + " -- " + array[pivot][endKey]);
+            return pivot;
+        }
+
+        if (array[pivot][startKey] &lt; keyValue) {
+            return this._locationOfKeyInArray(keyValue, array, pivot, end, startKey, endKey);
+        } else {
+            return this._locationOfKeyInArray(keyValue, array, start, pivot, startKey, endKey);
+        }
+    },
+
+    _populateTravelTimes: function(mapProvider) {
+        if(this.ignoreCalculateTravelTimeForResources){
+            return;
+        }
+        this.travelTimes = this._populateTravelTimesWithSrcDestLocations(mapProvider, this.geoLatLongLocationsResourceArray, this.geoLatLongLocationsTaskArray, this.geoLatLongLocationsArray,this.geoLatLongLocationsArray)
+    },
+
+    _populateTravelTimesWithSrcDestLocations:function(mapProvider, resourceLocations, taskLocations, srcLocations, destLocations){
+        var travelTimes = {};
+		//calling concatedAPI
+		//location map neede: each resource to each task, task back to resouce and task to task
+		//resources to tasks +tasks to resources+ tasks to tasks
+		if (resourceLocations.length != 0 &amp;&amp; taskLocations.length != 0) {
+			var smGeoDistanceUtil = new global.SMGeoDistanceUtils();
+			travelTimes = smGeoDistanceUtil.getConcatedTravelDistances(resourceLocations, taskLocations , mapProvider);
+
+            this.isRevertedToCrow = smGeoDistanceUtil.getRevertedToCrowValidation(mapProvider);
+        }       
+        return travelTimes;
+    },
+    
+    _adjustMaxTravelTime: function (sourceID, destinationID, destinationTimeObjects) {
+        var javaMaxInt = 2147483647;
+        var travelTime = destinationTimeObjects["duration"];
+        var rushHourTravelTime = destinationTimeObjects["duration_in_traffic"];
+
+        if(Number(travelTime) &gt;= javaMaxInt|| Number(rushHourTravelTime) &gt;= javaMaxInt){
+            gs.info("DynamicSchedulingOptimization: travel time exceed Java Integer.MAX_VALUE, fallback to use straightline calculation " + sourceID+ ", "+ destinationID);
+            var srcLocationObj = this.locationMap[sourceID];
+            var destLocationObj = this.locationMap[destinationID];
+            var srcLat = srcLocationObj.latitude;
+            var srcLng = srcLocationObj.longitude;
+            var destLat = destLocationObj.latitude;
+            var destLng = destLocationObj.longitude;
+            var straightLineResult = new global.SMGeoDistanceUtils().getTravelTimeDistance(srcLat, srcLng, destLat, destLng, false);
+            var adjustedTravelTime = straightLineResult['duration'];
+            if(Number(travelTime) &gt;= javaMaxInt){
+                destinationTimeObjects["duration"] = adjustedTravelTime;
+            }
+            if(Number(rushHourTravelTime) &gt;=  javaMaxInt){
+                destinationTimeObjects["duration_in_traffic"] = adjustedTravelTime;
+            }
+        }
+    }, 
+    
+    _getTravelTime: function(sourceID, destinationID, time) {
+        if (this.ignoreCalculateTravelTimeForResources) {
+            return 0;
+        }
+        var timeString = time.getDisplayValue().substring(11, 16);
+        var isRushHour =  new global.SMGeoDistanceUtils().isRushHour(timeString);
+        var sourceValue = this.travelTimes[sourceID];
+        if (JSUtil.notNil(sourceValue)) {
+            var destinationTimeObjects = sourceValue[destinationID];
+            if (JSUtil.notNil(destinationTimeObjects)) {
+                
+                try{
+                    this._adjustMaxTravelTime(sourceID, destinationID, destinationTimeObjects);
+                } catch (err) {
+                    gs.info(err);
+                }   
+                var travelTime = destinationTimeObjects["duration"];
+                if (isRushHour)
+                    travelTime = destinationTimeObjects["duration_in_traffic"];
+                return Number(travelTime);
+            }
+        }
+        return null;
+    },
+
+    _getTravelDistance: function(sourceID, destinationID) {
+        if (this.ignoreCalculateTravelTimeForResources) {
+            return 0;
+        }
+        var sourceValue = this.travelTimes[sourceID];
+        if (JSUtil.notNil(sourceValue)) {
+            var destinationTimeObjects = sourceValue[destinationID];
+            if (JSUtil.notNil(destinationTimeObjects)) {
+                var travelDist = destinationTimeObjects["distance"];
+                return Number(travelDist);
+            }
+        }
+        return null;
+    },
+    
+    _getTaskObjectFromTaskUpdates: function(task, resource, taskUpdates) {
+        var taskObj = {};
+        taskObj.taskID = task.getValue("sys_id");
+        taskObj.assigned_to = resource;
+        taskObj.taskNumber = task.getValue("number");
+        taskObj.location = task.getValue("location");
+
+        if (!this.useGeoLoc) {
+            var gdt = new GlideDateTime();
+            if (taskUpdates &amp;&amp; taskUpdates["expected_travel_start"]) {
+                gdt.setDisplayValue(taskUpdates["expected_travel_start"]);
+            } else {
+                gdt.setValue(task.getValue("expected_travel_start"));
+            }
+        } else {
+            var gdt = new GlideDateTime();
+            if (taskUpdates &amp;&amp; taskUpdates["expected_start"]) {
+                gdt.setDisplayValue(taskUpdates["expected_start"]);
+            } else {
+                gdt.setValue(task.getValue("expected_start"));
+            }
+        }
+        gdt.addSeconds(-1* this.taskSpacing);
+            taskObj.startDate = new GlideScheduleDateTime(gdt);
+
+        var gdtEnd = new GlideDateTime();
+        if (taskUpdates &amp;&amp; taskUpdates["estimated_end"]) {
+            gdtEnd.setDisplayValue(taskUpdates["estimated_end"]);
+        } else {
+            gdtEnd.setValue(task.getValue("estimated_end"));
+        }
+        gdtEnd.addSeconds(this.taskSpacing);
+        taskObj.endDate = new GlideScheduleDateTime(gdtEnd);
+
+        taskObj.startDateMS = taskObj.startDate.getMS();
+        taskObj.endDateMS = taskObj.endDate.getMS();
+        return taskObj;
+    },
+
+    _getTaskDuration: function(task) {
+        var workDuration = 0;
+        var taskDuration = task.getValue("estimated_work_duration");
+        if (!taskDuration) {
+            var estimatedStartWork = new GlideDateTime(task.getValue("expected_start"));
+            var estimatedEndWork = null;
+            workDuration = DEFAULT_WORK_DURATION * 1000;
+
+            if (!estimatedStartWork.hasDate()) {
+                estimatedStartWork = new GlideDateTime(GlideSystemDateUtil.nowNoTZ());
+                task.setValue("expected_start", estimatedStartWork);
+                task.update();
+            }
+        } else
+            workDuration = (new GlideDateTime(taskDuration)).getNumericValue();
+        return workDuration;
+    },
+    
+    _generateErrorResponse : function(msg, errorCode, task) {
+        var response = {};
+        response.success = false;
+        response.current = task.getDisplayValue("number");
+        response.message = msg;
+        response.msgType = "error";
+        this.loggerUtil.logError("Task : " + task.getDisplayValue("number") + ": Error: " + msg);
+        response.logs = this.loggerUtil.getLogs();
+        return response;    
+    },
+    
+    _generateID: function() {
+        function s4() {
+            return Math.floor((1 + Math.random()) * 0x10000)
+                .toString(16)
+                .substring(1);
+        }
+        return s4() + s4() + s4() + s4() + s4() + s4() + s4() + s4();
+    },
+    
+    logAccessHour: function(loggerUtil, workBlock, possibleStart, accessHour, allResourceInfo) {
+        if (loggerUtil._isLoggerOff())
+            return;
+        var workBlockInfo = "work block: resource: " + allResourceInfo[workBlock.resource].resourceName + ": Start Date: " + workBlock.startDate.getDisplayValue() + ": End Date: " + workBlock.endDate.getDisplayValue();
+        if (!accessHour) {
+            loggerUtil.logDebug("Resource arrives at location at " + possibleStart.getDisplayValue() + ", no valid access hour found in " + workBlockInfo);
+        } else {
+            loggerUtil.logDebug("Valid access hour " + accessHour.startTime.getDisplayValue() + "-" + accessHour.endTime.getDisplayValue() + " found in " + workBlockInfo);
+        }
+
+    },
+    
+    _getSpanStartByTZ: function(earliestSpan, timeZone){
+        var spanStart = new GlideDateTime();
+        var tz = Packages.java.util.TimeZone.getTimeZone(timeZone);
+        spanStart.setTZ(tz);
+        spanStart.setValue(earliestSpan.toString().substring(0, 19));
+        
+        return spanStart;
+    },
+    
+    _getAgentTimeMap: function(agent, startDate, endDate, agentTimeOffs, agentTasks) {
+        //work schedule
+        var span = new GlideScheduleDateTimeSpan(new GlideScheduleDateTime(startDate), new GlideScheduleDateTime(endDate));
+        var timeMap = new GlideScheduleTimeMap();
+        timeMap.addInclude(span);
+        
+        //timeoff exclusions
+        if (agentTimeOffs) {
+            for (var i = 0; i &lt; agentTimeOffs.length; i++) {
+                var timeOffObj = agentTimeOffs[i];
+                if (timeOffObj.show_as == "busy") {
+                    timeMap.addExclude(timeOffObj.span);
+                }
+            }
+        }
+
+        //resource tasks exclusions
+        if (agentTasks) {
+            for (var i = 0; i &lt; agentTasks.length; i++) {
+                var agentTask = agentTasks[i];
+                var taskSpan = new GlideScheduleDateTimeSpan(agentTask.startDate, agentTask.endDate);
+                timeMap.addExclude(taskSpan);
+            };
+        }
+
+        //build availability time map
+        timeMap.buildMap("gmt");
+        return timeMap;
+    },
+
+	    mergeWorkBlocks: function(workBlocks1, workBlocks2) {
+        var mergedBlocks = [];
+        var i = 0;
+        var j = 0;
+
+        if (workBlocks1.length == 0 &amp;&amp; workBlocks2.length == 0)
+            return [];
+        else if (workBlocks1.length == 0)
+            return workBlocks2;
+        else if (workBlocks2.length == 0)
+            return workBlocks1;
+
+
+        while (i &lt; workBlocks1.length &amp;&amp; j &lt; workBlocks2.length) {
+            var block1 = workBlocks1[i];
+            var block2 = workBlocks2[j];
+			var start1MS = new GlideDateTime(block1.start).getNumericValue();
+			var start2MS = new GlideDateTime(block2.start).getNumericValue();
+			var end1MS = new GlideDateTime(block1.end).getNumericValue();
+			var end2MS = new GlideDateTime(block2.end).getNumericValue();
+
+            if (start1MS == start2MS &amp;&amp; end1MS == end2MS) {
+				mergedBlocks.push(block1);
+                i++;
+				j++;
+            } else if (start1MS &lt;= start2MS) {
+                mergedBlocks.push(block1);
+                i++;
+            } else {
+                mergedBlocks.push(block2);
+                j++;
+            }
+        }
+
+        while (i &lt; workBlocks1.length) {
+            mergedBlocks.push(workBlocks1[i]);
+            i++;
+        }
+
+        while (j &lt; workBlocks2.length) {
+            mergedBlocks.push(workBlocks2[j]);
+            j++;
+        }
+
+        return mergedBlocks;
+    },
+
+    findNonConflictWBs: function(workBlock, conflictWBs) {
+        var answerWBs = [];
+        var wbStart = workBlock.startDateMS;
+        var wbEnd = workBlock.endDateMS;
+        for (var j = 0; j &lt; conflictWBs.length; j++) {
+            var conflictWB = conflictWBs[j];
+            var cStart = new GlideDateTime(conflictWB.start).getNumericValue();
+            var cEnd = new GlideDateTime(conflictWB.end).getNumericValue();
+            if (cStart &lt;= wbStart &amp;&amp; cEnd &gt;= wbEnd)
+                continue;
+
+            if (cStart &gt; wbStart) {
+				var startDate = new GlideDateTime();
+				startDate.setValue(wbStart);
+				var endDate = new GlideDateTime();
+				endDate.setValue(cStart);
+				
+                answerWBs.push({
+                    "start": startDate,
+                    "end": endDate
+                });
+            }
+
+            if (cEnd &lt;= wbEnd)
+                wbStart = cEnd;
+
+            if (wbStart &gt;= wbEnd)
+                break;
+        }
+
+        if (wbStart &lt; wbEnd) {
+            answerWBs.push({
+                "start": wbStart,
+                "end": wbEnd
+            });
+        }
+
+        return answerWBs;
+    },
+
+
+    type: 'DynamicSchedulingResourceEntity'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-07-28 05:05:31&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;6ec620b25ba53010461b52380a81c737&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;68&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;DynamicSchedulingResourceEntity&lt;/sys_name&gt;
+        &lt;sys_package display_value="Dynamic Scheduling" source="com.snc.dynamic_scheduling"&gt;88cb5ebf4722c210cd4e1ce4316d43f3&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_6ec620b25ba53010461b52380a81c737&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-10-09 13:39:16&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:38:28</sys_created_on>
+        <sys_id>e5f6b05d83f01210c6695855eeaad3bd</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>DynamicSchedulingResourceEntity</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_e5f6b05d83f01210c6695855eeaad3bd</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:38:28</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

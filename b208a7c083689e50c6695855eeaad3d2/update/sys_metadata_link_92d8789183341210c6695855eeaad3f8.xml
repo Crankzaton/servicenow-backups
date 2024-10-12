@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>a64f8d1e5395e910d185ddeeff7b1226</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_entitlement.dao_SubscriptionDetail&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;dao_SubscriptionDetail&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var dao_SubscriptionDetail = Class.create();
+dao_SubscriptionDetail.prototype = {
+    initialize: function() {
+        this._detailTable = "subscription_detail";
+        this._entitlementTable = "subscription_entitlement";
+        this._isV2Schema = new sn_entitlement.UnallocatedEntityCalculation_ContextFactory().v2SchemaIsInUse();
+        this._v1Dao = new sn_entitlement.dao_SubscriptionDetailDaoV1();
+    },
+
+    /**
+     * Creates a set of subscription_detail records in the database and returns a object map of subscription_entitlement ids to subscription_detail ids
+     *
+     *
+     * @return {object} an object map of subscription_entitlement sysids to subscription_detail sysids
+     */
+    createSubscriptionDetailsMap: function() {
+        if (!this._isV2Schema)
+            return this._v1Dao.createSubscriptionDetailsMap();
+
+        let objectMap = {};
+        const entitlementGr = new GlideRecord(this._entitlementTable);
+        entitlementGr.addQuery('status', 0); // active
+        entitlementGr.query();
+        const calculatedOn = new GlideDateTime();
+        while (entitlementGr.next()) {
+            objectMap[entitlementGr.getUniqueValue()] = this._insertSubscriptionDetail(entitlementGr, calculatedOn);
+        }
+
+        return objectMap;
+    },
+
+    /**
+     * Retrieves a mapping from subscription to subscription detail for the is_latest=true subscription detail records
+     * 
+     * @return {object} an object map of subscription_entitlement sysids to subscription_detail sysids
+     */
+    getSubscriptionDetailsMapByIsLatest: function() {
+        const gr = new GlideRecord(this._detailTable);
+        gr.addQuery('is_latest', true);
+        gr.query();
+
+        let map = {};
+        while (gr.next()) {
+            const key = gr.subscription || gr.license;
+            const val = gr.getUniqueValue();
+            map[key] = val;
+        };
+        return map;
+    },
+
+    /**
+     * Creates a subscription_details record in the database from a subscription_entitlement record and returns the id of the created record
+     *
+     * @param {GlideRecord} the GlideRecord of the subscription_entitlement record to use in creating the subscription_detail record
+     * @param {GlideDateTime} time to use for the records calculated_on field
+     * @return {string} sysid of the inserted subscription_detail record
+     */
+    _insertSubscriptionDetail: function(entitlementGr, calculatedOn) {
+        const detailGr = new GlideRecord(this._detailTable);
+        detailGr.setValue('subscription_name', entitlementGr.getValue('name'));
+        detailGr.setValue('subscription', entitlementGr.getUniqueValue());
+        detailGr.setValue('calculated_on', calculatedOn);
+        return detailGr.insert();
+    },
+
+    /**
+     * Marks the set of subscription_detail records referenced in the object map of subscription_entitlement ids to subscription_detail ids
+     *  as is_latest and processing_complete both to 'true'
+     *
+     * @param {object} an object map of subscription_entitlement sysids to subscription_detail sysids
+     */
+    completeSubscriptionDetails: function(map) {
+        this._markOldDetailRecords();
+
+        const detailGr = new GlideRecord(this._detailTable);
+        const detailIds = Object.values(map);
+        detailGr.addQuery("sys_id", "IN", detailIds);
+        detailGr.query();
+        detailGr.setValue('processing_complete', 'true');
+        detailGr.setValue('is_latest', 'true');
+        detailGr.updateMultiple();
+    },
+
+    /**
+     * Marks old subscription_details records in the database as is_latest = false
+     *
+     */
+    _markOldDetailRecords: function() {
+        const detailGr = new GlideRecord(this._detailTable);
+        detailGr.addQuery('is_latest', 'true');
+
+        detailGr.query();
+        detailGr.setValue('is_latest', 'false');
+        detailGr.updateMultiple();
+    },
+
+    /**
+     * Updates an existing subscription_details record in the database
+     *
+     * @param {object} the subscriptionDetail entry to update into the database
+     */
+    updateRecord: function(detailEntry) {
+        const gr = new GlideRecord(this._detailTable);
+        if (!gr.get(detailEntry.sysId)) {
+            gs.warn(`Unable to find ${this._detailTable} entry with sys_id ${detailEntry.sysId} , aborting update.`);
+            return;
+        }
+
+        gr.setValue("unconfirmed_user_count", detailEntry.unconfirmedUserCount);
+        gr.setValue("allocated_user_count", detailEntry.allocatedUserCount);
+        gr.setValue("unconfirmed_group_count", detailEntry.unconfirmedGroupCount);
+        gr.setValue("allocated_user_without_licensable_role_count", detailEntry.allocatedUserWithoutLicensableRoleCount);
+        gr.setValue("allocated_user_oob_count", detailEntry.allocatedUserOobCount);
+        gr.setValue("unconfirmed_user_oob_count", detailEntry.unconfirmedUserOobCount);
+        gr.setValue("licensable_group_count", detailEntry.licensableGroupCount);
+        gr.setValue("licensable_group_subscribed_count", detailEntry.licensableGroupSubscribedCount);
+        gr.setValue("allocated_quota_count", detailEntry.allocatedQuotaCount);
+        gr.setValue("allocated_custom_table_count", detailEntry.allocatedCustomTableCount);
+
+        gr.update();
+    },
+
+    /**
+     * Gets an array of subscription_details records calculated_on times that are is_latest and in the list of {subscriptionEntitlements}
+     *
+     * @param {array} the subscription_entitlemtnt enties to find subscription_details entries for
+     * @return {array} an array of created_on times for the selected subscription_detail records
+     */
+    getLatestSubscriptionDetailsCalculatedOnBySubscription: function(subscriptionEntitlements) {
+        const sd = new GlideRecord(this._detailTable);
+        sd.addQuery("subscription", "IN", subscriptionEntitlements);
+        sd.addQuery("is_latest", "true");
+        sd.query();
+        const times = [];
+        while (sd.next())
+            times.push(sd.getValue("calculated_on"));
+
+        return times;
+    },
+
+    type: 'dao_SubscriptionDetail'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-03-02 21:04:27&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;a64f8d1e5395e910d185ddeeff7b1226&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;42&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;dao_SubscriptionDetail&lt;/sys_name&gt;
+        &lt;sys_package display_value="Licensing Engine" source="sn_entitlement"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Licensing Engine"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_a64f8d1e5395e910d185ddeeff7b1226&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-07-31 22:13:57&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:46:42</sys_created_on>
+        <sys_id>92d8789183341210c6695855eeaad3f8</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>dao_SubscriptionDetail</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_92d8789183341210c6695855eeaad3f8</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:46:42</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

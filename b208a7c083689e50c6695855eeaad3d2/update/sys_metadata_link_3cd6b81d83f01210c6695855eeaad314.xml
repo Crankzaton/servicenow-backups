@@ -1,0 +1,274 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>63474242a32301103953792e16fcda6b</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_nb_action.FieldRecommendationService&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;FieldRecommendationService&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var FieldRecommendationService = Class.create();
+FieldRecommendationService.prototype = {
+    tableName: Constants.TBL_FIELD_RECOMMENDATION,
+
+    pillPickerExprConstants: {
+        "fi_expr_start": "{{" + Constants.pillPickerVars.FIELD_RECOMMENDATION_INPUT_KEY, //When pill expression contains field recommendation inputs
+        "expr_end": "}}"
+    },
+
+    initialize: function(grOrSysId) {
+        this.logger = new global.GSLog(Constants.PROP_LOG_LEVEL, this.type);
+        if (grOrSysId &amp;&amp; grOrSysId.sys_class_name == this.tableName) {
+            this.currentRecord = grOrSysId;
+        } else if (grOrSysId) {
+            var actionGr = new GlideRecord(this.tableName);
+            if (actionGr.get(grOrSysId)) {
+                this.currentRecord = actionGr;
+            }
+        }
+    },
+
+    hasValidRecord: function() {
+        return this.currentRecord &amp;&amp; this.currentRecord.sys_class_name == this.tableName;
+    },
+
+    getRecommendations: function(actionInputs) {
+        try {
+            var recommendations = {};
+            var actionInputObject = this._getActionInputObject(actionInputs);
+            var definitionsGr = this._getDefinitions();
+            if (definitionsGr) {
+                while (definitionsGr.next()) {
+                    var details = this._getDefinitionDetails(definitionsGr, actionInputObject);
+                    if (details.hasOwnProperty('fieldRecommendation')) {
+                        var recommendation = details.fieldRecommendation;
+                        var field = details.field;
+                        this._mergeRecommendations(recommendations, field, recommendation);
+                    }
+                }
+            }
+            return recommendations;
+        } catch (e) {
+            this.logger.error('Error executing getRecommendations, Error: ' + e);
+        }
+
+    },
+
+    _mergeRecommendations: function(recommendations, field, recommendation) {
+        if (recommendations[field]) {
+            recommendations[field].push(recommendation);
+        } else {
+            recommendations[field] = [recommendation];
+        }
+    },
+
+    _getActionInputObject: function(actionInputs) {
+        var inputObj = {};
+        for (var attribute in actionInputs) {
+            if (attribute == Constants.SYS_META || attribute == Constants.COL_SYS_ID) {
+                continue;
+            }
+            var element = actionInputs[attribute];
+
+            //DEF0421746
+            if (element == 'undefined' || element === undefined) {
+                inputObj[attribute] = Constants.STRING_WHITESPACE;
+                continue;
+            }
+
+            var value = '';
+            if (element) {
+                if (actionInputs.constructor.name != "ScopedGlideElement") {
+                    value = actionInputs[attribute];
+                } else {
+                    value = actionInputs[attribute].getRefRecord();
+                    if (value &amp;&amp; !value.isValidRecord()) {
+                        value = actionInputs[attribute];
+                    }
+                }
+            }
+            if (gs.nil(value)) {
+                inputObj[attribute] = actionInputs[attribute].getDisplayValue();
+            } else {
+                inputObj[attribute] = value;
+            }
+        }
+        return inputObj;
+    },
+
+    _getDefinitions: function() {
+        var definitionGr = new GlideRecord(Constants.TBL_FIELD_RECOMMENDATION_DEFINITION);
+        definitionGr.addActiveQuery();
+        definitionGr.addQuery(Constants.COL_FIELD_RECOMMENDATION, this.currentRecord.getUniqueValue());
+        definitionGr.orderBy(Constants.COL_ORDER);
+        definitionGr.query();
+        if (definitionGr.hasNext()) {
+            return definitionGr;
+        }
+        return false;
+    },
+
+    _getDefinitionDetails: function(definitionGr, actionInputObject) {
+        var fieldRecommendation = {};
+        var field = definitionGr.getValue(Constants.COL_FIELD);
+        var recommendationMessage = definitionGr.getDisplayValue(Constants.COL_RECOMMENDATION_MESSAGE);
+        var confidence = definitionGr.getValue(Constants.COL_CONFIDENCE);
+        confidence = this._parseValue(confidence, actionInputObject);
+
+        fieldRecommendation[Constants.RECOMMENDATION_MESSAGE] = this._parseValue(recommendationMessage, actionInputObject);
+        if (fieldRecommendation[Constants.RECOMMENDATION_MESSAGE] == Constants.STRING_WHITESPACE) {
+            this.logger.warn('Recommendation message contains a pill that returned empty value on parsing for Field recommendation defintion id = ' + definitionGr.getUniqueValue());
+            return {};
+        }
+        fieldRecommendation[Constants.IS_CONFIDENT] = false;
+        var autofillConfigValue = definitionGr.getValue(Constants.COL_RECOMMENDATION_METHOD);
+
+        if (autofillConfigValue == Constants.CHOICE_NO_AUTOFILL) {
+            fieldRecommendation[Constants.CONFIDENCE] = confidence;
+        } else if (autofillConfigValue == Constants.CHOICE_AUTOFILL_USING_CONFIDENCE) {
+            var thresholdForStamping = definitionGr.getValue(Constants.COL_CONFIDENCE_THRESHOLD_FOR_DIRECT_ASSIGNMENT);
+            if (parseInt(confidence) &gt;= parseInt(thresholdForStamping)) {
+                fieldRecommendation[Constants.CONFIDENCE] = confidence;
+                if (!this._setStampedValueDetails(definitionGr, actionInputObject, fieldRecommendation))
+                    return {};
+
+            }
+        } else if (autofillConfigValue == Constants.CHOICE_AUTOFILL_USING_RESOURCE_GENERATOR) {
+            var autofillExpression = definitionGr.getValue(Constants.COL_RECOMMENDATION_PREFERENCE);
+            var shouldAutofill = this._parseValue(autofillExpression, actionInputObject);
+            if (shouldAutofill == "true") {
+                if (!this._setStampedValueDetails(definitionGr, actionInputObject, fieldRecommendation))
+                    return {};
+            }
+        }
+
+        return {
+            "fieldRecommendation": fieldRecommendation,
+            "field": field
+        };
+    },
+
+    _setStampedValueDetails: function(definitionGr, actionInputObject, fieldRecommendation) {
+        var stampValue = definitionGr.getValue(Constants.COL_RECOMMENDED_VALUE);
+        var parsedStampValue = this._parseValue(stampValue, actionInputObject, true);
+        if (parsedStampValue == Constants.STRING_WHITESPACE) {
+            this.logger.warn('Recommended value contains a pill that returned empty value on parsing for Field recommendation defintion id = ' + definitionGr.getUniqueValue());
+            return false;
+        }
+        fieldRecommendation[Constants.IS_CONFIDENT] = true;
+        var stampDetails = {};
+        if (parsedStampValue instanceof GlideRecord &amp;&amp; parsedStampValue.isValidRecord()) {
+            stampDetails[Constants.VALUE] = parsedStampValue.getValue(Constants.COL_SYS_ID);
+            stampDetails[Constants.DISPLAY_VALUE] = parsedStampValue.getDisplayValue();
+        } else {
+            stampDetails[Constants.VALUE] = parsedStampValue;
+        }
+        fieldRecommendation[Constants.STAMP_DETAILS] = stampDetails;
+        return true;
+    },
+
+    _parseValue: function(parameterizedInputValue, inputObj, isStampValue) {
+        isStampValue = isStampValue || false;
+        var getGlideRecord = isStampValue;
+        var parsedInputValue = parameterizedInputValue;
+        var pattern = /(\{{[a-z0-9_.-?]*}})/gi;
+        try {
+            var pillExpressions = parameterizedInputValue ? parameterizedInputValue.match(pattern) : [];
+            if (gs.nil(pillExpressions) || !inputObj) {
+                return parsedInputValue;
+            }
+            var pillExpressionsLength = pillExpressions.length;
+            if (pillExpressionsLength &gt; 1 ||
+                (pillExpressionsLength == 1 &amp;&amp; pillExpressions[0] &amp;&amp; pillExpressions[0].trim() != parameterizedInputValue.trim())) {
+                getGlideRecord = false;
+            }
+            for (var i = 0; i &lt; pillExpressionsLength; i++) {
+                var pillExpr = pillExpressions[i];
+                var pillExprParsedValue;
+                var pillVariableStr = pillExpr.substring(this.pillPickerExprConstants.fi_expr_start.length + 1, pillExpr.lastIndexOf(this.pillPickerExprConstants.expr_end));
+                var pillVariables = pillVariableStr ? pillVariableStr.split(".") : [];
+                var parsedInput = ' ';
+                if (pillVariables.length == 1) {
+                    parsedInput = inputObj[pillVariableStr];
+                } else if (pillVariables.length &gt; 1 &amp;&amp; this._isValidRecord(inputObj[pillVariables[0]])) {
+                    var lookupStr = pillVariableStr.substring(pillVariables[0].length + 1);
+                    var replaceValue = this._getReplaceValueFromGr(inputObj[pillVariables[0]], lookupStr, isStampValue, getGlideRecord);
+                    parsedInput = gs.nil(replaceValue) ? ' ' : replaceValue;
+                }
+                pillExprParsedValue = parsedInput;
+                if (pillExprParsedValue == Constants.STRING_WHITESPACE || pillExprParsedValue == Constants.STRING_EMPTY) {
+                    return Constants.STRING_WHITESPACE;
+                }
+                parsedInputValue = this._getFinalParsedInputValue(pillExpr, pillExprParsedValue, parsedInputValue, parameterizedInputValue, getGlideRecord, isStampValue);
+            }
+        } catch (e) {
+            var inputs = 'parameterizedInputValue: ' + parameterizedInputValue +
+                ', actionInputObject: ' + JSON.stringify(inputObj) +
+                ', getGlideRecord: ' + getGlideRecord;
+            this.logger.error('Error executing _parseValue, Inputs - ' + inputs + ', Error: ' + e);
+        }
+        return parsedInputValue;
+    },
+
+    _isValidRecord: function(record) {
+        return !gs.nil(record) &amp;&amp; record.isValidRecord;
+    },
+
+    _getReplaceValueFromGr: function(gr, lookupStr, isStampValue, getGlideRecord) {
+        if (getGlideRecord) {
+            var replaceValue = gr.getElement(lookupStr).getRefRecord();
+            if (!gs.nil(replaceValue)) {
+                return replaceValue.isValidRecord() ? replaceValue : null;
+            }
+        }
+        return isStampValue ? gr.getValue(lookupStr) : gr.getDisplayValue(lookupStr);
+    },
+
+    _getFinalParsedInputValue: function(pillExpr, pillExprParsedValue, parsedInputValue, parameterizedInputValue, getGlideRecord, isStampValue) {
+        var isPillEqualToInput = pillExpr.trim() == parameterizedInputValue.trim();
+        if (this._isValidRecord(pillExprParsedValue)) {
+            pillExprParsedValue = getGlideRecord ? pillExprParsedValue :
+                (isStampValue ? pillExprParsedValue.getUniqueValue() : pillExprParsedValue.getDisplayValue());
+        }
+        if (isPillEqualToInput) {
+            return pillExprParsedValue;
+        }
+        return parsedInputValue.replace(pillExpr, pillExprParsedValue);
+    },
+
+    type: 'FieldRecommendationService'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-05-23 02:21:35&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;63474242a32301103953792e16fcda6b&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;9&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;FieldRecommendationService&lt;/sys_name&gt;
+        &lt;sys_package display_value="Recommended Actions" source="sn_nb_action"&gt;427fe83177221010d7159b71a91061e1&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Recommended Actions"&gt;427fe83177221010d7159b71a91061e1&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_63474242a32301103953792e16fcda6b&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-07-07 05:04:49&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:37:52</sys_created_on>
+        <sys_id>3cd6b81d83f01210c6695855eeaad314</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>FieldRecommendationService</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_3cd6b81d83f01210c6695855eeaad314</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:37:52</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

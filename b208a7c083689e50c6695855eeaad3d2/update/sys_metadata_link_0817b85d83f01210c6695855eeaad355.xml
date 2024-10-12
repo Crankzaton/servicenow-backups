@@ -1,0 +1,261 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>76cd0b78530201101865ddeeff7b127a</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_ex_sp.ActionUtilSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;[WARNING: Customers should NOT modify this script]&amp;#13;
+&amp;#13;
+The purpose of this script include is to provide default behaviours for the ActionUtilSNC script include.&amp;#13;
+To change the behaviour of these methods (or add new methods), Customers should override/add new methods to the ActionUtil script include. &lt;/description&gt;
+        &lt;name&gt;ActionUtilSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ActionUtilSNC = Class.create();
+ActionUtilSNC.prototype = {
+    initialize: function(context) {
+        this.context = context;
+		this.isValidContext = !gs.nil(context);
+		this.returnParametersWithTypes = false;
+		this.dynamicParameterMap = {};
+    },
+
+    type: 'ActionUtilSNC',
+
+    toggleParameterTypes: function() {
+        this.returnParametersWithTypes = !this.returnParametersWithTypes;
+    },
+
+    fetchActionsForGroup: function(groupId) {
+        var resolvedActions = [];
+        var actions = new GlideRecord('sn_ex_sp_m2m_action_group');
+		actions.addQuery('group.active', true);
+        actions.addQuery('action.active',true);
+        actions.addQuery('group', groupId);
+        actions.orderByDesc('primary');
+        actions.orderBy('order');
+        actions.query();
+        while (actions.next()) {
+            if (this.resolveActionVisibility(actions)) {
+                resolvedActions.push({
+                    actionId: actions.getValue('action'),
+                    order: actions.getValue('order'),
+                    primary: actions.getValue('primary') == true,
+                });
+            }
+        }
+        return resolvedActions;
+
+    },
+
+    fetchFormattedActions: function(actionsList) {
+        var that = this;
+        return actionsList.map(function(action) {
+            var gr = new GlideRecord('sn_ex_sp_action');
+            if(!gr.get(action.actionId))
+                return {};
+            return that.mergeObjects(action, that.getActionDefaultObj(gr));
+        }).filter(function(x) {
+            return x.hasOwnProperty('type');
+        });
+    },
+
+    getActionDefaultObj: function(action) {
+		var action_Type = new GlideRecord('sn_ex_sp_action_type');
+
+		if(action.table &amp;&amp; this.isValidContext)
+		{
+			if(action.table != this.context.getTableName())
+				return {};
+		}
+		else if(action.table &amp;&amp; !this.isValidContext) {
+			return {};
+		}
+
+		action_Type.get(action.action_type);
+		
+		var hasServerScript = !gs.nil(action_Type.server_script.toString());
+		var reverseExecution = action_Type.getValue('reverse_execution');
+		//get parameters for server script
+		var serverscriptvalue = {"actionSysId": action.getUniqueValue()};
+		if(hasServerScript){
+			var serverParameters = new GlideRecord('sn_ex_sp_action_parameter');
+			serverParameters.addQuery('action', action.getUniqueValue());
+			serverParameters.addQuery('is_client', false);
+			serverParameters.query();
+			while(serverParameters.next()){
+				var val = this.resolveParameter(serverParameters);
+				serverscriptvalue[serverParameters.getValue('name')]=val;
+			}
+		}
+
+		//get parameters for client script
+		var clientParams = {"actionSysId": action.getUniqueValue()};
+        var clientParamters = new GlideRecord('sn_ex_sp_action_parameter');
+		clientParamters.addQuery('action', action.getUniqueValue());
+		clientParamters.addQuery('is_client', true);
+		clientParamters.query();
+		while(clientParamters.next()){
+			var val = this.resolveParameter(clientParamters);
+			clientParams[clientParamters.getValue('name')]=val;
+		}
+
+        var clientScript = this._replaceTranslations(action_Type.client_script.toString());
+		
+        return {
+			type: action.getValue('action_type'),
+            actionName: action.getDisplayValue('name'),
+            actionIcon: action.getDisplayValue('icon'),
+			clientParams: clientParams,
+			clientScript : clientScript,
+			serverScriptInputs : serverscriptvalue,
+			hasServerScript: hasServerScript,
+			reverseExecution: reverseExecution
+        };
+    },
+	
+	_replaceTranslations: function(script) {
+        try {
+            var keys = script.match(/\${(.+?)\}/g);
+            if (keys &amp;&amp; keys.length &gt; 0) {
+                var keyValueMap = {};
+                for (var i = 0; i &lt; keys.length; i++) {
+                    if (keyValueMap[keys[i]]) {
+                        continue;
+                    }
+                    keyValueMap[keys[i]] = gs.getMessage(keys[i].substring(keys[i].indexOf('${') + 2, keys[i].indexOf('}')).trim());
+                    if (!keyValueMap[keys[i]]) {
+                        keyValueMap[keys[i]] = '';
+                    }
+                    script = script.replaceAll(keys[i], keyValueMap[keys[i]]);
+                }
+            }
+        } catch (e) {
+            return script;
+        }
+        return script;
+    },
+	
+	executeActionServerScript : function(actionId, actionParameters){
+		var gr = new GlideRecord('sn_ex_sp_action');
+		gr.get(actionId);
+		var actionTypeGR = gr.action_type.getRefRecord();
+		var evaluator = new GlideScopedEvaluator();
+		var that = this;
+		Object.keys(actionParameters).map(function(x){
+			evaluator.putVariable(x, that._inputParamCreator(actionParameters[x]));
+			return x;
+		});
+		return evaluator.evaluateScript(actionTypeGR,'server_script');
+		
+		
+	},
+
+	_inputParamCreator: function(input){
+		if(this.returnParametersWithTypes &amp;&amp; input.hasOwnProperty('param_type')){
+			if(input.param_type == 'json')
+				return JSON.parse(input.value);
+			return input.value;
+		}
+		return input;
+	},
+
+	_outputParamCreator: function(type){
+		var that = this;
+		return function(value){
+			if(!that.returnParametersWithTypes)
+				return value;
+			return {'param_type': type, 'value': value};
+		};
+	},
+	
+	resolveParameter: function(parameter){
+		var type = parameter.getValue('parameter_type').toString();
+		var outputCreator = this._outputParamCreator(type);
+			switch(type){
+				case 'string':
+					return outputCreator(parameter.getValue('text'));
+				case 'json':
+					return outputCreator(parameter.getValue('json'));
+				case 'dynamic':
+					this.dynamicParameterMap[parameter.getValue('name')] = null;
+					return outputCreator();
+				case 'table':
+					return outputCreator(this.isValidContext ? (parameter.is_display_value ? this.context.getDisplayValue(parameter.getValue('field')) : this.context.getElement(parameter.getValue('field')).toString()) : '');
+			}
+	},
+
+    resolveActionVisibility: function(action) {
+        switch (action.action_visibility.toString()) {
+            case "self":
+                if (this.isValidContext &amp;&amp; this.context.getTableName() == 'sys_user') {
+                    return this.context.getValue('user_name') == gs.getUserName();
+                }
+                return  this.isValidContext ? this.context.getValue('sys_created_by') == gs.getUserName() : false;
+			case "others":
+                if (this.isValidContext &amp;&amp; this.context.getTableName() == 'sys_user') {
+                    return this.context.getValue('user_name') != gs.getUserName();
+                }
+                return  this.isValidContext ? this.context.getValue('sys_created_by') != gs.getUserName() : false;
+            case "manager":
+                if (this.context.getTableName() == 'sys_user') {
+                    return this.context.getValue('manager') == gs.getUserID();
+                }
+                return false;
+            case "user_criteria":
+                return sn_uc.UserCriteriaLoader.userMatches(gs.getUserID(), [action.getValue('user_criteria')]);
+            case 'adv':
+                var evaluator = new GlideScopedEvaluator();
+                evaluator.putVariable('context', this.context);
+                return evaluator.evaluateScript(action, 'script');
+            case "all":
+                return true;
+            default:
+                return false;
+        }
+    },
+
+    //Writing own object.assin like function as it is not supported in ECMA Script 5
+    mergeObjects: function() {
+        var overiddenClone = {};
+        for (var index = 0; index &lt; arguments.length; index++) {
+            for (var property in arguments[index]) {
+                overiddenClone[property] = arguments[index][property];
+            }
+        }
+        return overiddenClone;
+    },
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-03-03 04:44:00&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;76cd0b78530201101865ddeeff7b127a&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;116&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ActionUtilSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Employee Center" source="sn_ex_sp"&gt;4249e63a28d54d61bb6fbf61fd86cccb&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Employee Center"&gt;4249e63a28d54d61bb6fbf61fd86cccb&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_76cd0b78530201101865ddeeff7b127a&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-07 09:09:52&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:38:54</sys_created_on>
+        <sys_id>0817b85d83f01210c6695855eeaad355</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ActionUtilSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_0817b85d83f01210c6695855eeaad355</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:38:54</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

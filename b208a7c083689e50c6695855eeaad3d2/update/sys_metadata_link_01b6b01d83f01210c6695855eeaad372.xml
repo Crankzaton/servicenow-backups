@@ -1,0 +1,351 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>57891886732220102eb52d2b04f6a729</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.TriggerRuleSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Use the TriggerRule script-include if you would like to make changes to this script by overriding the function in TriggerRuleSNC. &lt;/description&gt;
+        &lt;name&gt;TriggerRuleSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var TriggerRuleSNC = Class.create();
+
+TriggerRuleSNC.prototype = {
+
+	ASSIGNMENT_GROUP: "assignment_group",
+	ASSIGNED_TO: "assigned_to",
+	DOCUMENT: "document",
+	DOCUMENT_TABLE: "document_table",
+	GROUP: "group",
+	SYS_CREATED_ON: "sys_created_on",
+	TABLE: "table",
+	TRIGGER_GROUP_FIELD: "trigger_group_field",
+	TRIGGER_RULE: "trigger_rule",
+	TRIGGER_RULES_LOG_LEVEL: "com.snc.trigger_rules.log.level",
+	TRIGGER_RULE_PROCESS: "trigger_rule.process",
+	TRIGGER_RULE_REASSIGNMENT: "trigger_rule.reassignment",
+	TRIGGER_RULE_TABLE_CFG: "trigger_rule_table_cfg",
+	TRIGGER_RULE_WF_CONTEXT: "trigger_rule_wf_context",
+	TRIGGER_USER_FIELD: "trigger_user_field",
+	TRIGGER_SCRIPT: "trigger_script",
+	WF_CONTEXT: "wf_context",
+	JOURNAL_FIELD: "journal_field",
+	WORK_NOTES: "work_notes",
+	PARENT_WF_CONTEXT: "parent_wf_context",
+
+
+	initialize: function() {
+		this.eventName = null;
+		this.triggerRuleGR = null;
+		this.recordGR = null;
+		this.workflowVars = {};
+		this._log = new GSLog(this.TRIGGER_RULES_LOG_LEVEL, this.type);
+
+		if (this._log.atLevel(GSLog.DEBUG))
+			this._log.logDebug("[initialize] ");
+	},
+	
+	setEventName: function(eventName) {
+		this.eventName = eventName;
+		return this;
+	},
+
+	setRule: function(triggerRule) {
+		if (typeof triggerRule === "string") {
+			this.triggerRuleGR = new GlideRecord(this.TRIGGER_RULE);
+			this.triggerRuleGR.get(triggerRule);
+		} else
+			this.triggerRuleGR = triggerRule;
+		return this;
+	},
+
+	setRecord: function(record) {
+		this.recordGR = record;
+		return this;
+	},
+
+	setWorkflowVars: function(workflowVars) {
+		this.workflowVars = workflowVars;
+		return this;
+	},
+
+	process: function() {
+		if (!this.triggerRuleGR || !this.recordGR || !this.triggerRuleGR.isValidRecord() || !this.recordGR.isValidRecord()) {
+			if (this._log.atLevel(GSLog.DEBUG))
+				this._log.logDebug("[process] Trigger rule record or current record is invalid");
+			return;
+		}
+
+		var groupField = this.ASSIGNMENT_GROUP;
+		var userField = this.ASSIGNED_TO;
+
+		var triggerRuleTableGR = new TriggerRuleTableConfigUtil().getTriggerRuleTableConfigRecord(this.triggerRuleGR.getValue(this.TABLE));
+		if (triggerRuleTableGR) {
+			groupField = triggerRuleTableGR.getValue(this.TRIGGER_GROUP_FIELD);
+			userField = triggerRuleTableGR.getValue(this.TRIGGER_USER_FIELD);
+		}
+
+		if (this._log.atLevel(GSLog.DEBUG))
+			this._log.logDebug("[process] Trigger rule: " + this.triggerRuleGR.getUniqueValue() + ", group field: " + groupField + ", user field: " + userField);
+
+		if (!this.recordGR.isValidField(groupField) || !this.recordGR.isValidField(userField)) {
+			if (this._log.atLevel(GSLog.DEBUG))
+				this._log.logDebug("[process] Trigger rule group or user field not valid for table: " + this.recordGR.getRecordClassName());
+			return;
+		}
+
+		// Must be a GlideElement as existing workflows used by customers expect the variable to be of type element
+		var triggeredGroupElement = null;
+
+		// Use group defined in trigger rule when performing initial assignment (original behavior)
+		if (this.TRIGGER_RULE_PROCESS === this.eventName)
+			triggeredGroupElement = this.triggerRuleGR[this.GROUP];
+
+		// Use provided group as record changes may not be saved to DB
+		if (this.TRIGGER_RULE_REASSIGNMENT === this.eventName)
+			triggeredGroupElement = this.recordGR[groupField];
+
+		if (JSUtil.nil(triggeredGroupElement + "")) {
+			if (this._log.atLevel(GSLog.DEBUG))
+				this._log.logDebug("[process] Group cannot be found for record table: " + this.recordGR.getRecordClassName() + ", sys_id: " + this.recordGR.getUniqueValue());
+			return;
+		}
+
+		// Check if the assigned user is valid for the group
+		var userSysId = this.recordGR.getValue(userField);
+		if (!JSUtil.nil(userSysId) &amp;&amp; this._isUserMemberOfGroup(userSysId, triggeredGroupElement + "")) {
+			if (this._log.atLevel(GSLog.DEBUG))
+				this._log.logDebug("[process] User field: " + userField + " is already populated with the member: " + userSysId + " of the group: " + triggeredGroupElement);
+			return;
+		}
+
+		var triggerAction = this.triggerRuleGR.getValue("trigger_action");
+
+		if (triggerAction === "script")
+			this._executeTriggerScript();
+
+		if (triggerAction === "workflow")
+			this._startTriggerWorkflow(triggeredGroupElement);
+	},
+
+	cleanTriggerRuleWorkflowContextTable: function() {
+		var daysAgo = gs.getProperty("com.snc.trigger_rules.wf_context_flush_days_ago", "3");
+		var triggerWFContextGR = new GlideRecord("trigger_rule_wf_context");
+		triggerWFContextGR.addEncodedQuery("sys_created_on&lt;javascript:gs.daysAgo(" + daysAgo + ")");
+		triggerWFContextGR.query();
+		triggerWFContextGR.deleteMultiple();
+	},
+
+	abortActionIfDefaultTriggerRuleExists: function(triggerRuleGR) {
+		var gr = new GlideRecord(this.TRIGGER_RULE);
+		gr.addQuery(this.TABLE, triggerRuleGR.getValue(this.TABLE));
+		gr.addQuery("trigger_group_assigned", true);
+		gr.addQuery("trigger_when", "default");
+		gr.addQuery("sys_id", "!=", triggerRuleGR.getUniqueValue());
+		gr.query();
+		if (!gr.next())
+			return;
+		triggerRuleGR.setAbortAction(true);
+		var ruleLink = "&lt;a href='" + gr.getLink() + "'&gt;" + gr.getDisplayValue() + "&lt;/a&gt;";
+		gs.addInfoMessage(gs.getMessage("Only one default trigger rule per table can be defined when triggering on group assignment. Trigger rule: {0} is the default rule for the {1} table", [ruleLink, triggerRuleGR.getDisplayValue(this.TABLE)]));
+	},
+
+	getTriggerRuleWhenToActivateAnnotation: function() {
+		return gs.getMessage("Enable 'trigger when group assigned changes' to only process this trigger rule when there is a group assigned and the value changes. Use the 'Trigger when' field to define the default behavior for this table or to make it conditional");
+	},
+
+	cancelWorkflows: function() {
+		var workflowUtil = new Workflow();
+		var existingWFContextGR = this._getWorkflowsContext(this.recordGR.getRecordClassName(), this.recordGR.getUniqueValue());
+		while (existingWFContextGR.next()) {
+			workflowUtil.cancelContext(existingWFContextGR.wf_context.getRefRecord());
+		}
+	},
+
+	_getWorkflowsContext: function(documentTable, documentId) {
+		var gr = new GlideRecord(this.TRIGGER_RULE_WF_CONTEXT);
+		gr.addQuery(this.DOCUMENT_TABLE, documentTable);
+		gr.addQuery(this.DOCUMENT, documentId);
+		gr.query();
+		return gr;
+        },
+
+	_isUserMemberOfGroup: function(userSysId, groupSysId) {
+		var user = GlideUser.getUserByID(userSysId);
+		if (!user) {
+			if (this._log.atLevel(GSLog.DEBUG))
+				this._log.logDebug("[isUserMemberOfGroup] User: " + userSysId + " not found");
+			return false;
+		}
+
+		return user.isMemberOf(groupSysId);
+	},
+
+	_groupHasRota: function(groupSysId) {
+		var rotaGR = new GlideRecord("cmn_rota");
+		rotaGR.addActiveQuery();
+		rotaGR.addQuery(this.GROUP, groupSysId);
+		rotaGR.setLimit(1);
+		rotaGR.query();
+		return rotaGR.hasNext();
+	},
+
+	_getTriggerGroupField: function() {
+		var triggerGroupField = "";
+		if (this.triggerRuleGR &amp;&amp; this.triggerRuleGR.trigger_rule_table_cfg)
+			triggerGroupField = this.triggerRuleGR.trigger_rule_table_cfg[this.TRIGGER_GROUP_FIELD] + "";
+
+		return JSUtil.nil(triggerGroupField) ? this.ASSIGNMENT_GROUP : triggerGroupField;
+	},
+
+	_getTriggerUserField: function() {
+		var triggerUserField = "";
+		if (this.triggerRuleGR &amp;&amp; this.triggerRuleGR.trigger_rule_table_cfg)
+			triggerUserField = this.triggerRuleGR.trigger_rule_table_cfg[this.TRIGGER_USER_FIELD] + "";
+
+		return JSUtil.nil(triggerUserField) ? this.ASSIGNED_TO : triggerUserField;
+	},
+
+	_getJournalField: function() {
+		var journalField = "";
+		if (this.triggerRuleGR &amp;&amp; this.triggerRuleGR.trigger_rule_table_cfg)
+			journalField = this.triggerRuleGR.trigger_rule_table_cfg[this.JOURNAL_FIELD] + "";
+
+		return JSUtil.nil(journalField) ? this.WORK_NOTES : journalField;
+	},
+
+	_executeTriggerScript: function() {
+		var triggerScript = this.triggerRuleGR.getValue(this.TRIGGER_SCRIPT);
+
+		if (JSUtil.nil(triggerScript)) {
+
+			if (this._log.atLevel(GSLog.DEBUG))
+				this._log.logDebug("[executeTriggerScript] Trigger rule action is set to script but trigger_script field is empty");
+
+			return;
+		}
+
+		var evaluator = new GlideScopedEvaluator();
+		evaluator.putVariable("current", this.recordGR);
+		evaluator.putVariable("rule", this.triggerRuleGR);
+		evaluator.putVariable(this.TRIGGER_GROUP_FIELD, this._getTriggerGroupField());
+		evaluator.putVariable(this.TRIGGER_USER_FIELD, this._getTriggerUserField());
+		evaluator.putVariable(this.JOURNAL_FIELD, this._getJournalField());
+		var result = evaluator.evaluateScript(this.triggerRuleGR, this.TRIGGER_SCRIPT);
+
+		if (this._log.atLevel(GSLog.DEBUG))
+			this._log.logDebug("[_executeTriggerScript] script result: " + result);
+	},
+
+	_startTriggerWorkflow: function(triggeredGroupElement) {
+		var triggerWorkflow = this.triggerRuleGR.getValue("trigger_workflow");
+		if (JSUtil.nil(triggerWorkflow)) {
+			if (this._log.atLevel(GSLog.DEBUG))
+				this._log.logDebug("[startWorkflow] Trigger rule action is set to workflow but trigger_workflow field is empty");
+			return;
+		}
+
+		var workflowUtil = new Workflow();
+		//Cancel all existing workflows on this record initiated from On-Call Trigger Rule.
+		this.cancelWorkflows();
+
+		this.workflowVars.assignment_group = triggeredGroupElement;
+		this.workflowVars.trigger_group_field = this._getTriggerGroupField();
+		this.workflowVars.trigger_user_field = this._getTriggerUserField();
+		this.workflowVars.journal_field = this._getJournalField();
+
+		if (this._log.atLevel(GSLog.DEBUG))
+			this._log.logDebug("[startWorkflow] workflowVars: " + JSON.stringify(this.workflowVars));
+
+		var runInRecordDomain = GlidePluginManager.isActive("com.glide.domain.msp_extensions") &amp;&amp; gs.getProperty("com.snc.on_call_rotation.trigger_workflows_in_record_domain", "false") == "true";
+		var currentDomain = gs.getSession().getCurrentDomainID(); // always the value will be 'global', as async events are processed as admin in global domain.
+		
+		/* Workflow should start from task domain - so it will have access to workflows created in both global and task domain */
+		if (runInRecordDomain)
+			gs.getSession().setDomainID(this.recordGR.getValue("sys_domain"));
+		
+		var wfContextGR = workflowUtil.startFlow(triggerWorkflow, this.recordGR, this.recordGR.operation(), this.workflowVars);
+		
+		/* Reset domain */
+		if (runInRecordDomain)
+			gs.getSession().setDomainID(currentDomain);
+		
+		if (!wfContextGR) {
+			if (this._log.atLevel(GSLog.DEBUG))
+				this._log.logDebug("[startWorkflow] Trigger rule workflow: " + triggerWorkflow + " did not attach to the record table: " + this.recordGR.getRecordClassName() + ", sys_id: " + this.recordGR.getUniqueValue());
+			return;
+		}
+
+		this.logWorkflowContext(this.recordGR.getRecordClassName(), this.recordGR.getUniqueValue(), wfContextGR.getUniqueValue(), this.triggerRuleGR.getUniqueValue());
+
+		this.recordGR.update();
+	},
+
+	_getWorkflowContext: function(documentTable, documentId) {
+		var gr = new GlideRecord(this.TRIGGER_RULE_WF_CONTEXT);
+		gr.addQuery(this.DOCUMENT_TABLE, documentTable);
+		gr.addQuery(this.DOCUMENT, documentId);
+		gr.orderByDesc(this.SYS_CREATED_ON);
+		gr.setLimit(1);
+		gr.query();
+		if (gr.next())
+			return gr;
+		return null;
+	},
+
+	logWorkflowContext: function(documentTable, documentId, workflowContextId, triggerRuleSysId, parentWFContextId) {
+
+		if (this._log.atLevel(GSLog.DEBUG))
+			this._log.logDebug("[logWorkflowContext] documentTable: " + documentTable + " documentId: " + documentId + " workflowContextId: " + workflowContextId + " triggerRuleSysId: " + triggerRuleSysId + " parentWFContextId: " + parentWFContextId);
+
+		var gr = new GlideRecord(this.TRIGGER_RULE_WF_CONTEXT);
+		gr.setValue(this.DOCUMENT_TABLE, documentTable);
+		gr.setValue(this.DOCUMENT, documentId);
+		gr.setValue(this.WF_CONTEXT, workflowContextId);
+		gr.setValue(this.TRIGGER_RULE, triggerRuleSysId);
+		if (parentWFContextId)
+			gr.setValue(this.PARENT_WF_CONTEXT, parentWFContextId);
+
+		var sysId = gr.insert();
+
+		if (this._log.atLevel(GSLog.DEBUG))
+			this._log.logDebug("[logWorkflowContext] trigger_rule_wf_context sysId: " + sysId);
+
+		return sysId;
+	},
+
+    type: 'TriggerRuleSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-02-26 16:57:43&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;57891886732220102eb52d2b04f6a729&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;69&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;TriggerRuleSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="On-Call Scheduling" source="com.snc.on_call_rotation"&gt;4bca78ec3cf1311068bcf327dfe37f86&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_57891886732220102eb52d2b04f6a729&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-02-20 13:56:26&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:37:20</sys_created_on>
+        <sys_id>01b6b01d83f01210c6695855eeaad372</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>TriggerRuleSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_01b6b01d83f01210c6695855eeaad372</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:37:20</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

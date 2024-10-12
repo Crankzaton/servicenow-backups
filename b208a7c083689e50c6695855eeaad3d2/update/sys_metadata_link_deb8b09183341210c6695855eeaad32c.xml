@@ -1,0 +1,530 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>9c34c510776141109033bfeacf5a993d</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_ex_sp.FavoriteAPISNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;[WARNING: Customers should NOT modify this script]&amp;#13;
+The purpose of this script include is to provide default behaviours for the FavoriteAPI script include.&amp;#13;
+To change the behaviour of these methods (or add new methods), Customers should override/add new methods to the FavoriteAPI script include.&lt;/description&gt;
+        &lt;name&gt;FavoriteAPISNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var FavoriteAPISNC = Class.create();
+FavoriteAPISNC.prototype = {
+
+    initialize: function(isMobile, contentType) {
+        this.FAVORITES_TABLE = "sp_favorite";
+        this.FAVORITES_CONFIG_TABLE = "sn_ex_sp_favorite_content_config";
+        var limit = parseInt(gs.getProperty('sn_ex_sp.max.favorite.items'));
+        this.LIMIT = limit &gt; 0 ? limit : -1;
+        this.configAPI = new sn_ex_sp.FavoriteContentConfigAPI(isMobile, contentType);
+        this.IS_MOBILE = isMobile;
+        this.versioningEnabled = GlidePluginManager.isActive('com.snc.knowledge_advanced') &amp;&amp; gs.getProperty("glide.knowman.versioning.enabled", "true") === "true";
+    },
+
+    /**
+     * This function fetches the favorite config url and the current url the user is on to compare them and mark the favorite recently viewed.
+     * @param {String} table
+     * @param {String} recordId
+     * @param {String} currentUrl
+     */
+    markAsRecentlyViewed: function(table, recordId, currentUrl) {
+        configUrl = this.configAPI.getConfigUrl(table, recordId);
+        if (currentUrl.indexOf('?') &gt; -1) {
+            currentUrl = currentUrl.substr(currentUrl.indexOf('?') + 1, currentUrl.length - 1);
+        }
+        if (configUrl === currentUrl) {
+            this.updateLastViewedForFavorite(table, recordId);
+        }
+    },
+
+    /**
+     * This function updates the specific favorite record's last viewed column with current date/time.
+     * @param {String} table
+     * @param {String} recordId
+     * @returns true/false
+     */
+    updateLastViewedForFavorite: function(table, recordId) {
+        if (!this._isAccessible(table, recordId)) {
+            return false;
+        }
+        var tables = this._getChildTables(table) || [table];
+        var favoriteGr = this._getFavoriteGr(gs.getUserID(), recordId, tables);
+        if (favoriteGr.next()) {
+            favoriteGr.setValue('last_viewed', new GlideDateTime());
+            if (favoriteGr.update()) {
+                return true;
+            }
+        }
+        return false;
+    },
+
+    /**
+     * This function checks if specified item is a favorite item of current user.
+     * @param {String} table
+     * @param {String} recordId
+     * @returns true/false
+     */
+    isFavorite: function(table, recordId) {
+        if (!this._isAccessible(table, recordId)) {
+            if (!this.IS_MOBILE)
+                gs.error(gs.getMessage('Either record is invalid or inaccessible'));
+            return false;
+        }
+        if (!this.configAPI.isRecordConfigured(table, recordId)) {
+            if (!this.IS_MOBILE)
+                gs.warn(gs.getMessage('Item is not configured'));
+            return false;
+        }
+        var tables = this._getChildTables(table) || [table];
+        if (table === 'kb_knowledge' &amp;&amp; this.versioningEnabled) {
+            return this._findAndReplaceFavoriteWithPublishedArticle(recordId, tables);
+        }
+        var favoriteGr = this._getFavoriteGr(gs.getUserID(), recordId, tables);
+        return favoriteGr.hasNext();
+    },
+
+    /**
+     * This function adds the specified item to current user's favorite items.
+     * @param {String} table
+     * @param {String} recordId
+     * @returns true/false
+     */
+    createFavorite: function(table, recordId) {
+        if (!this._isAccessible(table, recordId)) {
+            if (!this.IS_MOBILE)
+                gs.addErrorMessage(gs.getMessage('Either record is invalid or inaccessible'));
+            else
+                gs.addErrorMessage(gs.getMessage("Something went wrong. Try adding this item to your favorites again."));
+            return false;
+        }
+        if (!this.configAPI.isRecordConfigured(table, recordId)) {
+            if (!this.IS_MOBILE)
+                gs.warn(gs.getMessage('Item is not configured'));
+            else
+                gs.addErrorMessage(gs.getMessage("Something went wrong. Try adding this item to your favorites again."));
+            return false;
+        }
+        if (this.LIMIT &gt; 0) {
+            var favoriteAgr = new GlideAggregate('sp_favorite');
+            favoriteAgr.addAggregate('COUNT');
+            favoriteAgr.addQuery('user', gs.getUserID());
+            favoriteAgr.query();
+            if (favoriteAgr.next() &amp;&amp; (favoriteAgr.getAggregate('COUNT') &gt;= this.LIMIT)) {
+                if (this.IS_MOBILE)
+                    gs.addErrorMessage(gs.getMessage('Your favorites list is full. You can remove some items from your favorites to make room for new ones.'));
+                else
+                    gs.addErrorMessage(gs.getMessage('You have reached maximum number of favorites allowed'));
+                return false;
+            }
+        }
+        table = this.getClassName(table, recordId);
+        var favoriteGr = new GlideRecord('sp_favorite');
+        favoriteGr.initialize();
+        favoriteGr.setValue('user', gs.getUserID());
+        favoriteGr.setValue('reference_table', table);
+        favoriteGr.setValue('reference_document', recordId);
+        if (favoriteGr.insert()) {
+            return true;
+        }
+        if (!this.IS_MOBILE)
+            gs.addErrorMessage(gs.getMessage('Unable to favorite this item'));
+        else
+            gs.addErrorMessage(gs.getMessage("Something went wrong. Try adding this item to your favorites again."));
+        return false;
+    },
+    /**
+     * This function deletes the specified item from current user's favorite items.
+     * @param {String} table
+     * @param {String} recordId
+     * @returns true/false
+     */
+    removeFavorite: function(table, recordId) {
+        if (!this._isAccessible(table, recordId)) {
+            if (!this.IS_MOBILE)
+                gs.addErrorMessage(gs.getMessage('Either record is invalid or inaccessible'));
+            else
+                gs.addErrorMessage(gs.getMessage("Something went wrong. Try removing this item from your favorites again."));
+            return false;
+        }
+        if (!this.configAPI.isRecordConfigured(table, recordId)) {
+            if (!this.IS_MOBILE)
+                gs.warn(gs.getMessage('Item is not configured'));
+            else
+                gs.addErrorMessage(gs.getMessage("Something went wrong. Try removing this item from your favorites again."));
+            return false;
+        }
+        var tables = this._getChildTables(table) || [table];
+        if (table === 'kb_knowledge' &amp;&amp; this.versioningEnabled) {
+            var versions = this._getArticleVersions(recordId).versions;
+            var favoriteGr = this._getFavoriteGr(gs.getUserID(), versions, tables);
+        } else {
+            favoriteGr = this._getFavoriteGr(gs.getUserID(), recordId, tables);
+        }
+        if (favoriteGr.next() &amp;&amp; favoriteGr.deleteRecord()) {
+            return true;
+        }
+        if (!this.IS_MOBILE)
+            gs.addErrorMessage(gs.getMessage('Unable to remove this item from your favorites'));
+        else
+            gs.addErrorMessage(gs.getMessage("Something went wrong. Try removing this item from your favorites again."));
+        return false;
+    },
+    /**
+     * This function checks if specified favorite item is already present in DB.
+     * @param {String} recordId
+     * @returns true/false
+     */
+    isExistingFavorite: function(table, recordId) {
+        if (gs.nil(table) || gs.nil(recordId)) {
+            return false;
+        }
+        var tables = this._getChildTables(table) || [table];
+        if (table === 'kb_knowledge' &amp;&amp; this.versioningEnabled) {
+            var versions = this._getArticleVersions(recordId).versions;
+            var favoriteGr = this._getFavoriteGr(gs.getUserID(), versions, tables);
+            return favoriteGr.hasNext();
+        }
+        favoriteGr = this._getFavoriteGr(gs.getUserID(), recordId, tables);
+        return favoriteGr.hasNext();
+    },
+    /**
+     * @param {String} qsConfig - Quick Start Config form portal record
+     * @returns favoriteIcon object containing details about the icon.
+     **/
+    getFavoriteIcon: function(qsConfig) {
+        var favoriteIcon = {
+            'checkIcon': 'fa-heart',
+            'unCheckIcon': 'fa-heart-o',
+            'color': 'primary'
+        };
+        if (qsConfig)
+            qsConfig = JSON.parse(qsConfig)[0];
+        if (qsConfig &amp;&amp; qsConfig.hasOwnProperty('favorite')) {
+            favoriteIcon.checkIcon = qsConfig.favorite.icon_checked || 'fa-heart';
+            favoriteIcon.unCheckIcon = qsConfig.favorite.icon_unchecked || 'fa-heart-o';
+            favoriteIcon.color = qsConfig.favorite.color || 'primary';
+        }
+        return favoriteIcon;
+    },
+    _isAccessible: function(table, recordId) {
+        var contentGr = new GlideRecord(table);
+        var isContentPresent = (contentGr.isValid() &amp;&amp; contentGr.get('sys_id', recordId));
+        if (isContentPresent &amp;&amp; FavoriteSecurityUtil.canView(contentGr, this.IS_MOBILE)) {
+            return true;
+        }
+        return false;
+    },
+    /**
+     * @param {String} tables - Table names
+     * @param {Boolean} evaluateSecurity - If security needs to be evaluated
+     * @param {portalID}  - Portal record sys_id
+     * @returns favorites object
+     **/
+    getFavorites: function(tables, isMobile, evaluateSecurity, portalID) {
+        var favorites = {};
+        var favoriteGr = new GlideRecord("sp_favorite");
+        if (tables)
+            favoriteGr.addQuery("reference_table", "IN", tables);
+        favoriteGr.addQuery("user", gs.getUserID());
+        favoriteGr.orderByDesc('sys_created_on');
+        favoriteGr.query();
+        while (favoriteGr.next()) {
+            var configGr = this.getFavoriteConfigurations(isMobile, tables);
+            if (configGr.next()) {
+                if (evaluateSecurity) {
+                    if (this.canView(favoriteGr, portalID)) {
+                        favorites[favoriteGr.getValue("reference_document")] = favoriteGr.getDisplayValue("reference_document");
+                    }
+                } else {
+                    favorites[favoriteGr.getValue("reference_document")] = favoriteGr.getDisplayValue("reference_document");
+                }
+            }
+        }
+        return favorites;
+    },
+    /**
+     * @param {Glide Record} gr - Glide Record
+     * @param {portalID}  - Portal record sys_id
+     * @returns true or false
+     **/
+    canView: function(gr, portalID) {
+        var refRecord = new GlideRecord(gr.reference_table);
+        if (refRecord.get(gr.reference_document)) {
+            if (FavoriteSecurityUtil.canView(refRecord, this.IS_MOBILE)) {
+                return true;
+            }
+        }
+        return false;
+    },
+    /**
+     * @param {Boolean} isMobile - Is supported on mobile only
+     * @param {String} tables - Table(s) for which configuration is defined
+     * @returns the configuration record
+     **/
+    getFavoriteConfigurations: function(isMobile, tables) {
+        var favoriteConfig = new GlideRecord(this.FAVORITES_CONFIG_TABLE);
+        favoriteConfig.addActiveQuery();
+        favoriteConfig.addQuery("favorite_content_type.active", true);
+        if (tables) {
+            favoriteConfig.addQuery("table", "IN", tables);
+        }
+        if (isMobile) {
+            var mobileFilter = favoriteConfig.addQuery('availability', 'mobile');
+            mobileFilter.addOrCondition('availability', 'both');
+        } else {
+            var desktopFilter = favoriteConfig.addQuery('availability', 'portal');
+            desktopFilter.addOrCondition('availability', 'both');
+        }
+        favoriteConfig.query();
+        return favoriteConfig;
+    },
+    /**
+     * @param {Boolean} isMobile - Is supported on mobile only
+     * @returns the active content types along with the tables for which the configuration is defined
+     **/
+    getFavoriteContentTypes: function(isMobile) {
+        var contentTypes = {};
+        var favoriteConfig = this.getFavoriteConfigurations(isMobile);
+        while (favoriteConfig.next()) {
+            var type = favoriteConfig.getValue("favorite_content_type");
+            var table = favoriteConfig.getValue("table");
+            var tables = this._getChildTables(table) || [table];
+            if (!contentTypes[type]) {
+                contentTypes[type] = {
+                    "table": table,
+                    "tables": tables,
+                    "label": favoriteConfig.getDisplayValue('favorite_content_type.filter_title')
+                };
+            } else {
+                for (var i = 0; i &lt; tables.length; i++) {
+                    if (contentTypes[type]["tables"].indexOf(tables[i]) == -1) {
+                        contentTypes[type]["tables"].push(tables[i]);
+                    }
+                }
+            }
+        }
+        return contentTypes;
+    },
+    /**
+     * @param {String} contentType - content type for which the items are favorited
+     * @returns the count of favorites
+     **/
+    getFavoriteTypeCount: function(contentType) {
+        var configs = {};
+        var parentTable = "";
+        var favoriteConfig = new GlideRecord("sn_ex_sp_favorite_content_config");
+        favoriteConfig.addActiveQuery();
+        favoriteConfig.addQuery("favorite_content_type", contentType);
+        favoriteConfig.query();
+        while (favoriteConfig.next()) {
+            var table = favoriteConfig.getValue('table');
+            var condition = favoriteConfig.getValue('condition') ? favoriteConfig.getValue('condition') : "";
+            if (!configs[table]) {
+                configs[table] = [condition];
+            } else {
+                configs[table].push(condition);
+            }
+            if (parentTable === table || !parentTable) {
+                parentTable = table;
+            } else {
+                var parentHierarchy = new GlideTableHierarchy(parentTable);
+                var parentHierarchyTables = parentHierarchy.getTables();
+                parentHierarchyTables.forEach(function(parentHierarchyTable) {
+                    if (parentHierarchyTable === table) {
+                        parentTable = table;
+                    }
+                });
+            }
+        }
+        if (!parentTable) {
+            return 0;
+        }
+        var conditions = configs[parentTable];
+        var items = new GlideRecord(parentTable);
+        var encodedQuery = "";
+        for (var j = 0; j &lt; conditions.length; j++) {
+            if (!conditions[j]) {
+                encodedQuery = "";
+                break;
+            }
+            encodedQuery = encodedQuery + (j === 0 ? conditions[j] : "^OR" + conditions[j]);
+        }
+        items.addEncodedQuery(encodedQuery);
+        var favQuery = items.addJoinQuery("sp_favorite", "sys_id", "reference_document");
+        favQuery.addCondition("user", gs.getUserID());
+        items.query();
+        return items.getRowCount();
+    },
+    /**
+     * @param {Boolean} isMobile - Is supported on mobile only
+     * @returns the active content types along with the tables for which the configuration is defined and favorite count
+     **/
+    getFavoriteContentTypeWithCount: function(isMobile) {
+        var contentTypeFilters = [];
+        var contentTypes = this.getFavoriteContentTypes(isMobile) || {};
+        contentTypeFilters.push({
+            "label": gs.getMessage("All"),
+            "sys_id": "",
+            "tables": ""
+        });
+        var totalCount = 0;
+        for (key in contentTypes) {
+            var count = parseInt(this.getFavoriteTypeCount(key)) || 0;
+            totalCount = totalCount + count;
+            if (count != 0) {
+                var contentTypeFilter = {};
+                contentTypeFilter["label"] = contentTypes[key].label;
+                contentTypeFilter["count"] = count;
+                contentTypeFilter["sys_id"] = key;
+                contentTypeFilter["tables"] = contentTypes[key].tables;
+                contentTypeFilter["table"] = contentTypes[key].table;
+                contentTypeFilters.push(contentTypeFilter);
+            }
+        }
+        contentTypeFilters[0].count = totalCount;
+        return contentTypeFilters;
+    },
+    /**
+     * Returns whether favorite has been enabled for a content type.
+     * @returns {Boolean}
+     **/
+    isContentTypeEnabled: function() {
+        return this.configAPI.isContentTypeEnabled() || false;
+    },
+    /**
+     * Returns class name for a given record
+     * @returns {String} className
+     **/
+    getClassName: function(table, sys_id) {
+        var recordGr = new GlideRecord(table);
+        recordGr.get(sys_id);
+        return recordGr.getValue("sys_class_name") || table;
+    },
+    /**
+     * Returns list all tables in child hierarchy along with input table.
+     * @param {String} table
+     * @returns {String}
+     */
+    _getChildTables: function(table) {
+        var childTables = [];
+        var tableHierarchy = new GlideTableHierarchy(table);
+        childTables = tableHierarchy.getAllExtensions();
+        return childTables;
+    },
+    /**
+     * Returns true if favorites is enabled on the given portal
+     * @param {String} portalId
+     * @returns {Boolean}
+     */
+    isFavoriteEnabled: function(portalId) {
+        var portalGr = new GlideRecord("sp_portal");
+        if (portalGr.get(portalId))
+            return portalGr.getDisplayValue("enable_favorites") == "true";
+        return false;
+    },
+    /**
+     * Returns true if favorites is enabled for MESP portal and favorites configuration is available for the given record
+     * @param {String} table
+     * @param {String} recordId
+     * @returns {Boolean}
+     */
+    isRecordConfiguredForMobile: function(table, recordId) {
+        return this.isFavoriteEnabled(sn_ex_sp.FavoriteConstants.MESP_PORTAL) &amp;&amp; this.configAPI.isRecordConfigured(table, recordId);
+    },
+    /**
+     * Get all the versions of a knowledge article. Find if any of those versions has been favorited. Replace that version with the latest published version in sp_favorite table. This function will be called for displaying favorite icon.
+     * @param {String} kbId - sys_id of the knowledge article.
+     * return {Boolean} - returns true if the knowledge article is favorite.
+     **/
+    _findAndReplaceFavoriteWithPublishedArticle: function(kbId, tables) {
+        var articleVersions = this._getArticleVersions(kbId);
+        var favoriteGr = this._getFavoriteGr(gs.getUserID(), articleVersions.versions, tables);
+        if (favoriteGr.next()) {
+            if (articleVersions.publishedVersion) {
+                favoriteGr.setValue('reference_document', articleVersions.publishedVersion);
+                favoriteGr.update();
+            }
+            return true;
+        }
+        return false;
+    },
+    /**
+     * Returns the Gliderecord object for sp_favorite record of given recordIds
+     * @param {String} userId
+     * @param {List} recordIds (used as list when there are versions of the favorited kb article. Used as string for all other cases)
+     * @param {List} tables
+     * returns {GlideRecord}
+     */
+    _getFavoriteGr: function(userId, recordIds, tables) {
+        var favoriteGr = new GlideRecord('sp_favorite');
+        favoriteGr.addQuery('user', userId);
+        favoriteGr.addQuery('reference_document', recordIds);
+        favoriteGr.addQuery('reference_table', 'IN', tables);
+        favoriteGr.setLimit(1);
+        favoriteGr.query();
+        return favoriteGr;
+    },
+    /**
+     * Returns an object containing a list of all the versions of an article and published version of that article
+     * @param {String} kbId
+     * returns {Object}
+     */
+    _getArticleVersions: function(kbId) {
+        var originalKbGr = new GlideRecord('kb_knowledge');
+        originalKbGr.get(kbId);
+        var gr = new GlideRecord('kb_knowledge');
+        gr.addQuery('article_id', originalKbGr.getValue('article_id'));
+        gr.orderByDesc('sys_created_on');
+        gr.query();
+        var versions = [];
+        var publishedVersion = '';
+        while (gr.next()) {
+            if (gr.getValue('workflow_state') === 'published') {
+                publishedVersion = gr.getUniqueValue();
+            }
+            versions.push(gr.getUniqueValue());
+        }
+        return {
+            'versions': versions,
+            'publishedVersion': publishedVersion
+        };
+    },
+
+
+    type: 'FavoriteAPISNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-02-04 08:55:01&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;9c34c510776141109033bfeacf5a993d&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;158&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;FavoriteAPISNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Employee Center" source="sn_ex_sp"&gt;4249e63a28d54d61bb6fbf61fd86cccb&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Employee Center"&gt;4249e63a28d54d61bb6fbf61fd86cccb&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_9c34c510776141109033bfeacf5a993d&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-07-03 09:21:11&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:46:09</sys_created_on>
+        <sys_id>deb8b09183341210c6695855eeaad32c</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>FavoriteAPISNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_deb8b09183341210c6695855eeaad32c</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:46:09</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

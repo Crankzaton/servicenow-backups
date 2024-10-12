@@ -1,0 +1,1104 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>a9caf20a70333010f877d3e7afe0eeaf</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_ads_setup.SNHelpSetupService&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Guided setup specfic service to interact with Guidance services &lt;/description&gt;
+        &lt;name&gt;SNHelpSetupService&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var SNHelpSetupService = Class.create();
+SNHelpSetupService.prototype = {
+    initialize: function() {
+		var helpService = new global.SNHelpService();
+		this.constants = new sn_ads_setup.SNHelpSetupConstantProvider();
+		this.helpContent = helpService.helpContent;
+		this.helpUtil = helpService.helpUtil;
+		this.helpGuidance = helpService.helpGuidance;
+		this.setupUtil = new sn_ads_setup.SNHelpSetupUtil();
+		this.helpGuidanceInteraction = helpService.helpGuidanceInteraction;
+		this.status = this.constants.status;
+    },
+	
+	//Moved this method from Guidance_step_cotroller to here to accommodate task_type. 
+	getSetupSteps: function(step_id, task_type) {
+		var dbController = new global.SNHelpDBController(this.constants.tables.guidance_step);
+		var query = "parent=" + step_id;
+		if(task_type == this.constants.taskType.BASIC)
+			query += '^task_type='+this.constants.taskType.BASIC;
+		
+		if(task_type == this.constants.taskType.RECOMMENDED)
+			query += '^task_type='+this.constants.taskType.BASIC+'^ORtask_type='+this.constants.taskType.RECOMMENDED;
+		
+		
+		
+		var steps = dbController.getByEncodedQuery(query,  this.constants.tableColumns.order, ["sys_id", "name", "parent", "guidance", "task_type", "status", "order"]);
+		
+		return Array.isArray(steps) ? steps : [];
+	},
+	
+	// Moved this method from Guidance_controller here to fetch sys_updated_on
+	getGuidance: function(sys_id, fields) {
+		var guidanceRecord;
+		
+		if (!sys_id) {
+			this.helpUtil.setError(this.type,this.constants.errorMessages.empty_sys_id);
+			return null;
+		}
+		
+		
+		var dbController = new global.SNHelpDBController(this.constants.tables.guidance);
+		guidanceRecord  = dbController.getById(sys_id, fields);
+		if (!guidanceRecord) {
+			this.helpUtil.setError(this.type, this.constants.errorMessages.no_records, sys_id);
+			return null;
+		} 
+		
+		guidanceRecord.steps = this.getSteps(sys_id, guidanceRecord.type) || [];
+		
+		return { guidance: guidanceRecord };
+	},
+	// Moved this method from Guidance_controller here to fetch sys_updated_on
+	getSteps: function(sys_id, type, task_type) {
+		
+		var steps;
+		var query;
+		var stepFields, contentFields, content, isSetup;
+		var orderBy =  this.constants.tableColumns.order;
+		if (!sys_id) {
+			this.helpUtil.setError(this.type,this.constants.errorMessages.empty_sys_id);
+			return null;
+		}
+		
+		query = this.constants.tableColumns.guidance + "=" + sys_id;
+		if(task_type)
+		query += '^task_type='+task_type;
+		
+		
+		
+
+		if(type === this.constants.setupType.GLOBAL_SETUP || type === this.constants.setupType.PERSONAL_SETUP ) {
+			isSetup = true;
+			stepFields = this.constants.restAPIKeys.setupStep;
+			// for setup - Only include steps with parent null (Immediate steps)
+			query += "^parent=NULL";
+			
+		} else 
+			return null;
+		
+		
+		var dbController = new global.SNHelpDBController(this.constants.tables.guidance_step);
+		steps = dbController.getByEncodedQuery(query, orderBy, stepFields);
+		if (!steps) {
+			this.helpUtil.setError(this.type, this.constants.errorMessages.no_records, sys_id);
+			return null; 
+		}
+		
+		for (var i= 0; i&lt; steps.length; i++) {
+			content = this.helpContent.getContent(steps[i].sys_id, steps[i].layout, this.constants.restAPIKeys.setupContent) || {};
+			if(isSetup &amp;&amp; Array.isArray(content) &amp;&amp; content.length &gt; 0) {
+				steps[i].content = content[0];
+				
+				if(steps[i].content.related_content)
+					steps[i].content.related_content = this.getRelatedContent(steps[i].content.related_content);
+			} else {
+				steps[i].content = 	content;
+			}
+		}
+		
+		return steps;
+	},
+	getRelatedContent : function(related_content) {
+		var dbController = new global.SNHelpDBController(this.constants.tables.content);
+		return dbController.getByEncodedQuery("sys_idIN" + related_content, null, this.constants.restAPIKeys.content);
+		
+	},
+	// insert or update Category or Task Step
+	upsertStep: function(step_id, params) {
+		var result = {}, 
+			sysId,
+			contentResult,
+			config,
+			updateContent = false;
+		
+		var dbController = new global.SNHelpDBController(this.constants.tables.guidance_step);
+		var content = this._hasContent(params.content) ? params.content : null;
+		var isPluginCategory = params.isPluginCategory;
+		var hasPlugiCategory = this.setupUtil.hasPluginStep(params.guidance);
+
+		delete params.content;
+		
+		if(isPluginCategory &amp;&amp; hasPlugiCategory &amp;&amp; step_id == -1) {
+			result.status = 400;
+			result.message = gs.getMessage("Error : Category for installing plugin already exists {0}",  hasPlugiCategory);
+			return result;
+		} else if(isPluginCategory) {
+			// Update the name of install plugin category to Plugins
+			params.name = "Plugins";
+			params.type = params.type || "group";
+		}
+
+		// validate the name &amp; type params
+		if(step_id == -1) {
+			if(!params.name) {
+				result.status = 400;
+				result.message = gs.getMessage("Error: Name can't be empty");
+				return result;
+			} else if(!params.type) {
+				result.status = 400;
+				result.message = gs.getMessage("Error: Missing required param - type");
+				return result;
+			}
+		} else if(params.hasOwnProperty("name") &amp;&amp; !params.name) { 
+			result.status = 400;
+			result.message = gs.getMessage("Error: Name can't be empty");
+			return result;
+		}
+
+		if(GlideStringUtil.isEligibleSysID(step_id)) { 
+			sysId = dbController.update(step_id, params);
+			updateContent = true;
+		} else {
+			sysId = dbController.create(params);
+		}
+		
+		if(!sysId) {
+			result.status = 500;
+			result.message = gs.getMessage("Error creating record in table {0} ", this.table);
+		} else {
+			result.data = sysId;
+			result.status = updateContent ? 200 : 201;
+		}
+		
+		if(content) {
+			if(content.guidance_step !== sysId) 
+				content.guidance_step = sysId;
+			
+			if(updateContent &amp;&amp; GlideStringUtil.isEligibleSysID(content.sys_id))
+				contentResult = this.updateContent(content);
+			else
+				contentResult = this.createContent(content); 
+			
+			if(!contentResult)
+				gs.error("SNHelpSetupService:upsertStep - Error creating record in table {0} " + this.constants.tables.content);
+		}
+		
+		// Create install plugin task only if its not there.
+		if(isPluginCategory &amp;&amp; step_id == -1) {
+			this.createInstallPluginTask(params.guidance, sysId);
+			config = {
+				basic : [],
+				recommended : []
+			};
+			this.configurePluginsForSetupType(params.guidance, sysId, config);
+		}
+
+		return result;
+	},
+	/**
+	* Create Tasks for plugin category
+	* @params {categoryId} - sys_id of install_plugin category
+	* @returns {sys_id} of newly created install_plugin task
+	*
+	*/
+	createInstallPluginTask : function(guidanceId, categoryId, config) {
+		config = config || {};
+		var taskType = config.task_type || "";
+
+		var params = {
+			sys_id : -1,
+			type : "activity",
+			name : "Install Plugins " + taskType,
+			task_type : taskType ? taskType : "advanced",
+			parent : categoryId,
+			guidance : guidanceId,
+			rich_description: config.rich_description || "",
+			description: config.description || "",
+			status : config.status || "",
+			content : {
+				sys_id : -1,
+				configuration_types : "install_plugin",
+				table_name : "v_plugin",
+				title : "Install Plugins " + taskType,
+				records : config.records || '',
+			}
+		};
+		return this.upsertStep(-1, params);
+	},
+	
+	createContent: function(params) {
+		var dbController = new global.SNHelpDBController(this.constants.tables.content);
+		params.related_content = this.upsertRelatedContent(params.related_content, false);	
+		return dbController.create(params);
+	},
+	
+	updateContent: function(params) {
+		var dbController = new global.SNHelpDBController(this.constants.tables.content);
+		params.related_content = this.upsertRelatedContent(params.related_content, true);
+		return dbController.update(params.sys_id, params);
+	},
+	
+	upsertRelatedContent : function(relatedContent, update) {
+		var result;
+		var relatedContentSysIds = [];
+		
+		if(!relatedContent || Array.isArray(relatedContent) &amp;&amp; relatedContent.length === 0)
+			return null;
+		
+		for(var i = 0; i &lt; relatedContent.length; i++) {	
+			if(update &amp;&amp; GlideStringUtil.isEligibleSysID(relatedContent[i].sys_id))
+				result = this.updateContent(relatedContent[i]);
+			else
+				result = this.createContent(relatedContent[i]);
+				
+			if(result)
+				relatedContentSysIds.push(result);
+		}
+		return relatedContentSysIds.join(",");
+	},
+	
+	_hasContent : function(content) {
+		return (content &amp;&amp; Object.keys(content).length &gt; 0) ? true : false;
+	},
+	
+	isValidSetupId: function(setupId) {
+		return GlideStringUtil.isEligibleSysID(setupId) &amp;&amp; !!this.helpGuidance.getGuidance(setupId, ["sys_id"]);
+	},
+
+
+/*
+	Gets the survy step in the given guidance
+	@param Guidance Id
+	@return [step]
+*/	
+getSurveyStep : function(guidance_id){
+		var step, stepFields, orderBy =  this.constants.tableColumns.order, query, dbController;
+		
+		if (!guidance_id) {
+			this.helpUtil.setError(guidance_type, this.constants.errorMessages.empty_sys_id);
+			return null;
+		}
+		
+		query = this.constants.tableColumns.guidance + "=" + guidance_id;
+		stepFields = ['sys_id'];
+		// for setup - Only include steps with parent null (Immediate steps)
+		query += "^parent=NULL";
+		query += "^type=survey";
+		
+		dbController = new global.SNHelpDBController(this.constants.tables.guidance_step);
+		step = dbController.getByEncodedQuery(query, orderBy, stepFields);
+		if (!step) {
+			this.helpUtil.setError(this.type, this.constants.errorMessages.no_records, sys_id);
+			return null; 
+		}
+		
+		
+		return step;
+	},
+
+	
+	
+	/*
+		Fetch interaction step status
+		@param interactinoId for guidance 
+		@param taskType (basic, recommend and advacned)
+		@return status and timestamp 
+	*/
+	
+	getInteractionStepStatusByType: function(userInteractionId, taskType, guidanceId){
+		
+		var interactions, dbController, status ='', result = {}, fields = this.constants.restAPIKeys.interactionStep, orderByField = "sys_updated_on", query = "user_interaction=" + userInteractionId+ '^step.parentISNOTEMPTY', self, step_query, stepCount=0, itrCount=0, grStep, grInteraction;
+		
+        step_query = 'guidance='+guidanceId+'^parentISNOTEMPTY';
+		
+		if(taskType == this.constants.taskType.BASIC){
+			query += '^step.task_type='+this.constants.taskType.BASIC; 
+			step_query += '^task_type='+this.constants.taskType.BASIC; 
+		}
+		
+		if(taskType == this.constants.taskType.RECOMMENDED){
+			query += '^step.task_type='+this.constants.taskType.BASIC+'^ORstep.task_type='+this.constants.taskType.RECOMMENDED;
+			step_query += '^task_type='+this.constants.taskType.BASIC+'^ORtask_type='+this.constants.taskType.RECOMMENDED;
+		}
+		
+		
+	
+		
+		grStep = new GlideRecord(this.constants.tables.guidance_step);
+		grStep.addEncodedQuery(step_query);
+		grStep.query();
+		stepCount = grStep.getRowCount();
+		
+		grInteraction = new GlideRecord(this.constants.tables.user_interaction_step);
+		grInteraction.addEncodedQuery(query);
+		grInteraction.query();
+		itrCount = grInteraction.getRowCount();
+		
+		
+		
+		dbController = new global.SNHelpDBController(this.constants.tables.user_interaction_step);
+		interactions = dbController.getByEncodedQuery(query, orderByField, fields);
+		
+		if(!interactions) 
+			return null;
+		
+		if(interactions &amp;&amp; Array.isArray(interactions) &amp;&amp; interactions.length &gt; 0) {
+			self = this;
+			result.status = this.constants.statusToLabel[this.constants.status.COMPLETE]; 
+			
+			//As the query is order by sys_updated_on, the element in the interaction is the latest one. So this gives the latest timestamp
+			result.timeStamp = this.setupUtil.getDate(interactions[0].sys_updated_on);
+			interactions.forEach(function(interaction){
+				if(interaction.status != self.constants.status.COMPLETE)
+					result.status = self.constants.statusToLabel[self.constants.status.IN_PROGRESS];
+			});		
+		}
+		
+		//If there is a mismatch in step count and itr count, it status can not be completed 
+		if(itrCount &gt; 0 &amp;&amp;  stepCount != itrCount)
+			result.status = self.constants.statusToLabel[self.constants.status.IN_PROGRESS];
+		
+			
+		return result;
+	},
+
+	/**
+	* insert an interaction log
+	* @param {object} - key/value for log record
+	* @return {object} - response object
+	*/
+	addInteractionLog : function(params) {
+		var dbController = new global.SNHelpDBController(this.constants.tables.user_interaction_log);
+		var sysId = dbController.create(params);
+		var result = {};
+
+		if(!sysId) {
+			result.status = 500;
+			result.message = gs.getMessage("Error creating record in table {0} ", this.constants.tables.user_interaction_log);
+		} else {
+			result.data = {sys_id : sysId};
+			result.status = 201;
+		}
+		return result;
+	},
+
+	/**
+	* update or insert interaction step for logGr.guidance_step (task/category)
+	* @param {object} logGr - GlideRecord object for user_interaction_log
+	*/
+	upsertInteractionStep : function(logGr) {
+		var interaction =  this.helpGuidanceInteraction.findInteraction(logGr.guidance.toString(), true);
+		var interactionId  = interaction &amp;&amp; interaction.sys_id;
+		var stepId = logGr.guidance_step.toString();
+		var sysId, res, gr, query;
+
+		var params = {
+			action : logGr.action.toString(),
+			status : logGr.status.toString(),
+		};
+		if(logGr.user_input)
+			params.options = global.JSON.stringify({user_input : logGr.user_input.toString()});
+
+		// No interaction record found. create interaction record.
+		if(!interactionId) {
+			res = this.upsertInteraction(logGr.guidance.toString(), "custom");
+			interactionId = res.data &amp;&amp; res.data.sys_id;
+			if(!interactionId)
+				gs.error("Error updating task status for task " + current.guidance_step.getDisplayValue());
+		}
+
+		sysId = this._upsertInteractionStep(interactionId, stepId, params);
+		if(!sysId) {
+			gs.error("Error updating task status for task " + current.guidance_step.getDisplayValue());
+			return;
+		}
+
+		// Optimise this
+		if(logGr.guidance_step.name.toString().indexOf("Install Plugin") == 0 &amp;&amp; (logGr.guidance_step.task_type == "recommended" || logGr.guidance_step.task_type == "advanced")) {
+			gr = new GlideRecord(this.constants.tables.content);
+			gr.addQuery("configuration_types", "install_plugin");
+			gr.addQuery("guidance_step.parent", logGr.guidance_step.parent);
+			query = gr.addQuery("guidance_step.task_type", "basic");
+
+			if(logGr.guidance_step.task_type == "advanced")
+				query.addOrCondition("guidance_step.task_type", "recommended");
+			
+			gr.query();
+			
+			while(gr.next())
+				this._upsertInteractionStep(interactionId, gr.guidance_step.toString(), params);
+		}
+	},
+	
+	/**
+	* Update or Insert interaction step for category when task status changes
+	* @param {object} current -  GlideRecord object for current task status
+	*/
+	upsertParentStepInteraction: function(current) {
+		var stepGr = current.step.getRefRecord();
+		var currentStatus = current.status.toString();
+		var interactionGr = current.user_interaction.getRefRecord();
+		var parent = stepGr.parent.toString();
+		var sysId;
+		var params = {
+			related_user_interaction_step: current.getUniqueValue()
+		};
+
+		switch(currentStatus) {
+			case this.status.IN_PROGRESS :
+				params.status = this.status.IN_PROGRESS;
+				params.action = "started";
+				break;
+			case this.status.SKIPPED :
+			case this.status.COMPLETE :
+				params.status = this.getParentStepStatus(interactionGr, parent, currentStatus);
+				if(params.status == this.status.IN_PROGRESS)
+					params.action = "started";
+				else if(params.status == this.status.SKIPPED)
+					params.action = "skip";
+				else if(params.status == this.status.COMPLETE)
+					params.action = this.status.COMPLETE;
+		}
+
+		sysId = this._upsertInteractionStep(interactionGr.getUniqueValue(), parent, params);
+		if(!sysId)
+			gs.error("Error updating category status for task " + current.step.getDisplayValue());
+	},
+
+	/*
+	* @param {object} current - current gliderecord object for category
+	* @return {string | null} - sys_id of updated interaction record.
+	*/
+	updateSetupInteraction : function(current) {
+		var interactionGr = current.user_interaction.getRefRecord();
+		var setupId = interactionGr.guidance.toString();
+		var currentStatus = current.status.toString();
+		var sysId;
+
+		if(currentStatus === this.status.IN_PROGRESS)
+			interactionGr.status = this.status.IN_PROGRESS;
+		else
+			interactionGr.status = this.getSetupStatus(interactionGr.getUniqueValue(), setupId, currentStatus);
+
+		interactionGr.current_step = current.related_user_interaction_step.toString();
+
+		sysId = interactionGr.update();
+
+		if(!sysId)
+			gs.error("Error updating setup status for category " + current.step.getDisplayValue());
+	},
+
+	/**
+	* @param {string} interactionId - sys_id of help_user_interaction table record.
+	* @param {string} setupId - sys_id of help_guidance table record.
+	* @param {string} currentStatus - current category status
+	* @returns {string} status for help_user_interaction for setupId
+	*/
+
+	getSetupStatus : function(interactionId, setupId, currentStatus) {
+		var categories = [];
+		var count;
+
+		if(currentStatus === this.status.IN_PROGRESS)
+			return this.status.IN_PROGRESS;
+
+		var gr = new GlideRecord(this.constants.tables.guidance_step);
+		gr.addQuery("guidance", setupId);
+		gr.addNullQuery("parent");
+		gr.query();
+
+		while(gr.next())
+			categories.push(gr.getUniqueValue());
+
+		var statusGr = new GlideRecord(this.constants.tables.user_interaction_step);
+
+		statusGr.addQuery("user_interaction", interactionId);
+		statusGr.addQuery("step", "IN", categories.join(","));
+
+		statusGr.query();
+		count = statusGr.getRowCount();
+
+		// Not all the categories have corresponding interactino record. setup is in progress.
+		if(count &lt; categories.length)
+			return this.status.IN_PROGRESS;
+
+		while(statusGr.next())
+			if(statusGr.status.toString() !== currentStatus)
+				return this.status.IN_PROGRESS;
+
+		return currentStatus;
+	},
+	/**
+	* update or insert interaction step 
+	* @param {string} interactionId - sys_id of user_interaction record
+	* @param {string} stepId - sys_id of guidance_step (category or task)
+	* @params {object} params - key value map for user_interaction_step table
+	* 
+	*/
+	_upsertInteractionStep : function(interactionId, stepId, params) {
+		var stepGr = this.getInteractionStep(interactionId, stepId);
+		var dbController;
+		if(stepGr) {
+			stepGr.action = params.action;
+			stepGr.status = params.status;
+			stepGr.related_user_interaction_step = params.related_user_interaction_step;
+			if(params.options)
+				stepGr.options = params.options;
+			return stepGr.update();
+		} else {
+			dbController = new global.SNHelpDBController(this.constants.tables.user_interaction_step);
+			params.user_interaction = interactionId;
+			params.step = stepId;
+			return dbController.create(params);
+		}
+	},
+
+	/**
+	* Calculate the status of the category based on tasks
+	* We need to check the current active setup to check what tasks we need to complete before marking 
+	* parent category complete. For eg - for basic - all basic tasks needs to complete 
+	* while for best_exp - basic and best_exp tasks needs to complete before marking category complete.
+	* in case of custom all tasks needs to complete to mark category complete.
+	* @param {object} integrationGr - GlideRecord for setup interaction 
+	* @param {string} parent -  sys_id of the setup category 
+	* @param {string} currentStatus - status of the most recently updated setup task. 
+	* @returns {string} status - status of the category
+	*/
+	getParentStepStatus : function(interactionGr, parent, currentStatus) {
+		var tasks = [];
+		var interactionId = interactionGr.getUniqueValue();
+		var taskTypes = "";
+
+		switch(interactionGr.active_setup_type.toString()) {
+			case "quick" : 
+				taskTypes = "basic";
+				break;
+			case "best_exp":
+				taskTypes += "basic^ORtask_type=recommended";
+				break;
+			case "custom":
+				taskTypes += "basic^ORtask_type=recommended^ORtask_type=advanced";
+		}
+
+		var gr = new GlideRecord(this.constants.tables.guidance_step);
+		gr.addEncodedQuery("parent=" + parent + "^task_type=" + taskTypes);
+		gr.query();
+
+		while(gr.next())
+			tasks.push(gr.getUniqueValue());
+
+		var statusGr = new GlideRecord(this.constants.tables.user_interaction_step);
+		statusGr.addEncodedQuery("user_interaction=" + interactionId + "^stepIN" + tasks.join(","));
+		statusGr.query();
+		var count = statusGr.getRowCount(); 
+
+		// Interaction is not available for all tasks - category status is in progress.
+		if(count &lt; tasks.length)
+			return this.status.IN_PROGRESS;
+		while(statusGr.next())
+			if(statusGr.status.toString() !== currentStatus) // if all tasks status is not same, set category to in progress
+				return this.status.IN_PROGRESS;
+
+		return currentStatus;
+	},
+
+	/**
+	* Check if the interaction record exist for current task/category
+	* (Read ACL on interaction step table restrict read to sn_help_admin.)
+	* @param {string} interactionId - sys_id of setup interaction record
+	* @param {string} step - sys_id of setup step (category/task)
+	* @returns {object} gr - interactionStep GlideRecord for current step or null if not exists. 
+	*/
+	getInteractionStep : function(interactionId, step) {
+		var gr = new GlideRecord(this.constants.tables.user_interaction_step);
+		gr.addEncodedQuery("user_interaction=" + interactionId + "^step=" + step);
+		gr.query();
+		if(gr.hasNext() &amp;&amp; gr.next())
+			return gr;
+
+		return null;
+	},
+	/**
+	* Create interaction record if there is no record exists.
+	* @param {string} guidanceId - sys_id of guidance record
+	* @param {string} setupType - current setup_type - quick, best_exp, advanced
+	* @returns {string} sys_id of newly created interaction record.
+	*/
+	upsertInteraction : function(guidanceId, setupType) {
+		var sysId,
+			params,
+			dbController,
+			interactionGr,
+			result = {};
+
+		if (!this.isValidSetupId(guidanceId)) {
+			result.status = 400;
+			result.message = gs.getMessage("Invalid setup Id {0}", guidanceId);
+			return result;
+		}
+		interactionGr = this.getInteraction(guidanceId);
+		if(interactionGr &amp;&amp; interactionGr.active_setup_type.toString() != setupType) {
+			interactionGr.active_setup_type = setupType;
+			interactionGr.status = this.status.IN_PROGRESS; // setup type change, update the status
+			sysId = interactionGr.update();
+
+			if(sysId)
+				this.updateInteractionStatus(guidanceId, setupType);
+
+		} else if(!interactionGr){
+			dbController = new global.SNHelpDBController(this.constants.tables.user_interaction);
+			params = {
+				guidance : guidanceId,
+				active_setup_type : setupType,
+				status : this.status.NOTSTARTED,
+			};
+			sysId = dbController.create(params);
+		} else {
+			sysId = interactionGr.sys_id + "";
+		}
+
+		if(!sysId) {
+			gs.warn("Error while creating interaction record for setup " + guidanceId);
+			result.status = 500;
+			result.message = gs.getMessage("Error creating Interaction Record for setup {0}", guidanceId);
+			return result;
+		}
+
+		result.status = 200;
+		result.data = {sys_id : sysId};
+		return result;
+	},
+	/**
+	* Update the interaction status
+	*
+	*
+	*/
+	updateInteractionStatus : function(guidanceId, setupType) {
+		var categoryIds = [];
+		switch(setupType) {
+			case "quick" :
+				setupType = "basic";
+				break;
+			case "best_exp" :
+				setupType = "recommended";
+				break;
+			case "custom" :
+				setupType = "advanced";
+				break;
+		}
+		var gr = new GlideRecord(this.constants.tables.guidance_step);
+		gr.addQuery("guidance", guidanceId);
+		gr.addQuery("task_type", setupType);
+		gr.addQuery("type", "activity");
+		gr.query();
+		while(gr.next()){
+			categoryIds.push(gr.parent.toString());
+		}
+
+		gr = new GlideRecord(this.constants.tables.user_interaction_step);
+		gr.addQuery("step", "IN", categoryIds.join(","));
+		gr.status = this.status.IN_PROGRESS;
+		gr.updateMultiple();
+	},
+	
+	getInteraction : function(guidanceId) {
+		var gr = new GlideRecord(this.constants.tables.user_interaction);
+		gr.addQuery("guidance", guidanceId);
+		gr.query();
+
+		if(gr.hasNext() &amp;&amp; gr.next())
+			return gr;
+
+		return null;
+	},
+
+	/**
+	    Moved from Guidance step controller 
+		Return a step for given sys_id
+		@param : step sys_id
+		@returns : Single guidance step for given sys_id	
+	*/
+	getSetupStep : function(sys_id) {
+		var step, content;
+		
+		if (!sys_id) {
+			this.helpUtil.setError(this.type,this.helpConstants.errorMessages.empty_sys_id);
+			return null;
+		}
+		
+		dbController =  new global.SNHelpDBController(this.constants.tables.guidance_step);
+		step = dbController.getById(sys_id, this.constants.restAPIKeys.setupStep);
+		
+		if(step) {
+			content = this.helpContent.getContent(step.sys_id, step.layout, this.constants.restAPIKeys.setupContent) || {};
+			if(Array.isArray(content) &amp;&amp; content.length &gt; 0) {
+				step.content = content[0];
+				
+				if(step.content.related_content)
+					step.content.related_content = this.getRelatedContent(step.content.related_content);
+			} else {
+				step.content = content;
+			}
+			
+			//This is a explict check to fetch pluigns (basic, recommended, advacned)
+			if(step.content &amp;&amp; step.content.configuration_types=="install_plugin") {
+				step.content.records = this.getPluginsDetails(step.content.records);
+				if(step.content.records) {
+					var pluginTasks = this.setupUtil.getPluginTasks(step.guidance, step.parent);
+					var i;
+					var self = this;
+					switch(step.task_type) {
+						case this.constants.taskType.BASIC :
+							step.content.records.forEach(function(record) {
+								record.taskType = self.constants.taskType.BASIC;
+							});
+							for(i = 0; i &lt; pluginTasks.length; i++) {
+								if(pluginTasks[i].task_type === this.constants.taskType.ADVANCED){
+									step.description =  pluginTasks[i].description;
+									step.rich_description = pluginTasks[i].rich_description;
+								}
+							}
+							break;
+						case this.constants.taskType.RECOMMENDED :
+							for(i = 0; i &lt; pluginTasks.length; i++) {
+								if(pluginTasks[i].task_type === this.constants.taskType.BASIC) {
+									step.content.records.forEach(function(record) {
+										if(pluginTasks[i].content.records.indexOf(record.sys_id) &gt;= 0)
+											record.taskType = self.constants.taskType.BASIC;
+									});
+								} else {
+									step.content.records.forEach(function(record) {
+										if(!record.taskType)
+											record.taskType = self.constants.taskType.RECOMMENDED;
+									});
+								}
+								if(pluginTasks[i].task_type === this.constants.taskType.ADVANCED){
+									step.description =  pluginTasks[i].description;
+									step.rich_description =  pluginTasks[i].rich_description;
+								}
+							}
+							break;
+						case this.constants.taskType.ADVANCED :
+							for(i = 0; i &lt; pluginTasks.length; i++) {
+								if(pluginTasks[i].task_type === this.constants.taskType.BASIC) {
+									step.content.records.forEach(function(record) {
+										if(pluginTasks[i].content.records.indexOf(record.sys_id) &gt;= 0)
+											record.taskType = self.constants.taskType.BASIC;
+									});
+								} else if(pluginTasks[i].task_type === this.constants.taskType.RECOMMENDED) {
+									step.content.records.forEach(function(record) {
+										if(pluginTasks[i].content.records.indexOf(record.sys_id) &gt;= 0 &amp;&amp; !record.taskType)
+											record.taskType = self.constants.taskType.RECOMMENDED;
+									});
+								} else {
+									step.content.records.forEach(function(record) {
+										if(!record.taskType)
+											record.taskType = self.constants.taskType.ADVANCED;
+									});
+								}
+							}
+							break;
+					}
+				}
+			}
+			
+		}
+		return step;
+	},
+	
+	/**
+	    
+		Returns plugin deatils 
+		@param : pluginIds - string with comma separated sys_id of plugin id's 
+		@returns : array of plugin deaitls (id, name, installed status)
+	*/
+	
+	getPluginsDetails: function(pluginIds){
+		var results = [], result = {}, gr;
+
+		if(!pluginIds)
+			return null; 
+		
+		gr =  new GlideRecord(this.constants.tables.plugin);
+		gr.addEncodedQuery("sys_idIN"+pluginIds);
+		gr.query();
+		
+		while(gr.next()){
+			result = {}; 
+			result.id = gr.getValue("id");
+			result.sys_id = gr.getValue("sys_id");
+			result.name = gr.getValue("name");
+			result.active = gr.getValue("active");
+			result.description = gr.getValue("description");
+			results.push(result);
+		}
+		return results; 
+	},
+	
+	/* Reoreders steps within same category or moves step from source to destination category.
+	 * Move:
+     *   When moving step from one category to another, we move the step to destinationCategory
+	 *   with order set as -1. This ensures that the step is always at the top and then adjustStepOrder is called.
+	 *   
+	 * Reorder:
+	 *   The source order (current order) of step and destinationOrder is passed to adjustStepOrder
+    */
+    reorderStep: function(setupId, data) {
+        var destinationCategory = data.destination_category;
+        var step = data.step;
+        var sourceCategory = data.source_category;
+        var destinationOrder = data.destination_order;
+        var type = data.type;
+        var parent, result;
+        var dbController = new global.SNHelpDBController(this.constants.tables.guidance_step);
+        var dbStep = dbController.getById(step, ["sys_id", "order", "name", "type"]);
+		var prevOrder = dbStep.order;
+        // verify step
+        if (!dbStep) {
+            return {
+                status: 400,
+                message: gs.getMessage("Invalid step sys_id {0}", step)
+            };
+        }
+        if (type == this.constants.stepType.GROUP) {
+            // if step is a category
+            parent = setupId;
+        } else
+            parent = sourceCategory;
+        if (!this.verifyStepParent(step, parent, type)) {
+            return {
+                status: 404,
+                message: gs.getMessage("Step not child of source category")
+            };
+        }
+        // in case of moving task from one category to another
+        if (type != this.constants.stepType.GROUP &amp;&amp; sourceCategory != destinationCategory) {
+            result = this.upsertStep(step, {
+                parent: destinationCategory,
+                order: -1,
+                type: dbStep.type,
+                name: dbStep.name
+            });
+            if (result.status != 200) {
+                return {
+                    status: result.status,
+                    message: result.message
+                };
+            }
+			// source order is 0 as we moved the step and set its order as -1
+            result = this.adjustStepsOrder(setupId, type, destinationCategory, 0, destinationOrder - 1);
+            if (result.status != 200) {
+                return {
+                    status: result.status,
+                    message: result.message
+                };
+            }
+			// sourceOrder and destinationOrder are -1 as we don't have to splice any element. We just have to
+			// adjust orders of existing steps
+            result = this.adjustStepsOrder(setupId, type, sourceCategory, -1, -1);
+            if (result.status != 200) {
+                return {
+                    status: result.status,
+                    message: result.message
+                };
+            }
+        } else {
+            var sourceOrder = parseInt(dbStep.order);
+            // adjust order of steps in destination category
+            result = this.adjustStepsOrder(setupId, type, parent, sourceOrder - 1, destinationOrder - 1);
+            if (result.status != 200) {
+                return {
+                    status: result.status,
+                    message: result.message
+                };
+            }
+        }
+		var dependencyService = new SNHelpSetupDependencyService();
+		dependencyService.handleDependencyConflict(step, type, prevOrder, sourceCategory);
+        return {
+            status: 200,
+            message: gs.getMessage("Steps reordered")
+        };
+    },
+
+    verifyStepParent: function(stepId, parentId, type) {
+        var dbController = new global.SNHelpDBController(this.constants.tables.guidance_step);
+        var parent, step;
+        if (type == this.constants.stepType.GROUP) {
+            step = dbController.getById(stepId, ["guidance"]);
+            parent = step.guidance;
+        } else {
+            step = dbController.getById(stepId, ["parent"]);
+            parent = step.parent;
+        }
+        if (parent == parentId)
+            return true;
+        return false;
+    },
+
+	/*
+	* Adjust orders of steps of setup after reorder or move.
+	* Get all the child steps of parent step as in array. Remove the step from sourceOrder and place it at
+	* destinationOrder.
+	*  @params: sourceOrder - order of step before it is moved to destinationOrder
+	*  @params: destinationOrder - order of step where it has to be placed at
+	*/
+    adjustStepsOrder: function(setupId, type, parent, sourceOrder, destinationOrder) {
+        // get all steps
+        var queryString;
+        var orderBy = "order";
+        var fields = ["sys_id", "order", "name", "type"];
+        var dbController = new global.SNHelpDBController(this.constants.tables.guidance_step);
+        if (type == this.constants.stepType.GROUP)
+            queryString = "parentISEMPTY";
+        else
+            queryString = "parent=" + parent;
+        queryString += "^guidance=" + setupId + "^type=" + type;
+        var steps = dbController.getByEncodedQuery(queryString, orderBy, fields);
+        var stepOrder, result;
+        // reorder all steps
+        if (sourceOrder != -1 &amp;&amp; destinationOrder != -1) {
+            var toMove = steps[sourceOrder];
+            steps.splice(sourceOrder, 1);
+            steps.splice(destinationOrder, 0, toMove);
+        }
+        for (var step = 0; step &lt; steps.length; step++) {
+            if (parseInt(steps[step].order) != step + 1) {
+                result = this.upsertStep(steps[step].sys_id, {
+                    order: step + 1,
+                    name: steps[step].name,
+                    type: steps[step].type
+                });
+                if (result.status != 200) {
+                    return {
+                        status: result.status,
+                        message: result.message
+                    };
+                }
+            }
+        }
+        return {
+            status: 200
+        };
+    },
+	
+	/**
+	* Configure plugins for individual setup type - basic, recommended and advanced
+	* @params {string} setupId
+	* @params {string} pluginCategory
+	* @params {object} params - configuration object with individual plugins details.
+	* @returns {object} result - configuration object with individual plugins details.
+	*/
+	configurePluginsForSetupType : function(setupId, pluginCategory, params) {
+		var pluginTasks = this.setupUtil.getPluginTasks(setupId, pluginCategory);
+		var config = {};
+		var setupType = ["basic", "recommended"];
+		var DONE = "0"; // status of the task creation
+
+		if(pluginTasks.length &lt;= 1) {
+			for(key in setupType) {
+				config.task_type = setupType[key];
+				config.status = DONE;
+				config.records = params[setupType[key]] || "";
+				config.description = "Plugins for "+config.task_type;
+				if(Array.isArray(config.records))
+						config.records = config.records.join(",");
+				this.createInstallPluginTask(setupId, pluginCategory, config);
+			}
+		} else {
+			for(var i = 0; i &lt; pluginTasks.length; i++) {
+				if(pluginTasks[i].task_type == "basic" || pluginTasks[i].task_type == "recommended") {
+					config.records = params[pluginTasks[i].task_type];
+					if(Array.isArray(config.records))
+							config.records = config.records.join(",");
+
+					if(config.records &amp;&amp; config.records != pluginTasks[i].records) {
+						config.sys_id = pluginTasks[i].content.sys_id;
+						this.updateContent(config);
+					}
+				}
+			}
+		}
+
+		return this.getPluginsBySetupType(setupId, pluginCategory);
+	},
+
+	/**
+	* Gets the plugins details by setup type
+	* @params {string} setupId - sys_id of setup
+	* @params {string} pluginCategory - sys_id of plugin category
+	* @returns {object} result - configuration object with individual plugins details.
+	*/
+	getPluginsBySetupType: function(setupId, pluginCategory) {
+		var taskType,
+			resp = {
+				basic : [],
+				recommended : [],
+				advanced : []
+			},
+			result = {};
+
+		var gr = new GlideRecord(this.constants.tables.content);
+		gr.addQuery("guidance_step.parent", pluginCategory);
+		gr.addQuery("configuration_types", "install_plugin");
+		gr.query();
+		while(gr.next()) {
+			taskType = gr.guidance_step &amp;&amp; gr.guidance_step.task_type.toString();
+			resp[taskType] = gr.records.toString() ? gr.records.toString().split(",") : [];
+		}
+		resp.setupId = setupId;
+		resp.pluginCategory = pluginCategory;
+
+		result.status = 200;
+		result.data = resp;
+
+		return result;
+	},
+	
+	isCategoryforPlugins: function(categoryId){
+		var dbController, query, contents;
+		query = 'configuration_types=install_plugin^guidance_step.parent='+categoryId;
+		dbController = new global.SNHelpDBController(this.constants.tables.content);
+		contents = dbController.getByEncodedQuery(query, '', ['configuration_types']);
+		
+		if(Array.isArray(contents) &amp;&amp; contents.length &gt; 0)
+			return true;
+		return false; 
+	},
+	
+    type: 'SNHelpSetupService'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;maint&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-11-15 04:11:38&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;a9caf20a70333010f877d3e7afe0eeaf&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;265&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;SNHelpSetupService&lt;/sys_name&gt;
+        &lt;sys_package display_value="Guided Setup" source="sn_ads_setup"&gt;1cb77a801b9af01039c155f3604bcb9e&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Guided Setup"&gt;1cb77a801b9af01039c155f3604bcb9e&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_a9caf20a70333010f877d3e7afe0eeaf&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-08-22 09:31:48&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 09:17:35</sys_created_on>
+        <sys_id>3eeff09d83341210c6695855eeaad37d</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>SNHelpSetupService</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_3eeff09d83341210c6695855eeaad37d</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 09:17:35</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

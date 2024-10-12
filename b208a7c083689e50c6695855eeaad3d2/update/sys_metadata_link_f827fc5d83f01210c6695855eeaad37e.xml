@@ -1,0 +1,158 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>7bc03493b735011094bb21208e11a9b1</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_cmdb_ws.CMDBAttestationSmartDetectionUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Util that handles logic for CMDB Attestation Smart Detection&lt;/description&gt;
+        &lt;name&gt;CMDBAttestationSmartDetectionUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var CMDBAttestationSmartDetectionUtil = Class.create();
+
+CMDBAttestationSmartDetectionUtil.prototype = Object.extendsObject(CMDBAttestationUtil, {
+
+    initialize: function() {
+        CMDBAttestationUtil.prototype.initialize.call(this);
+    },
+
+    isPluginActive: function(pluginName) {
+        return GlidePluginManager.isActive(pluginName);
+    },
+
+    isEligibleForSmartDetection: function() {
+        return this.isPluginActive(this.PLUGINS.DISCOVERY_PLUGIN) || this.isPluginActive(this.PLUGINS.INTEGRATION_COMMONS_PLUGIN);
+    },
+
+    isSmartDetectionDisabled: function() {
+        return gs.getProperty(this.SYS_PROPS_NAME.DISABLE_SMART_DETECTION) === 'true';
+    },
+
+    attestAllEligibleCis: function(taskId) {
+        var currentUser = gs.getUserID();
+        var taskToCiGr = this.buildSmartDetectionCIGr(taskId);
+        taskToCiGr.query();
+        var sysIds = [];
+        while (taskToCiGr.next()) {
+            sysIds.push(taskToCiGr.getValue("sys_id"));
+        }
+        return this.performAttestationAction(taskId, sysIds, this.ACTIONS_MAPPING.attest.key, "Auto-attested through smart-detection", false, '', null);
+    },
+
+    resetTaskUserPref: function(taskId) {
+        var taskStateGr = new GlideRecord(this.TABLES.ATTESTATION_TASK_STATE);
+        taskStateGr.addQuery(this.TASK_STATE_FIELDS.CMDB_TASK, taskId);
+        taskStateGr.query();
+        if (taskStateGr.next()) {
+            taskStateGr.setValue(this.TASK_STATE_FIELDS.HIDE_POPUP_USER_PREF, false);
+            taskStateGr.update();
+        }
+    },
+
+    getSmartDetectionFilter: function() {
+        var discoverySrcExclusion = gs.getProperty(this.SYS_PROPS_NAME.DISCOVERY_SRC_EXCLUSION);
+        var discoveryWindow = gs.getProperty(this.SYS_PROPS_NAME.DISCOVERY_WINDOW);
+        var filters = {};
+        if (discoverySrcExclusion) {
+            filters.discoverySrcExclusion = discoverySrcExclusion;
+        }
+        if (discoveryWindow) {
+            var gdt = new GlideDateTime();
+            gdt.addDaysUTC(-discoveryWindow);
+            filters.lastDiscoveredAfter = gdt.getDisplayValue();
+        }
+        return filters;
+    },
+
+    buildSmartDetectionCIGr: function(taskId) {
+        var filter = this.getSmartDetectionFilter();
+        var discoverySrcExclusion = filter.discoverySrcExclusion;
+        var lastDiscoveredAfter = filter.lastDiscoveredAfter;
+        var ciGr = new GlideRecord(this.TABLES.TASK_TO_CI_TABLE);
+        ciGr.addQuery(this.TASK_TO_CI_FIELDS.CMDB_TASK, taskId);
+        ciGr.addQuery(this.TASK_TO_CI_FIELDS.DISCOVERY_SOURCE, this.QUERY_FILTERS.NOT_IN, discoverySrcExclusion);
+        ciGr.addQuery(this.TASK_TO_CI_FIELDS.DISCOVERY_SOURCE, this.QUERY_FILTERS.NOT_EQUAL, "");
+        ciGr.addQuery(this.TASK_TO_CI_FIELDS.LAST_DISCOVERED, this.QUERY_FILTERS.GTE, lastDiscoveredAfter);
+        ciGr.addQuery(this.TASK_TO_CI_FIELDS.ATTESTATION_STATUS, this.ATTESTATION_STATUS.NOT_YET_REVIEWED);
+        return ciGr;
+    },
+
+    getSmartDetectionEligibleCIsInfo: function(taskId) {
+        var ciGr = this.buildSmartDetectionCIGr(taskId);
+        ciGr.orderByDesc(this.TASK_TO_CI_FIELDS.LAST_DISCOVERED);
+        ciGr.query();
+        var rowCount = 0;
+        var lastDiscovered = "";
+        if (ciGr.next()) {
+            rowCount = ciGr.getRowCount();
+            var latestDiscoveredCi = ciGr.ci.getRefRecord();
+            lastDiscovered = latestDiscoveredCi.getDisplayValue(this.CI_FIELDS.LAST_DISCOVERED);
+        }
+        return {
+            ciCount: rowCount,
+            lastDiscovered: lastDiscovered,
+            runOn: new GlideDateTime().getDisplayValue(),
+        };
+    },
+	
+	insertOrUpdateSmartDetectionState: function(taskId, smartDetectionAccepted, ciCount, hidePopup) {
+		var runOn = new GlideDateTime().getDisplayValue();
+		var fieldValues = {};
+        fieldValues[this.TASK_STATE_FIELDS.SMART_DETECTION_ACCEPTED] = smartDetectionAccepted;
+        fieldValues[this.TASK_STATE_FIELDS.CI_COUNT] = ciCount;
+        fieldValues[this.TASK_STATE_FIELDS.SMART_DETECTION_RUN_ON] = runOn;
+        fieldValues[this.TASK_STATE_FIELDS.HIDE_POPUP_USER_PREF] = hidePopup;
+		this.insertOrUpdateTaskStateFields(taskId, fieldValues);
+	},
+
+    reviewSmartDetection: function(taskId, ciCount) {
+        this.insertOrUpdateSmartDetectionState(taskId, false, ciCount, false);
+    },
+
+    acceptSmartDetection: function(taskId, ciCount) {
+        var result = this.attestAllEligibleCis(taskId);
+        if (result.successCount &gt; 0) {
+            this.insertOrUpdateSmartDetectionState(taskId, true, ciCount, false);
+        }
+        return result;
+    },
+
+    cancelSmartDetection: function(taskId, ciCount, hidePopup) {
+        this.insertOrUpdateSmartDetectionState(taskId, false, ciCount, hidePopup);
+    },
+
+    type: 'CMDBAttestationSmartDetectionUtil'
+});]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;maint&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-02-26 01:30:19&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;7bc03493b735011094bb21208e11a9b1&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;87&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;CMDBAttestationSmartDetectionUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="CMDB Workspace" source="sn_cmdb_ws"&gt;c8ab76825371201032b7ddeeff7b1280&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="CMDB Workspace"&gt;c8ab76825371201032b7ddeeff7b1280&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_7bc03493b735011094bb21208e11a9b1&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;maint&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-06-16 20:21:36&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:39:13</sys_created_on>
+        <sys_id>f827fc5d83f01210c6695855eeaad37e</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>CMDBAttestationSmartDetectionUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_f827fc5d83f01210c6695855eeaad37e</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:39:13</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

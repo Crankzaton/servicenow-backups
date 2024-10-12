@@ -1,0 +1,189 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>37bde13d432121102aeb1ca57bb8f2a3</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_entitlement.RoleSyncer&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;sync roles&lt;/description&gt;
+        &lt;name&gt;RoleSyncer&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var RoleSyncer = Class.create();
+RoleSyncer.prototype = {
+    initialize: function(instanceName, licenseRoleDiscoveryService, licenseDownloaderUtils) {
+        this.instanceName = instanceName ? instanceName : gs.getProperty("instance_name");
+        this.licenseRoleDiscoveryService = new LicenseRoleDiscoveryService();
+        this.entitlementEngineUtils = new sn_lef.EntitlementEngineUtils();
+        this.licenseInfoDownloader = new sn_lef.LicenseInfoDownloader();
+        this.licenseDownloaderUtils = new LicensingDownloaderUtils();
+        this.logger = new LoggingUtil();
+    },
+
+    /**
+     * Upload discovered roles to central instance and download rationalized roles information to license_role
+     */
+    syncRoles: function() {
+        const payload = this._generatePayload();
+        const response = this._send(payload);
+        this._process(response);
+        // this should ideally be returned by the above, but while the entire set of downloads are reworked
+        // call existing download separately
+        this._download();
+    },
+
+    /**
+     * Generate payload to upload discovered role information 
+     * @returns {object} payload of the form
+     * [
+     *   {
+     *     "instance_name": "ash_instance",
+     *     "role_name": "x_snc_ash_app.ash_role",
+     *     "custom": "true",
+     *     "previous": [
+     *       {
+     *         "application": "ai_search",
+     *         "role_type": "fulfiller",
+     *         "scope": "global"
+     *       },
+     *       ...
+     *     ],
+     *     "changed": [
+     *       {
+     *         "application": "ai_search",
+     *         "role_type": "fulfiller",
+     *         "scope": "global"
+     *       },
+     *       ...
+     *      ]
+     *   },
+     *   ...
+     * ]
+     */
+    _generatePayload: function() {
+        const payload = [];
+        for (const [roleName, [previous, changed]] of this.licenseRoleDiscoveryService.fetchChangedRoleData())
+            payload.push(this._generatePayloadForRole(roleName, previous, changed));
+        return payload;
+    },
+
+    _generatePayloadForRole: function(roleName, previous, changed) {
+        const toRoleData = roleData =&gt; ({'role_type': roleData.roleType, 'application': roleData.application, 'scope': roleData.scope, 'reason': roleData.reason});
+        return {
+            'instance_name' : this.instanceName,
+            'role_name' : roleName,
+            'version' : this._getEntitlementAppVersion(),
+            'custom': this._isCustom(previous, changed),
+            'previous' : previous.map(toRoleData),
+            'changed' : changed.map(toRoleData)
+        };
+    },
+
+    _getEntitlementAppVersion: function() {
+        const gr = new GlideRecord("sys_store_app");
+        if (gr.get("scope", LicensingEngineConstants.ENTITLEMENT_APP_SCOPE))
+            return gr.getValue("version");
+        return "";
+    },
+
+    _isCustom: function(previous, changed) {
+        if (previous.length &gt; 0)
+            return previous[0].isCustom;
+        return changed[0].isCustom;
+    },
+
+    _send: function(payload) {
+        const endPointURL = "/api/now/ualicensingservice/updateLicenseRole";
+        const restMethod = "POST";
+
+        const authorization = this.entitlementEngineUtils.getAuthHeader();
+        const header = {
+            'Authorization': authorization,
+            'Accept': "application/json",
+            'Content-Type': 'application/json'
+        };
+        const restObject = {
+            'end_point': endPointURL,
+            'rest_method': restMethod,
+            'headers': header,
+            'request_body': JSON.stringify(payload)
+        };
+        return this.licenseDownloaderUtils.executeRESTAPI(restObject);
+    },
+
+    /**
+     * Process the response from discovered role upload endpoint
+     * @param {object} result - response body expected in this format
+     * {
+     *   result: [
+     *     {
+     *       'role_name' : 'roleA',
+     *       'status' : 'success',
+     *       'message': 'nothing to say'
+     *     },
+     *     {
+     *       'role_name' : 'roleB',
+     *       'status' : 'error',
+     *       'message': 'there be overrides'
+     *     } 
+     *   ]
+     * }
+     */
+    _process: function(response) {
+        const statusCode = response.getStatusCode();
+        if (statusCode &lt; 200 || statusCode &gt;= 300) {
+            this.logger.logError(this.type, "upload", `Failed with status code ${response.getStatusCode()} due to ${response.getErrorCode()} - ${response.getErrorMessage()}`);
+
+            this.licenseRoleDiscoveryService.applyRoleDataChangesAsError();
+            return;
+        }
+        const {result} = JSON.parse(response.getBody());
+        result.forEach(roleResult =&gt; this._processRole(roleResult));
+    },
+
+    _processRole: function(roleResult) {
+        this.logger.logInfo(this.type, '_processRole', `Applying changes to role ${roleResult.role_name} status ${roleResult.status} with message ${roleResult.message}`);
+        this.licenseRoleDiscoveryService.applyRoleDataChanges(roleResult.role_name, roleResult.status === 'success');
+    },
+
+    /**
+     * Call existing java code to download role information into license_role
+     */
+    _download: function() {
+        this.licenseInfoDownloader.downloadRoles();
+    },
+
+    type: 'RoleSyncer'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-03-13 20:21:15&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;37bde13d432121102aeb1ca57bb8f2a3&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;29&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;RoleSyncer&lt;/sys_name&gt;
+        &lt;sys_package display_value="Licensing Engine" source="sn_entitlement"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Licensing Engine"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_37bde13d432121102aeb1ca57bb8f2a3&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;maint&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-18 23:48:38&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:35:50</sys_created_on>
+        <sys_id>cb56f89983f01210c6695855eeaad3d4</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>RoleSyncer</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_cb56f89983f01210c6695855eeaad3d4</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:35:50</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

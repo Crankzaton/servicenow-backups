@@ -1,0 +1,382 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>49460fe753463010347cddeeff7b12b3</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.MIDDeploymentRequest&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;This class contains utility functions for working with MID Deployment Requests.&lt;/description&gt;
+        &lt;name&gt;MIDDeploymentRequest&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var MIDDeploymentRequest = Class.create();
+
+MIDDeploymentRequest.DEFAULT_MAX_MID_QUANTITY_PER_REQUEST = 10;
+
+/**
+ * Determine the maximum number of mid servers that are allowed to create per request
+ */
+MIDDeploymentRequest.maxMidQuantity = function() {
+    return parseInt(gs.getProperty('mid.deployment.max_mid_quantity', MIDDeploymentRequest.DEFAULT_MAX_MID_QUANTITY_PER_REQUEST)) ||
+        MIDDeploymentRequest.DEFAULT_MAX_MID_QUANTITY_PER_REQUEST;
+};
+
+/**
+ * Retrieve profile parameters
+ *
+ * @param {string} tableName The name of a profile config table, i.e. mid_profile_wrapper_config and mid_profile_config
+ * @param {string} profileID The sys_id of a MID Server profile record
+ * @returns {array} array of config parameters associated with a profile from the given table
+ */
+MIDDeploymentRequest.getProfileParams = function(tableName, profileID) {
+    if (JSUtil.nil(tableName) || (tableName != 'mid_profile_wrapper_config' &amp;&amp; tableName != 'mid_profile_config'))
+        throw new Error(gs.getMessage('Table {0} is not a valid profile config table', tableName));
+
+    var result = [];
+    var gr = new GlideRecord(tableName);
+    gr.addQuery("profile", profileID);
+    gr.query();
+    while (gr.next()) {
+        var param = {};
+        param["name"] = gr.getValue("name");
+        param["value"] = gr.getValue("value");
+        result.push(param);
+    }
+    return result;
+};
+
+/**
+ * Retrieve the profile data.
+ *
+ * @param {string} profileID The sys_id of a MID Server profile record
+ * @returns {object} an object that holds the given profile's data
+ */
+MIDDeploymentRequest.getProfile = function(profileID) {
+    var gr = new GlideRecord('mid_server_profile');
+    if (!gr.get(profileID))
+        throw new Error(gs.getMessage("The MID Server profile with ID {0} does not exist!", profileID));
+
+    var wrapperParams = MIDDeploymentRequest.getProfileParams("mid_profile_wrapper_config", profileID);
+
+    var configParams = MIDDeploymentRequest.getProfileParams("mid_profile_config", profileID);
+    // add the mid_profile_id config param
+    var param = {};
+    param["name"] = "mid_profile_id";
+    param["value"] = profileID;
+    configParams.push(param);
+
+    var profile = {};
+    profile["profile_id"] = profileID;
+    profile["config"] = configParams;
+    profile["wrapper_config"] = wrapperParams;
+    return profile;
+};
+
+/**
+ * Retrieve the agent application name with the given ID
+ *
+ * @param {string} applicationID The sys_id of a MID Server application record
+ * @returns {string} The agent application name with the given ID
+ */
+MIDDeploymentRequest.findMIDApplication = function(applicationID) {
+    var gr = new GlideRecord("ecc_agent_application");
+    if (!gr.get(applicationID))
+        throw new Error(gs.getMessage("The agent application with ID {0} does not exist!", applicationID));
+
+    return gr.getValue("name");
+};
+
+/**
+ * Retrieve the agent capabilities from a comma separated list of capability IDs
+ *
+ * @param {string} capabilityIDs a comma separated list of agent capability IDs
+ * @returns {array} An array of agent capabilities with the given IDs
+ */
+MIDDeploymentRequest.findMIDCapabilities = function(capabilityIDs) {
+    var result = [];
+    if (JSUtil.nil(capabilityIDs) || capabilityIDs.trim().length == 0)
+        return result;
+
+    var capArr = capabilityIDs.split(',');
+    var gr = new GlideRecord("ecc_agent_capability");
+    for (var i = 0; i &lt; capArr.length; i++) {
+        if (!gr.get(capArr[i])) {
+            gs.logWarning(gs.getMessage("Could not find MID Server capability with ID {0}", capArr[i]), this.MID_SERVER_MANAGEMENT);
+            continue;
+        }
+        var cap = {};
+        cap["capability"] = gr.getValue('capability');
+        cap["value"] = gr.getValue('value');
+        result.push(cap);
+    }
+    return result;
+};
+
+/**
+ * Convert a comma separated list to an array
+ */
+MIDDeploymentRequest.toArray = function(commaSeparatedList) {
+    if (commaSeparatedList == null || commaSeparatedList.trim().length == 0)
+        return [];
+
+    return commaSeparatedList.split(',').map(
+        function(item) {
+            return item.trim();
+        }
+    );
+};
+
+/**
+ * Convert a string to a JSON object
+ */
+MIDDeploymentRequest.toJSON = function(text) {
+    try {
+        return JSON.parse(text);
+    } catch (error) {
+        throw new Error(gs.getMessage("The text {0} is a not valid JSON string! Error: {1}", [text, error]));
+    }
+};
+
+
+MIDDeploymentRequest.prototype = {
+
+    MID_SERVER_MANAGEMENT: 'MID Server Management',
+
+    initialize: function(requestID) {
+        var gr = new GlideRecord('mid_server_deployment');
+        if (!gr.get(requestID))
+            throw new Error(gs.getMessage('The deployment request with ID {0} does not exist!', requestID));
+
+        this.requestID = '' + requestID;
+        this.realTableName = '' + gr.sys_class_name; // convert to string
+
+        gr = new GlideRecord(this.realTableName);
+        gr.get(this.requestID);
+        this.requestGR = gr;
+        this.maxMidQuantity = MIDDeploymentRequest.maxMidQuantity();
+    },
+
+    duplicate: function(duplicatedNameSuffix, numberOfMids) {
+        this.requestGR.name = this.requestGR.name + duplicatedNameSuffix;
+        if (JSUtil.notNil(numberOfMids) &amp;&amp; !isNaN(numberOfMids))
+            this.requestGR.mid_quantity = numberOfMids;
+        this.requestGR.number = '';
+        this.requestGR.state = 'new';
+        this.requestGR.processed_at = null;
+        this.requestGR.results = '';
+        return this.requestGR.insert();
+    },
+
+    findDeploymentMIDServer: function() {
+        var midSelectMethod = this.requestGR.getValue('mid_select_method');
+        var deploymentMIDServerID;
+        var midSelector;
+        switch (midSelectMethod) {
+            case 'auto_select':
+                var application = MIDDeploymentRequest.findMIDApplication(this.requestGR.getValue('mid_application'));
+                var capabilities = this.requestGR.getValue('mid_capabilities');
+                var capabilityList = MIDDeploymentRequest.findMIDCapabilities(capabilities);
+                midSelector = new SNC.MidSelector();
+                try {
+                    deploymentMIDServerID = midSelector.selectAnyDegradedOrBetterMidServer(application, null, capabilityList);
+                } catch (e) {
+                    throw new Error(gs.getMessage("Could not find a suitable MID Server with application {0} and capabilities {1}. Error: {2}", [application, JSON.stringify(capabilityList), e]));
+                }
+                break;
+
+            case 'specific_cluster':
+                var midClusterID = this.requestGR.getValue('mid_cluster');
+                midSelector = new SNC.MidSelector();
+                try {
+                    deploymentMIDServerID = midSelector.selectAnyDegradedOrBetterMidServerFromClusterEx(this.MID_SERVER_MANAGEMENT, midClusterID);
+                } catch (e) {
+                    throw new Error(gs.getMessage("Could not find a suitable MID Server from the cluster with ID {0}. Error: {1}", [midClusterID, e]));
+                }
+                break;
+
+            case 'specific_mid_server':
+                deploymentMIDServerID = this.requestGR.getValue('mid_server');
+                break;
+
+            default:
+                throw new Error(gs.getMessage("Unknown MID selection Method {0}", midSelectMethod));
+        }
+
+        var agentCache = new SNC.ECCAgentCache();
+        var agentGR = agentCache.getBySysId(deploymentMIDServerID);
+        if (agentGR == null)
+            throw new Error(gs.getMessage("Could not find a deployment MID Server with ID {0}", deploymentMIDServerID));
+
+        return agentGR.getValue('name');
+    },
+
+    generateMIDServerNames: function() {
+        var auto_generate = JSUtil.getBooleanValue(this.requestGR, 'auto_generate_mid_names');
+        if (auto_generate) {
+            var quantity = this.requestGR.getValue('mid_quantity');
+            if (quantity &lt;= 0)
+                throw new Error(gs.getMessage("The MID server quantity {0} must be a positive number", quantity));
+
+            if (quantity &gt; this.maxMidQuantity)
+                throw new Error(gs.getMessage("The MID server quantity {0} is greater than the maximum number {1} of MID Servers allowed per request", [quantity, this.maxMidQuantity]));
+
+            var prefix = this.requestGR.getValue('mid_server_name_prefix');
+            var midServerNames = '';
+            var numMgr = new NumberManager('ecc_agent');
+            for (var i = 0; i &lt; quantity; i++) {
+                var midName = numMgr.getNextObjNumberPadded();
+                if (i &gt; 0)
+                    midServerNames += ",";
+                midServerNames += midName.replace('MID_', prefix);
+            }
+            this.requestGR.setValue('mid_server_names', midServerNames);
+            this.requestGR.update();
+            return midServerNames;
+        }
+        return this.requestGR.getValue('mid_server_names');
+    },
+
+    validateMIDServerNames: function(midNameList) {
+        if (JSUtil.nil(midNameList) || midNameList.length == 0)
+            throw new Error(gs.getMessage("The list of new MID server names is empty"));
+
+        // check for duplicate MID Server name
+        var duplicates = [];
+        var agentCache = new SNC.ECCAgentCache();
+        for (var i = 0; i &lt; midNameList.length; i++) {
+            var agentGR = agentCache.getByName(midNameList[i]);
+            if (agentGR)
+                duplicates.push(midNameList[i]);
+        }
+
+        if (duplicates.length &gt; 0)
+            throw new Error(gs.getMessage("The MID server names {0} are already in use!", duplicates.join()));
+    },
+
+    isStatefulSet: function() {
+        return JSUtil.getBooleanValue(this.requestGR, "ss_choice");
+    },
+
+    getK8sDeploymentRequest: function() {
+        if (this.realTableName != 'mid_k8s_deployment')
+            throw new Error(gs.getMessage("The deployment type {0} is not supported!", this.realTableName));
+
+        var k8sDeploymentLabel = MIDDeploymentRequest.toJSON(this.requestGR.getValue("k8s_deployment_label"));
+        var profileID = this.requestGR.getValue("profile");
+        var profile = MIDDeploymentRequest.getProfile(profileID);
+
+        var midServerNames = this.generateMIDServerNames();
+        var midNameList = MIDDeploymentRequest.toArray(midServerNames);
+        this.validateMIDServerNames(midNameList);
+
+        var deployRequest = {};
+        deployRequest["deployment_request_id"] = this.requestID;
+        deployRequest["name"] = this.requestGR.getValue('name');
+        deployRequest["type"] = this.realTableName;
+        deployRequest["profile"] = profile;
+
+        deployRequest["container_image_repository"] = this.requestGR.getValue("container_image_repository");
+        deployRequest["container_image_tag"] = this.requestGR.getValue("container_image_tag");
+
+        deployRequest["cpu_request"] = this.requestGR.getValue("cpu_request");
+        deployRequest["memory_request"] = this.requestGR.getValue("memory_request");
+        deployRequest["cpu_limit"] = this.requestGR.getValue("cpu_limit");
+        deployRequest["memory_limit"] = this.requestGR.getValue("memory_limit");
+
+        deployRequest["post_start_command"] = this.requestGR.getValue("post_start_command");
+        deployRequest["pre_stop_command"] = this.requestGR.getValue("pre_stop_command");
+        deployRequest["termination_grace_time"] = this.requestGR.getValue("termination_grace_time");
+
+        deployRequest["k8s_namespace"] = this.requestGR.getValue("k8s_namespace");
+        deployRequest["k8s_service_account"] = this.requestGR.getValue("k8s_service_account");
+        deployRequest["k8s_deployment_label"] = k8sDeploymentLabel;
+
+        deployRequest["mid_secrets_name"] = this.requestGR.getValue("mid_secrets_name");
+        deployRequest["mid_secrets_file_path"] = this.requestGR.getValue("mid_secrets_file_path");
+
+        deployRequest["mid_mutual_auth_pem_secrets_name"] = this.requestGR.getValue("mid_mutual_auth_pem_secrets_name");
+        deployRequest["mid_mutual_auth_pem_file_path"] = this.requestGR.getValue("mid_mutual_auth_pem_file_path");
+
+        deployRequest["mid_server_names"] = midNameList;
+        return deployRequest;
+    },
+
+    createK8sProbe: function() {
+        if (this.realTableName != 'mid_k8s_deployment')
+            throw new Error(gs.getMessage("The deployment type {0} is not supported!", this.realTableName));
+
+        if (this.isStatefulSet())
+            throw new Error(gs.getMessage("StatefulSet is only supported via exported YAML file!"));
+
+        var deploymentMIDServer = this.findDeploymentMIDServer();
+        var deployRequest = this.getK8sDeploymentRequest();
+
+        var probe = new SncProbe();
+        probe.setName(deployRequest['name']);
+        probe.setTopic("KubernetesOperationProbe");
+        probe.setSource('');
+        probe.addParameter("enc_input_payload", "false");
+        probe.addParameter("skip_sensor", "true");
+        probe.addParameter("deployment_request_id", this.requestID);
+
+        var jsonStr = JSON.stringify(deployRequest);
+        var deployRequestBase64 = GlideStringUtil().base64Encode(jsonStr);
+        probe.addEncryptedParameter("deployment_request", deployRequestBase64);
+        var eccOutputSysId = probe.create(deploymentMIDServer);
+        if (JSUtil.nil(eccOutputSysId))
+            throw new Error(gs.getMessage("Failed to create KubernetesOperationProbe to the deployment MID server {0}", deploymentMIDServer));
+        var result = {};
+        result["eccOutputSysId"] = eccOutputSysId;
+        result["deploymentRequest"] = deployRequest;
+        return result;
+    },
+
+    clone: function(oldRequestId, newRequestId) {
+        this._copyRequestValues("mid_k8s_deployment_hpav2_behavior_policies", oldRequestId, newRequestId);
+        this._copyRequestValues("mid_k8s_deployment_hpav2_metrics", oldRequestId, newRequestId);
+    },
+
+    _copyRequestValues: function(tableName, oldRequestId, newRequestId) {
+        var gr = new GlideRecord(tableName);
+        gr.addQuery("mid_k8s_deployment_request", oldRequestId);
+        gr.query();
+        while (gr.next()) {
+            gr.setValue('mid_k8s_deployment_request', newRequestId);
+            gr.insert();
+        }
+    },
+
+    type: 'MIDDeploymentRequest'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;cong.thieu&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-08-24 21:03:09&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;49460fe753463010347cddeeff7b12b3&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;30&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;MIDDeploymentRequest&lt;/sys_name&gt;
+        &lt;sys_package display_value="MID Server" source="com.glideapp.agent"&gt;a6877ce83cb1311068bcf327dfe37f69&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_49460fe753463010347cddeeff7b12b3&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;now.midserver&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-08-04 18:37:00&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:36:39</sys_created_on>
+        <sys_id>4f8678d983f01210c6695855eeaad3ab</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>MIDDeploymentRequest</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_4f8678d983f01210c6695855eeaad3ab</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:36:39</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

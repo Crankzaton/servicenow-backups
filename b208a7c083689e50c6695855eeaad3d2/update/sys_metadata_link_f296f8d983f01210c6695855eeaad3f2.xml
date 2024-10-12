@@ -1,0 +1,276 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>4e205b6087aeb51060faa7530cbb355f</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.wf_SvcCriticalityUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;wf_SvcCriticalityUtils&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var wf_SvcCriticalityUtils = Class.create();
+wf_SvcCriticalityUtils.prototype = {
+    initialize: function() {},
+
+    /*
+	propagateToParent
+	=================
+    Propagates criticality updates to a parent record.
+    Where a parent has multiple child records, use the highest criticality (lowest number value) of all applicable children
+    Inputs:
+    	parentTableName: table_name of parent record
+    	parentValueSysId: sys_id of parent record
+    	parentFieldCriticality: the field name of the 'Criticality' attribute on child table
+    	childTableName: table name of child table 
+    	childFieldParent: field nema of 'Parent' attribute that references the parent from the child
+    	childFieldCriticality: field name of the 'Criticality' attribute on child table
+    	childEncodedQuery: OPTIONAL - additional encoded query
+    Returns:
+    	No UI returns - likely to be run from import set or Catalog item
+    	Parameter errors logged in syslog table
+    	
+    */
+    propagateToParent: function(parentTableName,
+        parentValueSysId,
+        parentFieldCriticality,
+        childTableName,
+        childFieldParent,
+        childFieldCriticality,
+        childEncodedQuery) {
+
+        // validate all mandatory parameters 
+        if (!parentTableName || parentTableName == '' ||
+            !parentValueSysId || parentValueSysId == '' ||
+            !parentFieldCriticality || parentFieldCriticality == '' ||
+            !childTableName || childTableName == '' ||
+            !childFieldParent || childFieldParent == '' ||
+            !childFieldCriticality || childFieldCriticality == '') {
+            gs.info(gs.getMessage('Unable to propagate business criticality to parent - invalid paramaters'))
+            return;
+        }
+
+        // get parent record
+        var parentGr = new GlideRecord(parentTableName);
+        if (parentGr.get(parentValueSysId)) {
+            // get highest criticality for all children of parent record
+            var criticalAttrValue = this.getMaxChildCriticality(childTableName, childFieldParent, parentValueSysId, childEncodedQuery, childFieldCriticality);
+            // update parent record
+            parentGr.setValue(parentFieldCriticality, criticalAttrValue);
+            parentGr.update();
+        }
+    },
+
+
+    /*
+    DXC propagateThroughM2m  propagates criticality updates through m2m relationships.
+    Where a target has multiple related source records, use the highest criticality (lowest number value) of all related records 
+    Inputs:
+    	targetTableName : table_name of target record
+    	targetFieldCriticality : the field name of the 'Criticality' attribute on target table
+    	sourceTableName: table name of source table (the record triggering this function)
+    	sourceValueSysId: sys_id of source record (the record triggering this function)
+    	sourceFieldCriticality : the field name of the 'Criticality' attribute on source table
+    	m2mTableName : table name of M2m relationship table
+    	m2mFieldTarget : field name referencing target record in M2m table
+    	m2mFieldSource : field name referencing source record in M2m table
+    	sourceEncodedQuery : OPTIONAL - additional encoded query on source table
+    	m2mEncodedQuery : OPTIONAL  - additional encoded query on M2m table       	
+    */
+    propagateThroughM2m: function(targetTableName,
+        targetFieldCriticality,
+        sourceTableName,
+        sourceValueSysId,
+        sourceFieldCriticality,
+        m2mTableName,
+        m2mFieldTarget,
+        m2mFieldSource,
+        sourceEncodedQuery,
+        m2mEncodedQuery) {
+
+        // validate all mandatory parameters 
+        if (!targetTableName || targetTableName == '' ||
+            !targetFieldCriticality || targetFieldCriticality == '' ||
+            !sourceTableName || sourceTableName == '' ||
+            !sourceValueSysId || sourceValueSysId == '' ||
+            !sourceFieldCriticality || sourceFieldCriticality == '' ||
+            !m2mTableName || m2mTableName == '' ||
+            !m2mFieldTarget || m2mFieldTarget == '' ||
+            !m2mFieldSource || m2mFieldSource == '') {
+            gs.info(gs.getMessage('Unable to propagate business criticality to m2m target - invalid paramaters'))
+            return;
+        }
+
+        // get target records via m2m
+        var m2mGr = new GlideRecord(m2mTableName);
+        m2mGr.addQuery(m2mFieldSource, sourceValueSysId);
+		var targetClassQry = m2mFieldTarget + '.sys_class_name';
+		m2mGr.addQuery(targetClassQry, targetTableName );
+        m2mGr.addEncodedQuery(m2mEncodedQuery);
+        m2mGr.query();
+        while (m2mGr.next()) {
+            // for each target record get highest criticality of source records via M2m
+            var targetGr = new GlideRecord(targetTableName);
+            if (targetGr.get(m2mGr.getValue(m2mFieldTarget))) {
+                var criticalAttrValue = this.getMaxM2mCriticality(m2mTableName,
+                    m2mFieldTarget,
+                    m2mGr.getValue(m2mFieldTarget),
+                    m2mEncodedQuery,
+                    sourceTableName,
+                    m2mFieldSource,
+                    sourceEncodedQuery,
+                    sourceFieldCriticality);
+                // update target record
+                targetGr.setValue(targetFieldCriticality, criticalAttrValue);
+                targetGr.update();
+            }
+        }
+    },
+
+
+
+    /*
+    DXC propagateFromM2m  propagates criticality updates from m2m relationship  (create / delete).
+    Where a target has multiple related source records, use the highest criticality (lowest number value) of all related records 
+    Inputs:
+    	targetTableName : table_name of target record
+    	targetFieldCriticality : the field name of the 'Criticality' attribute on target table
+    	sourceTableName: table name of source table (the record being updated)
+    	targetValueSysId: sys_id of target record (the record being cascaded to)
+    	sourceFieldCriticality : the field name of the 'Criticality' attribute on source table
+    	m2mTableName : table name of M2m relationship table
+    	m2mFieldTarget : field name referencing target record in M2m table
+    	m2mFieldSource : field name referencing source record in M2m table
+    	sourceEncodedQuery : OPTIONAL - additional encoded query on source table
+    	m2mEncodedQuery : OPTIONAL  - additional encoded query on M2m table       	
+    */
+    propagateFromM2m: function(targetTableName,
+        targetFieldCriticality,
+        sourceTableName,
+        targetValueSysId,
+        sourceFieldCriticality,
+        m2mTableName,
+        m2mFieldTarget,
+        m2mFieldSource,
+        sourceEncodedQuery,
+        m2mEncodedQuery) {
+
+        // validate all mandatory parameters
+        if (!targetTableName || targetTableName == '' ||
+            !targetFieldCriticality || targetFieldCriticality == '' ||
+            !sourceTableName || sourceTableName == '' ||
+            !targetValueSysId || targetValueSysId == '' ||
+            !sourceFieldCriticality || sourceFieldCriticality == '' ||
+            !m2mTableName || m2mTableName == '' ||
+            !m2mFieldTarget || m2mFieldTarget == '' ||
+            !m2mFieldSource || m2mFieldSource == '') {
+            gs.info(gs.getMessage('Unable to propagate business criticality to m2m target - invalid paramaters'))
+            return;
+        }
+        // get target record 
+        var targetGr = new GlideRecord(targetTableName);
+        if (targetGr.get(targetValueSysId)) {
+            //for target record get highest criticality of source records via M2m
+            var criticalAttrValue = this.getMaxM2mCriticality(m2mTableName,
+                m2mFieldTarget,
+                targetValueSysId,
+                m2mEncodedQuery,
+                sourceTableName,
+                m2mFieldSource,
+                sourceEncodedQuery,
+                sourceFieldCriticality);
+            // update target record   m2mTableName, m2mFieldTarget, targetValueSysId, ,m2mEncodedQuery sourceTableName, m2mFieldSource, sourceEncodedQuery, sourceFieldCriticality
+            targetGr.setValue(targetFieldCriticality, criticalAttrValue);
+            targetGr.update();
+        }
+    },
+
+
+    getMaxChildCriticality: function(childTableName,
+        parentAttr,
+        parentAttrValue,
+        additionalEncQry,
+        criticalAttrName) {
+        //get highest criticality of source records
+        var grChildTable = new GlideRecord(childTableName);
+        grChildTable.addQuery(parentAttr, parentAttrValue);
+        grChildTable.addEncodedQuery(additionalEncQry);
+        grChildTable.orderBy(criticalAttrName);
+        grChildTable.query();
+        if (grChildTable.next()) {
+            return grChildTable.getValue(criticalAttrName);
+        }
+        return '4 - not critical'; // default if no child records found
+
+    },
+
+
+    getMaxM2mCriticality: function(m2mTableName,
+        m2mFieldTarget,
+        targetValueSysId,
+        m2mEncodedQuery,
+        sourceTableName,
+        m2mFieldSource,
+        sourceEncodedQuery,
+        sourceFieldCriticality) {
+
+        // get source records via m2m
+        var returnCritval = '4 - not critical'
+        var m2mGr2 = new GlideRecord(m2mTableName); // unique variable name so as not to affect calling function
+        m2mGr2.addQuery(m2mFieldTarget, targetValueSysId);
+        var sourceClassQry = m2mFieldSource + '.sys_class_name';
+        m2mGr2.addQuery(sourceClassQry, sourceTableName);
+        m2mGr2.addEncodedQuery(m2mEncodedQuery);
+        m2mGr2.query();
+        while (m2mGr2.next()) {
+            // for each target record get highest criticality of source records via M2m
+            var sourceGr = new GlideRecord(sourceTableName);
+            if (sourceGr.get(m2mGr2.getValue(m2mFieldSource))) {
+                if (GlideFilter.checkRecord(sourceGr, sourceEncodedQuery)) {
+                    var targetCritVal = sourceGr.getValue(sourceFieldCriticality);
+                    if (targetCritVal[0] &lt; returnCritval[0]) { // higher criticality starts with  lower number
+                        returnCritval = targetCritVal
+                    }
+               }
+
+            }
+        }
+        return returnCritval;
+    },
+
+
+
+    type: 'wf_SvcCriticalityUtils'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;U843070&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-11-13 19:22:38&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;4e205b6087aeb51060faa7530cbb355f&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;22&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;wf_SvcCriticalityUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Global" source="global"&gt;global&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_4e205b6087aeb51060faa7530cbb355f&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-02-04 17:24:19&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:36:54</sys_created_on>
+        <sys_id>f296f8d983f01210c6695855eeaad3f2</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>wf_SvcCriticalityUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_f296f8d983f01210c6695855eeaad3f2</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:36:54</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,307 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>a51652e077911110a956b9999a5a99e4</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_employee.ep_AccessManagement&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Provide APIs to refesh application access for employees that meet a criteria&lt;/description&gt;
+        &lt;name&gt;ep_AccessManagement&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ep_AccessManagement = Class.create();
+ep_AccessManagement.prototype = {
+    initialize: function(appName) {
+        this.GRANT_ACTION = 'GRANT';
+        this.CREATE_ACTION = 'CREATE';
+        this.REVOKE_ACTION = 'REVOKE';
+        this.ACTION_EVENT_NAME = 'sn_employee.update.employee.app.access';
+        this.REFRESH_APP_EVENT_NAME = 'sn_employee.refresh.employee.app.access';
+        this.REFRESH_EVENT_STAGGER_NAME = 'sn_employee.refresh_app_event_stagger';
+        this.GRANT_STAGGER_NAME = 'sn_employee.app_access_grant_stagger';
+        this.REVOKE_STAGGER_NAME = 'sn_employee.app_access_revoke_stagger';
+        this.MAX_USER_PER_EVENT_NAME = 'sn_employee.max_users_per_grant_event';
+        this.appGr = null;
+        this.appName = null;
+        this.accessCondition = '';
+        this.profileCondition = '';
+        var appGr = new GlideRecord('sn_employee_app');
+        if (appGr.get('name', appName)) {
+            this.appName = appName;
+            this.appGr = appGr;
+        }
+    },
+
+    /** 
+     *  Schedule events to refresh access accross all Licensed Applications (sn_employee_app)
+     *  @returns void
+     */
+    refreshAccessForAllApps: function() {
+        var gdtWhenToProcess = new GlideDateTime();
+        var employeeAppGr = new GlideRecord('sn_employee_app');
+        employeeAppGr.query();
+        while (employeeAppGr.next()) {
+            gs.eventQueueScheduled(this.REFRESH_APP_EVENT_NAME, employeeAppGr, '', '', gdtWhenToProcess);
+            gdtWhenToProcess.addSeconds(this._getNumberProperty(this.REFRESH_EVENT_STAGGER_NAME, 300));
+        }
+    },
+
+    /** 
+     *  Refresh access for a Licensed Application (sn_employee_app)
+     *  @param {GlideRecord} employeeAppGr - sn_employee_app record to refresh access
+     *  @returns void
+     */
+    refreshAccessForApp: function(employeeAppGr) {
+        if (!employeeAppGr.isValidRecord())
+            throw this._getError('Invalid employee app GlideRecord');
+
+        //no criteria for app
+        var criteriaGr = new GlideRecord("sn_employee_app_access_criteria");
+        if (!criteriaGr.get('app', employeeAppGr.getUniqueValue()))
+            return;
+
+        this.appGr = employeeAppGr;
+        this.appName = employeeAppGr.getValue('name');
+        employeeAppGr.setValue('last_run_time', new GlideDateTime());
+        employeeAppGr.update();
+
+        this._setConditions();
+        this.grantAccess(this.profileCondition);
+        this.createAccess(this.accessCondition);
+    },
+
+    /** 
+     *  Grant app access by updating sn_employee_app_access to active for each profile that meets the @param condition
+     *  @param {String} condition - condition used to evaluate granting access for employee app access
+     *  @returns void
+     */
+    grantAccess: function(condition) {
+        var MAX_USERS_PER_EVENT = this._getNumberProperty(this.MAX_USER_PER_EVENT_NAME, 25000);
+        var appAccessGr = new GlideRecord('sn_employee_app_access');
+        appAccessGr.addEncodedQuery(condition);
+        appAccessGr.addQuery('app', this.appGr.getUniqueValue());
+        appAccessGr.addQuery('last_granted', '!=', this.appGr.getValue('last_run_time'));
+        appAccessGr.addQuery('profile.user.active', true);
+        appAccessGr.setLimit(MAX_USERS_PER_EVENT);
+
+        appAccessGr.setValue('last_granted', this.appGr.getValue('last_run_time'));
+        appAccessGr.setValue('active', true);
+        appAccessGr.updateMultiple();
+
+        //check if we have more records to grant outside of batch size
+        var extraGrantAccessGr = new GlideRecord('sn_employee_app_access');
+        extraGrantAccessGr.addEncodedQuery(condition);
+        extraGrantAccessGr.addQuery('last_granted', '!=', this.appGr.getValue('last_run_time'));
+        extraGrantAccessGr.addQuery('app', this.appGr.getUniqueValue());
+        extraGrantAccessGr.addQuery('profile.user.active', true);
+        extraGrantAccessGr.setLimit(1);
+        extraGrantAccessGr.query();
+        if (extraGrantAccessGr.hasNext()) {
+            var params = {};
+            params['appName'] = this.appName;
+            params['action'] = this.GRANT_ACTION;
+            params['condition'] = condition;
+
+            //schedule another grantAccess
+            var gdtWhenToProcess = new GlideDateTime().addSeconds(this._getNumberProperty(this.GRANT_STAGGER_NAME, 30));
+            gs.eventQueueScheduled(this.ACTION_EVENT_NAME, this.appGr, JSON.stringify(params), '', gdtWhenToProcess);
+        } else
+            this.revokeAccess(); //granting complete, move to revoke
+    },
+
+    /** 
+     *  Grant app access by creating sn_employee_app_access for each profile that meets the @param condition 
+     *  @param {String} condition - condition used to evaluate granting access for employee app access
+     *  @returns void
+     */
+    createAccess: function(condition) {
+        var counter = this._getNumberProperty(this.MAX_USER_PER_EVENT_NAME, 25000);
+        //includes all profiles that meet a condition which have no matching sn_employee_app_access.profile for the current app
+        var rlCondition = '^RLQUERYsn_employee_app_access.profile,=0^app=' + this.appGr.getUniqueValue() + '^ENDRLQUERY';
+        var profileGr = new GlideRecord('sn_employee_profile');
+        profileGr.addQuery('user.active', true);
+        profileGr.addEncodedQuery(condition + rlCondition);
+        profileGr.setLimit(counter + 1); // limit query results because processing in batch size of counter
+        profileGr.query();
+        while (counter &gt; 0 &amp;&amp; profileGr.next()) {
+            try {
+                var appAccessGr = new GlideRecord('sn_employee_app_access');
+                appAccessGr.setValue('app', this.appGr.getUniqueValue());
+                appAccessGr.setValue('profile', profileGr.getUniqueValue());
+                appAccessGr.setValue('date_granted', this.appGr.getValue('last_run_time'));
+                appAccessGr.setValue('last_granted', this.appGr.getValue('last_run_time'));
+                appAccessGr.setValue('active', true);
+                appAccessGr.insert();
+            } catch (error) {
+                throw this._getError('Insert of an employee app access record failed - ' + error);
+            }
+            counter--;
+        }
+
+        if (profileGr.hasNext()) {
+            var params = {};
+            params['appName'] = this.appName;
+            params['action'] = this.CREATE_ACTION;
+            params['condition'] = condition;
+
+            //schedule another createAccess
+            var gdtWhenToProcess = new GlideDateTime().addSeconds(this._getNumberProperty(this.GRANT_STAGGER_NAME, 30));
+            gs.eventQueueScheduled(this.ACTION_EVENT_NAME, this.appGr, JSON.stringify(params), '', gdtWhenToProcess);
+        }
+    },
+
+    /** 
+     *  Revoke app access by setting sn_employee_app_access inactive for employees that did not 
+     *  meet the sn_employee_app_access_criteria condition
+     *  @returns void
+     */
+    revokeAccess: function() {
+        var MAX_USERS_PER_EVENT = this._getNumberProperty(this.MAX_USER_PER_EVENT_NAME, 25000);
+        var appAccessGr = new GlideRecord('sn_employee_app_access');
+        appAccessGr.addQuery('last_granted', '!=', this.appGr.getValue('last_run_time'));
+        appAccessGr.addQuery('app', this.appGr.getUniqueValue());
+        appAccessGr.addActiveQuery();
+        appAccessGr.setLimit(MAX_USERS_PER_EVENT);
+
+        appAccessGr.setValue('active', false);
+        appAccessGr.setValue('date_revoked', this.appGr.getValue('last_run_time'));
+        appAccessGr.updateMultiple();
+
+        //check if we have more records to revoke outside of batch size
+        var extraRevokeAccessGr = new GlideRecord('sn_employee_app_access');
+        extraRevokeAccessGr.addQuery('last_granted', '!=', this.appGr.getValue('last_run_time'));
+        extraRevokeAccessGr.addQuery('app', this.appGr.getUniqueValue());
+        extraRevokeAccessGr.addActiveQuery();
+        extraRevokeAccessGr.setLimit(1);
+        extraRevokeAccessGr.query();
+        if (extraRevokeAccessGr.hasNext()){
+            var params = {};
+            params['appName'] = this.appName;
+            params['action'] = this.REVOKE_ACTION;
+
+            //schedule another revokeAccess
+            var gdtWhenToProcess = new GlideDateTime().addSeconds(this._getNumberProperty(this.REVOKE_STAGGER_NAME, 30));
+            gs.eventQueueScheduled(this.ACTION_EVENT_NAME, this.appGr, JSON.stringify(params), '', gdtWhenToProcess);
+        }
+
+    },
+
+    /** 
+     *  Set encoded query conditions for all criteria for an sn_employee_app
+     *  @returns void
+     */
+    _setConditions: function() {
+        var accessCondition = '';
+        var profileCondition = '';
+
+        var criteriaGr = new GlideRecord('sn_employee_app_access_criteria');
+        criteriaGr.query('app', this.appGr.getUniqueValue());
+        criteriaGr.query();
+        while (criteriaGr.next()) {
+            if (accessCondition !== '')
+                accessCondition += '^NQ';
+            if (accessCondition !== '')
+                profileCondition += '^NQ';
+
+            var criteria = criteriaGr.getValue('criteria');
+            if (criteria &amp;&amp; criteria !== '') {
+                accessCondition += criteria;
+                profileCondition += this._getProfileQuery(criteria, 'profile');
+            }
+        }
+
+        //used when querying employee profile table for create records
+        this.accessCondition = accessCondition; 
+        //used when querying sn_employee_app_access with a profile column name preappended to each condition field for grant
+        this.profileCondition = profileCondition;
+    },
+
+    /*
+     * Adapt an employee profile encoded query to work on a non employee profile table using the @param profileColumn
+     * @param {String} encodedQuery - Encoded query to adapt
+     * @param {String} profileColumn - employee profile field name to use to adapt encoded query
+     * @return (String) Parsed encoded query
+     */
+    _getProfileQuery: function(encodedQuery, profileColumn) {
+        if (!encodedQuery || !profileColumn || profileColumn == 'sys_id')
+            return encodedQuery;
+        if (encodedQuery.endsWith('^EQ'))
+            encodedQuery = encodedQuery.substring(0, encodedQuery.length - 3);
+
+        var queries = encodedQuery.split('^NQ');
+        var queriesRet = [];
+        for (var i = 0; i &lt; queries.length; i++) {
+            var orConditions = queries[i].split('^OR');
+            var orConditionsRet = [];
+            for (var j = 0; j &lt; orConditions.length; j++) {
+                var andConditions = orConditions[j].split('^');
+                var andConditionsRet = [];
+                for (var k = 0; k &lt; andConditions.length; k++)
+                    andConditionsRet.push(profileColumn + '.' + andConditions[k]);
+                if (andConditionsRet.length &gt; 0)
+                    orConditionsRet.push(andConditionsRet.join('^'));
+            }
+            if (orConditionsRet.length &gt; 0)
+                queriesRet.push(orConditionsRet.join('^OR'));
+        }
+        return queriesRet.join('^NQ');
+    },
+	
+    /** Return a number value for a given property
+     * @param {String} propName - Name of a property
+     * @param {Number} defaultValue - The default value to use for a property
+     * @return {Number} The number value for a given property
+     */
+    _getNumberProperty: function(propName, defaultValue) {
+        var propValue = Number(gs.getProperty(propName, defaultValue));
+        if (isNaN(propValue) || propValue &lt;= 0) {
+            gs.warn('Script - ' + this.type + ': Overriding invalid property value for ' + propName);
+            propValue = defaultValue;
+        }
+        return propValue;
+    },
+
+    /** 
+     *  Function to return an error
+	 *  @param {String} message - error message print in thrown exception
+     *  @returns {Error} The error to throw
+     */
+    _getError: function(message) {
+        var errorMessage = 'Script Include - ' + this.type + ' : ' + message;
+        return new Error(errorMessage);
+    },
+
+    type: 'ep_AccessManagement'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-08-10 19:25:41&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;a51652e077911110a956b9999a5a99e4&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;395&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ep_AccessManagement&lt;/sys_name&gt;
+        &lt;sys_package display_value="Employee Profile" source="sn_employee"&gt;1e95bac2738f001001b566b90ff6a7cd&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Employee Profile"&gt;1e95bac2738f001001b566b90ff6a7cd&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_a51652e077911110a956b9999a5a99e4&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-09-01 18:49:41&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:46:36</sys_created_on>
+        <sys_id>74d8f49183341210c6695855eeaad3e2</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ep_AccessManagement</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_74d8f49183341210c6695855eeaad3e2</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:46:36</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

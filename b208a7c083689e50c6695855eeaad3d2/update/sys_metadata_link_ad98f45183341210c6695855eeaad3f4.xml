@@ -1,0 +1,1103 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>91e1dd4c439e11102695d6085bb8f26f</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.PwdVAEnrollmentManager&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;PwdVAEnrollmentManager&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var PwdVAEnrollmentManager = Class.create();
+PwdVAEnrollmentManager.prototype = {
+    PARM_NUM_ENROLL: 'num_enroll',
+    CREATE_MODE: "create",
+    UPDATE_MODE: "update",
+    IN_PROGRESS: "0",
+    ACTIVE: "1",
+    INACTIVE: "2",
+    SUCCESS: "Success",
+    ERROR: "Error",
+    OTHER: "Other",
+    CODE_LENGTH: 6,
+    manager: new PwdEnrollmentManager(),
+    INVALID_PHONE_NUMBER: -4,
+    INVALID_REQUEST_RESPONSE: -3,
+    PAUSE_WINDOW_RESPONSE: -2,
+    PER_DAY_LIMIT_RESPONSE: -1,
+    GENERIC_FAIL_RESPONSE: 0,
+    SUCCESS_RESPONSE: 1,
+    PWD_MESSAGE: '7cd0c421bf200100710071a7bf0739bd',
+    UNSUBSCRIBE: 'c1bfa4040a0a0b8b001eeb0f3f5ee961',
+    SMS: 'SMS',
+    EMAIL: 'Email',
+    initialize: function() {
+        this.helper = new PwdNotificationHelper();
+    },
+
+    //General
+    getEntitledPasswordResetProcesses: function(userId) {
+        var processes = {};
+        var processIds = new global.PasswordResetScopedUtil().getProcessIdsByUserId(userId);
+        for (var i = 0; i &lt; processIds.length; i++) {
+            var processId = processIds[i];
+            var process = new SNC.PwdProcess(processId);
+            if (process.getId() == null || !process.isPublic() || !process.isActive() || (!process.isResetPwd() &amp;&amp; !process.isUnlockAccount()))
+                continue;
+            var verificationList = new SNC.PwdVerificationManager().getVerificationIds();
+            var processVerificationGr = new GlideRecord('pwd_map_proc_to_verification');
+            processVerificationGr.addQuery('process', processId);
+            processVerificationGr.addQuery('verification', 'IN', verificationList);
+            processVerificationGr.query();
+            if (processVerificationGr.next()) {
+                processes[process.getId()] = process.getLabel();
+            }
+        }
+        var otherAppVerifications = new global.PasswordResetScopedUtil().getVerificationsFromOtherApplications();
+        if (otherAppVerifications.size() &gt; 0)
+            processes["Other"] = this.OTHER;
+        return JSON.stringify(processes);
+    },
+
+    getEnrollmentVerificationsForProcess: function(userId, processId) {
+        var processMgr = new SNC.PwdProcessManager();
+        var enrollmentMgr = new SNC.PwdEnrollmentManager();
+        var result = {
+            "verificationIds": {},
+            "verificationTypeIds": {},
+            "info": ""
+        };
+        var verificationIds = {};
+        var verificationTypeIds = {};
+        var pwdVericationMgr = new SNC.PwdVerificationManager();
+        var info = "";
+        if (processId == this.OTHER) {
+            var infoHeader = gs.getMessage("For your selection,");
+            var enrolledVerifications = [];
+            var nonEnrolledVerifications = [];
+            var otherAppVerifications = new global.PasswordResetScopedUtil().getVerificationsFromOtherApplications();
+            var index = 0;
+            while (index != otherAppVerifications.size()) {
+                var verificationId = otherAppVerifications.get(index);
+                var verLabel = pwdVericationMgr.getVerificationLabelByVerificationId(verificationId);
+                var verificationTypeId = pwdVericationMgr.getVerificationTypeIdByVerificationId(verificationId);
+                verificationIds[verificationId] = verLabel;
+                verificationTypeIds[verificationId] = verificationTypeId;
+                if (enrollmentMgr.isUserEnrolledByVerificationId(userId, verificationId))
+                    enrolledVerifications.push(verLabel);
+                else
+                    nonEnrolledVerifications.push(verLabel);
+                index++;
+            }
+            info = infoHeader + "\n";
+            if (enrolledVerifications.length &gt; 0) {
+                var enrolledInfo = gs.getMessage("You have completed {0} enrollment(s):", enrolledVerifications.length + "");
+                var enrolledListInfo = enrolledInfo + "\n";
+                for (var i = 0; i &lt; enrolledVerifications.length; i++) {
+                    enrolledListInfo = enrolledListInfo + "- " + enrolledVerifications[i] + "\n";
+                }
+                info = info + enrolledListInfo;
+            }
+            if (nonEnrolledVerifications.length &gt; 0) {
+                var nonEnrolledInfo = nonEnrolledVerifications.length &gt; 1 ? gs.getMessage("You have {0} additional enrollment(s) to choose from:", nonEnrolledVerifications.length + "") : gs.getMessage("You have 1 pending enrollment:");
+                var nonEnrolledListInfo = nonEnrolledInfo + "\n";
+                for (var i = 0; i &lt; nonEnrolledVerifications.length; i++) {
+                    nonEnrolledListInfo = nonEnrolledListInfo + "- " + nonEnrolledVerifications[i] + "\n";
+                }
+                info = info + nonEnrolledListInfo;
+            }
+            result.info = info;
+            result.verificationIds = verificationIds;
+            result.verificationTypeIds = verificationTypeIds;
+        } else {
+            var processMgr = new SNC.PwdProcessManager();
+            var process = new SNC.PwdProcess(processId);
+            var minVerificationsAtProcess = process.getMinVerifications();
+            var infoHeader = process.getLabel() + ",";
+            var enrolledVerifications = [];
+            var nonEnrolledVerifications = [];
+            var autoEnrollVerifications = {};
+            var mandatoryVerifications = processMgr.getProcessVerificationIdsByMandatoryFlag(processId, true);
+            for (var i = 0; i &lt; mandatoryVerifications.size(); i++) {
+                autoEnrollVerifications[mandatoryVerifications.get(i)] = true;
+            }
+            var nonEnrolledMandatory = 0;
+            var verificationList = new SNC.PwdVerificationManager().getVerificationIds();
+            var processVerificationGr = new GlideRecord('pwd_map_proc_to_verification');
+            processVerificationGr.addQuery('process', processId);
+            processVerificationGr.addQuery('verification', 'IN', verificationList);
+            processVerificationGr.query();
+            while (processVerificationGr.next()) {
+                var verificationId = processVerificationGr.getValue('verification');
+                autoEnrollVerifications[verificationId] = false;
+                var verLabel = pwdVericationMgr.getVerificationLabelByVerificationId(verificationId);
+                var verificationTypeId = pwdVericationMgr.getVerificationTypeIdByVerificationId(verificationId);
+                verificationIds[verificationId] = verLabel;
+                verificationTypeIds[verificationId] = verificationTypeId;
+                if (enrollmentMgr.isUserEnrolledByVerificationId(userId, verificationId))
+                    enrolledVerifications.push(verLabel);
+                else {
+                    nonEnrolledVerifications.push(verLabel);
+                    if (mandatoryVerifications.indexOf(verificationId) &gt; -1)
+                        nonEnrolledMandatory++;
+                }
+            }
+            var autoEnrollMandatoryVerificationsCount = 0;
+            for (var key in autoEnrollVerifications) {
+                if (autoEnrollVerifications[key])
+                    autoEnrollMandatoryVerificationsCount = autoEnrollMandatoryVerificationsCount + 1;
+            }
+            info = infoHeader + "\n";
+            if (enrolledVerifications.length &gt; 0) {
+                var enrolledInfo = gs.getMessage("You have completed {0} enrollment(s):", enrolledVerifications.length + "");
+                var enrolledListInfo = enrolledInfo + "\n";
+                for (var i = 0; i &lt; enrolledVerifications.length; i++) {
+                    enrolledListInfo = enrolledListInfo + "- " + enrolledVerifications[i] + "\n";
+                }
+                info = info + enrolledListInfo;
+            }
+            if (nonEnrolledVerifications.length &gt; 0) {
+                var enrolledVerificationsCount = enrolledVerifications.length + autoEnrollMandatoryVerificationsCount;
+                if (nonEnrolledMandatory &gt; 0 || (minVerificationsAtProcess &gt; enrolledVerificationsCount)) {
+                    reqVerificationsCount = (nonEnrolledMandatory + enrolledVerificationsCount) &lt; minVerificationsAtProcess ? minVerificationsAtProcess - enrolledVerificationsCount : nonEnrolledMandatory;
+                    var minVerificationInfo = gs.getMessage("You must enroll for at least {0} more verification(s) to complete your enrollment", reqVerificationsCount + "");
+                    info = info + minVerificationInfo;
+                }
+            }
+            result.info = info;
+            result.verificationIds = verificationIds;
+            result.verificationTypeIds = verificationTypeIds;
+        }
+        return JSON.stringify(result);
+    },
+
+    //Auth Enrollment
+    enableMFAVerification: function(userId, verificationId) {
+        if (!this._isAuthorized(userId))
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("You are not authorized to perform that action")
+            });
+        // Enable google auth for pwd reset
+        this._updateEnrollmentRecord(userId, this.IN_PROGRESS, verificationId);
+        return JSON.stringify({
+            "status": this.SUCCESS,
+            "message": gs.getMessage("Enabled Multi-factor authentication successfully")
+        });
+    },
+    isMFAEnabledForUser: function(userId, defaultVal, verificationId) {
+        var gr = new GlideRecord('pwd_enrollment');
+        gr.addQuery('user', userId);
+        gr.addQuery('verification', verificationId);
+        gr.query();
+        if (gr.next()) {
+            return gr.getValue("status") != this.INACTIVE; // NOT Inactive
+        }
+        return defaultVal;
+    },
+    getMFAContent: function() {
+        var contentMap = new Packages.java.util.HashMap();
+        var result = {};
+        contentMap = SNC.MultifactorAuthUtil.loadPopupContent();
+        if (contentMap != null) {
+            result = {
+                "validated": contentMap.get("validated").toString(),
+                "qrCodeURL": contentMap.get("qrCodeURL").toString(),
+                "qrCodeText": contentMap.get("qrCodeText").toString(),
+                "canDisable": contentMap.get("canDisable").toString(),
+                "registrationTime": contentMap.get("registrationTime").toString()
+            };
+        }
+        return JSON.stringify(result);
+    },
+    resetMFACode: function(userId, verificationId) {
+        if (!this._isAuthorized(userId))
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("You are not authorized to perform that action")
+            });
+        this._updateEnrollmentRecord(userId, this.IN_PROGRESS, verificationId);
+        SNC.MultifactorAuthUtil.reset(false);
+        return this.getMFAContent();
+    },
+    disableMFA: function(userId, verificationId) {
+        if (!this._isAuthorized(userId))
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("You are not authorized to perform that action")
+            });
+        // Disable google auth for pwd reset
+        this._updateEnrollmentRecord(userId, this.INACTIVE, verificationId);
+        if (!this._isMFAEnabledInUserProfile(userId))
+            SNC.MultifactorAuthUtil.reset(true);
+        return JSON.stringify({
+            "status": this.SUCCESS,
+            "message": gs.getMessage("Multi-factor authentication has been disabled.")
+        });
+    },
+    getHTMLContentForQRCode: function(qrCodeURL, qrCodeText) {
+        var header = gs.getMessage("Open the app and scan the QR code below to pair your mobile device");
+        var textPrefix = gs.getMessage("Or type in: {0}", qrCodeText);
+        var hint = "&lt;p&gt;" + header + "&lt;/p&gt;&lt;img src=\"" + qrCodeURL + "\"/&gt;&lt;p&gt;" + textPrefix + "&lt;/p&gt;";
+        return hint;
+    },
+    validateAndEnrollMFA: function(input, userId, verificationId) {
+        if (!this._isAuthorized(userId))
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("You are not authorized to perform that action")
+            });
+        if (input.length != this.CODE_LENGTH || gs.nil(input)) {
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("The Authenticator App code that you entered is invalid. Try again.")
+            });
+        }
+        var previouslyEnabled = this._isMFAEnabledInUserProfile(userId);
+        var valid = SNC.MultifactorAuthUtil.isResponseValid(input);
+        if (valid) {
+            // Update pwd_enrollment as a flag of pwd google auth being enabled for the user
+            this._updateEnrollmentRecord(userId, this.ACTIVE, verificationId);
+        }
+        //calling validateResponse will enable the mfa flag if it was previously disabled
+        //for password reset we disable it again after validating the resposne
+        if (!previouslyEnabled) {
+            var userGr = new GlideRecord("sys_user");
+            userGr.get(userId);
+            userGr.setValue("enable_multifactor_authn", false);
+            userGr.update();
+        }
+        return JSON.stringify({
+            "status": valid ? this.SUCCESS : this.ERROR,
+            "message": valid ? gs.getMessage("You have successfully enrolled for Authenticator App Verification") : gs.getMessage("The Authenticator App code that you entered is invalid. Try again.")
+        });
+    },
+    _isMFAEnabledInUserProfile: function(userId) {
+        var userGr = new GlideRecord("sys_user");
+        userGr.get(userId);
+        return userGr.getValue("enable_multifactor_authn") == this.ACTIVE;
+    },
+    _updateEnrollmentRecord: function(userId, status, verificationId) {
+    	if (gs.nil(userId) || gs.nil(verificationId))
+            return;
+        var gr = new GlideRecord('pwd_enrollment');
+        gr.addQuery('user', userId);
+        gr.addQuery('verification', verificationId);
+        gr.query();
+        if (gr.next())
+            new SNC.PwdEnrollmentManager().updateEnrollment(userId, verificationId, status);
+        else
+            new SNC.PwdEnrollmentManager().createEnrollment(userId, verificationId, status);
+            
+        new global.PwdEnrollSnapshotUtil().createOrUpdateEnrollmentSnapshot(verificationId, userId, status);
+    },
+    _isAuthorized: function(userId) {
+        if (userId == gs.getUserID())
+            return true;
+        return false;
+    },
+    //Security Questions Enrollment
+    isUserEnrolledForSecurityQuestions: function(userId, verificationId) {
+        var wasPreviouslyEnrolled = false;
+        var enrollmentGr = new GlideRecord("pwd_enrollment");
+        enrollmentGr.addQuery("user", userId);
+        enrollmentGr.addQuery("verification", verificationId);
+        enrollmentGr.query();
+        if (enrollmentGr.next()) {
+            wasPreviouslyEnrolled = true;
+        }
+        return wasPreviouslyEnrolled;
+    },
+    createOrUpdateSecurityQuestions: function(data, mode, userId, verificationId) {
+        var parsedData = JSON.parse(data);
+        var verificationTypeId = new SNC.PwdVerificationManager().getVerificationTypeIdByVerificationId(verificationId);
+        var enrollmentProcessor = new SNC.PwdVerificationType(verificationTypeId).getEnrollmentProcessor();
+        var result = this.manager.initializeByScriptNameAndCategory(enrollmentProcessor, "password_reset.extension.enrollment_form_processor");
+        if (!this.manager.extensionScriptFound()) {
+            gs.error('Cannot find enrollment processor extension: {0}', enrollmentProcessor);
+            res.isError = true;
+            res.errorMessage = gs.getMessage('Cannot find enrollment processor extension: {0}', enrollmentProcessor);
+            return res;
+        }
+        var dataMap = {
+            "can_submit": "true",
+            "from_VA": "true"
+        };
+        var storedAnswerSysIds = this.getEnrolledAnswerIds(userId, verificationId);
+        if (mode == this.CREATE_MODE) {
+            var i = 1;
+            for (var key in parsedData) {
+                dataMap["question_" + i] = key;
+                dataMap["answer_" + i] = parsedData[key]["answer"];
+                dataMap["normalized_answer_" + i] = parsedData[key]["normalizedAnswer"];
+                dataMap["changed_" + i] = "true";
+                dataMap["stored_sys_id_" + i] = storedAnswerSysIds.size() &gt; 0 ? storedAnswerSysIds.get(i - 1) : "";
+                i++;
+            }
+            dataMap["mode"] = this.CREATE_MODE;
+        } else if (mode == this.UPDATE_MODE) {
+            var storedQuestions = this.getEnrolledQuestions(userId, verificationId);
+            var questionAnswers = {};
+            for (var i = 0; i &lt; storedQuestions.length; i++) {
+                questionAnswers[storedQuestions[i]] = {
+                    "answer": parsedData[storedQuestions[i]] ? parsedData[storedQuestions[i]]["answer"] : "*******************",
+                    "normalizedAnswer": parsedData[storedQuestions[i]] ? parsedData[storedQuestions[i]]["normalizedAnswer"] : "*******************",
+                    "answerId": storedAnswerSysIds.get(i),
+                    "isChanged": parsedData[storedQuestions[i]] ? "true" : "false"
+                };
+            }
+            for (var key in parsedData) {
+                if (!questionAnswers[key])
+                    questionAnswers[key] = {
+                        "answer": parsedData[key]["answer"],
+                        "normalizedAnswer": parsedData[key]["normalizedAnswer"],
+                        "answerId": "",
+                        "isChanged": "true"
+                    };
+            }
+            var i = 1;
+            for (var entry in questionAnswers) {
+                dataMap["question_" + i] = entry;
+                dataMap["answer_" + i] = questionAnswers[entry]["answer"];
+                dataMap["normalized_answer_" + i] = questionAnswers[entry]["normalizedAnswer"];
+                dataMap["stored_sys_id_" + i] = questionAnswers[entry]["answerId"];
+                dataMap["changed_" + i] = questionAnswers[entry]["isChanged"];
+                i++;
+            }
+            dataMap["mode"] = this.UPDATE_MODE;
+        }
+        dataMap["min_length_for_qa"] = gs.getProperty('password_reset.qa.ans_min_len');
+        dataMap["count"] = this.getNumOfQuestionsToEnroll(verificationId);
+        dataMap["verification_id"] = verificationId;
+        dataMap["mandatory"] = "true";
+        return this.manager.createNew(dataMap, verificationId, userId);
+    },
+    getEnrolledQuestionsAnswerIds: function(userId, verificationId) {
+        var questions = this.getEnrolledQuestions(userId, verificationId);
+        var answerIds = this.getEnrolledAnswerIds(userId, verificationId);
+        var res = {};
+        for (var i = 0; i &lt; questions.length; i++) {
+            res[questions[i]] = answerIds.get(i);
+        }
+        return JSON.stringify(res);
+    },
+    isQAConfigurationChanged: function(userId, verificationId) {
+        var storedQuestions = this.getEnrolledQuestions(userId, verificationId);
+        if (parseInt(this.getNumOfQuestionsToEnroll(verificationId)) &gt; storedQuestions.length)
+            return true;
+        return false;
+    },
+    getEnrolledQuestions: function(userId, verificationId) {
+        var questions = [];
+        var qaManager = new SNC.PwdQAManager();
+        var storedAnswerIds = this.getEnrolledAnswerIds(userId, verificationId);
+        for (var i = 0; i &lt; storedAnswerIds.size(); i++) {
+            questions.push(qaManager.getStoredQuestionByAnswerId(storedAnswerIds.get(i)));
+        }
+        return questions;
+    },
+    getEnrolledQuestionIds: function(userId, verificationId) {
+        var questions = {};
+        var qaManager = new SNC.PwdQAManager();
+        var storedAnswerIds = qaManager.getStoredAnswerIdsByVerificationId(userId, verificationId);
+        for (var i = 0; i &lt; storedAnswerIds.size(); i++) {
+            var question = qaManager.getStoredQuestionByAnswerId(storedAnswerIds.get(i));
+            var gr = new GlideRecord("pwd_question");
+            gr.addQuery("question_translated", question);
+            gr.query();
+            if (gr.next())
+                questions[gr.getValue("sys_id")] = question;
+        }
+        return JSON.stringify(questions);
+    },
+    getEnrolledAnswerIds: function(userId, verificationId) {
+        var QAmanager = new SNC.PwdQAManager();
+        return QAmanager.getStoredAnswerIdsByVerificationId(userId, verificationId);
+    },
+    validateQuestionAnswers: function(answer, newAnswers, enrolledData) {
+        var res = {
+            "isError": false,
+            "errorMessage": ""
+        };
+        var newAnswer = new PasswordResetUtil().decryptWithKMFModule(answer);
+        var MIN_LENGTH = gs.getProperty('password_reset.qa.ans_min_len');
+        var trimmedAnswer = newAnswer.trim() + "";
+        if (trimmedAnswer == '') {
+            res.isError = true;
+            res.errorMessage = gs.getMessage("All questions should be answered");
+            return JSON.stringify(res);
+        } else if (trimmedAnswer.length &lt; MIN_LENGTH) {
+            res.isError = true;
+            res.errorMessage = gs.getMessage("Answer text must be at least {0} characters", MIN_LENGTH);
+            return JSON.stringify(res);
+        }
+        var enrolledAnswerIds = JSON.parse(enrolledData);
+        var data = JSON.parse(newAnswers);
+        if (Object.keys(enrolledAnswerIds).length == 0) {
+            if (Object.keys(data).length &gt; 0) {
+                for (var key in data) {
+                    var normalizedAnswer = data[key]["normalizedAnswer"];
+                    var isSameAnswer = new SNC.PwdQAManager().compareEncryptedAnswers(trimmedAnswer, normalizedAnswer);
+                    if (isSameAnswer) {
+                        res.isError = true;
+                        res.errorMessage = gs.getMessage("All answers must be unique");
+                        return JSON.stringify(res);
+                    }
+                }
+            }
+        } else {
+            for (var answerId in enrolledAnswerIds) {
+                if (!data[answerId]) {
+                    var isSameAnswer = new SNC.PwdQAManager().compareAnswers(enrolledAnswerIds[answerId], trimmedAnswer, false);
+                    if (isSameAnswer) {
+                        res.isError = true;
+                        res.errorMessage = gs.getMessage("All answers must be unique");
+                        return JSON.stringify(res);
+                    }
+                }
+            }
+            for (var key in data) {
+                var normalizedAnswer = data[key]["normalizedAnswer"];
+                var isSameAnswer = new SNC.PwdQAManager().compareEncryptedAnswers(trimmedAnswer, normalizedAnswer);
+                if (isSameAnswer) {
+                    res.isError = true;
+                    res.errorMessage = gs.getMessage("All answers must be unique");
+                    return JSON.stringify(res);
+                }
+            }
+        }
+        return JSON.stringify(res);
+    },
+    getNumOfQuestionsToEnroll: function(verificationid) {
+        var pwdVerificationManager = new SNC.PwdVerificationManager();
+        return pwdVerificationManager.getVerificationParamValue(verificationid, this.PARM_NUM_ENROLL);
+    },
+    getSecurityQuestionsExcept: function(selectedQuestions) {
+        var selected = JSON.parse(selectedQuestions);
+        var options = [];
+        var gr = new GlideRecord("pwd_question");
+        gr.addQuery("sys_id", "NOT IN", Object.keys(selected));
+        gr.query();
+        while (gr.next()) {
+            options.push({
+                'value': gr.getValue("sys_id"),
+                'label': gr.getValue("question_translated")
+            });
+        }
+        return options;
+    },
+    //SoftPin Enrollment
+    createOrUpdateSoftPin: function(pin, verificationid, userId) {
+        var decryptPin = new PasswordResetUtil().decryptWithKMFModule(pin);
+        var verificationTypeId = new SNC.PwdVerificationManager().getVerificationTypeIdByVerificationId(verificationid);
+        var enrollmentProcessor = new SNC.PwdVerificationType(verificationTypeId).getEnrollmentProcessor();
+        var res = this.manager.initializeByScriptNameAndCategory(enrollmentProcessor, "password_reset.extension.enrollment_form_processor");
+        if (!this.manager.extensionScriptFound()) {
+            gs.error('Cannot find enrollment processor extension: {0}', enrollmentProcessor);
+        }
+        var dataMap = {
+            'softpin_input': decryptPin,
+            'pin_changed': 'true',
+            'mandatory': 'true'
+        };
+        return this.manager.createNew(dataMap, verificationid, userId);
+    },
+    validateSoftPin: function(pin, verificationId) {
+        var decryptPin = new PasswordResetUtil().decryptWithKMFModule(pin);
+        var res = {
+            "error": false,
+            "errorMessage": ""
+        };
+        var pwdSoftpinMgr = new SNC.PwdSoftPINManager();
+        var charRepetitionThreshold = pwdSoftpinMgr.getPINRepetitionThreshold(verificationId);
+        if (!charRepetitionThreshold)
+            charRepetitionThreshold = gs.getProperty('password_reset.softpin.repetition_threshold', 2);
+        var charSequenceThreshold = pwdSoftpinMgr.getPINSequenceThreshold(verificationId);
+        if (!charSequenceThreshold)
+            charSequenceThreshold = gs.getProperty('password_reset.softpin.sequence_threshold', 2);
+        charSequenceThreshold = parseInt(charSequenceThreshold);
+        var softPinLength = pwdSoftpinMgr.getPINLength(verificationId);
+        softPinLength = parseInt(softPinLength);
+        var providedSoftPIN = decryptPin;
+        var digitPattern = new RegExp("^\\d{" + softPinLength + "}$");
+        if (!digitPattern.test(providedSoftPIN)) {
+            res.error = true;
+            res.errorMessage = gs.getMessage('Soft PIN must be atleast {0} digits', softPinLength + "");
+        }
+        var repetitionsPattern = "(\\d+)";
+        for (var i = 0; i &lt; charRepetitionThreshold; i++)
+            repetitionsPattern += "\\1";
+        var repetitionsPatternRegX = new RegExp(repetitionsPattern);
+        if (repetitionsPatternRegX.test(providedSoftPIN)) {
+            res.error = true;
+            res.errorMessage = gs.getMessage("Soft PIN cannot have more than {0} repeated digits/pattern", charRepetitionThreshold + "");
+        }
+        if (this.checkForSequence(providedSoftPIN, charSequenceThreshold)) {
+            res.error = true;
+            res.errorMessage = gs.getMessage("Soft PIN cannot have more than {0} digits in sequence", charSequenceThreshold + "");
+        }
+        return res;
+    },
+    checkForSequence: function(data, threshold) {
+        // Check for sequential numerical characters
+        var increasingSequence = '0123456789';
+        var decreasingSequence = '9876543210';
+        data = data + "";
+        for (var i = 0; i &lt; data.length - threshold; i++) {
+            var subData = data.substring(i, i + threshold + 1);
+            if ((increasingSequence.indexOf(subData) &gt; -1) ||
+                (decreasingSequence.indexOf(subData) &gt; -1)) {
+                return true;
+            }
+        }
+        return false;
+    },
+    getSoftPinRules: function(verificationId) {
+        var rules = {};
+        var pwdSoftpinMgr = new SNC.PwdSoftPINManager();
+        var pinLength = pwdSoftpinMgr.getPINLength(verificationId);
+        var pinHistoryLimit = pwdSoftpinMgr.getSoftPINHistoryLimit();
+        pinLength = parseInt(pinLength);
+        var repetitionThreshold = pwdSoftpinMgr.getPINRepetitionThreshold(verificationId);
+        if (!repetitionThreshold)
+            repetitionThreshold = gs.getProperty('password_reset.softpin.repetition_threshold', 2);
+        var sequenceThreshold = pwdSoftpinMgr.getPINSequenceThreshold(verificationId);
+        if (!sequenceThreshold)
+            sequenceThreshold = gs.getProperty('password_reset.softpin.sequence_threshold', 2);
+        rules = {
+            "pinLength": pinLength,
+            "repetitionThreshold": repetitionThreshold,
+            "sequenceThreshold": sequenceThreshold,
+            "historyLimit": pinHistoryLimit
+        };
+        return JSON.stringify(rules);
+    },
+
+    //SMS Enrollment
+    getSMSDevices: function(userId, maskPhoneNumber) {
+        var dev = {};
+        var gr = new GlideRecord('cmn_notif_device');
+        gr.addActiveQuery();
+        gr.addQuery('user', userId);
+        gr.addQuery('type', this.SMS);
+        gr.orderBy('name');
+        gr.query();
+        while (gr.next()) {
+            var isSubscribed = false;
+            var grNM = GlideRecord('cmn_notif_message');
+            grNM.addQuery('device', gr.getValue('sys_id'));
+            grNM.addActiveQuery();
+            grNM.query();
+            while (grNM.next()) {
+                var filter = grNM.getValue('notification_filter'); // unsunscribe = c1bfa4040a0a0b8b001eeb0f3f5ee961
+                var notif = grNM.getValue('notification');
+                // subscribed, Good goto go
+                if (filter == null &amp;&amp; notif == this.PWD_MESSAGE)
+                    isSubscribed = true;
+            }
+            var eachDev = {};
+            eachDev["name"] = gr.getValue('name');
+            var phone_number = gr.getValue('phone_number');
+            if (maskPhoneNumber) {
+                phone_number = PwdMaskHelper.maskPhone(phone_number);
+            }
+            eachDev["phone"] = phone_number;
+            eachDev["isSubscribed"] = isSubscribed;
+            eachDev["sys_id"] = gr.getValue('sys_id');
+            // add provider name.
+            var prov = new GlideRecord("cmn_notif_service_provider");
+            if (prov.get(gr.getValue("service_provider"))) {
+                eachDev["provider"] = prov.getValue('name');
+            }
+            // check if device is verified and add country name and code
+            dev.setAttribute("isVerified", false);
+            var dvc = GlideRecord('pwd_device');
+            dvc.addQuery('device', gr.getUniqueValue());
+            dvc.query();
+            if (dvc.next()) {
+                eachDev["isVerified"] = (dvc.status == 1) ? true : false;
+                //set default country code if does no exists
+                if (!dvc.country_name) {
+                    dvc.setValue('country_name', 'United States');
+                }
+                if (!dvc.country_code) {
+                    dvc.setValue('country_code', '+1');
+                }
+                dvc.update();
+                eachDev["countryCode"] = dvc.country_code;
+                eachDev["countryName"] = dvc.country_name;
+            }
+            dev[gr.getValue('sys_id')] = eachDev;
+        }
+        return JSON.stringify(dev);
+    },
+    isNotifyEnabled: function() {
+        var resetUtil = new global.PasswordResetUtil();
+        return resetUtil.useNotifyInPasswordReset();
+    },
+    getCountryCodes: function() {
+        var countryCodes = {};
+        var list = PwdCountryCode.CountryCodeList;
+        for (var i = 0; i &lt; list.length; i++) {
+            countryCodes[list[i].name] = list[i].code;
+        }
+        return JSON.stringify(countryCodes);
+    },
+    _validateSMSDeviceDetails: function(useNotify, deviceName, countryName, countryCode, provider, phoneNumber) {
+        var res = {
+            "status": this.SUCCESS,
+            "message": ""
+        };
+        if (deviceName == "") {
+            res.status = this.ERROR;
+            res.message = gs.getMessage("You must specify a valid name to associate with your device");
+            return res;
+        }
+        if (useNotify == 'true' &amp;&amp; (countryName == "" || countryCode == "")) {
+            res.status = this.ERROR;
+            res.message = gs.getMessage("You must specify a country code");
+            return res;
+        }
+        if (phoneNumber == "") {
+            res.status = this.ERROR;
+            res.message = gs.getMessage("You must specify a phone number");
+            return res;
+        }
+        var phoneBare = phoneNumber.toString();
+        phoneBare = phoneBare.replace(/\D/g, ''); // strip non-digits
+        var validLengthRegX = new RegExp("^[0-9]{6,14}$");
+        var validLength = validLengthRegX.test(phoneBare); // 6 - 14 digits
+        //Must end with a digit, can begin with a digit or (, and may contain (, ), digit, - or space
+        var validPhoneRegX = /^[\d|\(][\d|\s|\(|\)|-]*[\d]$/;
+        var validPhone = validPhoneRegX.test(phoneNumber);
+        if (!validPhone || !validLength) {
+            res.status = this.ERROR;
+            res.message = gs.getMessage("Invalid phone number");
+            return res;
+        }
+        if (useNotify != "true" &amp;&amp; provider == "") {
+            res.status = this.ERROR;
+            res.message = gs.getMessage("You must specify a provider");
+            return res;
+        }
+        return res;
+    },
+    addNewSMSDevice: function(userId, verificationId, useNotify, deviceName, countryName, countryCode, provider, phoneNumber) {
+        var res = this._validateSMSDeviceDetails(useNotify, deviceName, countryName, countryCode, provider, phoneNumber);
+        if (res.status == this.ERROR)
+            return JSON.stringify(res);
+        if (!this._isAuthorized(userId))
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("You are not authorized to perform that action")
+            });
+        var phone = phoneNumber.toString();
+        phone = phone.replace(/\D/g, '');
+        if (useNotify == "true") {
+            return this._addDeviceWithCountryCode(userId, phone, deviceName, countryCode, countryName);
+        } else {
+            return this._addDeviceWithProvider(userId, phone, deviceName, provider);
+        }
+    },
+    _addDeviceWithCountryCode: function(userId, phone, deviceName, countryCode, countryName) {
+        if (this.helper.deviceWithCountryCodeExists(userId, phone, countryCode, this.SMS)) {
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("Device already exists: ({0}) {1}", [countryCode, phone])
+            });
+        }
+        var newDev = this.helper.createDeviceWithCountryCode(userId, phone, countryCode, countryName, deviceName);
+        if (newDev == null) {
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("Could not add device: ({0}) {1}", [countryCode, phone])
+            });
+        } else {
+            return JSON.stringify({
+                "status": this.SUCCESS,
+                "message": gs.getMessage("Added the device successfully.")
+            });
+        }
+    },
+    _addDeviceWithProvider: function(userId, phone, name, provider) {
+        if (this.helper.deviceExists(userId, phone, provider, this.SMS)) {
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("Device already exists: {0}", phone)
+            });
+        }
+        var newDev = this.helper.createDevice(userId, phone, provider, name);
+        if (newDev == null) {
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("Could not add device: {0}", phone)
+            });
+        } else {
+            return JSON.stringify({
+                "status": this.SUCCESS,
+                "message": gs.getMessage("Added the device successfully.")
+            });
+        }
+    },
+    sendEnrollmentCode: function(deviceId, verificationId) {
+        var response = new PwdSMSNotificationManager().sendEnrollmentCode(deviceId, verificationId);
+        return this._handleResponse(response, verificationId);
+    },
+
+    _handleResponse: function(response, verificationId) {
+        if (response == this.SUCCESS_RESPONSE) {
+            var expiry = new SNC.PwdSMSManager().getExpiryByVerificationId(verificationId);
+            var msgKey = "Verification Code Sent Message";
+            var responseMsg = gs.getMessage(msgKey, expiry); // I18N_OK 08-04-16
+            return JSON.stringify({
+                "status": this.SUCCESS,
+                "message": responseMsg
+            });
+        } else {
+            var msg;
+            switch (response) {
+                case this.PER_DAY_LIMIT_RESPONSE:
+                    var per_day_limit = this._getVerificationParam(verificationId, "max_per_day", "password_reset.sms.max_per_day");
+                    msg = gs.getMessage('Cannot send more than {0} verification codes in a day', [per_day_limit]);
+                    break;
+                case this.PAUSE_WINDOW_RESPONSE:
+                    var pause_window = this._getVerificationParam(verificationId, "pause_window", "password_reset.sms.pause_window");
+                    msg = gs.getMessage('You can send a new verification code after {0} minutes', pause_window);
+                    break;
+                case this.INVALID_REQUEST_RESPONSE:
+                    msg = gs.getMessage('Your password reset request is no longer valid. Submit another request.');
+                    break;
+                case this.INVALID_PHONE_NUMBER:
+                    msg = gs.getMessage('Could not deliver the code via SMS text. The number is not a valid phone number (not E.164 compliant).');
+                    break;
+                default:
+                    msg = gs.getMessage('Could not generate a verification code');
+            }
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": msg
+            });
+        }
+    },
+
+    verifyEnrollmentCode: function(userId, deviceId, verificationId, code) {
+        var response = new PwdSMSNotificationManager().verifyEnrollmentCode(deviceId, verificationId, code);
+        if (response) {
+            this.helper.subscribeDevice(deviceId, userId);
+            this._updateEnrollmentRecord(userId, this.ACTIVE, verificationId);
+            var msg = gs.getMessage('The device has been authorized');
+            return JSON.stringify({
+                "status": this.SUCCESS,
+                "message": msg
+            });
+        } else {
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("The verification code does not match")
+            });
+        }
+    },
+    getDeviceId: function(userId, phone) {
+        return this.helper.deviceExistsForPhone(userId, phone);
+    },
+    removeSMSDevice: function(userId, verificationId, deviceId) {
+        if (!this._isAuthorized(userId))
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("You are not authorized to perform that action.")
+            });
+        if (this.helper.deleteDevice(deviceId, userId)) {
+        	if (!gs.nil(verificationId)) {
+	            var isEnrolled = new SNC.PwdEnrollmentManager().isUserEnrolledByVerificationId(userId, verificationId);
+	            if (!isEnrolled) {
+	            	this._updateEnrollmentRecord(userId, this.INACTIVE, verificationId);
+	            }
+	        }
+            return JSON.stringify({
+                "status": this.SUCCESS,
+                "message": gs.getMessage("Deleted your mobile device.")
+            });
+        } else {
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("Could not delete device.")
+            });
+        }
+    },
+    updateSubscriptionOfDevice: function(userId, verificationId, deviceId, deviceName, isSubscribed) {
+        var filter = (isSubscribed.toString() == "true") ? this.UNSUBSCRIBE : '';
+        var update = this.helper.updateDeviceSubscription(deviceId, userId, filter);
+        if (update == null) {
+            if (filter == '')
+                return JSON.stringify({
+                    "status": this.ERROR,
+                    "message": gs.getMessage("Could not authorize device: {0}", deviceName)
+                });
+            else
+                return JSON.stringify({
+                    "status": this.ERROR,
+                    "message": gs.getMessage("Could not unauthorize device: {0}", deviceName)
+                });
+        } else {
+            if (filter == '') {
+            	this._updateEnrollmentRecord(userId, this.ACTIVE, verificationId);
+            	return JSON.stringify({
+                    "status": this.SUCCESS,
+                    "message": gs.getMessage("Device {0} has been authorized successfully", deviceName)
+                });
+            } else {
+            	if (!gs.nil(verificationId)) {
+            		var isEnrolled = new SNC.PwdEnrollmentManager().isUserEnrolledByVerificationId(userId, verificationId);
+            		if (!isEnrolled) {
+            		   this._updateEnrollmentRecord(userId, this.INACTIVE, verificationId);
+           		}
+        	}	
+			
+            	return JSON.stringify({
+                    "status": this.SUCCESS,
+                    "message": gs.getMessage("Device {0} has been unauthorized", deviceName)
+                });
+            } 
+        }
+    },
+
+    //Email Enrollment
+
+    getEmails: function(userId, maskEmailAddr) {
+        if (!this._isAuthorized(userId))
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("You are not authorized to perform that action")
+            });
+        var emails = {};
+        var userGr = new GlideRecord('sys_user');
+        userGr.get(userId);
+        var userProfEmail = userGr.getValue('email');
+        var gr = new GlideRecord('cmn_notif_device');
+        gr.addActiveQuery();
+        gr.addQuery('user', userId);
+        gr.addQuery('type', this.EMAIL);
+        gr.addQuery('email_address', '!=', '');
+        gr.orderBy('name');
+        gr.query();
+        while (gr.next()) {
+            var isSubscribed = false;
+
+            var grPD = GlideRecord('cmn_notif_message');
+            grPD.addQuery('device', gr.getValue('sys_id'));
+            grPD.addQuery('notification_filter', '');
+            grPD.addActiveQuery();
+            grPD.query();
+            if (grPD.next()) {
+                isSubscribed = true;
+            }
+
+            var eachEmail = {};
+            eachEmail["name"] = gr.getValue('name');
+            var email_addr = gr.getValue('email_address');
+            if (maskEmailAddr) {
+                email_addr = PwdMaskHelper.maskEmail(email_addr);
+            }
+            eachEmail["email"] = email_addr;
+            eachEmail["isSubscribed"] = isSubscribed;
+            eachEmail["sys_id"] = gr.getValue('sys_id');
+
+            // check if email is verified
+            eachEmail["isVerified"] = false;
+            var dvc = GlideRecord('pwd_device');
+            dvc.addQuery('device', gr.getUniqueValue());
+            dvc.query();
+            if (dvc.next()) {
+                eachEmail["isVerified"] = (dvc.status == 1) ? true : false;
+                dvc.update();
+            }
+            eachEmail["isUserProfileEmail"] = false;
+            if (email_addr == userProfEmail)
+                eachEmail["isUserProfileEmail"] = true;
+            emails[gr.getValue('sys_id')] = eachEmail;
+        }
+        return JSON.stringify(emails);
+    },
+
+    _validateEmailDeviceDetails: function(emailAddress, emailName) {
+        var res = {
+            "status": this.SUCCESS,
+            "message": ""
+        };
+        if (emailName == "") {
+            res.status = this.ERROR;
+            res.message = gs.getMessage("You must specify a valid name to associate with the email address");
+            return res;
+        }
+        var validEmailRegX = new RegExp("^([a-zA-Z0-9_\.\-])+\@(([a-zA-Z0-9\-])+\.)+([a-zA-Z0-9]{2,4})+$");
+        var validEmail = validEmailRegX.test(emailAddress);
+        if (!validEmail) {
+            res.status = this.ERROR;
+            res.message = gs.getMessage("Invalid Email address");
+            return res;
+        }
+        return res;
+    },
+
+    addNewEmailDevice: function(userId, emailAddress, emailName) {
+        var res = this._validateEmailDeviceDetails(emailAddress, emailName);
+        if (res.status == this.ERROR)
+            return JSON.stringify(res);
+        if (!this._isAuthorized(userId))
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("You are not authorized to perform that action")
+            });
+        if (this.helper.emailExists(userId, emailAddress, this.EMAIL)) {
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("Email already exists: {0}", emailAddress)
+            });
+        }
+
+        var newDev = this.helper.createEmail(userId, emailAddress, emailName);
+        if (newDev == null) {
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("Could not add the email: {0}", emailAddress)
+            });
+        } else {
+            return JSON.stringify({
+                "status": this.SUCCESS,
+                "message": gs.getMessage("Added the email successfully.")
+            });
+        }
+    },
+
+    getEmailDeviceId: function(userId, emailAddress) {
+        return this.helper.emailEntryExists(userId, emailAddress);
+    },
+
+    sendEmailEnrollmentCode: function(deviceId, verificationId) {
+        var response = new PwdEmailNotificationManager().sendEnrollmentCode(deviceId, verificationId);
+        return this._handleResponse(response, verificationId);
+    },
+
+    verifyEmailEnrollmentCode: function(userId, deviceId, verificationId, code) {
+        var response = new PwdEmailNotificationManager().verifyEnrollmentCode(deviceId, verificationId, code);
+        if (response) {
+            this.helper.subscribeDevice(deviceId, userId);
+            this._updateEnrollmentRecord(userId, this.ACTIVE, verificationId);
+            var msg = gs.getMessage('The email has been authorized');
+            return JSON.stringify({
+                "status": this.SUCCESS,
+                "message": msg
+            });
+        } else {
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("The verification code does not match")
+            });
+        }
+    },
+
+    addPrimaryEmail: function(userId, verificationId) {
+        if (!this._isAuthorized(userId))
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("You are not authorized to perform that action")
+            });
+        var userGr = new GlideRecord('sys_user');
+        userGr.get(userId);
+        var email = userGr.getValue('email');
+        // If the email already exists it may just be inactive. Either activate it or throw an error 
+        if (this.helper.emailExists(userId, email, this.EMAIL)) {
+            var dev = new GlideRecord('cmn_notif_device');
+            dev.addQuery('user', userId);
+            dev.addQuery('type', 'Email');
+            dev.addQuery('email_address', email);
+            dev.addQuery('active', false);
+            dev.query();
+
+            if (dev.next()) {
+                dev.setValue('active', true);
+                dev.update();
+                this._updateEnrollmentRecord(userId, this.ACTIVE, verificationId);
+                return JSON.stringify({
+                    "status": this.SUCCESS,
+                    "message": gs.getMessage("Added the email from your user profile.")
+                });
+            } else { // This shouldn't happen 			
+                return JSON.stringify({
+                    "status": this.ERROR,
+                    "message": gs.getMessage("Email already exists: {0}", email)
+                });
+            }
+        }
+        var name = gs.getMessage('User Profile Email');
+        var newDev = this.helper.createEmail(userId, email, name);
+        if (newDev == null) {
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("Could not add the email: {0}", email)
+            });
+        }
+        // Usually the pwd_device is created when enrollment code is generated, but we're bypassing that step so do it here
+        var devGr = new GlideRecord('pwd_device');
+        devGr.setValue('status', '1'); // verified
+        devGr.setValue('device', newDev);
+        devGr.insert();
+
+        var update = this.helper.updateDeviceSubscription(newDev, userId, '');
+        if (update == null)
+            return JSON.stringify({
+                "status": this.ERROR,
+                "message": gs.getMessage("Could not add the email")
+            });
+        else {
+        	this._updateEnrollmentRecord(userId, this.ACTIVE, verificationId);
+        	return JSON.stringify({
+                "status": this.SUCCESS,
+                "message": gs.getMessage("Added the email from your user profile.")
+            });
+        }
+    },
+
+    _getVerificationParam: function(verificationId, parameter, property) {
+        var value = new SNC.PwdVerificationManager().getVerificationParamValue(verificationId, parameter);
+        if (value == null) {
+            value = GlideProperties.get(property, '0');
+        }
+        return value;
+    },
+
+    type: 'PwdVAEnrollmentManager'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-09-27 18:13:44&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;91e1dd4c439e11102695d6085bb8f26f&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;3&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;PwdVAEnrollmentManager&lt;/sys_name&gt;
+        &lt;sys_package display_value="Password Reset" source="com.glideapp.password_reset"&gt;1399f4e43cf1311068bcf327dfe37fe4&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_91e1dd4c439e11102695d6085bb8f26f&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-16 19:35:44&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:45:34</sys_created_on>
+        <sys_id>ad98f45183341210c6695855eeaad3f4</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>PwdVAEnrollmentManager</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_ad98f45183341210c6695855eeaad3f4</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:45:34</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,205 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>68fc27bcc3222010a282a539e540dd9e</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.ChangeScheduleRESTUtilSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Base Change Schedule REST Util API. Use the "ChangeScheduleRESTUtil" script include to override functionality in this script if required&lt;/description&gt;
+        &lt;name&gt;ChangeScheduleRESTUtilSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ChangeScheduleRESTUtilSNC = Class.create();
+
+ChangeScheduleRESTUtilSNC.PAYLOAD = 'payload';
+
+ChangeScheduleRESTUtilSNC.prototype = {
+	initialize: function(chgMgtWorker) {
+		this._log = new GSLog(ChangeCommon.LOG_PROPERTY, this.type);
+		if (chgMgtWorker)
+			this.setChgMgtWorker(chgMgtWorker);
+	},
+
+	getSpans: function(nameValuePairs) {
+		if (this._log.atLevel(GSLog.DEBUG))
+			this._log.debug('[getSpans] nameValuePairs: ' + JSON.stringify(nameValuePairs));
+
+		if (!nameValuePairs)
+			return;
+
+		if (nameValuePairs.change_sys_id)
+			this._getSpansByChange(nameValuePairs.change_sys_id + '', nameValuePairs.timezone);
+		else
+			this._getSpansByNameValuePairs(nameValuePairs);
+	},
+
+	_getSpansByNameValuePairs: function(nameValuePairs) {
+		if (this._log.atLevel(GSLog.DEBUG))
+			this._log.debug('[_getSpansByNameValuePairs] nameValuePairs: ' + JSON.stringify(nameValuePairs));
+
+		if (!nameValuePairs.cmdb_ci_sys_id || !nameValuePairs.duration_in_seconds || !nameValuePairs.timezone) {
+			this._log.error('[_getSpansByNameValuePairs] missing parameters cmdb_ci/duration/timezone from: ' + JSON.stringify(nameValuePairs));
+			return;
+		}
+
+		var chgGr = new GlideRecord('change_request');
+
+		chgGr.initialize();
+
+		var gr = new GlideRecord('cmdb_ci');
+		if (!gr.get(nameValuePairs.cmdb_ci_sys_id)) {
+			this.getChgMgtWorker().addErrorMsg(gs.getMessage('cmdb ci not found'));
+			return;
+		}
+
+		chgGr.setValue('cmdb_ci', nameValuePairs.cmdb_ci_sys_id);
+
+		this._setPlannedDate(chgGr, nameValuePairs.planned_start_time, nameValuePairs.duration_in_seconds);
+
+		this._process(chgGr, nameValuePairs.timezone);
+	},
+
+	_getSpansByChange: function(chgSysID, timezone) {
+		if (this._log.atLevel(GSLog.DEBUG))
+			this._log.debug('[_getSpansByChange] chgSysID: ' + chgSysID);
+
+		var chgGr = new GlideRecord('change_request');
+		if (!chgGr.get(chgSysID)) {
+			this.getChgMgtWorker().addErrorMsg(gs.getMessage('Change Request not found'));
+			return;
+		}
+
+		if (!timezone) {
+			this._log.error('[_getSpansByChange] missing timezone');
+			return;
+		}
+
+		if (chgSysID !== this.getChgMgtWorker().getRequestParam('change_sys_id')) {
+			this._log.error('[_getSpansByChange] change_sys_id ' + chgSysID + ' does not match chgMgtWorkChangeSysId ' + request.changeSysId);
+			return;
+		}
+
+		if (!chgGr.cmdb_ci || !chgGr.start_date || !chgGr.end_date) {
+			this._log.error('[_getSpansByChange] missing cmdb_ci/start_date/end_date from Change ');
+			return;
+		}
+
+		if (this._log.atLevel(GSLog.DEBUG))
+			this._log.debug('[_getSpansByChange] chgSysID: ' + chgSysID);
+
+		this._process(chgGr, timezone);
+	},
+
+	_process: function(chgGr, timezone) {
+		if (this._log.atLevel(GSLog.DEBUG))
+			this._log.debug('[_process] Searching for span of Change with cmdb_ci: ' + chgGr.cmdb_ci + ', planned start time: ' + chgGr.start_date + ', planned end time: ' + chgGr.end_date);
+
+		var chgSchedule = new ChangeConflictSchedule(chgGr);
+		chgSchedule.setTimeZoneId(timezone);
+		var spanResult = chgSchedule.findScheduleWindows();
+
+		if (this._log.atLevel(GSLog.DEBUG))
+			this._log.debug('[_process] spanResult: ' + JSON.stringify(spanResult));
+
+		var payload = {
+			spans:[]
+		};
+
+		if (spanResult &amp;&amp; Array.isArray(spanResult.spans) &amp;&amp; spanResult.spans.length &gt; 0)
+			payload.spans = spanResult.spans;
+		else
+			this.getChgMgtWorker().addInfoMsg(this._getSpansNotFoundMsg(chgGr.start_date));
+
+		this.getChgMgtWorker().setResponseParam(ChangeScheduleRESTUtil.PAYLOAD, payload);
+	},
+
+	updateChangeScheduleTime: function(nameValuePairs) {
+		if (this._log.atLevel(GSLog.DEBUG))
+			this._log.debug('[updateChangeScheduleTime] nameValuePairs: ' + JSON.stringify(nameValuePairs));
+
+		if (!nameValuePairs || !nameValuePairs.change_sys_id || !nameValuePairs.duration_in_seconds || !nameValuePairs.timezone) {
+			this._log.error('[updateChangeScheduleTime] missing parameter change_sys_id or duration or timezone, nameValuePairs: ' + JSON.stringify(nameValuePairs));
+			return;
+		}
+
+		var chgSysID = nameValuePairs.change_sys_id;
+		var chgGr = new GlideRecord('change_request');
+		if (!chgGr.get(chgSysID)) {
+			this.getChgMgtWorker().addErrorMsg(gs.getMessage('Change Request not found'));
+			return;
+		}
+
+		this._setPlannedDate(chgGr, nameValuePairs.planned_start_time, nameValuePairs.duration_in_seconds);
+
+		var chgSchedule = new ChangeConflictSchedule(chgGr);
+		chgSchedule.setTimeZoneId(nameValuePairs.timezone);
+		var spanResult = chgSchedule.findScheduleWindows();
+
+		if (this._log.atLevel(GSLog.DEBUG))
+			this._log.debug('[updateChangeScheduleTime] spanResult: ' + JSON.stringify(spanResult));
+
+		if (spanResult &amp;&amp; spanResult.spans &amp;&amp; spanResult.spans.length &gt; 0) {
+			chgGr.setValue('start_date', spanResult.spans[0].start.value);
+			chgGr.setValue('end_date', spanResult.spans[0].end.value);
+			if (chgGr.update()) {
+				this.getChgMgtWorker().addInfoMsg(gs.getMessage('Change has been updated'));
+			} else
+				this.getChgMgtWorker().addErrorMsg(gs.getMessage('Change cannot be updated'));
+		} else
+			this.getChgMgtWorker().addInfoMsg(this._getSpansNotFoundMsg(nameValuePairs.planned_start_time));
+
+	},
+
+	_setPlannedDate: function(chgGr, planned_start_time, duration_in_seconds) {
+		var now = new GlideDateTime();
+
+		var startDate = (planned_start_time) ? new GlideDateTime(planned_start_time) : new GlideDateTime(now);
+		var endDate = (planned_start_time) ? new GlideDateTime(planned_start_time) : new GlideDateTime(now);
+		endDate.addSeconds(duration_in_seconds);
+
+		chgGr.setValue('start_date', startDate);
+		chgGr.setValue('end_date', endDate);
+	},
+
+	_getSpansNotFoundMsg: function(startTime) {
+		startTime = startTime ? startTime : 'now';
+		return gs.getMessage('No slots found for {0} days from {1}', [gs.getProperty('change.conflict.next_available.schedule_window', '90'), startTime]);
+	},
+
+	setChgMgtWorker: ChangeManagementWorkerSNC.methods.setChgMgtWorker,
+	getChgMgtWorker: ChangeManagementWorkerSNC.methods.getChgMgtWorker,
+
+	type: 'ChangeScheduleRESTUtilSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-02-23 11:09:28&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;68fc27bcc3222010a282a539e540dd9e&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;91&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ChangeScheduleRESTUtilSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Change Request" source="com.snc.change_request"&gt;3996f0643cb1311068bcf327dfe37f46&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_68fc27bcc3222010a282a539e540dd9e&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2021-03-31 11:31:37&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:38:11</sys_created_on>
+        <sys_id>61e6305d83f01210c6695855eeaad363</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ChangeScheduleRESTUtilSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_61e6305d83f01210c6695855eeaad363</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:38:11</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

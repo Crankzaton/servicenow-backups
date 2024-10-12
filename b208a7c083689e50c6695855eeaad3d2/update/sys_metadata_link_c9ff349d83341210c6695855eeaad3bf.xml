@@ -1,0 +1,493 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>ac07dd4b43ad1110a6dfaff3fab8f24a</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.AvailabilityCalculatorV2&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;AvailabilityCalculatorV2&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var AvailabilityCalculatorV2 = Class.create();
+AvailabilityCalculatorV2.prototype = {
+	initialize: function() {
+		this.CONSTANTS = (new global.AvailabilityConstants());
+		this.UTILS = (new global.AvailabilityUtils());
+		this.SCHEDULES = new GlideLRUCache(50);
+		this.cmdbCi = null;
+		this.offeringCommitments = null;
+		this.outages = [];  // [{begin, end, type}]
+	},
+
+	/**
+	 * Set configuration item on AvailabilityCalculator
+	 * @param {GlideRecord} ci
+	 */
+	setCi: function(ci) {
+		this.cmdbCi = ci;
+	},
+
+	/**
+	 * Set availability commitments for availability generation on AvailabilityCalculator
+	 * @param {GlideRecord} commitments
+	 */
+	setOfferingCommitments: function(commitments) {
+		this.offeringCommitments = commitments;
+	},
+
+	/**
+	 * Encapsulate retrival and generation of availability records in one external method
+	 * @param {GlideDateTime} originalBegin - the original, unadjusted begin date of the availability segment
+	 * @param {GlideDateTime} originalEnd - the original, unadjusted end date of the availability segment
+	 */
+	calculate: function(originalBegin, originalEnd) {
+		try {
+			if (!this.cmdbCi)
+				throw "cmdb_ci is not defined";
+
+			// system timezone changed from current user timezone to system timezone for date calculation purposes
+			var oldTZ = gs.getSession().getTimeZoneName();
+			var defaultTZ = GlideUser.getSysTimeZone();
+			try {
+				gs.getSession().setTimeZoneName(defaultTZ);
+				var interval = (new global.AvailabilityIntervalProcessor()).determineInterval(originalBegin, originalEnd);
+
+				if (!interval.adjustedBegin &amp;&amp; !interval.adjustedEnd)
+					throw "failed to calculate availability outage interval";
+
+				// convert adjustedBegin to GDT for cases where we need a GDT
+				var adjustedBegin = new GlideDateTime();
+				adjustedBegin.setNumericValue(interval.adjustedBegin);
+				var adjustedEnd = new GlideDateTime();
+				adjustedEnd.setNumericValue(interval.adjustedEnd);
+
+				var outages = this._getOutages(adjustedBegin, adjustedEnd);
+				var processedOutages = (new global.AvailabilityOutageProcessor()).processOutages(outages, adjustedBegin.getNumericValue(), adjustedEnd.getNumericValue());
+
+				// originalBegin and originalEnd needed here to determine calculated segments
+				this._calculateAvailabilityRecords(processedOutages, originalBegin, originalEnd);
+			} finally {
+				// return timezone to original state
+				gs.getSession().setTimeZoneName(oldTZ);
+			}
+		}
+		catch(e) {
+			gs.info("ACV2 - calculate: " + e);
+		}
+	},
+
+	/**
+	 * Format outage record to new object for future processing
+	 * @param {GlideRecord} grOutage
+	 * @returns {Object} - object containing begin date, end date, outage type
+	 */
+	_formatOutage: function(grOutage) {
+		var beginObj = grOutage[this.CONSTANTS.BEGIN].hasValue() &amp;&amp; grOutage[this.CONSTANTS.BEGIN].getGlideObject();
+		var endObj = grOutage[this.CONSTANTS.END].hasValue() &amp;&amp; grOutage[this.CONSTANTS.END].getGlideObject();
+
+		return {
+			"begin": (beginObj &amp;&amp; beginObj.isValid() ? beginObj.getNumericValue() : null),
+			"end": (endObj &amp;&amp; endObj.isValid() ? endObj.getNumericValue() : null),
+			// "beginGDT": beginObj.getValue(),
+			// "endGDT": endObj.getValue(),
+			"type": grOutage.getValue(this.CONSTANTS.TYPE)
+		};
+	},
+
+	/**
+	 * Return all outages between a begin date and an end date
+	 * @param {GlideDateTime} begin
+	 * @param {GlideDateTime} end
+	 * @returns {Array} - array of formatted outages
+	 */
+	_getOutages: function(begin, end) {
+		var outages = [];
+
+		// Get outages with cmdbCi as the configuration item
+		var gr = new GlideRecord(this.CONSTANTS.CMDB_CI_OUTAGE);
+		gr.addQuery(this.CONSTANTS.CMDB_CI, this.cmdbCi.sys_id);
+		gr.addQuery(this.CONSTANTS.TYPE, this.CONSTANTS.OUTAGE)
+			.addOrCondition(this.CONSTANTS.TYPE, this.CONSTANTS.PLANNED);
+		gr.addQuery(this.CONSTANTS.BEGIN, '!=', null);
+		gr.addQuery(this.CONSTANTS.END, '!=', null);
+		gr.addQuery(this.CONSTANTS.BEGIN, '&lt;', end);
+		gr.addQuery(this.CONSTANTS.END, '&gt;', begin);
+
+		// Get outates that have an assocaited affected ci of cmdbCi
+		var relatedOutages = new GlideRecord(this.CONSTANTS.CMDB_CI_OUTAGE);
+		relatedOutages.addQuery(this.CONSTANTS.TYPE, 'outage')
+			.addOrCondition(this.CONSTANTS.TYPE, this.CONSTANTS.PLANNED);
+		relatedOutages.addQuery(this.CONSTANTS.BEGIN, '!=', null);
+		relatedOutages.addQuery(this.CONSTANTS.END, '!=', null);
+		relatedOutages.addQuery(this.CONSTANTS.BEGIN, '&lt;', end);
+		relatedOutages.addQuery(this.CONSTANTS.END, '&gt;', begin);
+
+		var grJoin = relatedOutages.addJoinQuery(this.CONSTANTS.CMDB_OUTAGE_CI_MTOM, 'sys_id', 'outage');
+		grJoin.addCondition('ci_item', this.cmdbCi.sys_id);
+
+		// Combine both queries
+		relatedOutages.addEncodedQuery('^NQ' + gr.getEncodedQuery());
+		relatedOutages.orderBy(this.CONSTANTS.BEGIN);
+		relatedOutages.query();
+
+		while (relatedOutages.next()) {
+			outages.push(this._formatOutage(relatedOutages));
+		}
+
+		return outages;
+	},
+
+	/**
+	 * Iterate though all availability types and create/update the availabilty records for each segment
+	 * @param {Array&lt;Object&gt;} processedOutages
+	 * @param {Number} startIndex - beginning index (inclusive) to start iterating though processedOutages
+	 * @param {Number} endIndex - end index (inclusive) to stop iterating though processedOutages
+	 * @param {Number} segmentBegin - date stored as UNIX timestamp
+	 * @param {Number} endBegin - date stored as UNIX timestamp
+	 */
+	_calculateAvailabilityRecords: function(processedOutages, begin, end) {
+		// get all segments to calculate grouped by availability type
+		var segmentProcessor = new global.AvailabilitySegmentProcessor();
+		segmentProcessor.determineWorkingSegments(processedOutages, begin, end);
+		var bucketMap = segmentProcessor.getBucketMap();
+
+		// process segments for each commitment
+		var offeringCommitments = this.offeringCommitments;
+		while (offeringCommitments.next()) {
+			// iterate through all availability types in the map
+			for (var type in bucketMap) {
+				if (bucketMap.hasOwnProperty(type)) {
+					var bucket = bucketMap[type];
+
+					// iterate through all the segments of an availability type
+					for (var segmentKey in bucket) {
+						if (bucket.hasOwnProperty(segmentKey)) {
+							var segment = bucket[segmentKey];
+							this._generateAvailabilityData(offeringCommitments, processedOutages, type, segment.startIndex, segment.endIndex, segment.begin, segment.end);
+						}
+					}
+				}
+			}
+		}
+	},
+
+	/**
+	 * Create/update an availability record for a single segment
+	 * @param {GlideRecord} offeringCommitment
+	 * @param {Array&lt;Object&gt;} processedOutages
+	 * @param {String} type - availability type
+	 * @param {Number} startIndex - beginning index (inclusive) to start iterating though processedOutages
+	 * @param {Number} endIndex - end index (inclusive) to stop iterating though processedOutages
+	 * @param {Number} segmentBegin - date stored as UNIX timestamp
+	 * @param {Number} endBegin - date stored as UNIX timestamp
+	 */
+	_generateAvailabilityData: function(offeringCommitment, processedOutages, type, startIndex, endIndex, begin, end) {
+		// get calculated values for availability
+		var availValues = this._generateAvailabilityValuesFor(offeringCommitment, processedOutages, startIndex, endIndex, begin, end);
+
+		// pass field values to record update/create
+		var availRecord = new global.AvailabilityRecord(this.cmdbCi.sys_id, begin, end);
+		availRecord.setCiClass(this.UTILS.getCiClassFromCommitment(offeringCommitment));
+		availRecord.setType(type);
+		availRecord.updateOrCreateRecord(availValues.commitment, availValues.absoluteDuration, availValues.scheduledDuration,
+			availValues.absoluteAvailability, availValues.scheduledAvailability, availValues.absoluteCount, availValues.scheduledCount,
+			availValues.scheduledTotal, availValues.mtbf, availValues.mtrs, availValues.allowedDowntime, availValues.commitmentMet);
+	},
+
+	/**
+	 * Generates and calculates availability data given a commitment and outages to process
+	 * @param {GlideRecord} commitment
+	 * @param {Array&lt;Object&gt;} outages
+	 * @returns {Object} containing all data necessary for a service_availability record
+	 */
+	_generateAvailabilityValuesFor: function(offeringCommitment, outages, startIndex, endIndex, begin, end) {
+		var commitmentSchedule = offeringCommitment.service_commitment &amp;&amp; offeringCommitment.service_commitment.schedule + '';
+		var commitmentTz = offeringCommitment.service_commitment &amp;&amp; offeringCommitment.service_commitment.timezone + '';
+		var cmdbCi = this.UTILS.getCiFromCommitment(offeringCommitment);
+		var commitmentGlideSchedule = this._getCommitmentGlideSchedule(commitmentSchedule, commitmentTz, cmdbCi);
+
+		var absoluteOutageData = this._addOutages(outages, null, begin, end, startIndex, endIndex);
+		// (V1) absolute
+		var absoluteOutageDataDuration = absoluteOutageData.totalDuration.getNumericValue();
+		// (V1) absolute_count
+		var absoluteOutageDataOutageCount = absoluteOutageData.totalOutages;
+
+		var scheduledOutageData = this._addOutages(outages, commitmentGlideSchedule, begin, end, startIndex, endIndex);
+		// (V1) scheduled
+		var scheduledOutageDataDuration = scheduledOutageData.totalDuration.getNumericValue();
+		// (V1) scheduled_count
+		var scheduledOutageDataOutageCount = scheduledOutageData.totalOutages;
+
+		var changeInAvailability = [];
+		var calculationSpan = {};
+
+		// create an outage spanning the whole period between begin and end
+		// use _addOutage() on this created outage
+		// to get total duration of the period
+		calculationSpan.begin = begin;
+		calculationSpan.end = end;
+		calculationSpan.type = this.CONSTANTS.OUTAGE_TYPES.OUTAGE;
+		changeInAvailability.push(calculationSpan);
+
+		var changedAbsoluteOutageData = this._addOutages(changeInAvailability);
+		// (V1) absolute_total
+		var changedAbsoluteOutageDataDuration = changedAbsoluteOutageData.totalDuration.getNumericValue();
+
+		var changedScheduledOutageData = this._addOutages(changeInAvailability, commitmentGlideSchedule);
+		// (V1) scheduled_total
+		var changedScheduledOutageDataDuration = changedScheduledOutageData.totalDuration.getNumericValue();
+
+		var absoluteAvailabilityTotal = 100 * ((changedAbsoluteOutageDataDuration - absoluteOutageDataDuration) / changedAbsoluteOutageDataDuration);
+
+		var scheduledAvailabilityTotal = 100;
+		if (changedScheduledOutageDataDuration != 0)
+			scheduledAvailabilityTotal = 100 * ((changedScheduledOutageDataDuration - scheduledOutageDataDuration) / changedScheduledOutageDataDuration);
+
+		// Mean Time Between Failures - average time between Commitment outages for this Configuration Item
+		var mtbf = 0;
+		// Mean Time to Restore Service - average duration of Commitment outages for this Configuration Item
+		var mtrs = 0;
+		if (scheduledOutageDataOutageCount != 0) {
+			mtbf = (changedScheduledOutageDataDuration - scheduledOutageDataDuration) / scheduledOutageDataOutageCount;
+			mtrs = scheduledOutageDataDuration / scheduledOutageDataOutageCount;
+		}
+		// Allowed downtime is downtime that we're allowed under this schedule (might be zero)
+		var allowedDowntime = changedScheduledOutageDataDuration * ((100 - offeringCommitment.service_commitment.availability) / 100);
+
+		// Update vars with GlideDuration
+		mtbf = new GlideDuration(mtbf);
+		mtrs = new GlideDuration(mtrs);
+		allowedDowntime = new GlideDuration(allowedDowntime);
+
+		var commitmentMet = scheduledOutageDataDuration &lt;= allowedDowntime.getNumericValue();
+		var finalCommitmentData = {
+			commitment: offeringCommitment.getValue('service_commitment'),
+			absoluteDuration: absoluteOutageData.totalDuration,
+			scheduledDuration: scheduledOutageData.totalDuration,
+			absoluteAvailability: absoluteAvailabilityTotal,
+			scheduledAvailability: scheduledAvailabilityTotal,
+			absoluteCount: absoluteOutageDataOutageCount,
+			scheduledCount: scheduledOutageDataOutageCount,
+			scheduledTotal: changedScheduledOutageData.totalDuration,
+			mtbf: mtbf,
+			mtrs: mtrs,
+			allowedDowntime: allowedDowntime,
+			commitmentMet: commitmentMet
+		};
+		return finalCommitmentData;
+	},
+
+
+	/**
+	 * Function that adds up all outages duration
+	 * @param {Array&lt;Object&gt;} outages
+	 * @param {GlideSchedule|null} schedule
+	 * @param {GlideDateTime|null} begin beginning cutoff to trim outages to
+	 * @param {GlideDateTime|null} end end cutoff to trim outages to
+	 * @param {Number|null} startIndex index to start iteration of outages array [inclusive]
+	 * @param {Number|null} startIndex index to end iteration of outages array (exclusive)
+	 * @returns {Object} containing totalOutages processed and totalDuration
+	 */
+	_addOutages: function(outages, schedule, begin, end, startIndex, endIndex) {
+		var innerStartIndex = startIndex;
+		var innerEndIndex = endIndex;
+		if (!outages) {
+			var zeroDuration = new GlideDuration();
+			zeroDuration.setNumericValue(0);
+
+			return {
+				totalOutages: 0,
+				totalDuration: zeroDuration 
+			};
+		}
+		if (!startIndex)
+			innerStartIndex = 0;
+		if (!endIndex || endIndex &gt; outages.length)
+			innerEndIndex = outages.length;
+
+		var totalOutages = 0;
+		var scheduleBegin, scheduleEnd;
+		if (schedule) {
+			scheduleBegin = new GlideDateTime();
+			scheduleEnd = new GlideDateTime();
+		}
+
+		/**
+		 * Trims outages to passed in begin and end dates
+		 * @param {Object} outage
+		 * @param {Number} begin begin cutoff to trim outage to
+		 * @param {Number} end end cutoff to trim outage to
+		 * @returns {Object|null}
+		 */
+		function _adjustBoundaries(outage, begin, end) {
+			if (!outage)
+				return null;
+			else if (begin == null || end == null)
+				return outage;
+			else if (outage.begin &gt;= begin &amp;&amp; outage.end &lt;= end)
+				return outage;
+
+			var adjustedOutage = {
+				begin: outage.begin,
+				end: outage.end,
+				type: outage.type
+			};
+
+			if (outage.begin &lt; begin)
+				adjustedOutage.begin = begin;
+			if (outage.end &gt; end)
+				adjustedOutage.end = end;
+
+			return adjustedOutage;
+		};
+
+		var totalDurationSum = 0;
+		for (var outageIndex = innerStartIndex; outageIndex &lt; innerEndIndex; outageIndex++) {
+			// trim currentOutage to within segment boundaries
+			var currentOutage = _adjustBoundaries(outages[outageIndex], begin, end);
+
+			var duration = 0;
+			if (currentOutage.type &amp;&amp; currentOutage.type === this.CONSTANTS.OUTAGE_TYPES.OUTAGE) {
+				if (schedule) {
+					scheduleBegin.setNumericValue(currentOutage.begin);
+					scheduleEnd.setNumericValue(currentOutage.end);
+					duration = schedule.duration(scheduleBegin, scheduleEnd).getNumericValue();
+				} else
+					duration = (currentOutage.end - currentOutage.begin);
+			}
+			if (duration &gt; 0)
+				totalOutages++;
+
+			totalDurationSum += duration;
+		}
+
+		var totalDuration = new GlideDuration();
+		totalDuration.setNumericValue(totalDurationSum);
+
+		return {
+			totalOutages: totalOutages,
+			totalDuration: totalDuration
+		};
+	},
+
+	/**
+	 * Gets commitment's GlideSchedule
+	 * @param {String} commitmentSchedule
+	 * @param {String} commitmentTz
+	 * @param {String} cmdbCi
+	 * @returns {GlideSchedule}
+	 */
+	_getCommitmentGlideSchedule: function(commitmentSchedule, commitmentTz, cmdbCi) {
+		var currentSchedule = this._getCachedSchedule(commitmentSchedule, commitmentTz);
+		var maintenanceWindows = this._getMaintenanceWindow(cmdbCi);
+		if (!maintenanceWindows)
+			return currentSchedule;
+		if (!currentSchedule)
+			currentSchedule = this._getFullDay(commitmentTz);
+
+		for (var maintWindowsIndex = 0; maintWindowsIndex &lt; maintenanceWindows.length; maintWindowsIndex++){
+			currentSchedule.addOtherSchedule0(maintenanceWindows[maintWindowsIndex], false);
+		}
+
+		return currentSchedule;
+	},
+
+	/**
+	 * Gets GlideSchedule from cache. If not present, caches schedule and returns it
+	 * @param {String} commitmentSchedule
+	 * @param {String} commitmentTz
+	 * @returns {GlideSchedule}
+	 */
+	_getCachedSchedule: function(commitmentSchedule, commitmentTz) {
+		if (!commitmentSchedule)
+			return null;
+		var cachedSchedule = this.SCHEDULES.get(commitmentSchedule);
+		if (!cachedSchedule){
+			cachedSchedule = new GlideSchedule(commitmentSchedule);
+			this.SCHEDULES.put(commitmentSchedule, cachedSchedule);
+		}
+		// Copy this in case we add a maintenance schedule later (munges the schedule itself)
+		cachedSchedule = new GlideSchedule(cachedSchedule);
+		if (commitmentTz)
+			cachedSchedule.setTimeZone(commitmentTz);
+		return cachedSchedule;
+	},
+
+	/**
+	 * Gets maintanance windows for a given CI
+	 * @param {String} cmdbCi sys_id of cmdbCi
+	 * @returns {Array&lt;GlideRecord&gt;} maintenance windows array
+	 */
+	_getMaintenanceWindow: function(cmdbCi) {
+		var maintenanceCommitment = new GlideRecord(this.CONSTANTS.SERVICE_OFFERING_COMMITMENT);
+		maintenanceCommitment.addQuery('service_commitment.type', 'maintenance_window');
+		maintenanceCommitment.addQuery('service_offering', cmdbCi).addOrCondition('cmdb_ci', cmdbCi);
+		maintenanceCommitment.addNotNullQuery('service_commitment.schedule');
+		maintenanceCommitment.query();
+		if (!maintenanceCommitment.hasNext())
+			return null;
+
+		var maintenanceWindows = new Array();
+		while (maintenanceCommitment.next()) {
+			var maintenanceSchedule = maintenanceCommitment.service_commitment.schedule;
+			var maintenanceCommitmentTz = maintenanceCommitment.service_commitment.timezone;
+			maintenanceWindows.push(this._getCachedSchedule(maintenanceSchedule, maintenanceCommitmentTz));
+		}
+		return maintenanceWindows;
+	},
+
+	/**
+	 * Gets a full day as a GlideSchedule
+	 * @param {String} commitmentTz
+	 * @returns {GlideSchedule}
+	 */
+	_getFullDay: function(commitmentTz) {
+		var schedule = new GlideSchedule();
+		var cmnGr = new GlideRecord(this.CONSTANTS.CMN_SCHEDULE_SPAN);
+		cmnGr.initialize(); // necessary to force in a guid
+		cmnGr.setValue('start_date_time', '20100101T000000');
+		cmnGr.setValue('end_date_time', '20100102T000000');
+		cmnGr.setValue('repeat_type', 'daily');
+		schedule.addTimeSpan(cmnGr); // cmnGr must have a guid at this point
+
+		if (commitmentTz)
+			schedule.setTimeZone(commitmentTz);
+
+		return schedule;
+	},
+	type: 'AvailabilityCalculatorV2'
+};
+]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-08-30 19:31:15&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;ac07dd4b43ad1110a6dfaff3fab8f24a&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;653&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AvailabilityCalculatorV2&lt;/sys_name&gt;
+        &lt;sys_package display_value="Availability" source="com.snc.availability"&gt;cfe7f4ac3cb1311068bcf327dfe37ffb&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_ac07dd4b43ad1110a6dfaff3fab8f24a&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-03-22 16:23:19&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 09:17:44</sys_created_on>
+        <sys_id>c9ff349d83341210c6695855eeaad3bf</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AvailabilityCalculatorV2</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_c9ff349d83341210c6695855eeaad3bf</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 09:17:44</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

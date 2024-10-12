@@ -1,0 +1,298 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>97af8a5dc7f33010408bc8d6f2c2607f</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_collab_request.CollabTaskServiceV2&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;CollabTaskServiceV2&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var CollabTaskServiceV2 = (function() {
+    return {
+        /*
+        	Generates collaboration task record for the passed user or group data 
+        */
+        inviteCollaborators: function(usersIds, groupsIds, appId, descriptorId, feature, sourceStudioName, optionalMessage) {
+            var statusCodes = CollabTaskConstants.statusCodes;
+
+            var appManagementData = AppManagementDataUtil.getCurrentUserData(appId);
+            var validDescriptor = appManagementData.inviteDescriptorsFilter.length === 0 || appManagementData.inviteDescriptorsFilter.indexOf(descriptorId) &gt; -1;
+
+            //added another condition if feature is JOIN we are allowing the users to create join app request by them selves
+            if (((appManagementData.canUserManageCollaborators || appManagementData.canUserInviteCollaborators) || feature === 'JOIN') &amp;&amp; validDescriptor) {
+                // for each of the collaborator create collaboration task
+                try {
+                    var collabControllerUtils = new CollabControllerUtils();
+                } catch (e) {
+                    throw new sn_ws_err.ServiceError()
+                        .setStatus(404)
+                        .setMessage(gs.getMessage("Valid controller is not found"))
+                        .setDetail(e);
+                }
+
+                var collabRequestUtils = new CollabReqUtils();
+                var redirectToController = !collabControllerUtils.isCurrentInstanceController() &amp;&amp; collabControllerUtils.isControllerConfigured;
+                var collabTaskRecords = [];
+                var userInsertResponse = [];
+
+                (usersIds || []).forEach(function(userId) {
+                    if (redirectToController) {
+                        // generate collaboration task record for user by sending the second param as false into the util
+                        var userCollabTaskResponse = CollabTaskUtils.generateCollaborationTaskRecord(userId, false, appId, descriptorId, false, feature, sourceStudioName, optionalMessage);
+                        var collabTaskObject = collabRequestUtils.getObjectFromGlideRecord(userCollabTaskResponse.collaborationTaskRecord);
+                        collabTaskRecords.push(collabTaskObject);
+                    } else {
+                        var insertResponse = CollabTaskUtils.generateCollaborationTaskRecord(userId, false, appId, descriptorId, true, feature, sourceStudioName, optionalMessage);
+
+                        userInsertResponse.push(insertResponse);
+                    }
+                });
+
+                var groupInsertResponse = [];
+
+                (groupsIds || []).forEach(function(groupId) {
+                    if (redirectToController) {
+                        // genrate collaboration task record for group by sending the second param as true into the util
+                        var groupCollabTaskResponse = CollabTaskUtils.generateCollaborationTaskRecord(groupId, true, appId, descriptorId, false, feature, sourceStudioName);
+                        var collabTaskObject = collabRequestUtils.getObjectFromGlideRecord(groupCollabTaskResponse.collaborationTaskRecord);
+                        collabTaskRecords.push(collabTaskObject);
+                    } else {
+                        var insertResponse = CollabTaskUtils.generateCollaborationTaskRecord(groupId, true, appId, descriptorId, true, feature, sourceStudioName);
+
+                        groupInsertResponse.push(insertResponse);
+                    }
+                });
+
+                if (collabTaskRecords.length) {
+                    try {
+                        var controllerResult = CollabTaskUtils
+                            .createCollaborationTaskRecordsInController(collabTaskRecords, collabControllerUtils.getControllerRecord());
+                        userInsertResponse = controllerResult.users;
+                        groupInsertResponse = controllerResult.groups;
+
+                    } catch (e) {
+                        throw new sn_ws_err.ServiceError()
+                            .setStatus(500)
+                            .setMessage(gs.getMessage("Something went wrong when creating collaboration requests in controller"))
+                            .setDetail(e.message || gs.getMessage("Unknown error when posting task records to controller environment"));
+                    }
+                }
+
+                return {
+                    body: {
+                        descriptorId: descriptorId,
+                        appId: appId,
+                        users: userInsertResponse,
+                        groups: groupInsertResponse,
+                        sourceStudioName: sourceStudioName,
+                    },
+                    status: statusCodes.SUCCESS
+                };
+            } else {
+                throw new sn_ws_err.ServiceError()
+                    .setStatus(statusCodes.FORBIDDEN)
+                    .setMessage(gs.getMessage('User does not have permission to invite collaborators to app with Id {0}.', appId));
+            }
+        },
+
+        getPendingCollaborators: function(appId) {
+            var statusCodes = CollabTaskConstants.statusCodes;
+
+            if (!UserDelegatedDevPermissions.canUserReadApp(appId)) {
+                throw new sn_ws_err.ServiceError()
+                    .setStatus(statusCodes.FORBIDDEN)
+                    .setMessage(gs.getMessage('403 Forbidden: User does not have access to app with id {0}.', appId));
+            }
+
+            var appManagementData = AppManagementDataUtil.getCurrentUserData(appId);
+
+            if (appManagementData.readOnlyMode) {
+                throw new sn_ws_err.ServiceError()
+                    .setStatus(statusCodes.FORBIDDEN)
+                    .setMessage(gs.getMessage('403 Forbidden: User does not have permission to read pending collaboration tasks for the app with id {0}.', appId));
+            }
+
+            try {
+                var collabControllerUtils = new CollabControllerUtils();
+            } catch (e) {
+                throw new sn_ws_err.ServiceError()
+                    .setStatus(404)
+                    .setMessage(gs.getMessage("Valid controller is not found"))
+                    .setDetail(e);
+            }
+
+            var redirectToController = !collabControllerUtils.isCurrentInstanceController() &amp;&amp; collabControllerUtils.isControllerConfigured;
+            var recordState = CollabTaskConstants.collabTaskStates;
+            var collabTasksInScope = [];
+
+            if (redirectToController) {
+                try {
+                    var getCollabTasksOutput = CollabTaskUtils.getCollaborationTaskRecordsFromController(appId, recordState.NEW, collabControllerUtils.getControllerRecord());
+
+                } catch (e) {
+                    throw new sn_ws_err.ServiceError()
+                        .setStatus(500)
+                        .setMessage(gs.getMessage("Something went wrong when fetching collaboration requests from controller"))
+                        .setDetail(e.message || e || gs.getMessage("Unknown error when fetching task records from controller environment"));
+                }
+
+                if (getCollabTasksOutput.hasError) {
+                    throw new sn_ws_err.ServiceError()
+                        .setStatus(getCollabTasksOutput.statusCode)
+                        .setMessage(gs.getMessage("Something went wrong when fetching collaboration requests from controller"))
+                        .setDetail(getCollabTasksOutput.errorMessage);
+                }
+
+                collabTasksInScope = getCollabTasksOutput.collabTasksInScope;
+            } else {
+                collabTasksInScope = CollabTaskUtils.getCollaborationRequestsInScope(appId, recordState.NEW);
+            }
+
+            return {
+                body: {
+                    appId: appId,
+                    collabTasks: collabTasksInScope
+                },
+                status: statusCodes.SUCCESS
+            };
+        },
+
+        /* Gets logged in user's opened collaboration tasks */
+        getUserPendingCollaborationTasks: function(appSysIDs) {
+            try {
+                var collabControllerUtils = new CollabControllerUtils();
+            } catch (e) {
+                throw new sn_ws_err.ServiceError()
+                    .setStatus(404)
+                    .setMessage(gs.getMessage("Valid controller is not found"))
+                    .setDetail(e);
+            }
+            var redirectToController = !collabControllerUtils.isCurrentInstanceController() &amp;&amp; collabControllerUtils.isControllerConfigured;
+            var collabTaskStates = CollabTaskConstants.collabTaskStates;
+            var statusCodes = CollabTaskConstants.statusCodes;
+            var collabTasks = [];
+
+            if (redirectToController) {
+                try {
+                    var getCollabTasksOutput = CollabTaskUtils.getUserCollaborationTaskRecordsFromController(appSysIDs, collabTaskStates.NEW, collabControllerUtils.getControllerRecord());
+                    collabTasks = getCollabTasksOutput.collabTasks;
+                } catch (ex) {
+                    throw new sn_ws_err.ServiceError()
+                        .setStatus(500)
+                        .setMessage(gs.getMessage(ex.message))
+                        .setDetail(ex);
+                }
+
+            } else {
+                try {
+                    collabTasks = CollabTaskUtils.getPendingUserCollabRecords(appSysIDs, collabTaskStates.NEW, gs.getUserID());
+                } catch (ex) {
+                    throw new sn_ws_err.ServiceError()
+                        .setStatus(500)
+                        .setMessage(gs.getMessage(ex.message))
+                        .setDetail(ex);
+                }
+            }
+            collabTasks = collabTasks.map(function(task) {
+                var taskData = {}
+                taskData['appSysId'] = task.app_sys_id;
+                taskData['sysId'] = task.sys_id;
+                return taskData;
+            });
+            return {
+                body: {
+                    pendingCollabTasks: collabTasks
+                },
+                status: statusCodes.SUCCESS
+            };
+        },
+
+        /*
+        	Cancels collaboration task record with provided task id
+        */
+        cancelCollaborationTask: function(taskID) {
+            var statusCodes = CollabTaskConstants.statusCodes;
+            try {
+                var collabControllerUtils = new CollabControllerUtils();
+            } catch (e) {
+                throw new sn_ws_err.ServiceError()
+                    .setStatus(404)
+                    .setMessage(gs.getMessage("Valid controller is not found"))
+                    .setDetail(e);
+            }
+
+            var redirectToController = !collabControllerUtils.isCurrentInstanceController() &amp;&amp; collabControllerUtils.isControllerConfigured;
+            if (redirectToController) {
+                try {
+                    var cancelCollaborationResponse = CollabTaskUtils.cancelCollaborationTaskFromController(taskID, collabControllerUtils.getControllerRecord());
+                    if (cancelCollaborationResponse.hasError) {
+                        throw new sn_ws_err.ServiceError()
+                            .setStatus(cancelCollaborationResponse.statusCode)
+                            .setMessage(gs.getMessage("Something went wrong when cancelling collaboration request from controller"))
+                            .setDetail(cancelCollaborationResponse.errorMessage);
+                    }
+                } catch (e) {
+                    throw new sn_ws_err.ServiceError()
+                        .setStatus(500)
+                        .setMessage(gs.getMessage("Something went wrong when cancelling collaboration requests from controller"))
+                        .setDetail(e.message || e || gs.getMessage("Unknown error when cancelling task record from controller environment"));
+                }
+
+            } else {
+                CollabTaskUtils.cancelCollaborationTask(taskID, gs.getUserID());
+            }
+
+            return {
+                body: {
+                    taskId: taskID,
+                    message: gs.getMessage("Successfully cancelled the collaboration task")
+
+                },
+                status: statusCodes.SUCCESS
+            };
+        },
+		getControllerInfo: function() {
+			var statusCodes = CollabTaskConstants.statusCodes;
+            var collabControllerUtils = new CollabControllerUtils();
+			var pluginDetails = collabControllerUtils.getVersionInstalledInController();
+            return {
+                body: pluginDetails,
+                status: statusCodes.SUCCESS
+            };
+        }
+    };
+})();]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-11-12 17:07:30&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;97af8a5dc7f33010408bc8d6f2c2607f&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;57&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;CollabTaskServiceV2&lt;/sys_name&gt;
+        &lt;sys_package display_value="Collaboration Request" source="sn_collab_request"&gt;f6ad5d41c3222010a9f5e548fa40dd69&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Collaboration Request"&gt;f6ad5d41c3222010a9f5e548fa40dd69&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_97af8a5dc7f33010408bc8d6f2c2607f&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-02-16 08:02:13&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:45:54</sys_created_on>
+        <sys_id>eaa87c5183341210c6695855eeaad331</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>CollabTaskServiceV2</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_eaa87c5183341210c6695855eeaad331</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:45:54</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

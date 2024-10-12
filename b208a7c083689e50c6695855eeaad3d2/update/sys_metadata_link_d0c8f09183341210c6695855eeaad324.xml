@@ -1,0 +1,321 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>9ee525e8533130106bdaddeeff7b1298</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.PwdExpirationUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;PwdExpirationUtils&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var PwdExpirationUtils = Class.create();
+PwdExpirationUtils.prototype = {
+    PWD_EXPIRATION_EVENT: 'pwd.expiration.reminder',
+    _isDomainSepActive: null,
+    initialize: function() {
+        this._isPasswordExpirationFeatureEnabled = GlideProperties.getBoolean('pwd_reset.enable.password_expiration_reminder', false);
+        this._refreshExpirationDataDuration = GlideProperties.get('pwd_reset.refresh_expiration_data.duration', 30);
+        this._isDomainSepActive = GlidePluginManager.isRegistered('com.glide.domain.msp_extensions.installer');
+    },
+    deleteAllExpirationRecordsForAUser: function(userSysId) {
+        var expirationGr = new GlideRecord("pwd_expiration");
+        expirationGr.addQuery("user", userSysId);
+        expirationGr.deleteMultiple();
+    },
+    deleteAllExpirationRecordsForAProcess: function(processSysId) {
+        var expirationGr = new GlideRecord("pwd_expiration");
+        expirationGr.addQuery("pwd_process", processSysId);
+        expirationGr.deleteMultiple();
+    },
+    deleteExpirationRecordForUserProcessPair: function(userSysId, processSysId) {
+        var expirationGr = new GlideRecord("pwd_expiration");
+        expirationGr.addQuery("user", userSysId);
+        expirationGr.addQuery("pwd_process", processSysId);
+        expirationGr.deleteMultiple();
+    },
+    deactivateExpirationRecordsForUserProcessPair: function(userId, processId) {
+        var gr = new GlideRecord('pwd_expiration');
+        gr.addQuery("pwd_process", processId);
+        gr.addQuery("user", userId);
+        gr.query();
+
+        if (gr.next()) {
+            gr.setValue("active", false);
+            gr.update();
+        }
+    },
+    deactivateExpirationRecords: function(processId, deactivateAll) {
+        var gr = new GlideRecord('pwd_expiration');
+        if (processId)
+            gr.addQuery("pwd_process", processId);
+
+        if (!gs.nil(processId) || deactivateAll) {
+            gr.setValue("active", false);
+            gr.updateMultiple();
+        }
+    },
+    getProcessesAssociatedWithAGroup: function(groupId) {
+        var groupArr = [],
+            userGroups = {},
+            processes = {};
+        groupArr = this.getParentGroupHierarchy(groupId, groupArr, userGroups);
+        var processGroupGr = new GlideRecord("pwd_map_proc_to_group");
+        processGroupGr.addQuery("user_group", groupArr);
+        processGroupGr.addQuery("process.active", true);
+        processGroupGr.query();
+
+        while (processGroupGr.next()) {
+            processes[processGroupGr.process] = true;
+        }
+        return processes;
+    },
+    getParentGroupHierarchy: function(groupId, groupArr, userGroups) {
+        if (!groupId || userGroups[groupId]) {
+            return;
+        }
+        userGroups[groupId] = true;
+        var userGroupGr = new GlideRecord('sys_user_group');
+        userGroupGr.addActiveQuery();
+        userGroupGr.addQuery('sys_id', groupId);
+        userGroupGr.query();
+        if (userGroupGr.next()) {
+            groupArr.push(groupId);
+            this.getParentGroupHierarchy(userGroupGr.getValue("parent"), groupArr, userGroups);
+        }
+        return groupArr;
+    },
+    syncExpirationTableDataForProcessId: function(processId) {
+        if (!this._isPasswordExpirationFeatureEnabled)
+            return;
+        // first de-activate all the existing Expiration table data for the process
+        this.deactivateExpirationRecords(processId);
+        processGr = this._getProcessRecord(processId);
+        if (gs.nil(processGr)) {
+            gs.error("[Password Reset Expiration] Password Reset process record not found, error while refreshing Password Expiration table data for the process: " + processId);
+            return;
+        }
+        this._syncExpirationTableDataForProcess(processGr);
+    },
+    _syncExpirationTableDataForProcess: function(processGr) {
+        if (processGr.apply_to_all_users) {
+            var userGr = new GlideRecord("sys_user");
+            userGr.addActiveQuery();
+            userGr.query();
+            while (userGr.next()) {
+                this.updatePasswordExpirationDetails(userGr.getUniqueValue(), processGr.getUniqueValue());
+            }
+        } else {
+            var userGroupMemberGr = this.getAllUsersEntitledToAProcess(processGr.getUniqueValue());
+            while (userGroupMemberGr.next()) {
+                this.updatePasswordExpirationDetails(userGroupMemberGr.user, processGr.getUniqueValue());
+            }
+        }
+    },
+    getAllUsersEntitledToAProcess: function(processId) {
+        var userGroups = [];
+        var gr = new GlideRecord("pwd_map_proc_to_group");
+        gr.addQuery("process", processId);
+        gr.addQuery("user_group.active", true);
+        gr.query();
+        while (gr.next()) {
+            userGroups.push(gr.getValue("user_group"));
+        }
+        return this.getAllUsersForGroup(userGroups);
+    },
+    getAllUsersForGroup: function(userGroups) {
+        var allUserGroups = {};
+        var userGroupMemberGr = new GlideAggregate("sys_user_grmember");
+        if (userGroups.length !== 0) {
+            for (var i = 0; i &lt; userGroups.length; i++)
+                allUserGroups = this._getAllChildGroups(userGroups[i], allUserGroups);
+            userGroupMemberGr.addQuery("group", "IN", Object.keys(allUserGroups).join());
+            userGroupMemberGr.addAggregate('COUNT', 'user');
+            userGroupMemberGr.addQuery("user.active",true);
+            userGroupMemberGr.query();
+        }
+        return userGroupMemberGr;
+    },
+    //Recursively find all the groups 
+    _getAllChildGroups: function(parent_id, userGroups) {
+        if (userGroups[parent_id]) {
+            return;
+        }
+        userGroups[parent_id] = true;
+        var userGroupGr = new GlideRecord('sys_user_group');
+        userGroupGr.addActiveQuery();
+        userGroupGr.addQuery('parent', parent_id);
+        userGroupGr.setWorkflow(false);
+        userGroupGr.query();
+        while (userGroupGr.next()) {
+            this._getAllChildGroups(userGroupGr.getUniqueValue(), userGroups);
+        }
+        return userGroups;
+    },
+    _getProcessRecord: function(processSysId) {
+        var processGr = new GlideRecord("pwd_process");
+        processGr.addActiveQuery();
+        processGr.addQuery("send_expiration_reminder", true);
+        processGr.addQuery("sys_id", processSysId);
+        processGr.query();
+        if (processGr.next())
+            return processGr;
+        return null;
+    },
+    _createOrUpdateExpirationRecords: function(userGr, processGr) {
+        try {
+            var inputs = {};
+            inputs['user'] = userGr; // GlideRecord of table: sys_user
+            inputs['password_reset_process'] = processGr; // GlideRecord of table: pwd_process
+            var result = sn_fd.FlowAPI.getRunner().subflow('sn_pwdreset_ah.password_expiration_details_master_subflow').inForeground().withInputs(inputs).run();
+            var outputs = result.getOutputs();
+            if (outputs['status'] == "Error") {
+                gs.error("[global.PwdExpirationUtils] createOrUpdateExpirationRecords for user: " + userGr.getUniqueValue() + " and process: " + processGr.getUniqueValue() + "] execution error - " + outputs['error_message']);
+            }
+        } catch (ex) {
+            gs.error("[global.PwdExpirationUtils] createOrUpdateExpirationRecords for user: " + userGr.getUniqueValue() + " and process: " + processGr.getUniqueValue() + "] execution error - " + ex);
+        }
+    },
+    updatePasswordExpirationDetails: function(userId, processId) {
+        var expirationGr = new GlideRecord("pwd_expiration");
+        
+        // make the inserted record's domain to be current user's domain
+        if (this._isDomainSepActive) {
+            var grUser = new GlideRecord("sys_user");
+            grUser.get(userId);
+            expirationGr.addDomainQuery(grUser);
+        }
+        
+        expirationGr.addQuery("user", userId);
+        expirationGr.addQuery("pwd_process", processId);
+        expirationGr.query();
+
+        if (!expirationGr.next()) {
+            expirationGr.setValue("user", userId);
+            expirationGr.setValue("pwd_process", processId);
+        }
+        expirationGr.setValue("active", true);
+        expirationGr.update();
+    },
+    sendPasswordExpirationReminderToUsers: function(processId) {
+        if (!this._isPasswordExpirationFeatureEnabled)
+            return;
+        var processGr = this._getProcessRecord(processId);
+        if (gs.nil(processGr)) {
+            gs.error("[Password Reset Expiration] Process record not found, no password expiration reminder is sent for the process: " + processId);
+            return;
+        }
+        this._updateSendReminderFlagForProcessUsers(processGr);
+        this._notifyToProcessUsers(processGr);
+    },
+    _notifyToProcessUsers: function(processGr) {
+        var queryString = "pwd_expiration_dateISNOTEMPTY^pwd_expiration_date&gt;javascript:gs.beginningOfToday()";
+        var gr = new GlideRecord("pwd_expiration");
+        gr.addQuery("pwd_process", processGr.getUniqueValue());
+        gr.addQuery("send_notification", true);
+        gr.addEncodedQuery(queryString);
+        gr.addActiveQuery();
+        gr.query();
+
+        var parm1 = {
+            "daysRemaining": 0,
+            "processName": processGr.getDisplayValue('label'),
+            "urlSuffix": processGr.getValue('url_suffix'),
+            "isChangeEnabled": Boolean(processGr.change),
+            "isResetEnabled": Boolean(processGr.reset),
+            "isPublic": Boolean(processGr.public_access)
+        };
+
+        while (gr.next()) {
+            var dateDiff = gs.dateDiff(new GlideDate(), gr.getValue('pwd_expiration_date')); //ddd hh:mm:ss
+            var dateDiffArray = dateDiff.split(' ');
+            var daysRemaining = dateDiffArray.length &gt; 1 ? dateDiffArray[0] : 0;
+            parm1.daysRemaining = daysRemaining;
+            // Call the event to send notification to gr.getValue("user")
+            gs.eventQueue(this.PWD_EXPIRATION_EVENT, gr, JSON.stringify(parm1), null);
+            this._sendExpirationEventsToGCF();
+        }
+    },
+    _updateSendReminderFlagForProcessUsers: function(processGr) {
+        var expirationWarnDays = processGr.getValue("expiration_warn_days");
+        //Handling users with expired password
+        var queryString1 = "send_notification=true^pwd_expiration_date&lt;javascript:gs.beginningOfToday()";
+        var queryString2 = "send_notification=false^pwd_expiration_dateBETWEENjavascript:gs.beginningOfToday()@" + this._getDate(this._addDaysToDate(gs.beginningOfToday(), expirationWarnDays));
+        //Handling users with password never expires or user who resets password post password expiration
+        var queryString3 = "pwd_expiration_dateISEMPTY^ORpwd_expiration_date&lt;javascript:gs.beginningOfToday()^last_refresh_dateISNOTEMPTY^last_refresh_date&lt;=" + this._getDate(this._addDaysToDate(gs.beginningOfToday(), this._refreshExpirationDataDuration * -1));
+        //Handling the last scan error case 
+        var queryString4 = "error_count&gt;0";
+        //Initially we create an expiration record with empty Last Refresh date
+        var queryString5 = "error_count=0^last_refresh_dateISEMPTY";
+
+        this._updateSendReminderFlagForUsers(processGr, queryString1);
+        this._updateSendReminderFlagForUsers(processGr, queryString2);
+        this._updateSendReminderFlagForUsers(processGr, queryString3);
+        this._updateSendReminderFlagForUsers(processGr, queryString4);
+        this._updateSendReminderFlagForUsers(processGr, queryString5);
+    },
+    _updateSendReminderFlagForUsers: function(processGr, queryString) {
+        var gr = new GlideRecord("pwd_expiration");
+        gr.addQuery("pwd_process", processGr.getUniqueValue());
+        gr.addEncodedQuery(queryString);
+        gr.addActiveQuery();
+        gr.query();
+        while (gr.next()) {
+            var userGr = new GlideRecord("sys_user");
+            userGr.get(gr.getValue("user"));
+            this._createOrUpdateExpirationRecords(userGr, processGr);
+        }
+    },
+    _getDate: function(date) {
+        var gDate = new GlideDate();
+        gDate.setValue(date);
+        return new GlideDateTime(gDate.getValue());
+    },
+    _addDaysToDate: function(date, daysToAdd) {
+        var newDate = new GlideDateTime(date);
+        newDate.addDaysUTC(daysToAdd);
+        return newDate;
+    },
+    _sendExpirationEventsToGCF: function() {
+        var collectionPointObj = PwdResetGCFConstants.CollectionConstants.PasswordResetApp;
+        var collectionEventObj = collectionPointObj.PasswordResetNotifications;
+        var dimensionsObj = collectionEventObj.Dimensions;
+        new PwdResetUsageInstrumentation(collectionPointObj.COLLECTION_POINT_VALUE, collectionEventObj.COLLECTION_EVENT_VALUE)
+            .addBucket(dimensionsObj.TYPE, 'Expiration Reminder')
+            .buildUsageEvent();
+    },
+
+    type: 'PwdExpirationUtils'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-08-02 20:39:04&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;9ee525e8533130106bdaddeeff7b1298&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;4&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;PwdExpirationUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Password Reset" source="com.glideapp.password_reset"&gt;1399f4e43cf1311068bcf327dfe37fe4&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_9ee525e8533130106bdaddeeff7b1298&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-04-25 19:56:41&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:46:17</sys_created_on>
+        <sys_id>d0c8f09183341210c6695855eeaad324</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>PwdExpirationUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_d0c8f09183341210c6695855eeaad324</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:46:17</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

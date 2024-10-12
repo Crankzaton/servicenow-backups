@@ -1,0 +1,261 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>8dbeb36353523010ec1fddeeff7b126f</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_nlu_workbench.NLUBatchTestSetQuality&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Utilities for checking test set quality&lt;/description&gt;
+        &lt;name&gt;NLUBatchTestSetQuality&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var NLUBatchTestSetQuality = Class.create();
+(function() {
+    var tables = NLUWorkbenchConstants.tables;
+    var SYS_NLU_INTENT = global.NLUConstants.tables.SYS_NLU_INTENT;
+    var arrayUtil = new global.ArrayUtil();
+
+    var TYPE = {
+        PASS: 'pass',
+        WARNING: 'warning',
+        ERROR: 'error'
+    };
+
+    var TITLE_GT_65 = gs.getMessage('This test set has a good coverage of intents and is good to use');
+    var TITLE_LT_65 = function(coverage) {
+        return gs.getMessage('Only {0}% of intents in this model are covered by the test set; 65% is recommended.', coverage);
+    };
+    var TITLE_LT_65_MULTI = function(coverage) {
+        return gs.getMessage('Only {0}% of intents in the selected models are covered by the test set; 65% is recommended.', coverage);
+    };
+    var MESSAGE_LT_65 = gs.getMessage('You can still run batch test with this test set, but the recommended threshold may not be optimal.');
+    var MESSAGE_LT_65_OPT = gs.getMessage('You can still run optimization with this test set, but you could get a better optimized model by improving the test set.');
+    var MESSAGE_LT_25_OPT = gs.getMessage('Add more utterances to this test set and try again, or select another test set.');
+
+    function getUniqueExpectedIntents(testSetId, modelIntentNames, qc) {
+        var uniqueExpectedIntents = []; // list of expected intents which are part of model
+        var skippedIntents = []; // all the intents which are not present in the model(s)
+        var ag = new GlideAggregate(tables.NLU_BATCH_TEST_UTTERANCE);
+        ag.addQuery('test_set', testSetId);
+        if (qc)
+            ag.addEncodedQuery(qc);
+        ag.addAggregate('COUNT', 'intent');
+        ag.query();
+        while (ag.next()) {
+            if (gs.nil(ag.getValue('intent'))) continue;
+
+            var intentNamesArr = ag.intent.split(',');
+            var validIntents = [];
+            intentNamesArr.forEach(function(intent) {
+                var intentName = NLUCoreUtils.toLower(intent);
+                if (arrayUtil.indexOf(modelIntentNames, intentName) &gt; -1) {
+                    validIntents.push(intentName);
+                } else if (arrayUtil.indexOf(skippedIntents, intent) === -1) {
+                    skippedIntents.push(intent);
+                }
+            });
+
+            if (validIntents.length === intentNamesArr.length) {
+                uniqueExpectedIntents = arrayUtil.union(uniqueExpectedIntents, validIntents);
+            }
+        }
+        return {
+            expectedIntents: uniqueExpectedIntents,
+            skippedIntents: skippedIntents,
+        };
+    }
+
+    function getSkipedUtterancesCount(testSetId, skippedIntentNames) {
+        if (skippedIntentNames &amp;&amp; skippedIntentNames.length &gt; 0) {
+            var ga = new GlideAggregate(tables.NLU_BATCH_TEST_UTTERANCE);
+            ga.addQuery('test_set', testSetId);
+            var query = '';
+            skippedIntentNames.forEach(function(eachIntent) {
+                query += (query ? '^OR' : '') + 'intentLIKE' + eachIntent;
+            });
+            ga.addEncodedQuery(query);
+            ga.addAggregate('COUNT');
+            ga.query();
+            if (ga.next()) {
+                return parseInt(ga.getAggregate('COUNT'));
+            }
+        }
+        return 0;
+    }
+
+    function getIntentCoverage(models, testSetId, modelIntentNames, isOptimize) {
+        var type = TYPE.PASS,
+            title = TITLE_GT_65,
+            message = '';
+
+        var expectedAndSkipped = getUniqueExpectedIntents(testSetId, modelIntentNames);
+        var expectedIntentNames = expectedAndSkipped.expectedIntents;
+        var skippedIntentNames = expectedAndSkipped.skippedIntents;
+
+        var skipedUtterances = getSkipedUtterancesCount(testSetId, skippedIntentNames);
+
+        var intentsCovered = expectedIntentNames.length;
+        var totalIntents = arrayUtil.unique(modelIntentNames).length;
+        var intentCoverage = totalIntents &gt; 0 ? parseFloat(NLUCoreUtils.getPercentage(intentsCovered / totalIntents)) : 0;
+
+        if (intentCoverage &lt; 65) {
+            type = TYPE.WARNING;
+            title = models.length === 1 ? TITLE_LT_65(intentCoverage) : TITLE_LT_65_MULTI(intentCoverage);
+            message = isOptimize ? MESSAGE_LT_65_OPT : MESSAGE_LT_65;
+            if (isOptimize &amp;&amp; intentCoverage &lt; 25) {
+                type = TYPE.ERROR;
+                message = MESSAGE_LT_25_OPT;
+            }
+        }
+        return {
+            name: 'intentCoverage',
+            type: type,
+            value: {
+                total: totalIntents,
+                covered: intentsCovered,
+                coverage: intentCoverage
+            },
+            message: message,
+            skipedUtterances: skipedUtterances,
+            title: title
+        };
+    }
+
+    NLUBatchTestSetQuality.getTestSetQuality = function(models, testSetId, isOptimize) {
+        var qualitiesArray = [],
+            res = {
+                qualityCheck: TYPE.PASS
+            };
+        var modelIntentNamesMap = NLUCoreUtils.getTrainedIntentNamesMap(models, NLUCoreUtils.toLower);
+        var modelIntentNames = [];
+        for (var modelId in modelIntentNamesMap) {
+            var intentNames = modelIntentNamesMap[modelId].intents;
+            if (intentNames &amp;&amp; intentNames.length &gt; 0) {
+                arrayUtil.concat(modelIntentNames, intentNames);
+            }
+        }
+        var intentCoverage = getIntentCoverage(models, testSetId, modelIntentNames, isOptimize);
+        qualitiesArray.push(intentCoverage);
+        if (intentCoverage.type === TYPE.WARNING || intentCoverage.type === TYPE.ERROR) {
+            if (res.qualityCheck !== TYPE.ERROR) {
+                res.qualityCheck = intentCoverage.type;
+            }
+        }
+        res.qualityData = qualitiesArray;
+        return res;
+    };
+
+    /*
+	NOTE: Test coverage is same as IntentCoverage - but it is calculated for default test set
+	using only enabled intents (unlike only trained intents in Intent coverage)
+    */
+    NLUBatchTestSetQuality.getTestCoverage = function(modelId) {
+        var intentGr = new GlideRecord(SYS_NLU_INTENT);
+        intentGr.addQuery('model', modelId);
+        intentGr.addQuery('enable', true);
+        intentGr.query();
+        var modelIntentNames = [];
+        while (intentGr.next()) {
+            modelIntentNames.push(NLUCoreUtils.toLower(intentGr.getValue('name')));
+        }
+
+        var testSetGr = new GlideRecord(tables.NLU_BATCH_TEST_SET);
+        testSetGr.addQuery('model', modelId);
+        testSetGr.query();
+        if (testSetGr.next()) {
+            return getIntentCoverage([modelId], testSetGr.getUniqueValue(), modelIntentNames).value;
+        }
+
+        throw new Error('No default test set found for model ' + modelId);
+    };
+
+    function getTestUtterances(testSetId) {
+        var testUttrGr = new GlideRecord(tables.NLU_BATCH_TEST_UTTERANCE);
+        testUttrGr.addQuery('test_set', testSetId);
+        testUttrGr.query();
+        var testUtterances = [];
+        while (testUttrGr.next()) {
+            testUtterances.push(testUttrGr.getValue('utterance'));
+        }
+
+        return testUtterances;
+    }
+
+    function getIntentNames(modelId, encodedQuery) {
+        var intentGr = new GlideRecord(SYS_NLU_INTENT);
+        intentGr.addQuery('model', modelId);
+        if (encodedQuery)
+            intentGr.addEncodedQuery(encodedQuery);
+        intentGr.query();
+        var intents = [];
+        while (intentGr.next()) {
+            intents.push(NLUCoreUtils.toLower(intentGr.getValue('name')));
+        }
+
+        return intents;
+    }
+
+    function getDefaultTestSetId(modelId) {
+        var testSetGr = new GlideRecord(tables.NLU_BATCH_TEST_SET);
+        testSetGr.addQuery('model', modelId);
+        testSetGr.query();
+        if (testSetGr.next())
+            return testSetGr.getUniqueValue();
+
+        throw new Error('No default test set found for model ' + modelId);
+    }
+
+    NLUBatchTestSetQuality.getSkippedUtterancesCountForClone = function(modelId, testSetId) {
+        // 1. Filter utterances that are already present in defaultTestSet
+        var defaultUttrs = getTestUtterances(getDefaultTestSetId(modelId));
+        var copyFromUttrs = getTestUtterances(testSetId);
+
+        var uniqueUttrs = arrayUtil.diff(copyFromUttrs, defaultUttrs);
+
+        // 2. Filter utterances whose expected intents are not in model
+        var modelIntents = getIntentNames(modelId);
+        var qc = 'utteranceIN' + uniqueUttrs.join(',');
+        var skippedIntents = getUniqueExpectedIntents(testSetId, modelIntents, qc).skippedIntents;
+
+        var skipUttrCount = getSkipedUtterancesCount(testSetId, skippedIntents);
+		var duplicateUttrCount = arrayUtil.intersect(defaultUttrs, copyFromUttrs).length;
+        return skipUttrCount + duplicateUttrCount;
+    };
+
+    NLUBatchTestSetQuality.prototype = {
+        initialize: function() {},
+        type: 'NLUBatchTestSetQuality'
+    };
+})();]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-09-06 11:28:15&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;8dbeb36353523010ec1fddeeff7b126f&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;108&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;NLUBatchTestSetQuality&lt;/sys_name&gt;
+        &lt;sys_package display_value="NLU Workbench - Advanced Features" source="sn_nlu_workbench"&gt;31f5f491c3a710100bf407720f40ddf4&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="NLU Workbench - Advanced Features"&gt;31f5f491c3a710100bf407720f40ddf4&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_8dbeb36353523010ec1fddeeff7b126f&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-09-12 22:36:42&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:45:17</sys_created_on>
+        <sys_id>5988f05183341210c6695855eeaad334</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>NLUBatchTestSetQuality</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_5988f05183341210c6695855eeaad334</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:45:17</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

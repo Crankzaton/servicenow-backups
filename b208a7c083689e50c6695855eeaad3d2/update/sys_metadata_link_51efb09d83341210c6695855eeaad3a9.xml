@@ -1,0 +1,249 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>a8a2850143fc6110fcbf9bf6cab8f2f5</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_deploy_pipeline.ScheduledDeploymentService&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;ScheduledDeploymentService&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[/**
+ * Commonly used functions that support scheduled deployments.
+ */
+
+var ScheduledDeploymentService = Class.create();
+
+(function() {
+    ScheduledDeploymentService.SCHEDULED_DEPLOYMENT_REQUEST_TABLE = 'sn_deploy_pipeline_scheduled_deployment';
+    ScheduledDeploymentService.DEPLOYMENT_REQUEST_TABLE = 'sn_deploy_pipeline_deployment_request';
+
+    /**
+     * Returns scheduled deployment gliderecords for deployments ready to be promoted to production.
+     */
+    ScheduledDeploymentService.hasScheduledDeploymentsReadyForInstall = function() {
+        return getScheduledDeployments().next();
+    };
+
+    ScheduledDeploymentService.triggerScheduledDeploymentsInstall = function() {
+        var scheduledDeploymentGR = getScheduledDeployments();
+        var appSysIDs = [];
+
+        while (scheduledDeploymentGR.next()) {
+            var deploymentRequestRecord = scheduledDeploymentGR.deployment_request.getRefRecord();
+            var appSysID = deploymentRequestRecord.getValue('app_sys_id');
+            var appVersion = deploymentRequestRecord.getValue('app_version');
+            var deploymentRequestState = deploymentRequestRecord.getValue('state');
+
+            /**
+             * Guarding against scheduled deployment records for older versions of the same application.
+             * Updating `deployment_status` for older versions so they will not be processed by the scheduled job.
+             */
+            if (appSysIDs.indexOf(appSysID) &gt;= 0) {
+                scheduledDeploymentGR.setValue('deployment_status', 'fail');
+                scheduledDeploymentGR.update();
+                gs.info('Updating scheduled deployment status to fail for application: ' + appSysID + ' appVersion: ' + appVersion);
+
+                continue;
+            }
+
+            appSysIDs.push(appSysID);
+
+            /**
+             * Guarding against deployment request with state of 'New' (0), 'Closed - Published' (2), 'Closed - Rejected' (3), 'Closed - Failed' (4) and 'Canceled(5)'
+             * Updating `deployment_status` when the deployment request is canceled and app is ready to be promoted to production.
+             */
+            if (deploymentRequestState === '3') {
+                scheduledDeploymentGR.setValue('deployment_status', 'rejected');
+                scheduledDeploymentGR.update();
+
+                return;
+            } else if (deploymentRequestState === '4') {
+                scheduledDeploymentGR.setValue('deployment_status', 'fail');
+                scheduledDeploymentGR.update();
+
+                return;
+            } else if (deploymentRequestState === '5') {
+                scheduledDeploymentGR.setValue('deployment_status', 'canceled');
+                scheduledDeploymentGR.update();
+
+                return;
+            }
+
+            var payload = {
+                environment: scheduledDeploymentGR.target_environment.getRefRecord() || null,
+                scheduled_deployment_record: scheduledDeploymentGR || null,
+            };
+
+            try {
+                gs.info('Running scheduled deployment for application: ' + appSysID + ' version: ' + appVersion + ' to production.');
+
+                sn_fd.FlowAPI.executeSubflow('sn_deploy_pipeline.scheduled_deployment_install_application_with_id', payload);
+            } catch (ex) {
+                gs.error('Scheduled deployment failed for application: ' + appSysID + '  version: ' + appVersion + ' failed with error message: ' + ex.message + ' and error code: ' + ex.code);
+            }
+        }
+    };
+
+    ScheduledDeploymentService.updateScheduledDeploymentDate = function(currentRecordSysID, scheduledDeploymentDateInUTC) {
+        var deploymentRequestGR = new GlideRecordSecure(ScheduledDeploymentService.SCHEDULED_DEPLOYMENT_REQUEST_TABLE);
+        var hasValidDeploymentRequest = deploymentRequestGR.get('deployment_request', currentRecordSysID);
+        var scheduledDeploymentRecord = null;
+        var successfullyUpdated = false;
+
+        if (hasValidDeploymentRequest) {
+            var gdt = new GlideDateTime();
+            gdt.setValue(scheduledDeploymentDateInUTC);
+            scheduledDeploymentDateInUTC = gdt.getValue();
+
+            deploymentRequestGR.setValue('scheduled_deployment_date', scheduledDeploymentDateInUTC);
+            scheduledDeploymentRecord = deploymentRequestGR.update();
+
+            successfullyUpdated = true;
+        }
+
+        return {
+            scheduledDeploymentRecord: scheduledDeploymentRecord,
+            updatedScheduledDeploymentDate: scheduledDeploymentDateInUTC,
+            successfullyUpdated: successfullyUpdated,
+        };
+    };
+
+    ScheduledDeploymentService.approveDeploymentRequest = function(currentRecordSysID) {
+        var deploymentRequestGR = new GlideRecordSecure(ScheduledDeploymentService.DEPLOYMENT_REQUEST_TABLE);
+        var hasValidDeploymentRequest = deploymentRequestGR.get(currentRecordSysID);
+        var recordUpdateSuccessful = false;
+
+        if (hasValidDeploymentRequest) {
+            try {
+                // attempting to update an old deployment request record (not the most recent one) will throw an exception
+                deploymentRequestGR.setValue('approval', 'approved');
+                recordUpdateSuccessful = deploymentRequestGR.update();
+            } catch (error) {
+                throw new sn_ws_err.ServiceError()
+                    .setStatus(500)
+                    .setMessage(gs.getMessage("Attempt to update scheduled deployment failed with error message: {0}", [error]));
+            }
+        }
+
+        // deploymentRequestGR.update() returns sysId or null
+        // !! used to coerce `recordUpdateSuccessful` to boolean
+        return !!recordUpdateSuccessful;
+    };
+
+    ScheduledDeploymentService.cancelDeploymentRequest = function(currentRecordSysID) {
+        var deploymentRequestGR = new GlideRecordSecure(ScheduledDeploymentService.DEPLOYMENT_REQUEST_TABLE);
+        var deploymentRequestCanceledState = '5';
+        var scheduledDeploymentCanceledState = 'canceled';
+        var recordUpdateSuccessful = false;
+        var scheduledDeploymentRecord;
+        var hasValidDeploymentRequest = deploymentRequestGR.get(currentRecordSysID);
+        var result = {
+            success: false,
+            messages: [],
+            updatedRecord: deploymentRequestGR
+        };
+
+        if (!hasValidDeploymentRequest) {
+            gs.error(gs.getMessage("Attempt to update scheduled deployment failed. Deployment request with sys_id {0} is not valid", [currentRecordSysID]));
+            return result;
+        }
+
+        // cancel deployment request record
+        try {
+            // attempting to update an old deployment request record (not the most recent one) will throw an exception
+            deploymentRequestGR.setValue('state', deploymentRequestCanceledState);
+            deploymentRequestGR.setValue('approval', 'rejected');
+            recordUpdateSuccessful = deploymentRequestGR.update();
+        } catch (error) {
+            gs.error(gs.getMessage("Attempt to update scheduled deployment failed with error message: {0}", [error]));
+            return result;
+        }
+
+        if (!recordUpdateSuccessful) {
+            gs.error(gs.getMessage("Attempt to update scheduled deployment failed. Deployment request with sys_id {0} was not updated successfully.", [currentRecordSysID]));
+            return result;
+        }
+
+        result.success = true;
+        result.updatedRecord = deploymentRequestGR;
+
+        // cancel scheduled deployment record
+        scheduledDeploymentRecord = new GlideRecordSecure(ScheduledDeploymentService.SCHEDULED_DEPLOYMENT_REQUEST_TABLE);
+        scheduledDeploymentRecord.addQuery("deployment_request", currentRecordSysID);
+        var glideQuery = scheduledDeploymentRecord.addQuery("deployment_status", "ready_for_deployment");
+        glideQuery.addOrCondition("deployment_status", "new");
+        scheduledDeploymentRecord.query();
+
+        if (scheduledDeploymentRecord.next()) {
+            scheduledDeploymentRecord.deployment_status = scheduledDeploymentCanceledState;
+            recordUpdateSuccessful = scheduledDeploymentRecord.update();
+
+            if (!recordUpdateSuccessful) {
+                result.messages.push({
+                    message: gs.getMessage("Unable to cancel record in table: {0} with sys_id: {1}", [ScheduledDeploymentService.SCHEDULED_DEPLOYMENT_REQUEST_TABLE, scheduledDeploymentRecord.sys_id])
+                });
+            }
+        }
+
+        // Cancel Change Request if exists
+        cancelChangeRequestResult = new CMDBAndChangeManagementUtils().cancelChangeRequestIfExists(currentRecordSysID);
+        if (!cancelChangeRequestResult.status) {
+            result.messages.push({
+                message: cancelChangeRequestResult.message
+            });
+        }
+        return result;
+    }
+
+    function getScheduledDeployments() {
+        var scheduledDeploymentGR = new GlideRecord(ScheduledDeploymentService.SCHEDULED_DEPLOYMENT_REQUEST_TABLE);
+        scheduledDeploymentGR.addQuery('deployment_status', 'ready_for_deployment');
+        scheduledDeploymentGR.addQuery('scheduled_deployment_date', '&lt;=', new GlideDateTime());
+        scheduledDeploymentGR.orderByDesc('deployment_request.app_version');
+        scheduledDeploymentGR.query();
+
+        return scheduledDeploymentGR;
+    }
+
+    ScheduledDeploymentService.prototype = {
+        initialize: function() {
+            throw 'Not supported';
+        },
+
+        type: 'ScheduledDeploymentService'
+    };
+})();]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-02-02 02:42:15&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;a8a2850143fc6110fcbf9bf6cab8f2f5&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;54&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ScheduledDeploymentService&lt;/sys_name&gt;
+        &lt;sys_package display_value="Deployment Pipeline" source="sn_deploy_pipeline"&gt;bb67ed7253e83010b846ddeeff7b1204&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Deployment Pipeline"&gt;bb67ed7253e83010b846ddeeff7b1204&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_a8a2850143fc6110fcbf9bf6cab8f2f5&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-08-28 10:36:54&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 09:17:30</sys_created_on>
+        <sys_id>51efb09d83341210c6695855eeaad3a9</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ScheduledDeploymentService</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_51efb09d83341210c6695855eeaad3a9</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 09:17:30</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,767 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>3e3dbfdaa9a8ed94f877bee690644556</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.DataExtractionImpl&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;DataExtractionImpl&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var DataExtractionImpl = Class.create();
+DataExtractionImpl.prototype = {
+    initialize: function() {
+        this.DATA_EXTRACTION_ERRORS = {};
+        this.PROCESS = {};
+        this.UTIL = new DataExtractionUtil();
+        this.CONSTANTS = new DataExtractionConstants();
+    },
+
+    //Entry point to get training data
+    //Inputs: (JSON) required. contract describing the use case and other features to query
+    //        (JSON) optional. pagination_data describe the pagination information. empty in the first call
+    getTrainingData: function(contract, pagination_data) {
+
+        try {
+
+            var contractInfo = new DataExtractionContractValidation().isJSONValid(contract);
+            if (!contractInfo.isValid)
+                return contractInfo.errors;
+
+            // converting just the keys to upper case to avoid errors while validating encodedqueries (case sensitive)
+            this.PROCESS.contract = this.UTIL.ConvertContractKeysToUpperCase(contract);
+            this.PROCESS.useCase = contractInfo.useCase;
+
+            this.initializeProcess(pagination_data);
+            if (!this.UTIL.isNullOrEmpty(this.DATA_EXTRACTION_ERRORS)) {
+                this.wrapUpProcess();
+                return this.DATA_EXTRACTION_ERRORS;
+            }
+            var includeFeaturesAndLabels = true;
+            this.processDataFromTargetTable(includeFeaturesAndLabels);
+            if (!this.UTIL.isNullOrEmpty(this.DATA_EXTRACTION_ERRORS)) {
+                this.wrapUpProcess();
+                return this.DATA_EXTRACTION_ERRORS;
+            }
+
+            if (this.PROCESS.useCase != "SINGLE_TABLE") {
+                this.PROCESS.source_sys_ids = {};
+                this.processDataFromSource(includeFeaturesAndLabels);
+                if (!this.UTIL.isNullOrEmpty(this.DATA_EXTRACTION_ERRORS)) {
+                    this.wrapUpProcess();
+                    return this.DATA_EXTRACTION_ERRORS;
+                }
+            }
+
+            //processing other features from target after source validation to avoid processing possible records deleted because of inner join
+            if (Object.keys(this.PROCESS.extractedData).length &gt; 0 &amp;&amp;
+                this.UTIL.isValidJSONArrayKey(this.PROCESS.contract.TARGET, "OTHER_FEATURES"))
+                this.processOtherFeatures(this.PROCESS.contract.TARGET.TABLE,
+                    this.PROCESS.contract.TARGET.OTHER_FEATURES,
+                    Object.keys(this.PROCESS.extractedData));
+
+            this.wrapUpProcess();
+
+        } catch (err) {
+            this.addError("DATA_ERROR", err);
+            this.wrapUpProcess();
+            return this.DATA_EXTRACTION_ERRORS;
+        }
+
+        if (!this.UTIL.isNullOrEmpty(this.DATA_EXTRACTION_ERRORS))
+            return this.DATA_EXTRACTION_ERRORS;
+        else
+            return this.getExtractedData(includeFeaturesAndLabels);
+
+    },
+
+    getRecords: function(pagination_data) {
+        try {
+            this.initializeProcess(pagination_data);
+            if (!this.UTIL.isNullOrEmpty(this.DATA_EXTRACTION_ERRORS)) {
+                this.wrapUpProcess();
+                return this.DATA_EXTRACTION_ERRORS;
+            }
+            var includeFeaturesAndLabels = false;
+            this.processDataFromTargetTable(includeFeaturesAndLabels);
+            if (!this.UTIL.isNullOrEmpty(this.DATA_EXTRACTION_ERRORS)) {
+                this.wrapUpProcess();
+                return this.DATA_EXTRACTION_ERRORS;
+            }
+
+            if (this.PROCESS.useCase != "SINGLE_TABLE") {
+                this.PROCESS.source_sys_ids = {};
+                this.processDataFromSource(includeFeaturesAndLabels);
+                if (!this.UTIL.isNullOrEmpty(this.DATA_EXTRACTION_ERRORS)) {
+                    this.wrapUpProcess();
+                    return this.DATA_EXTRACTION_ERRORS;
+                }
+            }
+
+            this.wrapUpProcess();
+
+        } catch (err) {
+            this.addError("DATA_ERROR", err);
+            this.wrapUpProcess();
+            return this.DATA_EXTRACTION_ERRORS;
+        }
+
+        if (!this.UTIL.isNullOrEmpty(this.DATA_EXTRACTION_ERRORS))
+            return this.DATA_EXTRACTION_ERRORS;
+        else
+            return this.getExtractedData(includeFeaturesAndLabels);
+    },
+
+    getRecordCount: function(contract, minRecords) {
+        try {
+            var contractInfo = new DataExtractionContractValidation().isJSONValid(contract);
+            if (!contractInfo.isValid)
+                return contractInfo.errors;
+            this.PROCESS.contract = this.UTIL.ConvertContractKeysToUpperCase(contract);
+            var target = this.PROCESS.contract.TARGET;
+            this.PROCESS.useCase = contractInfo.useCase;
+            var maxNumberOfRecords = this.CONSTANTS.MAX_NUMBER_RECORDS_FOR_TRAINING;
+            if (this.UTIL.isValidJSONKey(this.PROCESS.contract.TARGET, "MAX_NUMBER_RECORDS")) {
+                maxNumberOfRecords = this.PROCESS.contract.TARGET.MAX_NUMBER_RECORDS;
+            }
+            var recordCount = 0;
+            if (this.PROCESS.useCase == "SINGLE_TABLE") {
+                var encodedQuery = this.UTIL.isValidJSONKey(target, "ENCODED_QUERY") ?
+                    target.ENCODED_QUERY : "";
+                if (this.PROCESS.info.apply_domain_separation &amp;&amp; gr.isValidField("sys_domain")) {
+                    encodedQuery = encodedQuery + "^" + "sys_domain=" + this.PROCESS.contract.DOMAIN_SYS_ID;
+                }
+                var agg = new GlideAggregate(target.TABLE);
+                if (encodedQuery != "") agg.addEncodedQuery(encodedQuery);
+                agg.addAggregate('COUNT');
+                agg.setGroup(false);
+                agg.query();
+                if (agg.next()) {
+                    recordCount = parseInt(agg.getAggregate('COUNT'), 0);
+                }
+            } else {
+                var response = this.getRecords();
+                if (response &amp;&amp; response.hasOwnProperty(this.CONSTANTS.ERROR_TYPE_KEY)) return response;
+                var paginationData = response["pagination_data"];
+                var current_offset = paginationData["offset"];
+                while (current_offset != -1) {
+                    if (minRecords != null &amp;&amp; paginationData.total_extracted_records &gt;= parseInt(minRecords, 10)) break;
+                    response = this.getRecords(paginationData);
+                    paginationData = response["pagination_data"];
+                    current_offset = paginationData["offset"];
+                }
+                recordCount = paginationData.total_extracted_records;
+            }
+            return maxNumberOfRecords &lt; recordCount &amp;&amp; maxNumberOfRecords != -1 ? maxNumberOfRecords : recordCount;
+        } catch (err) {
+            this.addError("DATA_ERROR", err);
+            this.wrapUpProcess();
+            return this.DATA_EXTRACTION_ERRORS;
+        }
+    },
+
+    initializeProcess: function(pgn) {
+        this.PROCESS.info = {};
+        this.PROCESS.info.batch_start_time = new GlideDateTime().getDisplayValue();
+        this.PROCESS.info.batch_extracted_attachments = 0;
+        this.PROCESS.info.batch_extracted_records = 0;
+        this.PROCESS.info.max_pagination_records = this.CONSTANTS.MAX_PAGINATION_RECORDS;
+
+        //If pagination_data is null or empty is an indication of first run, 
+        //therefore table rotation needs to be check to understand pagination
+        if (this.UTIL.isNullOrEmpty(pgn)) {
+            this.PROCESS.pgn = {};
+            this.PROCESS.pgn.batch_count = 1;
+            if (this.UTIL.isValidJSONKey(this.PROCESS.contract.TARGET, "MAX_NUMBER_RECORDS"))
+                this.PROCESS.pgn.total_number_records_to_process = this.PROCESS.contract.TARGET.MAX_NUMBER_RECORDS;
+            else
+                this.PROCESS.pgn.total_number_records_to_process = this.CONSTANTS.MAX_NUMBER_RECORDS_FOR_TRAINING;
+
+
+            this.PROCESS.pgn.table_rotation_info = {};
+            this.PROCESS.pgn.total_extracted_records = 0;
+            this.PROCESS.pgn.total_extracted_attachments = 0;
+            this.setPagination();
+
+        } else {
+            this.PROCESS.pgn = pgn;
+            this.PROCESS.pgn.batch_count++;
+            if (this.PROCESS.pgn.table_rotation_info.active)
+                this.resetPaginationForRotationValues();
+            else
+                this.resetPaginationValues();
+        }
+
+        if (this.UTIL.isValidJSONKey(this.PROCESS.contract.TARGET, "EXPECTED_NUMBER_RECORDS"))
+            this.PROCESS.info.expected_number_records = this.PROCESS.contract.TARGET.EXPECTED_NUMBER_RECORDS;
+        else
+            this.PROCESS.info.expected_number_records = this.PROCESS.pgn.total_number_records_to_process;
+
+        if (GlideDomainSupport.isDataOrProcessSeparationEnabled() &amp;&amp; this.UTIL.isValidJSONKey(this.PROCESS.contract, "DOMAIN_SYS_ID")) {
+            this.PROCESS.info.apply_domain_separation = true;
+        } else {
+            this.PROCESS.info.apply_domain_separation = false;
+        }
+    },
+
+    setPagination: function() {
+        this.PROCESS.pgn.table_rotation_info.rotation_schedule = "";
+        this.PROCESS.pgn.table_rotation_info.rotation_offset = 0;
+        this.PROCESS.pgn.offset = 0;
+        this.PROCESS.pgn.limit = this.CONSTANTS.MAX_PAGINATION_RECORDS;
+
+        if (this.UTIL.isValidJSONKey(this.PROCESS.contract, "AUTO_ROTATION_DISCOVERY") &amp;&amp;
+            this.PROCESS.contract.AUTO_ROTATION_DISCOVERY.toUpperCase() == "FALSE") {
+            this.PROCESS.pgn.table_rotation_info.active = false;
+
+        } else {
+            var tablesInContract = this.UTIL.getTableListFromContract(this.PROCESS.contract, this.PROCESS.useCase);
+            var rotationGroupId = this.UTIL.getRotationSysId(tablesInContract);
+
+            if (gs.nil(rotationGroupId))
+                this.PROCESS.pgn.table_rotation_info.active = false;
+
+            else {
+                this.PROCESS.pgn.table_rotation_info.active = true;
+                this.PROCESS.info.rtt = {};
+                this.PROCESS.info.rtt.limit = this.CONSTANTS.MAX_PAGINATION_RECORDS;
+
+                var targetInfo = this.UTIL.getTargetInfoForRotation(this.PROCESS.contract.TARGET.TABLE,
+                    this.UTIL.isValidJSONKey(this.PROCESS.contract.TARGET, "ENCODED_QUERY") ?
+                    this.PROCESS.contract.TARGET.ENCODED_QUERY : "");
+
+                if (this.PROCESS.pgn.total_number_records_to_process == -1 ||
+                    targetInfo.record_count &lt; this.PROCESS.pgn.total_number_records_to_process)
+                    this.PROCESS.pgn.total_number_records_to_process = targetInfo.record_count;
+
+                var scheduleInfo = this.UTIL.getNextRotationSchedule(rotationGroupId, targetInfo.min_date);
+                this.setRotationScheduleInfo(scheduleInfo);
+            }
+        }
+    },
+
+
+    setRotationScheduleInfo: function(scheduleInfo) {
+        this.PROCESS.info.rtt.encoded_query = scheduleInfo.encoded_query;
+        this.PROCESS.pgn.table_rotation_info.rotation_schedule = scheduleInfo.sys_id;
+    },
+
+    resetPaginationValues: function() {
+        this.PROCESS.pgn.offset = this.PROCESS.pgn.offset + this.CONSTANTS.MAX_PAGINATION_RECORDS;
+
+        if (this.isLastBatch())
+            this.PROCESS.pgn.limit = this.setRemainingAsLimit(this.PROCESS.pgn.offset);
+        else
+            this.PROCESS.pgn.limit = this.PROCESS.pgn.offset + this.CONSTANTS.MAX_PAGINATION_RECORDS;
+    },
+
+    setRemainingAsLimit: function(offset) {
+        return offset + (this.PROCESS.pgn.total_number_records_to_process - offset);
+    },
+
+
+    resetPaginationForRotationValues: function() {
+        this.PROCESS.info.rtt = {};
+
+        var scheduleInfo;
+        //table_rotation_info.rotation_offset -1 = change in shard
+        if (this.PROCESS.pgn.table_rotation_info.rotation_offset == -1) {
+            scheduleInfo = this.UTIL.getNextRotationSchedule(this.PROCESS.pgn.table_rotation_info.rotation_schedule);
+            this.PROCESS.pgn.table_rotation_info.rotation_offset = 0;
+        } else {
+            scheduleInfo = this.UTIL.getRotationSchedule(this.PROCESS.pgn.table_rotation_info.rotation_schedule);
+            this.PROCESS.pgn.table_rotation_info.rotation_offset = this.PROCESS.pgn.table_rotation_info.rotation_offset + this.CONSTANTS.MAX_PAGINATION_RECORDS;
+            this.PROCESS.pgn.offset = this.PROCESS.pgn.offset + this.CONSTANTS.MAX_PAGINATION_RECORDS;
+        }
+
+        this.setRotationScheduleInfo(scheduleInfo);
+
+        if (this.isLastBatch()) {
+            this.PROCESS.info.rtt.limit = this.setRemainingAsLimit(this.PROCESS.pgn.table_rotation_info.rotation_offset);
+            this.PROCESS.pgn.limit = this.setRemainingAsLimit(this.PROCESS.pgn.offset);
+        } else {
+            this.PROCESS.info.rtt.limit = this.PROCESS.pgn.table_rotation_info.rotation_offset + this.CONSTANTS.MAX_PAGINATION_RECORDS;
+            this.PROCESS.pgn.limit = this.PROCESS.pgn.offset + this.CONSTANTS.MAX_PAGINATION_RECORDS;
+        }
+    },
+
+    isLastBatch: function() {
+
+        return ((this.PROCESS.pgn.offset + this.CONSTANTS.MAX_PAGINATION_RECORDS) &gt;=
+            this.PROCESS.pgn.total_number_records_to_process);
+    },
+    isLastBatchForRotation: function() {
+
+        return ((this.PROCESS.pgn.table_rotation_info.rotation_offset + this.PROCESS.info.batch_total_number_target_records) &gt;=
+            this.PROCESS.info.rtt.shard_total_number_records_to_process);
+    },
+
+
+    //Prepare the extracted data to match the GraphQL contract expected result
+    getExtractedData: function(includeRecords) {
+        var extractedDataGQL = {};
+        extractedDataGQL.tag = this.UTIL.isValidJSONKey(this.PROCESS.contract, "TAG") ? this.PROCESS.contract.TAG : "";
+        extractedDataGQL.pagination_data = this.PROCESS.pgn;
+        if (includeRecords) {
+            extractedDataGQL.records = Object.keys(this.PROCESS.extractedData).map(function(key) {
+                return this.PROCESS.extractedData[key];
+            }, this);
+        }
+
+        if (this.PROCESS.info.expected_number_records != -1 &amp;&amp; this.PROCESS.pgn.total_extracted_records &gt;= this.PROCESS.info.expected_number_records) {
+            extractedDataGQL.records = extractedDataGQL.records.slice(0, this.PROCESS.info.expected_number_records);
+        }
+
+        return extractedDataGQL;
+    },
+
+    wrapUpProcess: function() {
+
+        this.PROCESS.info.batch_extracted_records = Object.keys(this.PROCESS.extractedData).length;
+        this.PROCESS.info.total_extracted_attachments = this.PROCESS.info.batch_extracted_attachments + this.PROCESS.pgn.total_extracted_attachments;
+        this.PROCESS.pgn.total_extracted_records = this.PROCESS.info.batch_extracted_records + this.PROCESS.pgn.total_extracted_records;
+        this.PROCESS.pgn.total_extracted_attachments = this.PROCESS.info.total_extracted_attachments;
+        this.PROCESS.info.batch_end_time = new GlideDateTime().getDisplayValue();
+
+        if (this.PROCESS.pgn.table_rotation_info.active &amp;&amp; this.isLastBatchForRotation()) {
+            this.PROCESS.pgn.table_rotation_info.rotation_offset = -1;
+            this.PROCESS.pgn.offset = this.PROCESS.pgn.offset + this.PROCESS.info.batch_total_number_target_records;
+        }
+
+        //adding validation for this.PROCESS.pgn.expected_number_records
+        if (this.isLastBatch() || (this.PROCESS.info.expected_number_records != -1 &amp;&amp; this.PROCESS.pgn.total_extracted_records &gt;= this.PROCESS.info.expected_number_records))
+            this.PROCESS.pgn.offset = -1;
+
+        var debugMessage = " Use case " + this.PROCESS.useCase +
+            " pagination " + JSON.stringify(this.PROCESS.pgn, null, 2) + " info " + JSON.stringify(this.PROCESS.info, null, 2);
+
+        if (!this.UTIL.isNullOrEmpty(this.DATA_EXTRACTION_ERRORS))
+            this._debug("Data Extraction has failed. " + debugMessage + ". Errors" + JSON.stringify(this.DATA_EXTRACTION_ERRORS, null, 2));
+
+        else
+            this._debug("Data Extraction has completed." + debugMessage);
+    },
+
+
+    //process Features and Labels (if applicable) from the target Table
+    processDataFromTargetTable: function(includeFeaturesAndLabels) {
+        if (!this.UTIL.isJSONObject(this.PROCESS.contract.TARGET)) {
+            this.addError("DATA_ERROR", "Target was not provided");
+            return;
+        }
+        var target = this.PROCESS.contract.TARGET;
+        this.PROCESS.extractedData = {};
+
+        try {
+            var gr = new GlideRecord(target.TABLE);
+
+            var eq = this.UTIL.isValidJSONKey(target, "ENCODED_QUERY") ?
+                this.getRefinedEncodedQuery(target.ENCODED_QUERY, gr) : this.getRefinedEncodedQuery("", gr);
+
+            if (!gs.nil(eq))
+                gr.addEncodedQuery(eq);
+
+            if (this.UTIL.isValidJSONKey(target, "ORDER")) {
+                if (target.ORDER == "ASC")
+                    gr.orderBy('sys_created_on');
+                else if (target.ORDER == "DESC")
+                    gr.orderByDesc('sys_created_on');
+            }
+
+            if (this.PROCESS.pgn.table_rotation_info.active)
+                gr.chooseWindow(this.PROCESS.pgn.table_rotation_info.rotation_offset, this.PROCESS.info.rtt.limit);
+            else
+                gr.chooseWindow(this.PROCESS.pgn.offset, this.PROCESS.pgn.limit);
+            gr.query();
+
+            this.setTotalNumberRecordsToProcess(gr.getRowCount());
+            this.PROCESS.info.batch_total_number_target_records = 0;
+
+            while (gr.next()) {
+                if (this.PROCESS.pgn.total_extracted_records + this.PROCESS.info.batch_total_number_target_records &gt;= this.PROCESS.pgn.total_number_records_to_process) break;
+                this.PROCESS.info.batch_total_number_target_records++;
+                var recordSysId = gr.getValue('sys_id');
+                var labelsData = [];
+                var featuresData = [];
+
+                if (includeFeaturesAndLabels) {
+                    if (this.UTIL.isValidJSONKey(target, "LABELS") &amp;&amp;
+                        target.LABELS.length &gt; 0)
+                        labelsData = this.UTIL.getSingleValueFields(gr, target.LABELS);
+
+                    if (this.UTIL.isValidJSONKey(target, "FEATURES") &amp;&amp;
+                        target.FEATURES.length &gt; 0)
+                        featuresData = this.UTIL.getSingleValueFields(gr, target.FEATURES);
+
+                    this.PROCESS.extractedData[recordSysId] = {
+                        target_sys_id: recordSysId,
+                        source_sys_id: null,
+                        sys_created_on: gr.getValue('sys_created_on'),
+                        features: featuresData,
+                        labels: labelsData,
+                        other_features: []
+                    };
+                } else {
+                    this.PROCESS.extractedData[recordSysId] = {
+                        target_sys_id: recordSysId,
+                        sys_created_on: gr.getValue('sys_created_on'),
+                    };
+                }
+            }
+
+        } catch (err) {
+            this.addError("DATA_ERROR", "Something went wrong while processing target information." + err);
+        }
+    },
+
+    getRefinedEncodedQuery: function(encodedQuery, gr) {
+        if (this.PROCESS.pgn.table_rotation_info.active)
+            encodedQuery = (gs.nil(encodedQuery) ? "" : encodedQuery + "^") + this.PROCESS.info.rtt.encoded_query;
+
+        if (this.PROCESS.info.apply_domain_separation &amp;&amp; gr.isValidField("sys_domain")) {
+            encodedQuery = (gs.nil(encodedQuery) ? "" : encodedQuery + "^") + "sys_domain=" + this.PROCESS.contract.DOMAIN_SYS_ID;
+        }
+        if (gr instanceof GlideRecord) gr.setCategory(this.CONSTANTS.READ_REPLICA_DB_CATEGORY);
+
+        return encodedQuery;
+    },
+
+    setTotalNumberRecordsToProcess: function(RecordsCount) {
+
+        if (this.PROCESS.pgn.table_rotation_info.active) {
+            this.PROCESS.info.rtt.shard_total_number_records_to_process = RecordsCount;
+
+        } else if (this.PROCESS.pgn.batch_count == 1 &amp;&amp;
+            (this.PROCESS.pgn.total_number_records_to_process == -1 ||
+                RecordsCount &lt; this.PROCESS.pgn.total_number_records_to_process))
+            this.PROCESS.pgn.total_number_records_to_process = RecordsCount;
+    },
+
+    //process features from the source table
+    processDataFromSource: function(includeFeaturesAndLabels) {
+        var source = this.PROCESS.contract.SOURCE;
+
+        if (gs.nil(this.PROCESS.useCase) ||
+            !this.UTIL.isJSONObject(source) ||
+            this.UTIL.isNullOrEmpty(this.PROCESS.extractedData)) {
+            this.addError("DATA_ERROR", "Source, useCase or data from source was not provided");
+            return;
+        }
+
+        this.processSingleFeaturesFromSource(includeFeaturesAndLabels);
+        if (this.UTIL.isNullOrEmpty(this.PROCESS.source_sys_ids))
+            return;
+
+
+        if (this.UTIL.isValidJSONArrayKey(this.PROCESS.contract.SOURCE, "OTHER_FEATURES")) {
+
+            //in case there is not single features specified for source, we still need to get the relationship to target
+            if (this.UTIL.isNullOrEmpty(this.PROCESS.source_sys_ids))
+                this.processSingleFeaturesFromSource(includeFeaturesAndLabels);
+
+            if (this.UTIL.isNullOrEmpty(this.PROCESS.source_sys_ids))
+                return;
+
+            var source_ids = Object.keys(this.PROCESS.source_sys_ids).map(function(key) {
+                return [this.PROCESS.source_sys_ids[key]];
+            }, this);
+
+            this.processOtherFeatures(this.PROCESS.contract.SOURCE.TABLE,
+                this.PROCESS.contract.SOURCE.OTHER_FEATURES,
+                source_ids);
+        }
+    },
+
+    processSingleFeaturesFromSource: function(includeFeaturesAndLabels) {
+        var source = this.PROCESS.contract.SOURCE;
+
+        if (gs.nil(this.PROCESS.useCase) ||
+            !this.UTIL.isJSONObject(source) ||
+            this.UTIL.isNullOrEmpty(this.PROCESS.extractedData)) {
+            this.addError("DATA_ERROR", "Source, useCase or data from source was not provided");
+            return;
+        }
+
+        var encodedQuery = source.JOIN.TARGET_ID_FIELD + "IN" + Object.keys(this.PROCESS.extractedData).join(',');
+
+        //if the join is using document id with target
+        if (this.UTIL.isValidJSONKey(source, "TARGET_TABLE_FIELD"))
+            encodedQuery += "^" + source.TARGET_TABLE_FIELD + "=" + this.PROCESS.contract.TARGET.TABLE;
+
+
+        if (this.PROCESS.useCase == "TWO_TABLE_JOIN") {
+            encodedQuery += "^" + (!this.UTIL.isValidJSONKey(source, "ENCODED_QUERY") ? "" : source.ENCODED_QUERY);
+
+            if (includeFeaturesAndLabels)
+                this.addSingleFeaturesFromSource(source.TABLE, source.FEATURES, encodedQuery, source.JOIN.TARGET_ID_FIELD);
+            else
+                this.addSingleFeaturesFromSource(source.TABLE, null, encodedQuery, source.JOIN.TARGET_ID_FIELD);
+
+        } else if (this.PROCESS.useCase == "TWO_TABLE_JOIN_WITH_M2M") {
+            encodedQuery += "^" + (!this.UTIL.isValidJSONKey(source.JOIN, "ENCODED_QUERY") ? "" : source.JOIN.ENCODED_QUERY);
+
+            //if the join is using document id with source
+            if (this.UTIL.isValidJSONKey(source, "SOURCE_TABLE_FIELD"))
+                encodedQuery += "^" + source.SOURCE_TABLE_FIELD + "=" + source.TABLE;
+
+            var m2mSysId = {};
+            //first get the sys_id from m2m to join
+            var m2mGR = new GlideRecord(source.JOIN.TABLE);
+            encodedQuery = this.getRefinedEncodedQuery(encodedQuery, m2mGR);
+            m2mGR.addEncodedQuery(encodedQuery);
+            m2mGR.query();
+            this.PROCESS.info.batch_total_number_source_records = m2mGR.getRowCount();
+            while (m2mGR.next()) {
+                if (this.UTIL.isValidJSONKey(m2mSysId, m2mGR.getValue(source.JOIN.SOURCE_ID_FIELD))) {
+                    m2mSysId[m2mGR.getValue(source.JOIN.SOURCE_ID_FIELD)].push(m2mGR.getValue(source.JOIN.TARGET_ID_FIELD));
+                } else {
+                    m2mSysId[m2mGR.getValue(source.JOIN.SOURCE_ID_FIELD)] = [m2mGR.getValue(source.JOIN.TARGET_ID_FIELD)];
+                }
+            }
+
+            //get the features from the source table
+            encodedQuery =
+                (!this.UTIL.isValidJSONKey(source, "ENCODED_QUERY") ? "" : source.ENCODED_QUERY + "^") +
+                "sys_idIN" + Object.keys(m2mSysId).join(',');
+            if (includeFeaturesAndLabels) {
+                this.addSingleFeaturesFromSource(source.TABLE, source.FEATURES, encodedQuery, m2mSysId);
+            } else {
+                this.addSingleFeaturesFromSource(source.TABLE, null, encodedQuery, m2mSysId);
+            }
+            m2mSysId = null;
+        }
+    },
+
+    //Add all features from source 
+    //inputs: table: table from which the features will be extracted
+    //.       features: array with the features to be extracted
+    //        encodedQuery: encodedQuery to apply to the table
+    //        fieldToJoin: if useCase "TWO_TABLE_JOIN" a fieldName is required
+    //                     in useCase "TWO_TABLE_JOIN_WITH_M2M" a map with the relationship is required
+    addSingleFeaturesFromSource: function(table, features, encodedQuery, fieldToJoin) {
+        if (gs.nil(this.PROCESS.useCase) ||
+            gs.nil(table) ||
+            gs.nil(fieldToJoin) ||
+            this.UTIL.isNullOrEmpty(this.PROCESS.extractedData)) {
+            this.addError("DATA_ERROR", "Error while adding features");
+            return;
+        }
+
+        try {
+            var processFeaturesAtRecordCreation = (!this.UTIL.isValidJSONKey(this.PROCESS.contract, "RUNTIME") ||
+                this.PROCESS.contract.RUNTIME.toUpperCase() == "CREATE");
+            var gr = new GlideRecord(table);
+            encodedQuery = this.getRefinedEncodedQuery(encodedQuery, gr);
+            gr.addEncodedQuery(encodedQuery);
+            gr.query();
+            this.PROCESS.info.batch_total_number_source_records = gr.getRowCount();
+            while (gr.next()) {
+                var recordSysIds = null;
+                if (this.PROCESS.useCase == "TWO_TABLE_JOIN")
+                    recordSysIds = [gr.getValue(fieldToJoin)];
+
+                else if (this.PROCESS.useCase == "TWO_TABLE_JOIN_WITH_M2M")
+                    recordSysIds = fieldToJoin[gr.getUniqueValue()];
+
+                for (var i = 0; i &lt; recordSysIds.length; i++) {
+                    var recordSysId = recordSysIds[i];
+                    if (this.PROCESS.extractedData.hasOwnProperty(recordSysId)) {
+                        if (processFeaturesAtRecordCreation &amp;&amp;
+                            (gs.nil(features) || this.PROCESS.extractedData[recordSysId].sys_created_on &lt;= gr.getValue("sys_created_on")))
+                            continue;
+                        this.PROCESS.source_sys_ids[recordSysId] = gr.getUniqueValue();
+                        this.PROCESS.extractedData[recordSysId].source_sys_id = gr.getUniqueValue();
+                        this.PROCESS.extractedData[recordSysId].features =
+                            this.UTIL.getSingleValueFields(gr, features, this.PROCESS.extractedData[recordSysId].features);
+                    }
+                }
+            }
+            this.cleanUpRecords();
+
+            if (this.UTIL.isNullOrEmpty(this.PROCESS.source_sys_ids))
+                this._debug("", "No records found in source for batch " + this.PROCESS.pgn.batch_count);
+
+
+        } catch (err) {
+            this.addError("DATA_ERROR", "Error while adding features" + err);
+        }
+    },
+
+
+    processOtherFeatures: function(table, otherFeatures, sysIds) {
+        if (!this.UTIL.isValidArray(otherFeatures) ||
+            !this.UTIL.isValidArray(sysIds) ||
+            this.UTIL.isNullOrEmpty(this.PROCESS.extractedData)) {
+
+            this.addError("DATA_ERROR", "Error while adding other features");
+            return;
+        }
+
+        for (i = 0; i &lt; otherFeatures.length; i++)
+            this.addMultiValuedFeatures(table, otherFeatures[i], sysIds);
+
+    },
+
+    addMultiValuedFeatures: function(table, otherFeature, sysIds) {
+
+        if (!this.UTIL.isJSONObject(otherFeature) ||
+            !this.UTIL.isValidArray(sysIds) ||
+            this.UTIL.isNullOrEmpty(this.PROCESS.extractedData)) {
+            this.addError("DATA_ERROR", "Error while adding other features");
+            return;
+        }
+        try {
+            var processFeaturesAtRecordCreation = (!this.UTIL.isValidJSONKey(this.PROCESS.contract, "RUNTIME") ||
+                this.PROCESS.contract.RUNTIME.toUpperCase() == "CREATE");
+
+            var maxNumberExtraFeatureByRecord = this.UTIL.isValidJSONKey(otherFeature, "MAX_NUMBER_RECORDS") ?
+                parseInt(otherFeature.MAX_NUMBER_RECORDS) : this.CONSTANTS.MAX_NUMBER_OTHER_FEATURES;
+
+            var tableGR = this.UTIL.getOtherFeatureTable(otherFeature, table);
+            var encodedQuery = (!this.UTIL.isValidJSONKey(otherFeature, "ENCODED_QUERY") ? "" : otherFeature.ENCODED_QUERY + "^");
+
+            var fieldGR;
+            if (otherFeature.TYPE.toLowerCase() == this.CONSTANTS.OTHER_FEATURES_TYPES["ATTACHMENT"]) {
+                encodedQuery = "content_typeIN" + (!this.UTIL.isValidJSONKey(otherFeature, "ATTACHMENT_TYPES") ?
+                        Object.keys(this.CONSTANTS.ALL_SUPPORTED_ATTACHMENT_TYPES).map(this.UTIL.getMIMEType) :
+                        otherFeature.ATTACHMENT_TYPES.map(this.UTIL.getMIMEType)) +
+                    "^size_bytes&lt;=" + this.CONSTANTS.MAX_BYTE_SIZE_FOR_ATTACHMENTS +
+                    "^table_name=" + table + "^table_sys_id" + "IN" + sysIds;
+                fieldGR = "table_sys_id";
+                otherFeature.LABEL = this.CONSTANTS.ATTACHMMENT_LABEL;
+
+            } else if (otherFeature.TYPE.toLowerCase() == this.CONSTANTS.OTHER_FEATURES_TYPES["ARRAY"]) {
+                encodedQuery = encodedQuery + otherFeature.JOIN_ID_FIELD + "IN" + sysIds;
+                fieldGR = otherFeature.JOIN_ID_FIELD;
+            }
+
+            if (gs.nil(fieldGR)) {
+                this.addError("DATA_ERROR", "Error while adding other features. fieldName was not found");
+                return;
+            }
+
+            var gr = new GlideRecord(tableGR);
+            encodedQuery = this.getRefinedEncodedQuery(encodedQuery, gr);
+            gr.addEncodedQuery(encodedQuery);
+            gr.query();
+
+            var otherFeaturesRecordMap = {};
+            while (gr.next()) {
+
+                var recordSysId = null;
+                recordSysId = gr.getValue(fieldGR);
+
+                if (processFeaturesAtRecordCreation &amp;&amp;
+                    this.PROCESS.extractedData[recordSysId].sys_created_on &lt;= gr.getValue("sys_created_on"))
+                    continue;
+
+                if (!otherFeaturesRecordMap.hasOwnProperty(recordSysId))
+                    otherFeaturesRecordMap[recordSysId] = [];
+
+                if (maxNumberExtraFeatureByRecord == -1 ||
+                    (maxNumberExtraFeatureByRecord &gt; 0 &amp;&amp;
+                        otherFeaturesRecordMap[recordSysId].length &lt; maxNumberExtraFeatureByRecord)) {
+
+                    if (otherFeature.TYPE.toLowerCase() == this.CONSTANTS.OTHER_FEATURES_TYPES["ATTACHMENT"]) {
+                        if (this.getTotalExtractedAttachments() &gt;= this.CONSTANTS.MAX_NUMBER_OF_ATTACHMENT_FOR_TRAINING)
+                            break;
+
+
+                        otherFeaturesRecordMap[recordSysId].push(this.UTIL.getAttachmentMetadata(gr));
+                        this.PROCESS.info.batch_extracted_attachments++;
+
+
+                    } else if (otherFeature.TYPE == "ARRAY") {
+                        otherFeaturesRecordMap[recordSysId].push(gr.getValue(otherFeature.FEATURE));
+                    }
+                }
+            }
+
+            for (key in this.PROCESS.extractedData) {
+                if (!this.PROCESS.extractedData[key].hasOwnProperty("other_features"))
+                    this.PROCESS.extractedData[key].other_features = [];
+
+                var sysId = (table == this.PROCESS.contract.TARGET.TABLE) ? key : this.PROCESS.source_sys_ids[key];
+
+                if (!otherFeaturesRecordMap.hasOwnProperty(sysId))
+                    this.PROCESS.extractedData[key].other_features.push(this.UTIL.getMultiValueFields(otherFeature.TYPE, table + "." + otherFeature.LABEL));
+
+                else {
+                    this.PROCESS.extractedData[key].other_features.push(this.UTIL.getMultiValueFields(otherFeature.TYPE, table + "." + otherFeature.LABEL,
+                        otherFeaturesRecordMap[sysId]));
+                    delete otherFeaturesRecordMap[sysId];
+                }
+            }
+            otherFeaturesRecordMap = null;
+
+        } catch (err) {
+            this.addError("DATA_ERROR", "Error while adding features" + err);
+        }
+    },
+
+    //clean up all records that were in target but not in source to guarantee an inner join.
+    cleanUpRecords: function() {
+        for (key in this.PROCESS.extractedData) {
+            if (!this.PROCESS.source_sys_ids.hasOwnProperty(key))
+                delete this.PROCESS.extractedData[key];
+
+        }
+    },
+
+
+    //Adding errors to DATA_EXTRACTION_ERRORS and the log
+    addError: function(type, message) {
+        if (gs.nil(type) || !this.CONSTANTS.ERROR_TYPES.hasOwnProperty(type))
+            type = this.CONSTANTS.UNKNOWN_TAG;
+
+        message = this.CONSTANTS.ERROR_TYPES[type] + ". " + message;
+        this._debug(type + ':' + message);
+
+        if (!this.DATA_EXTRACTION_ERRORS.hasOwnProperty(this.CONSTANTS.ERROR_TYPE_KEY)) {
+            this.DATA_EXTRACTION_ERRORS[this.CONSTANTS.ERROR_TYPE_KEY] = type;
+            this.DATA_EXTRACTION_ERRORS[this.CONSTANTS.ERROR_MESSAGE_KEY] = [message];
+        } else {
+            this.DATA_EXTRACTION_ERRORS[this.CONSTANTS.ERROR_MESSAGE_KEY].push(message);
+        }
+
+    },
+
+    _debug: function(msg) {
+        new DataExtractionDebugUtil().debug(msg);
+    },
+
+    type: 'DataExtractionImpl'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;maint&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-01-25 02:49:29&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;3e3dbfdaa9a8ed94f877bee690644556&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;135&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;DataExtractionImpl&lt;/sys_name&gt;
+        &lt;sys_package display_value="Predictive Intelligence" source="com.glide.platform_ml"&gt;c41430683c31311068bcf327dfe37f28&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_3e3dbfdaa9a8ed94f877bee690644556&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-07-11 11:27:31&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:36:08</sys_created_on>
+        <sys_id>af66b0d983f01210c6695855eeaad318</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>DataExtractionImpl</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_af66b0d983f01210c6695855eeaad318</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:36:08</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

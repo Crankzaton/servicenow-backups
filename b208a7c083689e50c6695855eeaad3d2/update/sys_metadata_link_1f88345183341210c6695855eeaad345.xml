@@ -1,0 +1,241 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>8f03d975a320021037a5a0d3041e618b</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.ProcessOOBSignatures&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Provides a way to clean up signatures created by the ServiceNow Code Signing build process that cannot be migrated ever.&lt;/description&gt;
+        &lt;name&gt;ProcessOOBSignatures&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ProcessOOBSignatures = Class.create();
+ProcessOOBSignatures.prototype = {
+    initialize: function(shouldDelete, processCondition) {
+		this.SIGNATURE_CONFIGURATION_TABLE_NAME = 'sn_kmf_signature_configuration';
+		this.SIGNATURE_RECORD_TABLE_NAME = 'sn_kmf_record_signature';
+		this.SYS_CERTIFICATE_TABLE_NAME = 'sys_certificate';
+		
+		this.SIGNATURE_GEN_FILTER_FIELD = 'signature_gen_filter';
+		this.TABLE_NAME_FIELD = 'table_name';
+		this.PURPOSE_FIELD = 'purpose';
+		this.IS_ATTACHMENT_FIELD = 'is_attachment';
+		this.DOCUMENT_ID_FIELD = 'document_id';
+		this.SYS_ID_FIELD = 'sys_id';
+		this.CERTIFICATE_ALIAS_FIELD = 'certificate_alias';
+
+		this.ACTION_PREVIEW_ONLY = 'PREVIEW ONLY!';
+		this.ACTION_DELETE       = 'DELETE RECORDS';
+
+		this.DELETED_RECORDS_INFO_FORMAT = '[Document Id],[Purpose],[Is attachment]\n' +
+											'-----------------------------------------------------------------------\n';
+
+		this.DIVIDER = '=============================================================================================\n';
+
+		this.NOT_IN_OPERATOR = 'NOT IN';
+		this.IN_OPERATOR = 'IN';
+		this.OOB_CERTIFICATE_PATTERN = /^code_signing_key_(.+)_publiccodesignver/;
+
+		this.shouldDelete = shouldDelete;
+		this.processCondition = processCondition;
+    },
+
+	checkIfOOBCertificate: function(certificateName) {
+		var reg = new RegExp(this.OOB_CERTIFICATE_PATTERN);
+		return reg.test(certificateName.trim());
+	},
+
+	fetchOOBCertificates: function() {
+		var oobCerts = [];
+		var gr = new GlideRecord(this.SYS_CERTIFICATE_TABLE_NAME);
+		gr.query();
+
+		while(gr.next()) {
+			if (this.checkIfOOBCertificate(gr.getValue('name')))
+				oobCerts.push(gr.getValue(this.SYS_ID_FIELD));
+		}
+
+		return oobCerts;
+	},
+
+	process: function() {
+		if(gs.nil(this.processCondition)) {
+			gs.info("processCondition parameter can't be empty");
+			return;
+		}
+
+		switch (this.processCondition) {
+			case 'oob_unwanted_signatures':
+				this.processOOBUnwantedSignatures(this.shouldDelete);
+				break;
+			default:
+				gs.log(gs.getMessage("{0} condition is not valid to process oob signatures", [this.processCondition]));
+		}
+	},
+
+	processOOBUnwantedSignatures: function(shouldDelete) {
+		shouldDelete = shouldDelete === 'true';
+		var sigConfigWithFilters = this.fetchsSigConfigWithFilters();
+		var oobCerts = this.fetchOOBCertificates();
+		
+		for(var index = 0; index &lt; sigConfigWithFilters.length; index++) {
+			this.deleteRecords(sigConfigWithFilters[index], shouldDelete, oobCerts);
+		}
+	},
+
+	fetchRecordsToBeKept: function(tableName, sigGenFilter) {
+		var recordsToBeKept = [];
+
+		var gr = new GlideRecord(tableName);
+		gr.addEncodedQuery(sigGenFilter);
+		gr.query();
+
+		while(gr.next()) {
+			recordsToBeKept.push(gr.getValue(this.SYS_ID_FIELD));
+		}
+		
+		return recordsToBeKept;
+	},
+
+	displayInformationForRecordDeletion: function(signatureConfig, shouldDelete, oobCerts) {
+		var gr = new GlideRecord(this.SIGNATURE_RECORD_TABLE_NAME);
+		
+		var logBuffer = [];
+
+		gr.addQuery(this.TABLE_NAME_FIELD, signatureConfig[0]);
+		gr.addQuery(this.IS_ATTACHMENT_FIELD, signatureConfig[1]);
+		gr.addQuery(this.PURPOSE_FIELD, signatureConfig[2]);
+		gr.addQuery(this.CERTIFICATE_ALIAS_FIELD, this.IN_OPERATOR, oobCerts);
+		gr.query(); // records that are signed for a particular configuration OOB
+
+		var deleteOverviewMessage = '--------&gt; ' + this.ACTION_PREVIEW_ONLY + ' - NO DELETION OF RECORDS';
+		// Signature record to be deleted
+		var deleteRecPrefix = 'Action -&gt; ' + this.ACTION_PREVIEW_ONLY;
+		if (shouldDelete) {
+			deleteOverviewMessage = '--------&gt; ' + this.ACTION_DELETE;
+			deleteRecPrefix = 'Action -&gt; ' + this.ACTION_DELETE;
+		}
+
+		var oobRowCountwithConfig = gs.getMessage('\n' + this.DIVIDER +
+			'\n' + deleteOverviewMessage +'\n\n' +
+			'* COUNT={3} Total signature records in the database for a specific configuration.' +
+			'\n\tCRITERIA: table_name={0}, purpose={2}, is_attachment={1}\n', 
+			[signatureConfig[0], signatureConfig[1], signatureConfig[2], gr.getRowCount()]
+		);
+		logBuffer.push(oobRowCountwithConfig);
+
+		gr.addQuery(this.DOCUMENT_ID_FIELD,  this.NOT_IN_OPERATOR, this.fetchRecordsToBeKept(signatureConfig[0], signatureConfig[3]));
+		gr.query(); // records that are signed for a particular configuration but do not meet the signature generation filter condition  
+
+		var oobRowCountToBeDeleted = gs.getMessage('* COUNT={0} Total signature records that DO NOT meet the generation filter.'
+													+ '\n\tFILTER=[{1}]\n',[gr.getRowCount(), signatureConfig[3]]);
+		logBuffer.push(oobRowCountToBeDeleted);
+
+		if (gr.getRowCount() &gt; 0) {
+			logBuffer.push(this.DELETED_RECORDS_INFO_FORMAT);
+		}
+	
+		while (gr.next()) {
+			logBuffer.push(gs.getMessage(deleteRecPrefix + ' {0},{1},{2}', [gr.getDisplayValue(this.DOCUMENT_ID_FIELD), gr.getDisplayValue(this.PURPOSE_FIELD),  gr.getDisplayValue(this.IS_ATTACHMENT_FIELD)]));				
+		}
+
+		if (shouldDelete)
+			gs.log(logBuffer.join('\n'));
+		else
+			gs.print(logBuffer.join('\n'));
+		
+		gs.print('\n\n');
+	}, 
+
+	deleteRecords: function(signatureConfig, shouldDelete, oobCerts) {
+		this.displayInformationForRecordDeletion(signatureConfig, shouldDelete, oobCerts);
+
+		if (!shouldDelete) {
+			return;
+		}
+
+		var dbDelete = new GlideDBDelete(this.SIGNATURE_RECORD_TABLE_NAME);
+		var dbQuery = new GlideDBQuery(this.SIGNATURE_RECORD_TABLE_NAME);
+
+		dbQuery.addQuery(this.TABLE_NAME_FIELD, signatureConfig[0]);
+		dbQuery.addQuery(this.IS_ATTACHMENT_FIELD, signatureConfig[1]);
+		dbQuery.addQuery(this.PURPOSE_FIELD, signatureConfig[2]);
+		dbQuery.addQuery(this.CERTIFICATE_ALIAS_FIELD, this.IN_OPERATOR, oobCerts);
+		dbQuery.addQuery(this.DOCUMENT_ID_FIELD,  this.NOT_IN_OPERATOR, this.fetchRecordsToBeKept(signatureConfig[0], signatureConfig[3]));
+		
+
+		dbDelete.setQuery(dbQuery);
+		dbDelete.setMultiple(true);
+		
+		try {
+			dbDelete.executeAndReturnException(); 
+		} catch (ex) {
+			gs.log(gs.getMessage(
+				"Delete operation for signature configuration: table_name = `{0}`, is_attachment = `{1}`, and purpose = `{2} is not successfull, reason = {3}"),
+				[signatureConfig[0], signatureConfig[1], signatureConfig[2], gr.getRowCount(), ex]
+			);
+		} finally {
+			dbDelete.close();
+			dbQuery.close();
+		}
+
+	},
+
+	fetchsSigConfigWithFilters: function() {
+		/*
+			output: list of configurations with non empty signature generation filter
+			[[&lt;table_name&gt;, &lt;sign_attachment&gt;, &lt;purpose&gt;, &lt;signature_gen_filter&gt;], [.....] .....]
+		*/
+
+		var sigConfigWithFilters = [];
+
+		var gr = new GlideRecord(this.SIGNATURE_CONFIGURATION_TABLE_NAME);
+		gr.addNotNullQuery(this.SIGNATURE_GEN_FILTER_FIELD);
+		gr.query();
+
+		while(gr.next()) {
+			var tableName = gr.getValue(this.TABLE_NAME_FIELD);
+			var signAttachment = gr.getValue('sign_attachment');
+			var purpose = gr.getValue(this.PURPOSE_FIELD);
+
+			var sigGenFilter = gr.getValue(this.SIGNATURE_GEN_FILTER_FIELD);
+			sigConfigWithFilters.push([tableName, signAttachment, purpose, sigGenFilter]);
+		}
+		
+		return sigConfigWithFilters;
+	},
+
+    type: 'ProcessOOBSignatures'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2024-02-24 17:34:22&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;8f03d975a320021037a5a0d3041e618b&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;2&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ProcessOOBSignatures&lt;/sys_name&gt;
+        &lt;sys_package display_value="Code Signing framework" source="com.glide.code_signing"&gt;9cab7c643c35311068bcf327dfe37f23&lt;/sys_package&gt;
+        &lt;sys_policy&gt;protected&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_8f03d975a320021037a5a0d3041e618b&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-02-26 03:21:47&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:45:24</sys_created_on>
+        <sys_id>1f88345183341210c6695855eeaad345</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ProcessOOBSignatures</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_1f88345183341210c6695855eeaad345</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:45:24</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

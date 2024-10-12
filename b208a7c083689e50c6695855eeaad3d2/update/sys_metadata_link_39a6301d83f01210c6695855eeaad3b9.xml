@@ -1,0 +1,198 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>53bdbf808870a110fa9bf275d1a04361</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.TurfUnion&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;TurfUnion&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[//https://github.com/mfogel/polygon-clipping/blob/v0.15.3/src/index.js
+var TurfUnion = Class.create();
+TurfUnion.prototype = {
+  initialize: function () {},
+  type: 'TurfUnion',
+
+};
+
+
+TurfUnion.union = function (features, properties) {
+	var result = TurfUnion.run('union', features, properties);
+	return result;
+};
+TurfUnion.intersection = function (features, properties) {
+  return TurfUnion.run('intersection', features, properties);
+};
+TurfUnion.xor = function (features, properties) {
+  return TurfUnion.run('xor', features, properties);
+};
+TurfUnion.difference = function (features, properties) {
+  return TurfUnion.run('difference', features, properties);
+};
+
+TurfUnion.operation = {};
+
+TurfUnion.run = function (type, features, properties) {
+
+  var obj = features.reduce(function (acc, val, i) {
+    var geom = val.geometry.coordinates;
+    if (i &gt; 0) {
+      acc.geoms.push(geom);
+    } else {
+      acc.geom = geom;
+    }
+    return acc;
+  }, {
+    geom: {},
+    geoms: []
+  });
+  var geom = obj.geom;
+  var moreGeoms = obj.geoms;
+
+  TurfUnion.operation.type = type;
+  PtRounder.rounder.reset();
+
+  /* Convert inputs to MultiPoly objects */
+  var multipolys = [new MultiPolyIn(geom, true)];
+  for (var i = 0, iMax = moreGeoms.length; i &lt; iMax; i++) {
+    multipolys.push(new MultiPolyIn(moreGeoms[i], false));
+  }
+  TurfUnion.operation.numMultiPolys = multipolys.length;
+
+  /* BBox optimization for difference operation
+   * If the bbox of a multipolygon that's part of the clipping doesn't
+   * intersect the bbox of the subject at all, we can just drop that
+   * multiploygon. */
+  if (TurfUnion.operation.type === 'difference') {
+    // in place removal
+    var subject = multipolys[0];
+    var i2 = 1;
+    while (i2 &lt; multipolys.length) {
+      if (getBboxOverlap(multipolys[i2].bbox, subject.bbox) !== null) i++;
+      else multipolys.splice(i2, 1);
+    }
+  }
+
+  /* BBox optimization for intersection operation
+   * If we can find any pair of multipolygons whose bbox does not overlap,
+   * then the result will be empty. */
+  if (TurfUnion.operation.type === 'intersection') {
+    // TODO: this is O(n^2) in number of polygons. By sorting the bboxes,
+    //       it could be optimized to O(n * ln(n))
+    for (var i3 = 0, iMax3 = multipolys.length; i &lt; iMax3; i3++) {
+      var mpA = multipolys[i3];
+      for (var j = i + 1, jMax = multipolys.length; j &lt; jMax; j++) {
+        if (getBboxOverlap(mpA.bbox, multipolys[j].bbox) === null) return [];
+      }
+    }
+  }
+
+  /* Put segment endpoints in a priority queue */
+  var queue = new SplayTree(SweepEvent.compare);
+  for (var i4 = 0, iMax4 = multipolys.length; i4 &lt; iMax4; i4++) {
+    var sweepEvents = multipolys[i4].getSweepEvents();
+    for (var j4 = 0, jMax4 = sweepEvents.length; j4 &lt; jMax4; j4++) {
+      queue.insert(sweepEvents[j4]);
+
+      if (queue.getSize() &gt; TurfUnion.POLYGON_CLIPPING_MAX_QUEUE_SIZE) {
+        // prevents an infinite loop, an otherwise common manifestation of bugs
+        throw new Error(
+          'Infinite loop when putting segment endpoints in a priority queue ' +
+          '(queue size too big). Please file a bug report.'
+        );
+      }
+    }
+  }
+
+  /* Pass the sweep line over those endpoints */
+  var sweepLine = new SweepLine(queue);
+  var prevQueueSize = queue.getSize();
+  var node = queue.pop();
+  while (node) {
+    var evt = node.key;
+    if (queue.getSize() === prevQueueSize) {
+      // prevents an infinite loop, an otherwise common manifestation of bugs
+      var seg = evt.segment;
+      throw new Error(
+        'Unable to pop() ' + (evt.isLeft ? 'left' : 'right') + ' SweepEvent ' +
+        '[' + evt.point.x + ', ' + evt.point.y + ' +] from segment #' + seg.id +
+        ' [' + seg.leftSE.point.x + ', ' + seg.leftSE.point.y + '] -&gt; ' +
+        '[' + seg.rightSE.point.x + ', ' + seg.rightSE.point.y + '] from queue. ' +
+        'Please file a bug report.'
+      );
+    }
+
+    if (queue.getSize() &gt; TurfUnion.POLYGON_CLIPPING_MAX_QUEUE_SIZE) {
+      // prevents an infinite loop, an otherwise common manifestation of bugs
+      throw new Error(
+        'Infinite loop when passing sweep line over endpoints ' +
+        '(queue size too big). Please file a bug report.'
+      );
+    }
+
+    if (sweepLine.segments.length &gt; TurfUnion.POLYGON_CLIPPING_MAX_SWEEPLINE_SEGMENTS) {
+      // prevents an infinite loop, an otherwise common manifestation of bugs
+      throw new Error(
+        'Infinite loop when passing sweep line over endpoints ' +
+        '(too many sweep line segments). Please file a bug report.'
+      );
+    }
+
+    var newEvents = sweepLine.process(evt);
+    for (var i5 = 0, iMax5 = newEvents.length; i5 &lt; iMax5; i5++) {
+      var evt2 = newEvents[i5];
+      if (evt2.consumedBy === undefined) queue.insert(evt2);
+    }
+    prevQueueSize = queue.getSize();
+    node = queue.pop();
+  }
+
+  // free some memory we don't need anymore
+  PtRounder.rounder.reset();
+
+
+  /* Collect and compile segments we're keeping into a multipolygon */
+  var ringsOut = RingOut.factory(sweepLine.segments);
+  var result = new RingOut.MultiPolyOut(ringsOut);
+  var unioned = result.getGeom();
+  if (unioned.length === 0) return null;
+  if (unioned.length === 1) return TurfHelpers.polygon(unioned[0], properties);
+  return TurfHelpers.multiPolygon(unioned, properties);
+};
+
+TurfUnion.POLYGON_CLIPPING_MAX_QUEUE_SIZE = 1e6;
+TurfUnion.POLYGON_CLIPPING_MAX_SWEEPLINE_SEGMENTS = 1e6;]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-01-30 13:21:04&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;53bdbf808870a110fa9bf275d1a04361&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;8&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;TurfUnion&lt;/sys_name&gt;
+        &lt;sys_package display_value=""&gt;fa60558563b044509d2cba84af9c019c&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value=""&gt;fa60558563b044509d2cba84af9c019c&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_53bdbf808870a110fa9bf275d1a04361&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-02-08 15:12:16&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:37:07</sys_created_on>
+        <sys_id>39a6301d83f01210c6695855eeaad3b9</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>TurfUnion</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_39a6301d83f01210c6695855eeaad3b9</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:37:07</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

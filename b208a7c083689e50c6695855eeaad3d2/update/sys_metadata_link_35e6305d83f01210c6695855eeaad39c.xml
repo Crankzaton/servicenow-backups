@@ -1,0 +1,659 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>69798f5ecc912910f87734fccc52ce4a</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.FSMAssetUsageUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;FSMAssetUsageUtils&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var FSMAssetUsageUtils = Class.create();
+FSMAssetUsageUtils.prototype = {
+	initialize: function() {},
+
+	type: 'FSMAssetUsageUtils',
+};
+FSMAssetUsageUtils.ASSET_STATUSES = {
+	IN_STOCK: 6,
+	IN_MAINTENANCE: 3,
+	IN_USE: 1,
+	CONSUMED: 10,
+};
+
+FSMAssetUsageUtils.ASSET_SUB_STATUSES = {
+	AVAILABLE: 'available',
+	RESERVED: 'reserved',
+	DEFECTIVE: 'defective',
+};
+
+FSMAssetUsageUtils.IS_EAM_ACTIVE = GlidePluginManager.isActive('com.sn_eam') || GlidePluginManager.isActive('sn_eam');
+// Work order tables
+FSMAssetUsageUtils.WM_TASK_TABLE = 'wm_task';
+FSMAssetUsageUtils.SM_ASSET_USAGE_TABLE = 'sm_asset_usage';
+
+// Asset tables
+FSMAssetUsageUtils.ALM_ASSET_TABLE = 'alm_asset';
+FSMAssetUsageUtils.ALM_CONSUMABLE_TABLE = 'alm_consumable';
+FSMAssetUsageUtils.ALM_STOCKROOM_TABLE = 'alm_stockroom';
+
+/* Swapout Asset reference qualifier API
+input - WorkTask sys_id
+*/
+
+FSMAssetUsageUtils.getReferenceQualifierForSwapOutAsset = function(workTaskId) {
+	if (FSMAssetUsageUtils.IS_EAM_ACTIVE) {
+		// eslint-disable-next-line no-undef
+		return sn_eam.EAMAssetUsageUtils.getAssetRefQual('swap', workTaskId);
+	}
+	return FSMAssetUsageUtils._getRefQualForRemoveForBAsset(workTaskId);
+};
+
+/* Swapin Asset reference qualifier API
+input - WorkTask sys_id, swappedOutAsset sys_id
+*/
+
+FSMAssetUsageUtils.getReferenceQualifierForSwapInAsset = function(workTaskId, swappedOutAssetId) {
+	if (FSMAssetUsageUtils.IS_EAM_ACTIVE) {
+		// eslint-disable-next-line no-undef
+		return sn_eam.EAMAssetUsageUtils.getReplacementAssetRefQual(swappedOutAssetId, workTaskId);
+	}
+	return FSMAssetUsageUtils.getReferenceQualifierForUse(workTaskId);
+};
+
+/* Get maxQuantity APIs for consumables for swap
+input - swapout consumable gliderecord, swapin consumable gliderecord
+output - maximum quantity for swap of consumable
+*/
+
+FSMAssetUsageUtils.getConsumbaleQuantityForSwap = function(swapOutConsumable, swapInConsumable) {
+	if (swapOutConsumable.sys_class_name.toString() === FSMAssetUsageUtils.ALM_CONSUMABLE_TABLE
+        &amp;&amp; swapInConsumable.sys_class_name.toString() === FSMAssetUsageUtils.ALM_CONSUMABLE_TABLE) {
+		if (!gs.nil(swapOutConsumable)) {
+			var assetStatus = parseInt(swapOutConsumable.install_status, 10);
+			if (assetStatus !== FSMAssetUsageUtils.ASSET_STATUSES.CONSUMED
+                &amp;&amp; assetStatus !== FSMAssetUsageUtils.ASSET_STATUSES.IN_MAINTENANCE) {
+				gs.addErrorMessage(gs.getMessage('Swap-out asset is not in valid state. Must be in consumed or in maintenance.'));
+				return 0;
+			}
+		}
+		if (!gs.nil(swapInConsumable)) {
+			var replacementAssetStatus = parseInt(swapInConsumable.install_status, 10);
+			var replacementAssetSubStatus = swapInConsumable.substatus.toString();
+			if (replacementAssetStatus !== FSMAssetUsageUtils.ASSET_STATUSES.IN_STOCK
+                || (replacementAssetSubStatus !== FSMAssetUsageUtils.ASSET_SUB_STATUSES.AVAILABLE
+                    &amp;&amp; replacementAssetSubStatus !== FSMAssetUsageUtils.ASSET_SUB_STATUSES.RESERVED)
+                || (!gs.nil(swapInConsumable.parent))) {
+				gs.addErrorMessage(gs.getMessage('Swap-in asset with parent or invalid state/sub-state.'));
+				return 0;
+			}
+		}
+		if (FSMAssetUsageUtils.IS_EAM_ACTIVE) {
+			// eslint-disable-next-line no-undef
+			return sn_eam.EAMUtils.getMaxSwapQty(swapOutConsumable, swapInConsumable);
+		}
+		return Math.min(
+			FSMAssetUsageUtils.getConsumbaleQuantityForRemove(swapOutConsumable),
+			FSMAssetUsageUtils.getConsumbaleQuantityForUse(swapInConsumable)
+		);
+	}
+	gs.addErrorMessage(gs.getMessage('Invalid Asset Type: Either swap-in or swap-out asset is not a consumable'));
+	return 0;
+};
+
+/* Execute swap API
+	input - asset(gliderecord), replacementAsset(gliderecord), substate, worktask sys_id, quantity in case of consumable
+*/
+
+FSMAssetUsageUtils.executeSwap = function(asset, replacementAsset, substate, workTaskId, quantity) {
+	if (!FSMAssetUsageUtils._validateConsumbaleQuantity(asset, quantity)) {
+		return false;
+	}
+	if (asset.sys_class_name.toString() === FSMAssetUsageUtils.ALM_CONSUMABLE_TABLE
+        &amp;&amp; replacementAsset.sys_class_name.toString() === FSMAssetUsageUtils.ALM_CONSUMABLE_TABLE
+        &amp;&amp; !gs.nil(quantity)) {
+		var maxSwapQuantity = FSMAssetUsageUtils.getConsumbaleQuantityForSwap(asset, replacementAsset);
+		if (quantity &gt; maxSwapQuantity) {
+			gs.addErrorMessage(gs.getMessage('Insufficient quantity. Requested quantity {0} exceeds available swap quantity {1}.', [quantity, maxSwapQuantity]));
+			return false;
+		}
+	}
+	if (substate !== FSMAssetUsageUtils.ASSET_SUB_STATUSES.AVAILABLE
+        &amp;&amp; substate !== FSMAssetUsageUtils.ASSET_SUB_STATUSES.DEFECTIVE) {
+		gs.addErrorMessage(gs.getMessage('Unable to swap asset. Requested substate should be either available or defective.'));
+		return false;
+	}
+	var assetStatus = parseInt(asset.install_status, 10);
+	var replacementAssetStatus = parseInt(replacementAsset.install_status, 10);
+	var replacementAssetSubStatus = replacementAsset.substatus.toString();
+	if ((assetStatus === FSMAssetUsageUtils.ASSET_STATUSES.CONSUMED
+            || assetStatus === FSMAssetUsageUtils.ASSET_STATUSES.IN_USE
+            || assetStatus === FSMAssetUsageUtils.ASSET_STATUSES.IN_MAINTENANCE)
+        &amp;&amp; (replacementAssetStatus === FSMAssetUsageUtils.ASSET_STATUSES.IN_STOCK
+            &amp;&amp; (replacementAssetSubStatus === FSMAssetUsageUtils.ASSET_SUB_STATUSES.AVAILABLE
+                || replacementAssetSubStatus === FSMAssetUsageUtils.ASSET_SUB_STATUSES.RESERVED)
+            &amp;&amp; (gs.nil(replacementAsset.parent)))) {
+		var agentStockroom = FSMAssetUsageUtils._getPersonalStockroomFromTask(workTaskId);
+		var agentLocation = FSMAssetUsageUtils._getLocationFromStockroom(agentStockroom);
+		var taskLocation = FSMAssetUsageUtils._getTaskLocation(workTaskId);
+		if (FSMAssetUsageUtils.IS_EAM_ACTIVE) {
+			// eslint-disable-next-line no-undef
+			if (sn_eam.EAMUtils.canSwap(asset)) {
+				if (asset.sys_class_name.toString() === FSMAssetUsageUtils.ALM_CONSUMABLE_TABLE) {
+					new sn_eam.EAMAssetAutomationAPI().swapConsumable({
+						oldAssetId: asset.sys_id,
+						newAssetId: replacementAsset.sys_id,
+						quantity: quantity,
+						location: agentLocation,
+						stockroom: agentStockroom,
+						newLocation: taskLocation,
+						substatus: substate,
+					});
+					return true;
+				}
+				new sn_eam.EAMAssetAutomationAPI().swapAsset({
+					oldAssetId: asset.sys_id,
+					newAssetId: replacementAsset.sys_id,
+					location: agentLocation,
+					stockroom: agentStockroom,
+					newLocation: taskLocation,
+					substatus: substate,
+				});
+				return true;
+			}
+			gs.addErrorMessage(gs.getMessage('Unable to swap asset. It is a non swappable component.'));
+			return false;
+		}
+		return FSMAssetUsageUtils._executeSwapOperation(
+			asset, replacementAsset, substate, agentStockroom, workTaskId, quantity
+		);
+	}
+	gs.addErrorMessage(gs.getMessage('Asset not eligible for swap. Swapped out asset should be in use, consumed or in maintenance. Swapped in asset should be in available/reserved sub-state'));
+	return false;
+};
+
+FSMAssetUsageUtils._executeSwapOperation = function(
+	asset, replacementAsset, substate, agentStockroom, workTaskId, quantity
+) {
+	var parent = !gs.nil(asset.parent) ? asset.parent.getRefRecord() : '';
+	var assignedTo = !gs.nil(asset.assigned_to) ? asset.assigned_to.sys_id : '';
+	FSMAssetUsageUtils._removeReleaseUndoAssetForBA(
+		asset, substate, agentStockroom, quantity, 'swapout'
+	);
+	FSMAssetUsageUtils.executeUse(replacementAsset, workTaskId, quantity, parent, assignedTo);
+	return true;
+};
+
+/* Remove reference qualifier API
+input - WorkTask sys_id
+*/
+
+FSMAssetUsageUtils.getReferenceQualifierForRemove = function(workTaskId) {
+	var refQual = '';
+	if (FSMAssetUsageUtils.IS_EAM_ACTIVE) {
+		// eslint-disable-next-line no-undef
+		refQual += sn_eam.EAMAssetUsageUtils.getAssetRefQual('remove', workTaskId);
+	} else {
+		refQual += FSMAssetUsageUtils._getRefQualForRemoveForBAsset(workTaskId);
+	}
+	return refQual;
+};
+
+FSMAssetUsageUtils._getRefQualForRemoveForBAsset = function(workTaskId) {
+	var refQual = '';
+	var taskLocation = FSMAssetUsageUtils._getTaskLocation(workTaskId);
+	refQual += 'parentISEMPTY';
+	refQual += '^install_statusIN1,10,3';
+	refQual += '^location=' + taskLocation;
+	return refQual;
+};
+
+/* Use reference qualifier API
+input - WorkTask sys_id
+*/
+
+FSMAssetUsageUtils.getReferenceQualifierForUse = function(workTaskId) {
+	var refQual = '';
+	if (FSMAssetUsageUtils.IS_EAM_ACTIVE) {
+		// eslint-disable-next-line no-undef
+		refQual += sn_eam.EAMAssetUsageUtils.getAssetRefQual('use', workTaskId);
+	} else {
+		refQual += 'sys_idIN' + FSMAssetUsageUtils._getReservedAssetsForWorkTask(workTaskId);
+		refQual += '^ORsys_idIN' + FSMAssetUsageUtils._getAgentAvailabeAssets(workTaskId);
+	}
+	return refQual;
+};
+
+FSMAssetUsageUtils._getAgentAvailabeAssets = function(workTaskId) {
+	var agentStockroom = FSMAssetUsageUtils._getPersonalStockroomFromTask(workTaskId);
+	var assetIds = [];
+	var assetGr = new GlideRecord(FSMAssetUsageUtils.ALM_ASSET_TABLE);
+	assetGr.addQuery('install_status', FSMAssetUsageUtils.ASSET_STATUSES.IN_STOCK);
+	assetGr.addQuery('substatus', FSMAssetUsageUtils.ASSET_SUB_STATUSES.AVAILABLE);
+	assetGr.addQuery('stockroom', agentStockroom);
+	assetGr.addNullQuery('parent');
+	assetGr.query();
+	while (assetGr.next()) {
+		assetIds.push(assetGr.getUniqueValue());
+	}
+	return assetIds;
+};
+
+FSMAssetUsageUtils._getReservedAssetsForWorkTask = function(workTaskId) {
+	var assetIds = [];
+	var assetUsageGr = new GlideRecord(FSMAssetUsageUtils.SM_ASSET_USAGE_TABLE);
+	assetUsageGr.addQuery('service_order_task', workTaskId);
+	assetUsageGr.addQuery('status', 'not_used');
+	assetUsageGr.addNotNullQuery('asset');
+	assetUsageGr.addQuery('asset.substatus', FSMAssetUsageUtils.ASSET_SUB_STATUSES.RESERVED);
+	assetUsageGr.addNullQuery('asset.parent');
+	assetUsageGr.query();
+	while (assetUsageGr.next()) {
+		assetIds.push(assetUsageGr.asset.sys_id + '');
+	}
+	return assetIds;
+};
+
+/* Get maxQuantity APIs for consumables for remove
+input - consumable gliderecord
+output - maximum quantity for remove of consumable
+*/
+
+FSMAssetUsageUtils.getConsumbaleQuantityForRemove = function(consumable) {
+	if (consumable.sys_class_name.toString() === FSMAssetUsageUtils.ALM_CONSUMABLE_TABLE) {
+		var assetStatus = parseInt(consumable.install_status, 10);
+		var quantity = consumable.quantity;
+		if (assetStatus === FSMAssetUsageUtils.ASSET_STATUSES.CONSUMED
+            || assetStatus === FSMAssetUsageUtils.ASSET_STATUSES.IN_MAINTENANCE) {
+			if (FSMAssetUsageUtils.IS_EAM_ACTIVE &amp;&amp; FSMAssetUsageUtils._isEAMAsset(consumable)) {
+				// eslint-disable-next-line no-undef
+				return sn_eam.EAMUtils.getMaxRetireQty(consumable);
+			}
+			return quantity;
+		}
+		gs.addErrorMessage(gs.getMessage('Asset not in valid state. Must be in consumed or in maintenance.'));
+		return 0;
+	}
+	gs.addErrorMessage(gs.getMessage('Invalid asset type. The queried asset is not consumable.'));
+	return 0;
+};
+
+/* Get maxQuantity APIs for consumables for use
+input - consumable gliderecord
+output - maximum quantity for use of consumable
+*/
+
+FSMAssetUsageUtils.getConsumbaleQuantityForUse = function(consumable) {
+	if (consumable.sys_class_name.toString() === FSMAssetUsageUtils.ALM_CONSUMABLE_TABLE) {
+		var assetStatus = parseInt(consumable.install_status, 10);
+		var assetSubStatus = consumable.substatus.toString();
+		var quantity = consumable.quantity;
+		if (assetStatus === FSMAssetUsageUtils.ASSET_STATUSES.IN_STOCK
+            &amp;&amp; (assetSubStatus === FSMAssetUsageUtils.ASSET_SUB_STATUSES.AVAILABLE
+                || assetSubStatus === FSMAssetUsageUtils.ASSET_SUB_STATUSES.RESERVED)
+            &amp;&amp; (gs.nil(consumable.parent))) {
+			return quantity;
+		}
+		gs.addErrorMessage(gs.getMessage('Consumable asset with parent or invalid sub-state.'));
+		return 0;
+	}
+	gs.addErrorMessage(gs.getMessage('Invalid asset type. The queried asset is not consumable.'));
+	return 0;
+};
+
+/*
+Abbreviations used on API names
+BA : Base Asset
+CA : Consumable Asset
+SA : Serializable Asset
+*/
+
+/* Execute use API
+	input - asset(gliderecord), worktask sys_id, quantity in case of consumable, parent(gliderecord), user sys_id
+	Pass either parent or assigned_to but not both
+*/
+
+FSMAssetUsageUtils.executeUse = function(asset, workTaskId, quantity, parentAsset, user) {
+	if (!gs.nil(parentAsset) &amp;&amp; !gs.nil(user)) {
+		gs.addErrorMessage(gs.getMessage("Error: Invalid request. Please provide either the 'parent' or 'assigned to' field, but not both."));
+		return false;
+	}
+	if (!FSMAssetUsageUtils._validateConsumbaleQuantity(asset, quantity)) {
+		return false;
+	}
+	var assetStatus = parseInt(asset.install_status, 10);
+	var assetSubStatus = asset.substatus.toString();
+	if (assetStatus === FSMAssetUsageUtils.ASSET_STATUSES.IN_STOCK
+        &amp;&amp; (assetSubStatus === FSMAssetUsageUtils.ASSET_SUB_STATUSES.AVAILABLE
+            || assetSubStatus === FSMAssetUsageUtils.ASSET_SUB_STATUSES.RESERVED)
+        &amp;&amp; (gs.nil(asset.parent))) {
+		var taskLocation = FSMAssetUsageUtils._getTaskLocation(workTaskId);
+		if (FSMAssetUsageUtils.IS_EAM_ACTIVE &amp;&amp; (FSMAssetUsageUtils._isEAMAsset(asset)
+                || (!gs.nil(parentAsset) &amp;&amp; FSMAssetUsageUtils._isEAMAsset(parentAsset)))) {
+			if (asset.sys_class_name.toString() === FSMAssetUsageUtils.ALM_CONSUMABLE_TABLE) {
+				var releasableQuantity = FSMAssetUsageUtils.getConsumbaleQuantityForUse(asset);
+				if (releasableQuantity &gt;= quantity) {
+					new sn_eam.EAMAssetAutomationAPI().useConsumable({
+						assetId: asset.sys_id,
+						parentAssetId: parentAsset.sys_id,
+						userId: user,
+						quantity: quantity,
+						location: taskLocation,
+					});
+					return true;
+				}
+				gs.addErrorMessage(gs.getMessage('Insufficient quantity. Requested quantity {0} exceeds available quantity {1}.', [quantity, releasableQuantity]));
+				return false;
+			}
+			new sn_eam.EAMAssetAutomationAPI().useAsset({
+				assetId: asset.sys_id,
+				parentAssetId: parentAsset.sys_id,
+				userId: user,
+				location: taskLocation,
+			});
+			return true;
+		}
+		if (asset.sys_class_name.toString() === FSMAssetUsageUtils.ALM_CONSUMABLE_TABLE) {
+			return FSMAssetUsageUtils._executeUseForCA(asset, user, taskLocation, quantity);
+		}
+		return FSMAssetUsageUtils._executeUseForSA(asset, user, taskLocation);
+	}
+	gs.addErrorMessage(gs.getMessage('Asset cannot be used. It either has a parent or is not in available/reserved sub-state.'));
+	return false;
+};
+
+FSMAssetUsageUtils._executeUseForSA = function(asset, user, location) {
+	var values = {
+		install_status: FSMAssetUsageUtils.ASSET_STATUSES.IN_USE,
+		substatus: '',
+		stockroom: '',
+		location: location,
+		assigned_to: user,
+	};
+	FSMAssetUsageUtils._updateAssetAttributes(asset, values);
+	return true;
+};
+
+FSMAssetUsageUtils._executeUseForCA = function(asset, user, location, requestedReleasableQuantity) {
+	var releasableQuantity = FSMAssetUsageUtils.getConsumbaleQuantityForUse(asset);
+	if (releasableQuantity &gt;= requestedReleasableQuantity) {
+		new global.Consumables().split(asset.sys_id, requestedReleasableQuantity, FSMAssetUsageUtils.ASSET_STATUSES.CONSUMED, '', '', '', location, user, '', '');
+		return true;
+	}
+	gs.addErrorMessage(gs.getMessage('Insufficient quantity. Requested quantity {0} exceeds available quantity {1}.', [requestedReleasableQuantity, releasableQuantity]));
+	return false;
+};
+
+/* Execute remove API
+	input - asset(gliderecord), substate, worktask sys_id, quantity in case of consumable
+*/
+
+FSMAssetUsageUtils.executeRemove = function(asset, substate, workTaskId, quantity) {
+	if (!FSMAssetUsageUtils._validateConsumbaleQuantity(asset, quantity)) {
+		return false;
+	}
+	if (substate !== FSMAssetUsageUtils.ASSET_SUB_STATUSES.AVAILABLE
+        &amp;&amp; substate !== FSMAssetUsageUtils.ASSET_SUB_STATUSES.DEFECTIVE) {
+		gs.addErrorMessage(gs.getMessage('Unable to remove asset. Requested substate should be either available or defective.'));
+		return false;
+	}
+	var assetStatus = parseInt(asset.install_status, 10);
+	if (assetStatus === FSMAssetUsageUtils.ASSET_STATUSES.CONSUMED
+        || assetStatus === FSMAssetUsageUtils.ASSET_STATUSES.IN_USE
+        || assetStatus === FSMAssetUsageUtils.ASSET_STATUSES.IN_MAINTENANCE) {
+		var agentStockroom = FSMAssetUsageUtils._getPersonalStockroomFromTask(workTaskId);
+		var agentLocation = FSMAssetUsageUtils._getLocationFromStockroom(agentStockroom);
+		if (FSMAssetUsageUtils.IS_EAM_ACTIVE &amp;&amp; FSMAssetUsageUtils._isEAMAsset(asset)) {
+			// eslint-disable-next-line no-undef
+			if (sn_eam.EAMUtils.canRetire(asset).answer) {
+				if (asset.sys_class_name.toString() === FSMAssetUsageUtils.ALM_CONSUMABLE_TABLE) {
+					var releasableQuantity = FSMAssetUsageUtils.getConsumbaleQuantityForRemove(asset);
+					if (releasableQuantity &gt;= quantity) {
+						new sn_eam.EAMAssetAutomationAPI().retireConsumable({
+							assetId: asset.sys_id,
+							quantity: quantity,
+							stockroom: agentStockroom,
+							location: agentLocation,
+							substatus: substate,
+						});
+						return true;
+					}
+					gs.addErrorMessage(gs.getMessage('Insufficient quantity. Requested quantity {0} exceeds available quantity {1}.', [quantity, releasableQuantity]));
+					return false;
+				}
+				new sn_eam.EAMAssetAutomationAPI().retireAsset({
+					assetId: asset.sys_id,
+					stockroom: agentStockroom,
+					location: agentLocation,
+					substatus: substate,
+				});
+				return true;
+			}
+			gs.addErrorMessage(gs.getMessage('Unable to remove asset. It is a required component.'));
+			return false;
+		}
+		return FSMAssetUsageUtils._removeReleaseUndoAssetForBA(
+			asset, substate, agentStockroom, quantity, 'remove'
+		);
+	}
+	gs.addErrorMessage(gs.getMessage('Asset not eligible for removal. Must be in use, consumed or in maintenance.'));
+	return false;
+};
+
+/* Release asset API
+	input - asset(gliderecord), worktask sys_id, quantity in case of consumable
+*/
+
+FSMAssetUsageUtils.releaseAsset = function(asset, workTaskId, quantity) {
+	if (!FSMAssetUsageUtils._validateConsumbaleQuantity(asset, quantity)) {
+		return false;
+	}
+	var assetUsageGr = new GlideRecord(FSMAssetUsageUtils.SM_ASSET_USAGE_TABLE);
+	assetUsageGr.addQuery('service_order_task', workTaskId);
+	assetUsageGr.addQuery('status', 'not_used');
+	assetUsageGr.addQuery('asset', asset.sys_id);
+	assetUsageGr.addQuery('asset.substatus', FSMAssetUsageUtils.ASSET_SUB_STATUSES.RESERVED);
+	assetUsageGr.query();
+	if (assetUsageGr.next()) {
+		var agentStockroom = FSMAssetUsageUtils._getPersonalStockroomFromTask(workTaskId);
+		if (FSMAssetUsageUtils.IS_EAM_ACTIVE &amp;&amp; FSMAssetUsageUtils._isEAMAsset(asset)) {
+			// eslint-disable-next-line no-undef
+			if (sn_eam.EAMUtils.canRetire(asset).answer) {
+				return FSMAssetUsageUtils._removeReleaseUndoAssetForBA(
+					asset, FSMAssetUsageUtils.ASSET_SUB_STATUSES.AVAILABLE, agentStockroom, quantity, 'release'
+				);
+			}
+			gs.addErrorMessage(gs.getMessage('Unable to release asset. It is a required component.'));
+			return false;
+		}
+		return FSMAssetUsageUtils._removeReleaseUndoAssetForBA(
+			asset, FSMAssetUsageUtils.ASSET_SUB_STATUSES.AVAILABLE, agentStockroom, quantity, 'release'
+		);
+	}
+	gs.addErrorMessage(gs.getMessage('Asset with reserved substate is not found'));
+	return false;
+};
+
+/* Undo asset API
+	input - asset(gliderecord), worktask sys_id, quantity in case of consumable
+*/
+
+FSMAssetUsageUtils.undoAsset = function(asset, workTaskId, quantity) {
+	if (!FSMAssetUsageUtils._validateConsumbaleQuantity(asset, quantity)) {
+		return false;
+	}
+	var assetStatus = parseInt(asset.install_status, 10);
+	if (assetStatus === FSMAssetUsageUtils.ASSET_STATUSES.CONSUMED
+        || assetStatus === FSMAssetUsageUtils.ASSET_STATUSES.IN_USE
+        || assetStatus === FSMAssetUsageUtils.ASSET_STATUSES.IN_MAINTENANCE) {
+		var agentStockroom = FSMAssetUsageUtils._getPersonalStockroomFromTask(workTaskId);
+		if (FSMAssetUsageUtils.IS_EAM_ACTIVE &amp;&amp; FSMAssetUsageUtils._isEAMAsset(asset)) {
+			// eslint-disable-next-line no-undef
+			if (sn_eam.EAMUtils.canRetire(asset).answer) {
+				return FSMAssetUsageUtils._removeReleaseUndoAssetForBA(
+					asset, FSMAssetUsageUtils.ASSET_SUB_STATUSES.AVAILABLE, agentStockroom, quantity, 'undo'
+				);
+			}
+			gs.addErrorMessage(gs.getMessage('Unable to undo asset. It is a required component.'));
+			return false;
+		}
+		return FSMAssetUsageUtils._removeReleaseUndoAssetForBA(
+			asset, FSMAssetUsageUtils.ASSET_SUB_STATUSES.AVAILABLE, agentStockroom, quantity, 'undo'
+		);
+	}
+	gs.addErrorMessage(gs.getMessage('Asset not eligible for undo. Must be in use, consumed or in maintenance.'));
+	return false;
+};
+
+/* Common Utility APIs for remove, release and undo */
+
+FSMAssetUsageUtils._removeReleaseUndoAssetForBA = function(asset, substate, stockroom, quantity, operation) {
+	if (asset.sys_class_name.toString() === FSMAssetUsageUtils.ALM_CONSUMABLE_TABLE) {
+		return FSMAssetUsageUtils._removeReleaseUndoAssetForCA(
+			asset, substate, stockroom, quantity, operation
+		);
+	}
+	return FSMAssetUsageUtils._removeReleaseUndoAssetForSA(
+		asset, substate, stockroom
+	);
+};
+
+FSMAssetUsageUtils._removeReleaseUndoAssetForCA = function(
+	asset, substate, stockroom, requestedReleasableQuantity, operation
+) {
+	var releasableQuantity = 0;
+	if (operation === 'remove' || operation === 'undo' || operation === 'swapout') {
+		releasableQuantity = FSMAssetUsageUtils.getConsumbaleQuantityForRemove(asset);
+	} else if (operation === 'release') {
+		releasableQuantity = FSMAssetUsageUtils._getConsumbaleQuantityForRelease(asset);
+	}
+	var location = FSMAssetUsageUtils._getLocationFromStockroom(stockroom);
+	if (releasableQuantity &gt;= requestedReleasableQuantity) {
+		var columnUpdates = {
+			managed_by: '',
+			owned_by: '',
+			assigned: '',
+			install_date: '',
+			parent: '',
+		};
+		new global.Consumables().split(asset.sys_id, requestedReleasableQuantity, FSMAssetUsageUtils.ASSET_STATUSES.IN_STOCK, substate, '', stockroom, location, '', '', columnUpdates);
+		return true;
+	}
+	gs.addErrorMessage(gs.getMessage('Insufficient quantity. Requested quantity {0} exceeds available quantity {1}.', [requestedReleasableQuantity, releasableQuantity]));
+	return false;
+};
+
+FSMAssetUsageUtils._removeReleaseUndoAssetForSA = function(asset, substate, stockroom) {
+	var location = FSMAssetUsageUtils._getLocationFromStockroom(stockroom);
+	var values = {
+		install_status: FSMAssetUsageUtils.ASSET_STATUSES.IN_STOCK,
+		substatus: substate,
+		managed_by: '',
+		owned_by: '',
+		assigned_to: '',
+		assigned: '',
+		install_date: '',
+		parent: '',
+		stockroom: stockroom,
+		location: location,
+	};
+	FSMAssetUsageUtils._updateAssetAttributes(asset, values);
+	return true;
+};
+
+/* Utility APIs */
+
+FSMAssetUsageUtils._getTaskLocation = function(workTaskId) {
+	var wotGr = new GlideRecord(FSMAssetUsageUtils.WM_TASK_TABLE);
+	wotGr.get(workTaskId);
+	return wotGr.getValue('location');
+};
+
+FSMAssetUsageUtils._getPersonalStockroomFromTask = function(workTaskId) {
+	var wotGr = new GlideRecord(FSMAssetUsageUtils.WM_TASK_TABLE);
+	wotGr.get(workTaskId);
+	var agent = wotGr.getValue('assigned_to');
+	var stockroomId = new global.SMStockRooms().getAgentStockroom(agent);
+	return stockroomId;
+};
+
+FSMAssetUsageUtils._getLocationFromStockroom = function(stockroomId) {
+	var stockroomGr = new GlideRecord(FSMAssetUsageUtils.ALM_STOCKROOM_TABLE);
+	stockroomGr.get(stockroomId);
+	return stockroomGr.getValue('location');
+};
+
+FSMAssetUsageUtils._isEAMAsset = function(asset) {
+	if (FSMAssetUsageUtils._isEAMModel(asset.model)
+        || (!gs.nil(asset.parent) &amp;&amp; FSMAssetUsageUtils._isEAMModel(asset.parent.model))) {
+		return true;
+	}
+	return false;
+};
+
+FSMAssetUsageUtils._isEAMModel = function(model) {
+	// eslint-disable-next-line no-undef
+	var eamModelClasses = sn_ent.EnterpriseContentEAMUtils.getEAMModelClasses().split(',');
+	if (eamModelClasses.indexOf(model.sys_class_name + '') !== -1) {
+		return true;
+	}
+	return false;
+};
+
+FSMAssetUsageUtils._updateAssetAttributes = function(assetGr, assetObj) {
+	var assetfield;
+	for (assetfield in assetObj) {
+		assetGr.setValue(assetfield, assetObj[assetfield]);
+	}
+	assetGr.update();
+};
+
+FSMAssetUsageUtils._validateConsumbaleQuantity = function(asset, quantity) {
+	if (asset.sys_class_name.toString() === FSMAssetUsageUtils.ALM_CONSUMABLE_TABLE &amp;&amp; quantity &lt;= 0) {
+		gs.addErrorMessage(gs.getMessage('Consumable quantity cannot be negative or 0'));
+		return false;
+	}
+	return true;
+};
+
+FSMAssetUsageUtils._getConsumbaleQuantityForRelease = function(consumable) {
+	var quantity = consumable.quantity;
+	if (FSMAssetUsageUtils.IS_EAM_ACTIVE &amp;&amp; FSMAssetUsageUtils._isEAMAsset(consumable)) {
+		// eslint-disable-next-line no-undef
+		return sn_eam.EAMUtils.getMaxRetireQty(consumable);
+	}
+	return quantity;
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;maint&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-03-03 05:51:41&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;69798f5ecc912910f87734fccc52ce4a&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;60&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;FSMAssetUsageUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Asset Management" source="com.snc.asset_management"&gt;3e467ca03cb1311068bcf327dfe37f49&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_69798f5ecc912910f87734fccc52ce4a&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-06-06 16:42:36&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:38:12</sys_created_on>
+        <sys_id>35e6305d83f01210c6695855eeaad39c</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>FSMAssetUsageUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_35e6305d83f01210c6695855eeaad39c</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:38:12</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

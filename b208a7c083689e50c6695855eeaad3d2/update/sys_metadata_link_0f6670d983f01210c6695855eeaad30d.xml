@@ -1,0 +1,279 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>3e06d4b0c7910110abf4d6e827c26056</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.PluginsData&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;PluginsData&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var PluginsData = Class.create();
+PluginsData.prototype = {
+    initialize: function() {},
+
+    refreshPluginCache: function(userPluginData) {
+        var existingTracker = this.isRefreshInProgress();
+        if (!gs.nil(existingTracker))
+            return existingTracker;
+        var worker = new GlideScriptedHierarchicalWorker();
+        worker.setProgressName("Update plugin cache");
+        worker.setBackground(true);
+        worker.setCannotCancel(true);
+        worker.setScriptIncludeName("global.PluginsData");
+        worker.setScriptIncludeMethod("getPlugins");
+        worker.putMethodArg("userPluginData", userPluginData);
+        worker.start();
+        return worker.getProgressID();
+    },
+
+    isRefreshInProgress: function() {
+        var gr = new GlideRecord("sys_progress_worker");
+        gr.addQuery("name", "Update plugin cache");
+        gr.addQuery("state", 'IN', "starting,running");
+        gr.orderByDesc("sys_created_on");
+        gr.setLimit(1);
+        gr.query();
+        if (gr.next()) {
+            var currentDateTime = new GlideDateTime().getNumericValue();
+            var progressWorkerCreatedTime = new GlideDateTime(gr.sys_created_on).getNumericValue();
+            if ((currentDateTime - progressWorkerCreatedTime) &gt; 3600000)
+                return "";
+            return gr.getUniqueValue();
+        }
+        return "";
+    },
+
+    getAllPluginInfo: function() {
+        try {
+            return SNC.UAAppInfo.getAllPluginInfo();
+        } catch (e) {
+            gs.log(e, "Plugin list access attempted by a non admin user");
+            return "[]";
+        }
+    },
+
+    getPlugins: function(userPluginData) {
+        var allPlugins = gs.nil(userPluginData) ? this.getAllPluginInfo() : userPluginData;
+        var encodedResponse = new global.JSON().decode(allPlugins);
+        var plugins = [];
+        encodedResponse.forEach(function(plugin) {
+            if (plugin.scope.toLowerCase().startsWith("x_"))
+                return;
+            plugin.isPlugin = true;
+            plugin.name = plugin.app_name;
+            plugin.id = plugin.app_id;
+            plugin.isInstalled = plugin.active == 0 ? false : true;
+            plugin.free = plugin.for_fee == 0;
+            plugin.paid = plugin.for_fee == 1;
+            plugin["all_lobs"] = [plugin.lob_id];
+            plugin.isOutOfBandApp = (plugin.scope.toLowerCase().startsWith("sn_") &amp;&amp; plugin.id.toLowerCase() == plugin.scope.toLowerCase()) ? true : false;
+
+            plugin.is_customized_app = sn_app_customization.AppCustomizationAPI.isInactivePluginCustomizedApp(plugin.id);
+            if (plugin.is_customized_app)
+                plugin.can_install_or_upgrade_customization = true;
+
+            plugin.can_edit_in_studio = false;
+            plugin.can_open_in_studio = false;
+            if (plugin.active === "1" &amp;&amp; plugin.scope !== "global") {
+                var storeAppGR = new GlideRecord("sys_store_app");
+                storeAppGR.addQuery("scope", plugin.scope);
+                storeAppGR.setLimit(1);
+                storeAppGR.query();
+                if (storeAppGR.next()) {
+                    var isCustomizationSupported = sn_app_customization.AppCustomizationAPI.isAppCustomizationCapableByScopeName(plugin.scope);
+                    var canEditInStudio = storeAppGR.can_edit_in_studio == true ? true : false;
+                    plugin.can_edit_in_studio = canEditInStudio &amp;&amp; isCustomizationSupported;
+                    plugin.can_open_in_studio = !canEditInStudio &amp;&amp; isCustomizationSupported;
+                    plugin.store_app_sys_id = storeAppGR.getUniqueValue();
+                    if (plugin.is_customized_app)
+                        plugin.can_install_or_upgrade_customization = sn_app_customization.AppCustomizationAPI
+                        .canInstallOrRepairCustomization(plugin.store_app_sys_id);
+                }
+            }
+
+            plugin.customized_version_info = sn_app_customization.AppCustomizationAPI.getInactivePluginCustomizationVersionInfo(plugin.id);
+            plugin.indicators = this.generateIndicatorObjectList(plugin.indicators);
+
+            plugins.push(plugin);
+        });
+        new global.AppManagerCache().putResponseInCache("pluginResponse", plugins);
+
+        return plugins;
+    },
+
+    getpluginsdata: function(isFirstLoad, forceCallLUA) {
+        var result = {};
+        var pluginResponseFromCache = new global.AppManagerCache().getResponseFromCache("pluginResponse");
+
+        if (gs.nil(pluginResponseFromCache) || forceCallLUA) {
+            pluginResponseFromCache = this.getPlugins();
+        }
+
+        if (isFirstLoad) {
+            var userPluginData = gs.getUser().hasRole("maint") ? SNC.UAAppInfo.getAllPluginInfo() : '';
+            result.pluginTrackerId = this.refreshPluginCache(userPluginData);
+        }
+
+        result.pluginData = pluginResponseFromCache;
+        return result;
+    },
+
+    generateIndicatorObjectList: function(indicatorKeys) {
+        var indicatorKeyMessageMap = {
+            "unsupported_environment": gs.getMessage("Unsupported Environment"),
+        };
+
+        var indicatorObjList = [];
+        var parsedKeys = JSON.parse(indicatorKeys || '[]');
+        parsedKeys.forEach(function(key, index) {
+            indicatorObjList[index] = {
+                id: key,
+                message: indicatorKeyMessageMap[key]
+            };
+        });
+
+        return indicatorObjList;
+    },
+    getLOBCategories: function() {
+        return new global.JSON().decode(SNC.UAAppInfo.getLOBCategories());
+    },
+
+    checkNoActivateTagInPluginDefn: function(pluginGR) {
+        return gs.getXMLText(pluginGR.definition, "//no_activate") != "true";
+    },
+
+    checkPluginInstallationAllowed: function() {
+        return new PluginActivationVisible().isInstallationAllowed();
+    },
+
+    getUninstalledConditionalPlugins: function(pluginId) {
+        var inActiveConditionalPlugin = GlidePluginManager.getUninstalledConditionalPlugins(pluginId);
+        inActiveConditionalPlugin.query();
+        var inActiveConditionalPlugins = [];
+        while (inActiveConditionalPlugin.next()) {
+            inActiveConditionalPlugins.push({
+                "name": inActiveConditionalPlugin.getValue("name"),
+                "sys_id": inActiveConditionalPlugin.getValue("id")
+            });
+        }
+        return inActiveConditionalPlugins;
+    },
+
+    getAndClearSessionInfo: function(keys, result) {
+        for (var i = 0; i &lt; keys.length; i++) {
+            var key = keys[i];
+            try {
+                result[key] = gs.getSession().getClientData(key) || "";
+                if (result[key])
+                    gs.getSession().clearClientData(key);
+            } catch (err) {}
+        }
+    },
+    
+    getUpgradeHistoryInfo: function(encodedQuery) {
+    	var upgradeHistory = new GlideRecord('sys_upgrade_history_log');
+    	upgradeHistory.addEncodedQuery(encodedQuery);
+    	upgradeHistory.query();
+    	return {count: upgradeHistory.getRowCount(), query: encodedQuery};
+    },
+
+    loadDemoData: function(plugin_id) {
+        var worker = new GlidePluginManagerWorker();
+        var progress_name = "load demo data";
+        worker.setProgressName(progress_name);
+        worker.setPluginId(plugin_id);
+        worker.setBackground(true);
+        worker.setLoadDemoDataOnly(true);
+        worker.setIncludeDemoData(true);
+        worker.start();
+        return worker.getProgressID();
+    },
+
+    canRollbackPlugin : function(plugin_id) {
+        return GlidePluginManager.canRollback(plugin_id);
+    },
+
+    rollbackPlugin: function(plugin_id) {
+        var rctxid = GlidePluginManager.getRollbackContextId(plugin_id);
+        var worker = new GlideRollbackWorker();
+        worker.setRollbackContextID(rctxid);
+        worker.setProgressName("Executing Rollback");
+        worker.setBackground(true);
+        worker.start();		
+        var trackerId = worker.getProgressID();
+        return {trackerId:trackerId , rctxid:rctxid};
+    },
+
+    getRollbackRunId : function(rctxid){
+        var rrid = GlidePluginManager.getRollbackRunId(rctxid);
+        return rrid;
+    },
+
+    getPluginDetailsById: function(pluginId) {
+        var response = {
+            name: pluginId,
+            id: pluginId,
+            dependencies: [],
+            userVisibility: false
+        };
+        var plugin = GlidePluginManager.getInstalledPlugin(pluginId);
+        if (!plugin || gs.nil(plugin)) return response;
+
+        var dependencies = GlidePluginManager.getPluginDependencies(pluginId);
+
+        response.name = plugin.getDisplayName();
+        response.id = plugin.getName();
+        response.userVisibility = true;
+        response.dependencies = dependencies ? JSON.parse(dependencies) : [];
+
+        return response;
+    },
+
+	getLicenseInfoByPluginId: function(pluginID) {
+		var appLicenseInfo = {};
+		try {
+			var entitledBO = new sn_entitlement.GlideEntitlementAPI().getLicenseDetailsForArtifact('app_id', pluginID);
+			appLicenseInfo.has_license = entitledBO.getIsEntitled();
+			appLicenseInfo.is_allowed_install = entitledBO.getIsPermitted();
+		}catch(error) {
+			gs.info("Error occured while processing license info for Plugin ID: {0}, falling back to legacy. ", pluginID);
+		}
+		return appLicenseInfo;
+	},
+
+    type: 'PluginsData'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-01-24 08:34:29&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;3e06d4b0c7910110abf4d6e827c26056&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;45&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;PluginsData&lt;/sys_name&gt;
+        &lt;sys_package display_value="Unified plugin experience client" source="com.snc.unified_plugin"&gt;312b74a03c35311068bcf327dfe37fd0&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_3e06d4b0c7910110abf4d6e827c26056&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-20 13:11:22&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:36:07</sys_created_on>
+        <sys_id>0f6670d983f01210c6695855eeaad30d</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>PluginsData</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_0f6670d983f01210c6695855eeaad30d</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:36:07</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

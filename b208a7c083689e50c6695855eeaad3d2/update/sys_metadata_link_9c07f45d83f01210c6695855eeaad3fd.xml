@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>722b17a00f12201039534ee7c8767e2d</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.LFExportImportTranslator&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Contains APIs used to export or import translations for an artifact&lt;/description&gt;
+        &lt;name&gt;LFExportImportTranslator&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var LFExportImportTranslator = Class.create();
+LFExportImportTranslator.prototype = {
+    initialize: function() {
+        this.lfValidationUtils = new LFValidationUtils();
+        this.lfUtils = new LFUtils();
+        this.lfConstants = new LFConstants();
+        this.arrayUtils = new ArrayUtil();
+        this.lfSettingUtils = new LFSettingUtils();
+        this.lfReadSaveScriptUtils = new LFReadSaveScriptUtils();
+        this.lfLUAUtils = new LFLUAUtils();
+        this.fileTypesSupported = [this.lfConstants.CSV_FILE_TYPE, this.lfConstants.XLIFF_FILE_TYPE];
+    },
+
+    exportFile: function(artifactInternalName, sysId, targetLanguage, additionalInfo) {
+        this.lfValidationUtils.validateUserHasRole(this.lfConstants.EDITOR);
+        if (additionalInfo === undefined) {
+            additionalInfo = {};
+        }
+        this._validateInputsForExport(artifactInternalName, sysId, targetLanguage, additionalInfo);
+        var configuredFileType = this._checkIfExportImportIsEnabled(artifactInternalName, targetLanguage);
+        var fileType = additionalInfo.fileType || configuredFileType;
+        var sourceLanguage = additionalInfo.sourceLanguage || this.lfUtils.getDefaultSourceLanguage();
+
+        var documentContent = this.lfReadSaveScriptUtils.generateDocumentContent(artifactInternalName, sysId, targetLanguage);
+        var content = documentContent['content'];
+        var itemToTranslate = this.lfUtils.groupByProperty(content);
+        var fileName = [artifactInternalName, sourceLanguage, targetLanguage, sysId].join("_");
+        if (fileType == this.lfConstants.CSV_FILE_TYPE) {
+            var fileData = this.lfUtils.createCSVFromDocumentContent(itemToTranslate, sourceLanguage, targetLanguage, fileName);
+            var exportFileType = "text/csv";
+        } else if (fileType == this.lfConstants.XLIFF_FILE_TYPE) {
+            fileData = this.lfUtils.createXLIFFFromDocumentContent(itemToTranslate, sourceLanguage, targetLanguage, fileName);
+            exportFileType = "text/xml";
+        }
+        var sourceOfRequest = this.lfValidationUtils.isFieldTypeNonString(additionalInfo.sourceOfRequest) ? this.lfConstants.API : additionalInfo.sourceOfRequest;
+        this.lfLUAUtils.sendTranslationEvent("Export", fileType, sourceOfRequest,
+            artifactInternalName, targetLanguage, sourceLanguage, false, false);
+        return {
+            "fileData": fileData,
+            "fileType": exportFileType
+        };
+    },
+
+    importFile: function(artifactInternalName, sysId, fileContent, fileType, additionalInfo) {
+        this.lfValidationUtils.validateUserHasRole(this.lfConstants.EDITOR);
+        this._validateInputsForImport(artifactInternalName, sysId, fileType, additionalInfo);
+        var overrideExistingTranslations = additionalInfo.overrideExistingTranslations;
+        overrideExistingTranslations = (overrideExistingTranslations == undefined) || overrideExistingTranslations;
+        this._validateOverrideTranslationsField(overrideExistingTranslations);
+        var targetLanguage = additionalInfo.targetLanguage;
+        var sourceLanguage = additionalInfo.sourceLanguage;
+        var documentContent = this.lfReadSaveScriptUtils.generateDocumentContent(artifactInternalName, sysId, targetLanguage);
+        var exceptionMapper;
+        if (documentContent == null || documentContent['version'] !== 'v1') {
+            exceptionMapper = new LFExceptionMapper('READ_SCRIPT_ERROR');
+            exceptionMapper.throwException();
+        }
+        var isContentUpdated;
+        var source = [artifactInternalName, sourceLanguage, targetLanguage, sysId].join("_");
+        try {
+            isContentUpdated = this.lfUtils.updateContentFromFileData(fileType, fileContent, documentContent['content'], sourceLanguage, targetLanguage, source, overrideExistingTranslations);
+        } catch (ex) {
+            exceptionMapper = new LFExceptionMapper('INVALID_FILE_CONTENT');
+            exceptionMapper.throwException();
+        }
+        if (!isContentUpdated) {
+            exceptionMapper = new LFExceptionMapper('NO_TRANSLATIONS_IN_IMPORTED_FILE');
+            exceptionMapper.throwException();
+        }
+        var additionalParameters = documentContent['additionalParameters'];
+        var currentArtifactScope = (additionalParameters &amp;&amp; additionalParameters.scope) ? additionalParameters.scope : 'global';
+        var updateSetManager = new LFUpdateSetManager(this.lfConstants.ADHOC);
+        // Create dedicated update set in current artifact scope to save translations
+        updateSetManager.switchToUpdateSetInScope(currentArtifactScope);
+
+        var saveScriptParams = {
+            'documentContent': documentContent,
+            'language': targetLanguage,
+            'sysId': sysId,
+            'sourceOfRequest': this.lfConstants.API,
+            'hasProject': false
+        };
+        new LFReadSaveScriptUtils(this.lfConstants.ADHOC).publishTranslations(artifactInternalName, saveScriptParams);
+        // Add previous update set as default in session
+        updateSetManager.switchToPreviousUpdateSet();
+        var sourceOfRequest = this.lfValidationUtils.isFieldTypeNonString(additionalInfo.sourceOfRequest) ? this.lfConstants.API : additionalInfo.sourceOfRequest;
+        this.lfLUAUtils.sendTranslationEvent("Import", fileType, sourceOfRequest,
+            artifactInternalName, targetLanguage, sourceLanguage, false, false);
+    },
+
+    _validateInputsForImport: function(artifactInternalName, sysId, fileType, additionalInfo) {
+        this.lfValidationUtils.isArtifactTypeInvalid(artifactInternalName);
+        this.lfValidationUtils.isSysIdInvalid(sysId);
+        this._validateFileType(fileType);
+        this.lfValidationUtils.validateAdditionalInfoExistence(additionalInfo);
+        var sourceLanguage = additionalInfo.sourceLanguage;
+        var targetLanguage = additionalInfo.targetLanguage;
+        this.lfValidationUtils.isSourceLanguageInvalid(sourceLanguage);
+        this.lfValidationUtils.isTargetLanguagesInvalid([targetLanguage]);
+        this.lfValidationUtils.validateArtifact(artifactInternalName, [sysId]);
+        this.lfValidationUtils.validateTargetLanguages([targetLanguage]);
+        this.lfValidationUtils.validateSourceLanguage(sourceLanguage);
+        this.lfValidationUtils.validateTargetLanguageCodeSetting(artifactInternalName, [targetLanguage]);
+        this._checkIfExportImportIsEnabled(artifactInternalName, targetLanguage);
+    },
+
+    _validateInputsForExport: function(artifactInternalName, sysId, targetLanguage, additionalInfo) {
+        this.lfValidationUtils.isArtifactTypeInvalid(artifactInternalName);
+        this.lfValidationUtils.isSysIdInvalid(sysId);
+        this.lfValidationUtils.isTargetLanguagesInvalid([targetLanguage]);
+        this.lfValidationUtils.isAdditionalInfoInvalid(additionalInfo);
+        var checkForSourceLang = additionalInfo.hasOwnProperty('sourceLanguage');
+        if (checkForSourceLang) {
+            var sourceLanguage = additionalInfo.sourceLanguage;
+            this.lfValidationUtils.isSourceLanguageInvalid(sourceLanguage);
+        } else {
+            sourceLanguage = this.lfUtils.getDefaultSourceLanguage();
+        }
+        this.lfValidationUtils.isSourceLanguageInTargetLanguages(sourceLanguage, [targetLanguage]);
+        if (additionalInfo.hasOwnProperty('fileType')) {
+            this._validateFileType(additionalInfo.fileType);
+        }
+        this.lfValidationUtils.validateArtifact(artifactInternalName, [sysId]);
+        this.lfValidationUtils.validateTargetLanguages([targetLanguage]);
+        if (checkForSourceLang) {
+            this.lfValidationUtils.validateSourceLanguage(sourceLanguage);
+        }
+        this.lfValidationUtils.validateTargetLanguageCodeSetting(artifactInternalName, [targetLanguage]);
+    },
+
+    _checkIfExportImportIsEnabled: function(artifactInternalName, targetLanguage) {
+        var targetLanguageSysId = this.lfUtils.getLanguageCodeDetails(targetLanguage).sysId;
+        var settings = this.lfSettingUtils.getLFSetting(artifactInternalName, targetLanguageSysId);
+        var settingKeys = this.lfConstants.SETTING_KEYS;
+        var fileType = settings[settingKeys.ExportFormat];
+        if (settings[settingKeys.EnableImportExport] === '1' &amp;&amp; fileType) {
+            return fileType;
+        }
+        var exceptionMapper = new LFExceptionMapper('EXPORT_IMPORT_DISABLED', [targetLanguage]);
+        exceptionMapper.throwException();
+    },
+
+    _validateOverrideTranslationsField: function(overrideExistingTranslations) {
+        if (this.lfValidationUtils.isFieldTypeNonBoolean(overrideExistingTranslations)) {
+            var exceptionMapper = new LFExceptionMapper('INVALID_OVERRIDE_EXISTING_TRANSLATIONS_PARAMETER');
+            exceptionMapper.throwException();
+        }
+    },
+
+    _validateFileType: function(fileType) {
+        if (this.lfValidationUtils.isFieldTypeNonString(fileType)) {
+            var exceptionMapper = new LFExceptionMapper("INVALID_FILE_TYPE_FIELD");
+            exceptionMapper.throwException();
+        } else if (!this.arrayUtils.contains(this.fileTypesSupported, fileType)) {
+            exceptionMapper = new LFExceptionMapper("INVALID_FILE_TYPE");
+            exceptionMapper.throwException();
+        }
+    },
+
+    type: 'LFExportImportTranslator'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-02-10 05:59:59&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;722b17a00f12201039534ee7c8767e2d&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;10&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;LFExportImportTranslator&lt;/sys_name&gt;
+        &lt;sys_package display_value="Localization Framework" source="com.glide.localization_framework"&gt;a4dd193447720210cd4e1ce4316d4312&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_722b17a00f12201039534ee7c8767e2d&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-06-16 12:44:28&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:38:39</sys_created_on>
+        <sys_id>9c07f45d83f01210c6695855eeaad3fd</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>LFExportImportTranslator</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_9c07f45d83f01210c6695855eeaad3fd</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:38:39</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

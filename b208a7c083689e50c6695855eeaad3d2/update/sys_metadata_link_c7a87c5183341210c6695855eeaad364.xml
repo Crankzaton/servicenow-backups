@@ -1,0 +1,587 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>97f49f74a310311086e48964851e6120</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_kmf.CodeSigningDetailedVerificationAPI&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;CodeSigningDetailedVerificationAPI&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[/*
+	Usage:-
+	
+	* @param signedRecordSysId is the document Id of the signature record to check
+	* @param purpose is the sys_id used to extract the purpose_id from sys_kmf_crypto_purpose table
+	* @param tableName the name of the record table
+	
+	- signedRecordSysId, purpose and tableName uniquely identify a record in "sn_kmf_record_signature" table
+	- note that the script expects a "purpose" which is different from "purposeId"
+	- purpose is either "wild_card_purpose" or the value of "sys_id" column in "sys_kmf_crypto_purpose" table
+	
+	var CodeSigningDetailedVerificationAPI = new sn_kmf.CodeSigningDetailedVerificationAPI(
+		"7c977b22d722110050f5edcb9e6103b8","wild_card_purpose","sys_script"
+	);
+	CodeSigningDetailedVerificationAPI.displayDetailedVerification();
+*/
+
+var CodeSigningDetailedVerificationAPI = Class.create();
+CodeSigningDetailedVerificationAPI.prototype = {
+	initialize: function(recordSysId, purpose, tableName) {
+		this.tableName = tableName;
+		this.recordSysId = recordSysId;
+		this.purpose = purpose;
+		
+		this.ROLE_SECURITY_ADMIN = "security_admin";
+		this.SERIALIZER_TYPE_RECORD = "record";
+		this.SERIALIZER_TYPE_VARIABLE = "variable";
+		this.SERIALIZER_TYPE_VARIABLE_VALIDATION = "variableValidation";
+		this.SERIALIZER_TYPE_RECORD_VALIDATION = "recordValidation";
+		this.CODESIGNING_PURPOSE_INTEGRATION_HUB = "integration_hub";
+
+		this.SN_KMF_RECORD_SIGNATURE = "sn_kmf_record_signature";
+		this.SN_KMF_SIGNATURE_CONFIGURATION = "sn_kmf_signature_configuration";
+		this.SYS_KMF_CRYPTO_PURPOSE = "sys_kmf_crypto_purpose";
+		this.SYS_CERTIFICATE = "sys_certificate";
+		this.SYS_PROPERTIES = "sys_properties";
+		this.SYS_ATTACHMENT = "sys_attachment";
+
+		this.KMF_KEY_TABLE_NAME = "sys_kmf_module_key";
+
+		this.CODE_SIGNING_FEATURE_PROPERTY = "com.snc.kmf.signature.validation.optin";
+		this.SIGNATURE_VALIDATION_FLAG_PROPERTY = "com.snc.kmf.signature.validation.flag";
+		this.CERTIFICATE_VALIDATION_PROPERTY = "com.snc.kmf.cert.validation.enabled";
+
+		this.WILD_CARD_PURPOSE_REFERENCE = "wild_card_purpose";
+		this.WILD_CARD_PURPOSE = "*";
+
+		this.SYS_UPDATED_ON_FIELD = "sys_updated_on";
+		this.SYS_UPDATED_BY_FIELD = "sys_updated_by";
+		this.SYS_CREATED_ON_FIELD = "sys_created_on";
+		this.TABLE_NAME_FIELD = "table_name";
+		this.SYS_ID_FIELD = "sys_id";
+
+		this.FIELD_OPERATIONS = "operations";
+		this.KEY_LIFECYCLE_STATE_FIELD = "key_lifecycle_state";
+		this.CRYPTO_MODULE_FIELD = "crypto_module";
+		this.SIGNATURE_GENERATION = "signature_generation";
+		this.DOCUMENT_ID_FIELD =  "document_id";
+		this.PURPOSE_FIELD = "purpose";
+		this.CERTIFICATE_ALIAS_FIELD = "certificate_alias";
+		
+		this.OOB_CERTIFICATE_PATTERN = /^code_signing_key_(.+)_publiccodesignver/;
+
+		this.CODE_ATTEST_CM_SYS_ID = "75bdd8c2c70111109d59fa49f4c26031";
+		this.CODE_SIGNING_CM_SYS_ID = "a3123fddc32310101109046f5e40dd3e";
+
+		this.CODE_ATTEST_CM_NAME = "cm_code_attest";
+		this.CODE_SIGNING_CM_NAME = "cm_code_signing";
+
+		this.KEY_ACTIVE_STATES = "active,renewed";
+		this.IN = "IN";
+		
+		this.certificateId = "";
+		this.purposeId = "";
+		this.certificateName = "";
+
+		this.validationParamsExists = false;
+		this.isAttachment = false;
+		this.recordNotTrusted = false;
+
+		this.displayBuffer = [];
+		
+	},
+
+	isAuthorized: function() {
+		if (gs.hasRole(this.ROLE_SECURITY_ADMIN))
+			return true;
+
+		gs.info('User not authorized to run the script.');
+		return false;
+	},
+	
+	displayDetailedVerification: function() {
+		if (!this.isAuthorized())
+			return;
+
+		if (gs.nil(this.tableName) || gs.nil(this.recordSysId) || gs.nil(this.purpose)) {
+			gs.info("tableName or recordSysId or purpose cannot be null or empty.\n");
+			return;
+		}
+
+		this.displayHeader();
+		this.printSectionSeparator();
+
+		this.displayCodeSigningProperties();
+		this.printSectionSeparator();
+
+		this.displaySigningKeyDetails();
+		this.printSectionSeparator();
+
+		// if "*" is passed as purpose instead of "wild_card_purpose"
+		if (this.purpose == this.WILD_CARD_PURPOSE) 
+			this.purpose = this.WILD_CARD_PURPOSE_REFERENCE;
+
+		this.setAndDisplayPurposeId();
+		this.printSectionSeparator();
+
+		this.displayVerificationStatus();
+		this.printSectionSeparator();
+
+		this.displayKMFRecordDetails();
+		this.printSectionSeparator();
+
+		this.displayRelevantVerificationDetails();
+
+		this.generateLowerLevelScriptAPI();
+		this.printSectionSeparator();
+
+		this.checkLogsSection();
+		this.printSectionSeparator();
+
+		if (this.recordNotTrusted) 
+			this.checkAndDisplayAllSignatureRecordDetails();
+
+		gs.info(this.displayBuffer.join('\n'));
+
+	},
+
+	displayHeader: function() {
+		this.displayBuffer.push("\n\nNOTE: The script displays information relevant to the verification of a signature record.");
+		this.displayBuffer.push("Additional details and recommendations may be found in the “Code Signing Troubleshooting Guide”.");
+	},
+
+	displaySigningKeyDetails: function() {
+		if (!this.isAuthorized())
+			return;
+	
+		this.displayBuffer.push("SIGNING KEY DETAILS: -\n");
+
+		this.displayBuffer.push("CODE ATTEST MODULE: -\n");
+		this.checkActiveKMFGenerationKeys(this.CODE_ATTEST_CM_SYS_ID, this.CODE_ATTEST_CM_NAME);
+
+		this.displayBuffer.push("CODE SIGNING MODULE :-\n");
+		this.checkActiveKMFGenerationKeys(this.CODE_SIGNING_CM_SYS_ID, this.CODE_SIGNING_CM_NAME);
+	},
+
+	displayRelevantVerificationDetails: function() {
+		if (!this.isAuthorized())
+			return;
+
+		this.displayConfigurationDetails();
+		this.printSectionSeparator();
+		
+		this.displayCertificateDetails();
+		this.printSectionSeparator();
+
+		this.displayRecordDetails();
+		this.printSectionSeparator();
+	},
+	
+	printSectionSeparator: function() {
+		this.displayBuffer.push("-------------------------------------------------------------------------------------------    END OF SECTION    -------------------------------------------------------------------------------------------" + "\n");
+	},
+	
+	checkIfRecordSignedOOB: function(certificateName) {
+		var reg = new RegExp(this.OOB_CERTIFICATE_PATTERN);
+		return reg.test(certificateName.trim());
+	},
+	
+	displayRecordDetails: function() {
+		if (!this.isAuthorized())
+			return;
+
+		this.displayBuffer.push(gs.getMessage("RECORD DETAILS:-\n"));
+		var tableName = this.isAttachment ? this.SYS_ATTACHMENT : this.tableName;
+
+		var gr = new GlideRecord(tableName);
+		gr.addQuery(this.SYS_ID_FIELD, this.recordSysId);
+		gr.query();
+		
+		if (!gr.next()) {
+			this.displayBuffer.push(gs.getMessage("Unable to find record in table {0} with id = {1}.\n" , [tableName, this.recordSysId]));
+			return;
+		}
+		
+		this.displayBuffer.push(gs.getMessage("Last updated on: {0}\n", [gr.getDisplayValue(this.SYS_UPDATED_ON_FIELD)]));
+		this.displayBuffer.push(gs.getMessage("Last updated by: {0}\n", [gr.getDisplayValue(this.SYS_UPDATED_BY_FIELD)]));
+		this.displayBuffer.push(gs.getMessage("Is attachment record? {0}\n", [this.isAttachment]));
+		this.displayBuffer.push(gs.getMessage("Record signed Out Of Box (OOB): {0}\n", [this.checkIfRecordSignedOOB(this.certificateName)]));
+	},
+
+	displayCertificateDetails: function() {
+		if (!this.isAuthorized())
+			return;
+			
+		this.displayBuffer.push(gs.getMessage("CERTIFICATE DETAILS:- \n"));
+
+		if (gs.nil(this.certificateId)) {
+			this.displayBuffer.push("Cannot display certificate details as no verification certificate was found in signature record table.\n");
+			return;
+		}
+
+		var gr = this.getCertGrFromId(this.certificateId);
+		
+		if (gs.nil(gr)) {
+			this.displayBuffer.push(gs.getMessage("No certificate record found for certificate Id {0}.\n", [this.certificateId]));
+			return;
+		}
+
+		var codeSigningUtil = new global.CodeSigningUtil();
+		this.displayBuffer.push(gs.getMessage("Is trusted certificate? {0}\n", [codeSigningUtil.verifyCertTrusted(gr)]));
+
+		this.isCertSelfSigned(gr);
+		
+		this.displayBuffer.push(gs.getMessage("Id: {0}\n", [this.certificateId]));
+		this.displayBuffer.push(gs.getMessage("Name: {0} \n", [gr.getDisplayValue("name")]));
+	
+		this.displayBuffer.push(gs.getMessage("Is active: {0}\n", [gr.getDisplayValue("active")]));
+		this.displayBuffer.push(gs.getMessage("Expires on: {0}\n", [gr.getDisplayValue("expires")]));
+		this.displayBuffer.push(gs.getMessage("Issued by: {0}\n", [gr.getDisplayValue("issuer")]));
+		
+		this.displayBuffer.push(gs.getMessage("Last updated on: {0}\n", [gr.getDisplayValue(this.SYS_UPDATED_ON_FIELD)]));
+		this.displayBuffer.push(gs.getMessage("Last updated by: {0}\n", [gr.getDisplayValue(this.SYS_UPDATED_BY_FIELD)]));
+		
+		this.displayBuffer.push(gs.getMessage("Type: {0}\n", [gr.getDisplayValue("type")]));
+		this.certificateName = gr.getDisplayValue("name");
+	},
+
+	getCertGrFromId: function(certId) {
+		if (!this.isAuthorized())
+			return;
+
+		var gr = new GlideRecord(this.SYS_CERTIFICATE);
+		gr.addQuery(this.SYS_ID_FIELD, certId);
+		gr.query();
+
+		if(!gr.next()) {
+			return null;
+		}
+
+		return gr;
+	},
+	
+	displayKMFRecordDetails: function() {
+		if (!this.isAuthorized())
+			return;
+		
+		this.displayBuffer.push("SIGNATURE DETAILS:- \n");
+
+		var gr = new GlideRecord(this.SN_KMF_RECORD_SIGNATURE);
+		
+		gr.addQuery(this.TABLE_NAME_FIELD, this.tableName);
+		gr.addQuery(this.DOCUMENT_ID_FIELD, this.recordSysId);
+		gr.addQuery(this.PURPOSE_FIELD, this.purpose);
+		gr.orderByDesc(this.SYS_CREATE_ON_FIELD);
+		gr.setLimit(1);
+		
+		gr.query();
+		if (!gr.next()) {
+			this.displayBuffer.push("Signature record does not exist for the given tableName, purpose and recordSysId.\n");
+			return;
+		}
+		
+		this.displaySignatureRecordFields(gr);
+		
+	},
+
+	displaySignatureRecordFields: function(gr) {
+		if (!this.isAuthorized())
+			return;
+
+		this.displayBuffer.push(gs.getMessage("Id: {0} \n", [gr.getValue(this.SYS_ID_FIELD)]));
+		
+		this.fieldList = gr.getDisplayValue("field_list");
+		this.signature = gr.getDisplayValue("signature");
+		this.signatureAlgorithm = gr.getDisplayValue("signature_algorithm");
+
+		this.displayBuffer.push(gs.getMessage("Fields for signing the record: {0} \n", [this.fieldList]));
+		this.displayBuffer.push(gs.getMessage("Signature: {0} \n", [this.signature]));
+		this.displayBuffer.push(gs.getMessage("Signature algorithm: {0} \n", [this.signatureAlgorithm]));
+
+		this.displayBuffer.push(gs.getMessage("Signature created: {0} \n", [gr.getDisplayValue(this.SYS_CREATED_ON_FIELD)]));
+		
+		this.displayBuffer.push(gs.getMessage("Signature last updated: {0} \n", [gr.getDisplayValue(this.SYS_UPDATED_ON_FIELD)]));
+		this.displayBuffer.push(gs.getMessage("Signature last updated by: {0} \n", [gr.getDisplayValue(this.SYS_UPDATED_BY_FIELD)]));
+
+		this.displayBuffer.push(gs.getMessage("Certificate used for verification: {0} \n", [gr.getDisplayValue(this.CERTIFICATE_ALIAS_FIELD)]));
+		
+		this.certificateId = gr.getValue(this.CERTIFICATE_ALIAS_FIELD);
+		this.isAttachment = gr.getDisplayValue("is_attachment") === "true";
+		this.validationParamsExists = !gs.nil(gr.getValue("validation_params"));
+	},
+	
+	displayConfigurationDetails: function() {
+		if (!this.isAuthorized())
+			return;
+
+		this.displayBuffer.push("SIGNATURE CONFIGURATION DETAILS:- \n");
+
+		var gr = new GlideRecord(this.SN_KMF_SIGNATURE_CONFIGURATION);
+		
+		gr.addQuery(this.TABLE_NAME_FIELD, this.tableName);
+		gr.addQuery(this.PURPOSE_FIELD, this.purpose);
+		gr.addQuery("sign_attachment", this.isAttachment);
+		
+		gr.query();
+		if (!gr.next()) {
+			this.displayBuffer.push(gs.getMessage("Signature configuration record does not exist for the given table name, purpose and sign attachment status as {0}.\n", [this.isAttachment]));
+			return;
+		}
+		
+		this.displayBuffer.push(gs.getMessage("Id: {0} \n", [gr.getValue(this.SYS_ID_FIELD)]));
+	
+		this.displayBuffer.push(gs.getMessage("Signature generation filter: {0} \n", [this.getDisplayValue(gr.getDisplayValue("signature_gen_filter"))]));
+		this.displayBuffer.push(gs.getMessage("Signature crypto module: {0} \n", [this.getDisplayValue(gr.getDisplayValue("signature_crypto_module"))]));
+		
+		this.displayBuffer.push("NOTE: Signature generation fields in the signature configuration record may have changed since the signatures were generated.");
+		this.displayBuffer.push("At the time of verification, the fields displayed in the “SIGNATURE DETAILS” section above were used.");
+		this.displayBuffer.push("The difference between the values usually is NOT the cause for a non-trusted verification status.\n");
+			
+		this.displayBuffer.push(gs.getMessage("Current signature generation fields: {0} \n", [gr.getDisplayValue("signature_gen_fields")]));
+		
+	},
+	
+	setAndDisplayPurposeId: function() {
+		if (!this.isAuthorized())
+			return;
+		
+		this.displayBuffer.push("PURPOSE DETAILS: - \n");
+
+		if (this.purpose == this.WILD_CARD_PURPOSE_REFERENCE)
+			this.purposeId = this.WILD_CARD_PURPOSE; // `displayVerificationStatus` expects "wild_card_purpose" id as "*"
+		else {
+			var gr = new GlideRecord(this.SYS_KMF_CRYPTO_PURPOSE);
+			gr.addQuery("sys_id", this.purpose);
+			gr.query();
+			
+			if (gr.next())
+				this.purposeId = gr.getDisplayValue("purpose_id");
+			else {
+				this.displayBuffer.push(gs.getMessage("Crypto purpose record does not exist for purpose: {0} \n", [this.purpose]));
+				return; 
+			}
+		}
+		
+		this.displayBuffer.push(gs.getMessage("Using `{0}` purpose with purpose Id `{1}` \n" , [this.purpose, this.purposeId]));
+	},
+	
+	displayVerificationStatus: function() {
+		if (!this.isAuthorized())
+			return;
+			
+		this.displayBuffer.push("VERIFICATION STATUS:- \n");
+		
+		if (gs.nil(this.purposeId)) {
+			this.displayBuffer.push(gs.getMessage("Cannot proceed for trust verification as {0} purpose is not supported.\n", [this.purpose]));
+			return;
+		}
+
+		var codeSigningAPI = new sn_cs_ns.CodeSigningAPI();
+		
+		if (codeSigningAPI.isRecordTrusted(this.tableName, this.recordSysId, this.purposeId))
+			this.displayBuffer.push(gs.getMessage("Record `{0}` with purpose_id `{1}` in table `{2}` is trusted \n", [this.recordSysId, this.purposeId, this.tableName]));
+		else {
+			this.displayBuffer.push(gs.getMessage("Record `{0}` with purpose_id `{1}` in table `{2}` is not trusted \n", [this.recordSysId, this.purposeId, this.tableName]));
+			this.recordNotTrusted = true;
+		}
+	},
+
+	getDisplayValue: function(message) {
+		if (gs.nil(message))
+			return "Empty";
+
+		return message;
+	},
+
+	displayCodeSigningProperties: function() {
+		if (!this.isAuthorized())
+			return;
+
+		var gr = new GlideRecord(this.SYS_PROPERTIES);
+
+		this.displayBuffer.push("PROPERTIES DETAILS: -\n");
+
+		if (gr.get(this.CODE_SIGNING_FEATURE_PROPERTY))
+			this.displayBuffer.push(gs.getMessage("Code Signing feature opt-in? {0}\n", [this.getDisplayValue(gr.getDisplayValue("value"))]));
+		else 
+			this.displayBuffer.push(gs.getMessage("Code Signing feature opt-in property not found.\n", [this.CODE_SIGNING_FEATURE_PROPERTY]));
+
+		if (gr.get(this.SIGNATURE_VALIDATION_FLAG_PROPERTY))
+			this.displayBuffer.push(gs.getMessage("Code Signing turned on? {0}\n", [this.getDisplayValue(gr.getDisplayValue("value"))]));
+		else
+			this.displayBuffer.push(gs.getMessage("Code signing turn on property not found.\n", [this.SIGNATURE_VALIDATION_FLAG_PROPERTY]));
+
+		if (gr.get(this.CERTIFICATE_VALIDATION_PROPERTY))
+			this.displayBuffer.push(gs.getMessage("Certificate validation on? {0}\n", [this.getDisplayValue(gr.getDisplayValue("value"))]));
+		else 
+			this.displayBuffer.push(gs.getMessage("Certificate validation property not found.\n", [this.CERTIFICATE_VALIDATION_PROPERTY]));
+	},
+
+	checkAndDisplayAllSignatureRecordDetails: function() {
+		if (!this.isAuthorized())
+			return;
+
+		var gr = new GlideRecord(this.SN_KMF_RECORD_SIGNATURE);
+		
+		gr.addQuery(this.TABLE_NAME_FIELD, this.tableName);
+		gr.addQuery(this.DOCUMENT_ID_FIELD, this.recordSysId);
+		gr.addQuery(this.PURPOSE_FIELD, this.purpose);
+		gr.orderByDesc(this.SYS_CREATE_ON_FIELD);
+
+		gr.query();
+
+		if(gr.getRowCount() &gt; 1) {
+			this.displayBuffer.push("Signature validation has failed. Displaying details of all the signatures which match with the supplied parameters in the API:-\n");
+			
+			gr.next(); // we already displayed the relevant details of the first record 
+
+			while(gr.next()) {
+				this.displaySignatureRecordFields(gr);
+				this.displayRelevantVerificationDetails();
+			}
+		}
+	},
+
+	checkActiveKMFGenerationKeys: function(cryptoModuleSysId, cryptoModuleName) {
+		if (!this.isAuthorized())
+			return;
+
+		var grKMF = this.getActiveGenerationKeyGrModule(cryptoModuleSysId);
+
+		if (gs.nil(grKMF)) {
+			this.displayBuffer.push(gs.getMessage("There are no active signature generation keys in {0} module.\n", [cryptoModuleName]));
+			return;
+		}
+
+		this.displayBuffer.push(gs.getMessage("Active signature generation keys found in {0} module.\n", [cryptoModuleName]));
+	
+		var migrationAPI = new global.CodeSigningSignatureMigrationAPI();
+		var certSysId = migrationAPI.getActiveKMFVerifyCertSysId(cryptoModuleSysId);
+
+		if (gs.nil(certSysId)) {
+			this.displayBuffer.push(gs.getMessage("Certificate associated with the active signing key for {0} module is not found.\n", [this.cryptoModuleName]));
+			return;
+		}
+
+		var gr = this.getCertGrFromId(certSysId);
+		if (gs.nil(gr))  {
+			this.displayBuffer.push(gs.getMessage("Certificate record associated with the active signing key for {0} module does not exists.\n", [this.cryptoModuleName]));
+			return;
+		}
+		
+		this.displayBuffer.push(gs.getMessage("Verification certificate associated with {0} module: `{1}`\n", [cryptoModuleName, gr.getDisplayValue("name")]));
+		
+		this.isCertSelfSigned(gr);
+		
+	},
+
+	getActiveGenerationKeyGrModule: function(cryptoModuleSysId) {
+		var grKMF = new GlideRecord(this.KMF_KEY_TABLE_NAME);
+		grKMF.addQuery(this.CRYPTO_MODULE_FIELD, cryptoModuleSysId);
+		grKMF.addQuery(this.FIELD_OPERATIONS, this.SIGNATURE_GENERATION);
+		grKMF.addQuery(this.KEY_LIFECYCLE_STATE_FIELD, this.IN, this.KEY_ACTIVE_STATES);
+		grKMF.query();
+
+		if (!grKMF.next())
+			return null;
+
+		return grKMF;
+	},
+
+	isCertSelfSigned: function(certGr) {
+		var subject = certGr.getDisplayValue("subject");
+		var issuer = certGr.getDisplayValue("issuer");
+
+		if (!gs.nil(subject) &amp;&amp; !gs.nil(issuer))
+			this.displayBuffer.push(gs.getMessage("Is certificate self-signed? {0}\n", [subject.replace(/\s/g, '') == issuer.replace(/\s/g, '')]));
+		else 
+			this.displayBuffer.push("Cannot check for self-signed status as issuer or subject is null/empty.\n");
+	},
+
+	generateLowerLevelScriptAPI: function() {
+		if (!this.isAuthorized())
+			return;
+		
+		this.displayBuffer.push("SCRIPT FOR LOWER-LEVEL CUSTOM VERIFICATION API:- \n");		
+		
+		this.displayBuffer.push("NOTE: The script generated below is a template for using lower-level custom verification API.");
+		this.displayBuffer.push("Please refer to the Troubleshooting Guide for details on the parameters and on how to use the generated script.\n");
+	
+		var scriptAPITemplate = "new sn_cs_ns.CodeSigningCustomVerificationAPI() \
+		.withCodeSigningRecord(\"{0}\", \"{1}\", \"{2}\") \
+		.withSerializer(\"{3}\",\"{4}\") \
+		.withCertificate(\"{5}\") \
+		.withSignatureAlgorithm(\"{6}\") \
+		.withRecordBasedVerification(true) \
+		.withBroadcastVerificationError(false) \
+		.verify(\"{7}\");\n";
+		
+		var scriptAPI = gs.getMessage(scriptAPITemplate, [
+			this.recordSysId,
+			this.purposeId,
+			this.tableName,
+			this.getPlaceholderSerializer(this.purposeId, this.validationParamsExists),
+			this.fieldList,
+			this.certificateId,
+			this.signatureAlgorithm,
+			this.signature
+		]);
+
+		this.displayBuffer.push(scriptAPI);
+
+	},
+
+	getPlaceholderSerializer: function(purposeId, validationParamsExists) {
+		validationParamsExists = String(validationParamsExists).toLowerCase() === 'true';
+		
+		if (purposeId == this.CODESIGNING_PURPOSE_INTEGRATION_HUB &amp;&amp; validationParamsExists)
+			return this.SERIALIZER_TYPE_VARIABLE_VALIDATION;
+		else if (purposeId == this.CODESIGNING_PURPOSE_INTEGRATION_HUB) 
+			return this.SERIALIZER_TYPE_VARIABLE;
+		else if (validationParamsExists)
+			return this.SERIALIZER_TYPE_RECORD_VALIDATION;
+		else
+			return this.SERIALIZER_TYPE_RECORD;
+	},
+
+	checkLogsSection: function() {
+		this.displayBuffer.push("NOTE: The details displayed above can help identify the cause of an untrusted signature record, though do not cover all use cases.");
+		this.displayBuffer.push("If the information displayed fails to identify the cause, review the “Checking Logs” section of the “Troubleshooting Guide”.\n");
+	},
+	
+	type: 'CodeSigningDetailedVerificationAPI'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-07-25 18:00:56&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;97f49f74a310311086e48964851e6120&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;3&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;CodeSigningDetailedVerificationAPI&lt;/sys_name&gt;
+        &lt;sys_package display_value="ServiceNow Key Management Framework" source="sn_kmf"&gt;c515f25b53332300cd1eddeeff7b126e&lt;/sys_package&gt;
+        &lt;sys_policy&gt;protected&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="ServiceNow Key Management Framework"&gt;c515f25b53332300cd1eddeeff7b126e&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_97f49f74a310311086e48964851e6120&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-08-23 16:37:26&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:45:56</sys_created_on>
+        <sys_id>c7a87c5183341210c6695855eeaad364</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>CodeSigningDetailedVerificationAPI</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_c7a87c5183341210c6695855eeaad364</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:45:56</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

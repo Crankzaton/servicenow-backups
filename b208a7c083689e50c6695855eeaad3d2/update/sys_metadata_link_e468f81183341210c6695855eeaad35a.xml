@@ -1,0 +1,233 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>841780ed77ef0110160a0adc3c5a9971</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_nlu_workbench.NLUPerformanceUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Utilities to fetch NLU Performance records&lt;/description&gt;
+        &lt;name&gt;NLUPerformanceUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var NLUPerformanceUtil = Class.create();
+
+var OUTCOME_QUERIES = {
+    CORRECT: 'correct,correct_among_multiple',
+    SINGLE_CORRECT: 'correct',
+    CORRECT_AMONG_MULTIPLE: 'correct_among_multiple',
+    INCORRECT: 'incorrect,incorrect_among_multiple,uncategorized',
+    SINGLE_INCORRECT: 'incorrect',
+    INCORRECT_AMONG_MULTIPLE: 'incorrect_among_multiple,uncategorized',
+    UNKNOWN: 'skipped,uncategorized',
+    NO_PREDICTION: 'skipped',
+    SINGLE_UNKNOWN: 'uncategorized'
+};
+
+var tableName = 'open_nlu_predict_intent_feedback';
+
+NLUPerformanceUtil.prototype = {
+    initialize: function() {},
+
+    getAuditLogByTask: function(task) {
+        var gr = new GlideRecord(tableName);
+        gr.addQuery('app_document', task);
+        gr.chooseWindow(0, 1);
+        gr.query();
+
+        while (gr.next()) {
+            return gr.getValue('audit_log');
+        }
+        return null;
+    },
+
+    getDynamicallyTranslatedLog: function() {
+        var translatedLogs = {};
+
+        var gr = new GlideRecord('sys_cs_message');
+        gr.addEncodedQuery('va_system_payload!=NULL');
+        gr.query();
+        while (gr.next()) {
+            var task = gr.getValue('task');
+            var log = this.getAuditLogByTask(task);
+            if (log) {
+                translatedLogs[log] = 1;
+            }
+        }
+        return translatedLogs;
+    },
+
+    getLogsMapByOutcome: function(selectedId, encodedQuery, outcomes, ignoreLogs) {
+        // CORRECT, SINGLE_CORRECT, CORRECT_AMONG_MULTIPLE, SINGLE_INCORRECT and NO_PREDICTION cases
+        var auditLogMap = outcomes ? ignoreLogs : {};
+
+        var gr = new GlideRecord(tableName);
+        var outcomeQuery = encodedQuery + '^nlu_discovery_outcomeIN' + (outcomes || OUTCOME_QUERIES[selectedId]);
+        gr.addEncodedQuery(outcomeQuery);
+        gr.query();
+        while (gr.next()) {
+            var log = gr.getValue('audit_log');
+            if (outcomes || !ignoreLogs[log]) {
+                auditLogMap[log] = 1;
+            }
+        }
+        return auditLogMap;
+    },
+
+    getLogsByAggregration: function(selectedId, encodedQuery, ignoreLogs, isMultiple) {
+        // INCORRECT, INCORRECT_AMONG_MULTIPLE, UNKNOWN and SINGLE_UNKNOWN cases
+        var logs = [];
+        var agg = new GlideAggregate(tableName);
+        var outcomeQuery = encodedQuery + '^nlu_discovery_outcomeIN' + OUTCOME_QUERIES[selectedId];
+        agg.addAggregate('COUNT', 'audit_log');
+        agg.addEncodedQuery(outcomeQuery);
+        agg.query();
+        while (agg.next()) {
+            var count = parseInt(agg.getAggregate('COUNT', 'audit_log'));
+            var countCheck = isMultiple ? count &gt; 1 : count === 1;
+            var log = agg.getValue('audit_log');
+            if (countCheck &amp;&amp; !ignoreLogs[log]) {
+                logs.push(log);
+            }
+        }
+        return logs;
+    },
+
+    getAuditLogs: function(selectedId, encodedQuery, translatedLogMap) {
+        // TODO: Decouple the logic into single use-cases
+        var skipOutcome = '',
+            logMap = {};
+        if (selectedId === 'UNKNOWN' || selectedId === 'SINGLE_UNKNOWN') {
+            skipOutcome = OUTCOME_QUERIES.CORRECT + ',' + OUTCOME_QUERIES.SINGLE_INCORRECT + ',incorrect_among_multiple';
+            logMap = this.getLogsMapByOutcome(selectedId, encodedQuery, skipOutcome, translatedLogMap);
+            return this.getLogsByAggregration(selectedId, encodedQuery, logMap, false);
+        } else if (selectedId === 'INCORRECT_AMONG_MULTIPLE' || selectedId === 'INCORRECT') {
+            skipOutcome = OUTCOME_QUERIES.CORRECT;
+            if (selectedId === 'INCORRECT_AMONG_MULTIPLE') {
+                skipOutcome += ',' + OUTCOME_QUERIES.SINGLE_INCORRECT;
+            }
+            logMap = this.getLogsMapByOutcome(selectedId, encodedQuery, skipOutcome, translatedLogMap);
+            var multiplePredOutcome = this.getLogsByAggregration(selectedId, encodedQuery, logMap, true);
+            if (selectedId !== 'INCORRECT_AMONG_MULTIPLE') {
+                var singlePredOutcome = this.getLogsByAggregration('SINGLE_INCORRECT', encodedQuery, logMap, false);
+                for (var i = 0; i &lt; singlePredOutcome.length; ++i) {
+                    if (multiplePredOutcome.indexOf(singlePredOutcome[i]) === -1)
+                        multiplePredOutcome.push(singlePredOutcome[i]);
+                }
+            }
+            return multiplePredOutcome;
+        }
+        return Object.keys(this.getLogsMapByOutcome(selectedId, encodedQuery, null, translatedLogMap));
+    },
+
+    getPerformanceInfoCount: function(encodedQuery) {
+        var gr = new GlideAggregate(tableName);
+        gr.addEncodedQuery(encodedQuery);
+        gr.addAggregate('COUNT');
+        gr.query();
+        return gr.next() ? parseInt(gr.getAggregate('COUNT')) : 0;
+    },
+
+    getPerformanceInfo: function(selectedIds, encodedQuery, translatedLogMap, offset, limit) {
+        if (selectedIds.length === 0) {
+            return {
+                data: [],
+                count: 0
+            };
+        }
+        var auditLogs = [],
+            performanceQuery = encodedQuery;
+        if (selectedIds.indexOf('ALL_OUTCOME') &lt; 0) {
+            var _self = this;
+            selectedIds.forEach(function(selectedId) {
+                auditLogs = auditLogs.concat(_self.getAuditLogs(selectedId, encodedQuery, translatedLogMap));
+            });
+
+            if (auditLogs.length &gt; 0) {
+                performanceQuery += '^audit_logIN' + auditLogs.join(',');
+            }
+        } else {
+            performanceQuery += '^audit_logNOT IN' + Object.keys(translatedLogMap).join(',');
+        }
+
+        var count = this.getPerformanceInfoCount(performanceQuery);
+        performanceQuery += '^ORDERBYutterance,sys_created_on,audit_log,nlu_discovery_outcome';
+        var gr = new GlideRecord(tableName);
+        gr.addEncodedQuery(performanceQuery);
+        gr.chooseWindow(offset &gt; 0 ? offset - 1 : 0, offset + limit + 1); // -1 and +1 is to cover =1 and &gt;1 uncategorised outcome distribution
+        gr.query();
+        var id = '',
+            predictionInfo = {},
+            i = 0,
+            data = [];
+        while (gr.next()) {
+            if (id === gr.getValue('audit_log') &amp;&amp; (offset === 0 || i != 1)) {
+                predictionInfo = {
+                    id: gr.getValue('audit_log') + "-" + Math.random(),
+                    createdOn: gr.getDisplayValue('sys_created_on'),
+                    modelName: gr.getDisplayValue('nlu_model'),
+                    prediction: gr.getValue('prediction'),
+                    utterance: gr.getValue('utterance')
+                };
+                if (gr.getValue('nlu_discovery_outcome') === data[i - 1].outcome) {
+                    // this overriding is needed for multiple uncategorised outcome which should be grouped as incorrect among multiple
+                    data[i - 1].outcome = 'incorrect_among_multiple';
+                }
+            } else {
+                id = gr.getValue('audit_log');
+                predictionInfo = {
+                    id: gr.getValue('audit_log'),
+                    createdOn: gr.getDisplayValue('sys_created_on'),
+                    groupedUtterance: gr.getValue('utterance'),
+                    modelName: gr.getDisplayValue('nlu_model'),
+                    outcome: gr.getValue('nlu_discovery_outcome'),
+                    prediction: gr.getValue('prediction'),
+                    utterance: gr.getValue('utterance')
+                };
+                if (offset !== 0 &amp;&amp; i === 1 &amp;&amp; gr.getValue('nlu_discovery_outcome') === data[0].outcome) {
+                    // this overriding is needed for multiple uncategorised outcome which should be grouped as incorrect among multiple
+                    predictionInfo.outcome = 'incorrect_among_multiple';
+                }
+            }
+            data.push(predictionInfo);
+            ++i;
+        }
+        return {
+            data: data.splice(offset &gt; 0 ? 1 : 0, limit),
+            count: count
+        };
+    },
+
+    type: 'NLUPerformanceUtil'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;maint&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-05-18 11:48:26&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;841780ed77ef0110160a0adc3c5a9971&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;41&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;NLUPerformanceUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="NLU Workbench - Advanced Features" source="sn_nlu_workbench"&gt;31f5f491c3a710100bf407720f40ddf4&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="NLU Workbench - Advanced Features"&gt;31f5f491c3a710100bf407720f40ddf4&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_841780ed77ef0110160a0adc3c5a9971&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;maint&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-11-22 07:12:14&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:44:41</sys_created_on>
+        <sys_id>e468f81183341210c6695855eeaad35a</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>NLUPerformanceUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_e468f81183341210c6695855eeaad35a</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:44:41</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

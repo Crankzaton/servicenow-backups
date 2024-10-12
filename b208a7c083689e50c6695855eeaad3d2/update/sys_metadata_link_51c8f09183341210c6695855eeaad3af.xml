@@ -1,0 +1,305 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>a0b0e98a43e6211076cddab4b7b8f26e</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.HSPlaybookUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;HSPlaybookUtil&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var HSPlaybookUtil = Class.create();
+HSPlaybookUtil.prototype = {
+    initialize: function() {
+        this.REPORT_INCIDENT_PLAYBOOK_NAME = 'sn_ohs_im.report_an_incident';
+    },
+
+    isPlaybookDisabled: function() {
+        return gs.getProperty("sn_ohs_im.disable_playbook");
+    },
+
+    createIncidentForAdditionalInjuryAndIllnessRecord: function(incidentRecord) {
+        try {
+            var iiGr = new GlideRecord('sn_ohs_im_injury_illness');
+            iiGr.addQuery('incident', incidentRecord.getValue("sys_id"));
+            //Oldest first
+            iiGr.orderBy('sys_created_on');
+            iiGr.query();
+            if (iiGr.getRowCount() &gt; 1) {
+                var iiRecordLoopCount = 0;
+
+                while (iiGr.next()) {
+                    //Keep the oldest i/i record with the original incident and create new incident for the newer ones
+                    if (iiRecordLoopCount &gt; 0) {
+
+                        //copy the original incident
+                        var fields = incidentRecord.getElements();
+                        var newIncidentGr = new GlideRecord('sn_ohs_im_incident');
+                        newIncidentGr.initialize();
+                        newIncidentGr.setWorkflow(false);
+
+                        for (var i = 0; i &lt; fields.length; i++) {
+                            var glideElement = fields[i];
+
+                            //let GlideRecord auto generate sys_id and number field values
+							if(glideElement.getName() === 'short_description') {
+								newIncidentGr[glideElement.getName()] = incidentRecord.getValue('short_description') + ' ' + incidentRecord.getValue('number') + ' - playbook split #' + iiRecordLoopCount;
+							} else if (glideElement.getName() === 'events') {
+								var affectedPersonDisplayValue = iiGr.affected_person ? iiGr.affected_person.getDisplayValue() : iiGr.visitor.getDisplayValue();
+								newIncidentGr[glideElement.getName()] = "Split Incident for Injured person: " + affectedPersonDisplayValue + " \r\n" + incidentRecord.getValue(glideElement.getName());
+							} else if (glideElement.getName() != 'sys_id' &amp;&amp; glideElement.getName() != 'number') {
+                                newIncidentGr[glideElement.getName()] = incidentRecord.getValue(glideElement.getName());
+                            }
+                        }
+                        var newIncidentSysId = newIncidentGr.insert();
+                        iiGr.setValue('incident', newIncidentSysId);
+                        iiGr.setWorkflow(false);
+                        iiGr.update();
+
+                        gs.info('***** Created new incident: {0} for injury and illness record: {1}', newIncidentSysId, iiGr.getValue('sys_id'));
+
+                    }
+
+                    iiRecordLoopCount++;
+                }
+            }
+        } catch (ex) {
+            gs.error('***** creating incident for additional Injury and Illness record data failed: {0}', ex);
+        }
+    },
+
+    triggerPlaybook: function(table, recordSysId) {
+        if (this.isPlaybookDisabled() === "true") {
+            return;
+        }
+        var gr = new GlideRecord(table);
+        if (!gr.get(recordSysId)) {
+            gs.error('Unable to trigger playbook because record not found. Table: {0}, sys_id: {1}', table, recordSysId);
+            return;
+        }
+        if (this.isPlaybookTriggered(gr)) {
+            gs.info('Playbook has already been triggered for this record. Table: {0}, sys_id: {1}', table, recordSysId);
+        } else {
+            sn_playbook.PlaybookExperience.triggerPlaybook(this.REPORT_INCIDENT_PLAYBOOK_NAME, gr);
+        }
+    },
+
+    isPlaybookTriggered: function(gr) {
+        return sn_playbook.PlaybookExperience.parentRecordContainsPlaybook(gr, this.REPORT_INCIDENT_PLAYBOOK_NAME);
+    },
+
+    triggerPlaybookForIncidentRecord: function(incidentRecord) {
+        if (this.isPlaybookTriggered(incidentRecord)) {
+            return;
+        }
+        this.createIncidentForAdditionalInjuryAndIllnessRecord(incidentRecord);
+        sn_playbook.PlaybookExperience.triggerPlaybook(this.REPORT_INCIDENT_PLAYBOOK_NAME, incidentRecord);
+        this.processIncidentPlaybook(incidentRecord);
+    },
+    processIncidentPlaybook: function(incidentGr) {
+        var contextGr = this.getContextForIncident(incidentGr.getValue('sys_id'));
+        var totalNumberOfSteps = 8;
+        if (contextGr.getRowCount() === 1) {
+            for (var i = 0; i &lt; totalNumberOfSteps; i++) {
+                var inProgressActivityContextGr = this.getInProgressActivityContext(contextGr.getValue('sys_id'));
+                if (inProgressActivityContextGr.getRowCount() != 0) {
+                    var state = this.processActivity(inProgressActivityContextGr, incidentGr);
+
+                    // If we calculate the state of the step to be in progress we stop at this steps.
+                    // We want the user to continue the playbook from that step.
+                    if (IN_PROGRESS === state) {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+
+            }
+        } else {
+            gs.error('***** Playbook not triggered for this record. Table: sn_ohs_im_incident, sys_id: {0}', incidentGr.getValue('sys_id'));
+        }
+
+    },
+    processActivity: function(inProgressActivityContextGr, incidentGr) {
+        var inProgressActivityDefinition = inProgressActivityContextGr.getValue('activity_definition');
+        if (USER_FORM_ACTIVITY_DEFINITION === inProgressActivityDefinition || CREATE_OSHA_301_FORM_ACTIVITY_DEFINITION === inProgressActivityDefinition) {
+            return this.updateStateOfUserFormActivityDefinition(inProgressActivityContextGr, incidentGr);
+        } else {
+            return this.updateStateActivityDefinition(inProgressActivityContextGr, incidentGr);
+        }
+    },
+    getContextForIncident: function(incidentSysId) {
+        var contextGr = new GlideRecord('sys_pd_context');
+        contextGr.addQuery('input_table', 'sn_ohs_im_incident');
+        contextGr.addQuery('input_record', incidentSysId);
+        contextGr.query();
+        if (contextGr.next()) {
+            return contextGr;
+        }
+
+        return null;
+    },
+    getInProgressActivityContext: function(contextSysId) {
+        var activityContextGr = new GlideRecord('sys_pd_activity_context');
+        activityContextGr.addQuery('context', contextSysId);
+        activityContextGr.addQuery('state', IN_PROGRESS);
+        activityContextGr.query();
+        if (activityContextGr.next()) {
+            return activityContextGr;
+        }
+
+        return null;
+    },
+    getFlowDataFromActivityContextVar: function(activityContextGr) {
+        var varsGr = new GlideRecord('sys_variable_value');
+        varsGr.addQuery('document', 'sys_pd_activity_context');
+        varsGr.addQuery('document_key', activityContextGr.getValue('sys_id'));
+        varsGr.addQuery('variable', '5e5272b2c3211010381b60bc0eba8f13'); // experience_status_record
+        varsGr.query();
+        if (varsGr.next()) {
+            return varsGr.getValue('value');
+        }
+
+        return null;
+    },
+    getInjuryIllnessRecord: function(incidentSysId) {
+        var iiGr = new GlideRecord('sn_ohs_im_injury_illness');
+        iiGr.addQuery('incident', incidentSysId);
+        iiGr.query();
+
+        if (iiGr.getRowCount() &gt; 0) {
+            iiGr.next();
+        }
+
+        return iiGr;
+    },
+    updateStateActivityDefinition: function(activityContextGr, incidentGr) {
+        var state = this.calculateActivityState(activityContextGr, incidentGr);
+        if (IN_PROGRESS != state) {
+            this.updateFlowDataState(activityContextGr.getValue('associated_record'), state);
+        }
+
+        return state;
+    },
+    updateStateOfUserFormActivityDefinition: function(activityContextGr, incidentGr) {
+        var flowDataSysId = this.getFlowDataFromActivityContextVar(activityContextGr);
+        var state = this.calculateActivityState(activityContextGr, incidentGr);
+        if (IN_PROGRESS != state) {
+            this.updateFlowDataState(flowDataSysId, state);
+        }
+
+        return state;
+    },
+    updateFlowDataState: function(sysId, state) {
+        var flowDataGr = new GlideRecord('sys_flow_data');
+        flowDataGr.get(sysId);
+        flowDataGr.setValue('state', state);
+        flowDataGr.update();
+    },
+    calculateActivityState: function(activityContextGr, incidentGr) {
+        var activitySysId = activityContextGr.getValue('activity');
+        if (ADD_EVENTS_DETAILS_ACTIVITY === activitySysId) {
+            return this.calculateStateForAddEventDetails(incidentGr);
+        } else if (ADD_PEOPLE_INVOLVED === activitySysId) {
+            return this.calculateStateForViewListAndCreateRecordsActivityDefinition('sn_ohs_im_involved_party', incidentGr.getValue('sys_id'));
+        } else if (ADD_ASSETS_INVOLVED_ACTIVITY === activitySysId) {
+            return this.calculateStateForViewListAndCreateRecordsActivityDefinition('sn_ohs_im_m2m_task_sn_ent_asset', incidentGr.getValue('sys_id'));
+        } else if (ADD_ROOT_CAUSE_ANALYSIS_ACTIVITY === activitySysId) {
+            return this.calculateStateForViewListAndCreateRecordsActivityDefinition('sn_ohs_im_rca', incidentGr.getValue('sys_id'));
+        } else {
+            var iiGr = this.getInjuryIllnessRecord(incidentGr.getValue('sys_id'));
+            if (DESCRIBE_THE_INJURY_ILLNESS_ACTIVITY === activitySysId) {
+                var incidentState = incidentGr.getValue('state');
+                if (iiGr.getRowCount() === 0) {
+                    return incidentState === '3' ? SKIPPED : IN_PROGRESS;
+                }
+                return COMPLETE;
+            } else if (SELECTED_INJURED_BODY_PART_ACTIVITY === activitySysId &amp;&amp; iiGr) {
+                return this.calculateSelectInjuredBodyParts(iiGr);
+            } else if (ADD_HOSPITAL_INFORMATION__ACTIVITY === activitySysId) {
+                return this.calculateAddHospitalInformation(iiGr);
+            } else if (RECORD_THE_INJURY_ACTIVITY === activitySysId) {
+                return this.calculateRecordTheInjury(iiGr);
+            }
+        }
+        return IN_PROGRESS;
+    },
+    calculateStateForAddEventDetails: function(incidentGr) {
+        if (incidentGr.getValue('wsd_location')) {
+            return COMPLETE;
+        }
+
+        return SKIPPED;
+    },
+    calculateStateForViewListAndCreateRecordsActivityDefinition: function(table, incidentSysId) {
+        var gr = new GlideRecord(table);
+        gr.addQuery('ohs_task', incidentSysId);
+        gr.query();
+        if (gr.getRowCount() &gt; 0) {
+            return COMPLETE;
+        }
+
+        return SKIPPED;
+    },
+    calculateSelectInjuredBodyParts: function(iiGr) {
+        var injuryGr = new GlideRecord('sn_ohs_im_injury');
+        injuryGr.addQuery('injury_report', iiGr.getValue('sys_id'));
+        injuryGr.query();
+        if (injuryGr.getRowCount() &gt; 0) {
+            return COMPLETE;
+        }
+
+        return SKIPPED;
+    },
+    calculateAddHospitalInformation: function(iiGr) {
+        if (iiGr.getValue('healthcare_professional_name') &amp;&amp; iiGr.getValue('facility') &amp;&amp; iiGr.getValue('facility_address')) {
+            return COMPLETE;
+        }
+
+        return SKIPPED;
+    },
+    calculateRecordTheInjury: function(iiGr) {
+        if (iiGr.getValue('recordable') === '1') {
+            if (iiGr.getValue('osha_injury_type') &amp;&amp; iiGr.getValue('object_substance_cause') &amp;&amp; iiGr.getValue('location') &amp;&amp;
+                iiGr.getValue('before_incident_description') &amp;&amp; iiGr.getValue('description')) {
+                return COMPLETE;
+            }
+        }
+
+        return SKIPPED;
+    },
+    type: 'HSPlaybookUtil'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-05-03 06:52:56&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;a0b0e98a43e6211076cddab4b7b8f26e&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;23&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;HSPlaybookUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value=""&gt;f27b42a72f373010f2bf532a2799b693&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value=""&gt;f27b42a72f373010f2bf532a2799b693&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_a0b0e98a43e6211076cddab4b7b8f26e&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-11-14 12:12:46&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:46:22</sys_created_on>
+        <sys_id>51c8f09183341210c6695855eeaad3af</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>HSPlaybookUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_51c8f09183341210c6695855eeaad3af</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:46:22</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,442 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>85439da653712110706eddeeff7b1233</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.ResponsibilityAccessConfigCacheUtilSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;ResponsibilityAccessConfigCacheUtilSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ResponsibilityAccessConfigCacheUtilSNC = Class.create();
+ResponsibilityAccessConfigCacheUtilSNC.prototype = {
+    initialize: function() {
+        this.context = {};
+    },
+
+
+
+
+    /**************************     METHODS FOR FETCHING RESPONSIBILITY ACCESS CONFIGURATIONS     **************************/
+
+    /*
+     * Returns
+     * true: if there is a valid Responsibility access config record present in the table for [appliesToRelationship, accessLevel, accessibleEntity]
+     * false: otherwise
+     * 
+     */
+    hasAccessConfigRecord: function(appliesToRelationship, accessLevel, accessibleEntity) {
+        if (gs.nil(appliesToRelationship) || gs.nil(accessibleEntity)) {
+            return false;
+        }
+
+        // If accessLevel is not passed, default it to READ
+        accessLevel = accessLevel || global.CSMRelationshipConstants.ACCESS.READ;
+
+        var appliesToRelationshipObject = this.getAppliesToRelationshipFromCache(appliesToRelationship);
+
+        if (gs.nil(appliesToRelationshipObject))
+            return false;
+
+        if (!gs.nil(appliesToRelationshipObject[accessLevel]) &amp;&amp; !gs.nil(appliesToRelationshipObject[accessLevel][accessibleEntity]))
+            return true;
+
+        var FULL_ACCESS_LEVEL = global.CSMRelationshipConstants.ACCESS.FULL;
+        if (this.FULL_ACCESS_LEVEL_LIST.indexOf(accessLevel) &gt;= 0 &amp;&amp; !gs.nil(appliesToRelationshipObject[FULL_ACCESS_LEVEL]) &amp;&amp; !gs.nil(appliesToRelationshipObject[FULL_ACCESS_LEVEL][accessibleEntity]))
+            return true;
+
+        return false;
+    },
+
+    /*
+     * Returns list of responsibility sys_id's after filtering based on the passed parameters
+     * 
+     */
+    getResponsibilitiesFromCache: function(appliesToRelationship, accessLevel, accessibleEntity, applicableTo, restrictAccessTo, skipRoleCheck, skipDomainCheck) {
+        if (gs.nil(appliesToRelationship) || gs.nil(accessibleEntity)) {
+            return [];
+        }
+
+        // If accessLevel is not passed, default it to READ
+        accessLevel = accessLevel || global.CSMRelationshipConstants.ACCESS.READ;
+
+        var appliesToRelationshipObject = this.getAppliesToRelationshipFromCache(appliesToRelationship);
+        if (gs.nil(appliesToRelationshipObject))
+            return [];
+
+        this.context.isDomainSupportPluginActive = new global.CSManagementUtils().isDomainSupportPluginActive();
+        this.context.userDomainId = gs.getSession().getCurrentDomainID();
+
+        var responsibilities = this._getResponsibilitiesFromAccessLevelKey(appliesToRelationshipObject[accessLevel], accessibleEntity, applicableTo, restrictAccessTo, skipRoleCheck, skipDomainCheck) || [];
+
+        // If accessLevel is a part of FULL_ACCESS_LEVEL_LIST, then return responsibilities that matches with FULL access level also
+        if (this.FULL_ACCESS_LEVEL_LIST.indexOf(accessLevel) &gt;= 0) {
+            var responsibilitiesFromFullAccess = this._getResponsibilitiesFromAccessLevelKey(appliesToRelationshipObject[global.CSMRelationshipConstants.ACCESS.FULL], accessibleEntity, applicableTo, restrictAccessTo, skipRoleCheck, skipDomainCheck) || [];
+            responsibilities = this.mergeLists(responsibilities, responsibilitiesFromFullAccess);
+        }
+
+        return responsibilities;
+    },
+
+    /*
+     * Builds private cache catalog RESPONSIBILITY_ACCESS_CONFIG_CACHE, if it doesn't exist; and
+     * Returns below Object
+     * 
+     * Access level (String) : {
+     *           Accessible Entity (String): [
+     *               {
+     *                   "responsibility": sys_id of the responsibility,
+     *                   "name": Name (derived from responsibility),
+     *                   "domainId": Domain ID of the responsibility (derived from responsibility),
+     *                   "roles": [
+     *                       role1, role2, ...
+     *                   ],
+     *                   "applicableTo": List (derived from responsibility),
+     *                   "restrictAccessTo": String
+     *               }
+     * 
+     */
+    getAppliesToRelationshipFromCache: function(appliesToRelationship) {
+        if (gs.nil(appliesToRelationship))
+            return {};
+
+        if (!this._isCacheCatalogAvailable()) {
+            var responsibilityAccessConfig = this.buildResponsibilityAccessConfigCache() || {};
+            return responsibilityAccessConfig[appliesToRelationship] || {};
+        }
+
+        var appliesToRelationshipObjectString = GlideCacheManager.get(this.CACHE_NAME, appliesToRelationship) || '{}';
+        return JSON.parse(appliesToRelationshipObjectString);
+    },
+
+    /*
+     * Returns list of responsibility sys_id's from accessLevelObject matching the parameter filters
+     * 
+     */
+    _getResponsibilitiesFromAccessLevelKey: function(accessLevelObject, accessibleEntity, applicableTo, restrictAccessTo, skipRoleCheck, skipDomainCheck) {
+        if (gs.nil(accessLevelObject) || gs.nil(accessibleEntity) || gs.nil(accessLevelObject[accessibleEntity]))
+            return [];
+
+        var responsibilityMap = {};
+        var accessibleEntityObject = accessLevelObject[accessibleEntity] || [];
+        accessibleEntityObject.forEach(function(responsibilityObject) {
+            if (this._isValidResponsibility(responsibilityObject, applicableTo, restrictAccessTo, skipRoleCheck, skipDomainCheck))
+                responsibilityMap[responsibilityObject.responsibility] = true;
+        }, this);
+
+        return Object.keys(responsibilityMap);
+    },
+
+    /*
+     * Returns
+     * true : if the responsibilityObject matches with the other params
+     * false : otherwise
+     */
+    _isValidResponsibility: function(responsibilityObject, applicableTo, restrictAccessTo, skipRoleCheck, skipDomainCheck) {
+        if (gs.nil(responsibilityObject))
+            return false;
+
+        // Nil responsibilityObject.applicableTo is not valid
+        if (!gs.nil(applicableTo)) {
+            if (applicableTo.contains(','))
+                return false;
+            if (gs.nil(responsibilityObject.applicableTo) || responsibilityObject.applicableTo.split(',').indexOf(applicableTo) == -1)
+                return false;
+        }
+
+        // Nil responsibilityObject.restrictAccessTo is valid for all
+        if (!gs.nil(restrictAccessTo)) {
+            if (restrictAccessTo.contains(','))
+                return false;
+            if (!gs.nil(responsibilityObject.restrictAccessTo) &amp;&amp; restrictAccessTo != responsibilityObject.restrictAccessTo)
+                return false;
+        }
+
+        if (!(skipRoleCheck == true || skipRoleCheck == 'true')) {
+            if (!gs.hasRole(responsibilityObject.roles))
+                return false;
+        }
+
+        if (!(skipDomainCheck == true || skipDomainCheck == 'true')) {
+            // global.CSMDomainSeparationUtils() is available only if domain support plugin is active
+            if (this.context.isDomainSupportPluginActive == true) {
+                // This context is set at getResponsibilitiesFromCache() public method
+                if (!new global.CSMDomainSeparationUtils().hasAccessToDomain(responsibilityObject.domainId, this.context.userDomainId))
+                    return false;
+            }
+        }
+
+        return true;
+    },
+
+
+
+
+    /***********************     METHODS FOR BUILDING/FLUSHING CACHE    *****************************/
+
+    /*
+     * For each appliesToRelationship in Responsibility Access Config Table,
+     * creates a cache entry with 
+     * key = appliesToRelationship
+     * value = {
+     *   Object
+     * }
+     * 
+     * where Object structure is as follows:
+     * Access level (String) : {
+     *           Accessible Entity (String): [
+     *               {
+     *                   "responsibility": sys_id of the responsibility,
+     *                   "name": Name (derived from responsibility),
+     *                   "domainId": Domain ID of the responsibility (derived from responsibility),
+     *                   "roles": [
+     *                       role1, role2, ...
+     *                   ],
+     *                   "applicableTo": List (derived from responsibility),
+     *                   "restrictAccessTo": String
+     *               }
+     */
+    buildResponsibilityAccessConfigCache: function() {
+        var responsibilityAccessConfig = this.populateResponsibilityAccessConfig() || {};
+        this._initPrivateCache();
+        Object.keys(responsibilityAccessConfig).forEach(function(key) {
+            GlideCacheManager.put(this.CACHE_NAME, key, JSON.stringify(responsibilityAccessConfig[key]));
+        }, this);
+        return responsibilityAccessConfig;
+    },
+
+    /*
+     * Performs full cache flush
+     * 
+     */
+    flushResponsibilityAccessConfigCache: function() {
+        GlideCacheManager.flush(this.CACHE_NAME);
+    },
+
+    /*
+     * Returns below Object after processing each records in Responsibility access config table
+     * 
+     * Access level (String) : {
+     *           Accessible Entity (String): [
+     *               {
+     *                   "responsibility": sys_id of the responsibility,
+     *                   "name": Name (derived from responsibility),
+     *                   "domainId": Domain ID of the responsibility (derived from responsibility),
+     *                   "roles": [
+     *                       role1, role2, ...
+     *                   ],
+     *                   "applicableTo": List (derived from responsibility),
+     *                   "restrictAccessTo": String
+     *               }
+     */
+    populateResponsibilityAccessConfig: function() {
+        this.context.responsibilityDefinitionMap = this.getResponsibilityDefinitions();
+        var responsibilityAccessConfig = {};
+        var gr = new GlideRecord(global.CSMBaseConstants.RESPONSIBILITY_ACCESS_CONFIG_TABLE);
+        gr.queryNoDomain();
+        while (gr.next()) {
+            this._populateAppliesToRelationship(responsibilityAccessConfig, gr);
+        }
+        return responsibilityAccessConfig;
+    },
+
+    /*
+     * Queries Responsibility Definition table and returns a map
+     * responsibilityId : {
+     *   name : responsibility name,
+     *   applicableTo : applicable to,
+     *   domainId : domain of the responsibility
+     * }
+     * 
+     */
+    getResponsibilityDefinitions: function() {
+        var responsibilityDefinitions = {};
+        var gr = new GlideRecord(global.CSMBaseConstants.RESPONSIBILITY_DEFINITION_TABLE);
+        gr.queryNoDomain();
+        while (gr.next()) {
+            responsibilityDefinitions[gr.sys_id + ''] = {
+                name: gr.name + '',
+                applicableTo: gr.applicable_to + '',
+                domainId: gr.sys_domain + ''
+            };
+        }
+        return responsibilityDefinitions;
+    },
+
+    /*
+     * Creates private cache catalog 'RESPONSIBILITY_ACCESS_CONFIG_CACHE', with key
+     * _created_on_ : current time
+     *
+     */
+    _initPrivateCache: function() {
+        if (!this._isCacheCatalogAvailable()) {
+            GlideCacheManager.addPrivateCacheable(this.CACHE_NAME);
+            GlideCacheManager.put(this.CACHE_NAME, "_created_on_", new GlideDateTime().getNumericValue());
+        }
+    },
+
+    _isCacheCatalogAvailable: function() {
+        return !(GlideCacheManager.get(this.CACHE_NAME, "_created_on_") === null);
+    },
+
+    /*
+     * param1 : Object
+     * param2 : GlideRecord of Responsibility Access Configuration
+     * 
+     */
+    _populateAppliesToRelationship: function(responsibilityAccessConfig, accessConfigGR) {
+        if (gs.nil(accessConfigGR) || gs.nil(accessConfigGR.applies_to_relationship))
+            return;
+
+        var appliesToRelationship = accessConfigGR.applies_to_relationship + '';
+        this._initializeObject(responsibilityAccessConfig, appliesToRelationship);
+        this._populateAccessLevels(responsibilityAccessConfig[appliesToRelationship], accessConfigGR);
+    },
+
+    /*
+     * param1 : Object
+     * param2 : GlideRecord of Responsibility Access Configuration
+     * 
+     */
+    _populateAccessLevels: function(appliesToRelationshipObj, accessConfigGR) {
+        if (gs.nil(appliesToRelationshipObj) || gs.nil(accessConfigGR) || gs.nil(accessConfigGR.access_levels))
+            return;
+
+        var accessLevelList = (accessConfigGR.access_levels + '').split(',');
+        accessLevelList.forEach(function(accessLevel) {
+            this._initializeObject(appliesToRelationshipObj, accessLevel);
+            this._populateAccessibleEntities(appliesToRelationshipObj[accessLevel], accessConfigGR);
+        }, this);
+    },
+
+    /*
+     * param1 : Object
+     * param2 : GlideRecord of Responsibility Access Configuration
+     * 
+     */
+    _populateAccessibleEntities: function(accessLevelObj, accessConfigGR) {
+        if (gs.nil(accessLevelObj) || gs.nil(accessConfigGR) || gs.nil(accessConfigGR.accessible_entities))
+            return;
+
+        var accessibleEntityList = (accessConfigGR.accessible_entities + '').split(',');
+        accessibleEntityList.forEach(function(accessibleEntity) {
+            this._initializeObject(accessLevelObj, accessibleEntity, this.TYPE_ARRAY);
+            this._populateResponsibilityData(accessLevelObj[accessibleEntity], accessConfigGR);
+        }, this);
+    },
+    /*
+     * Populates responsibility, roles, restrictAccessTo, applicableTo, responsibility name, responsibility domain ID
+     * param1 : Object
+     * param2 : GlideRecord of Responsibility Access Configuration
+     * 
+     */
+    _populateResponsibilityData: function(accessibleEntityArray, accessConfigGR) {
+        if (gs.nil(accessibleEntityArray) || gs.nil(accessConfigGR) || gs.nil(accessConfigGR.responsibility))
+            return;
+
+        if (!(accessConfigGR.active == true))
+            return;
+
+        var responsibilityId = accessConfigGR.responsibility + '';
+
+        // Create separate objects for each restrictAccessTo to avoid duplicates
+        var restrictAccessToList = (accessConfigGR.restrict_access_to + '').split(',');
+        restrictAccessToList.forEach(function(restrictAccessTo) {
+            var responsibilityObject = {
+                responsibility: responsibilityId,
+                name: this.context.responsibilityDefinitionMap[responsibilityId].name,
+                domainId: this.context.responsibilityDefinitionMap[responsibilityId].domainId,
+                roles: (accessConfigGR.roles + '').split(','),
+                applicableTo: this.context.responsibilityDefinitionMap[responsibilityId].applicableTo,
+                restrictAccessTo: restrictAccessTo
+            };
+            this.__processResponsibility(accessibleEntityArray, responsibilityObject);
+        }, this);
+    },
+
+    /*
+     * param1 : Array
+     * param2 : Candidate object that can be pushed to the array, or merged with any existing objects in the array
+     * 
+     */
+    __processResponsibility: function(accessibleEntityArray, newResponsibilityObject) {
+        // The params {accessibleEntityArray} and {newResponsibilityObject} are always not null here.
+
+        var needsInsert = true;
+        accessibleEntityArray.forEach(function(existingObject) {
+            if (existingObject.responsibility != newResponsibilityObject.responsibility)
+                return;
+
+            if (existingObject.restrictAccessTo != newResponsibilityObject.restrictAccessTo)
+                return;
+
+            needsInsert = false;
+            existingObject.roles = this.mergeLists(existingObject.roles, newResponsibilityObject.roles);
+        }, this);
+
+        if (needsInsert)
+            accessibleEntityArray.push(newResponsibilityObject);
+    },
+
+    mergeLists: function(list1, list2) {
+        var listMap = {};
+        if (!gs.nil(list1)) {
+            list1.forEach(function(listItem) {
+                listMap[listItem] = true;
+            });
+        }
+        if (!gs.nil(list2)) {
+            list2.forEach(function(listItem) {
+                listMap[listItem] = true;
+            });
+        }
+        return Object.keys(listMap);
+    },
+
+    /*
+     * If {key} doesn't exist in {obj}, then create it
+     * 
+     */
+    _initializeObject: function(obj, key, type) {
+        if (Object.keys(obj).indexOf(key) == -1)
+            obj[key] = (type == this.TYPE_ARRAY) ? [] : {};
+    },
+
+    CACHE_NAME: "RESPONSIBILITY_ACCESS_CONFIG_CACHE",
+    TYPE_ARRAY: "TYPE_ARRAY",
+    FULL_ACCESS_LEVEL_LIST: new global.CSManagementUtils().getFullAccessLevelList(),
+    type: 'ResponsibilityAccessConfigCacheUtilSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-03-28 12:24:51&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;85439da653712110706eddeeff7b1233&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;2&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ResponsibilityAccessConfigCacheUtilSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Customer Service Base Entities" source="com.snc.cs_base"&gt;4f2cce6b47664210cd4e1ce4316d43a4&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_85439da653712110706eddeeff7b1233&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-08-01 08:59:14&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:44:45</sys_created_on>
+        <sys_id>a968f81183341210c6695855eeaad3be</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ResponsibilityAccessConfigCacheUtilSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_a968f81183341210c6695855eeaad3be</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:44:45</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,522 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>89006f22775a1110f14a24f1cd5a996b</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.AutoResolutionComposite&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Composite API integration for Auto-Resolution flow&lt;/description&gt;
+        &lt;name&gt;AutoResolutionComposite&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var AutoResolutionComposite = Class.create();
+AutoResolutionComposite.prototype = Object.extendsObject(AutoResolutionMLBase, {
+	contextSysId : '',
+	capability : '',
+
+	initialize: function(configSysId, contextSysId) {
+		this.setConfigSysId(configSysId);
+		this.contextSysId = contextSysId;
+		this.setCapability();
+		this.LOGGER = new AutoResolutionLoggingUtils()
+			.withName(this.type)
+			.withConfiguration(this.getConfigSysId())
+			.createLogger();
+	},
+
+	addSolutionDefinition: function(inputSolutionName) {
+		var compositeSolutionTemplate = this.getCompositeSolutionTemplate(inputSolutionName,
+			AutoResolutionConstants.ML_CAPBILITIES.AGENT_ZERO_WORKFLOW);
+		if (gs.nil(compositeSolutionTemplate)) {
+			return '';
+		}
+
+		var compositeSolutionName;
+		try {
+			compositeSolutionName = sn_ml.CompositeSolutionStore.add(compositeSolutionTemplate);
+		} catch (error) {
+			this.LOGGER.error("Failed to add a Composite solution definition. Error: {0}", error);
+			compositeSolutionName = '';
+		}
+
+		return compositeSolutionName;
+	},
+
+	createOrUpdateCompositeSolution: function(inputLanguageConfigGr) {
+		var inputSolutionName = inputLanguageConfigGr.getValue("ml_solution_name");
+		var languageCode = inputLanguageConfigGr.getValue("training_language");
+		var isConfigActive = AutoResolutionUtil.isConfigurationActive(this.getConfigSysId());
+		var languageConfigGr;
+
+		// Check if there exists a Composite solution name
+		var compositeSolutionName;
+		try {
+			compositeSolutionName = AutoResolutionLanguageHelper.getSolutionNameForLanguage(languageCode,
+				this.getConfigSysId(), this.getCapability());
+		} catch (error) {
+			// Creating a new language config record because there does not exist a language config record with the Composite
+			compositeSolutionName = '';
+		}
+
+		var isUpdateSuccessful = true;
+		if (gs.nil(compositeSolutionName)) {
+			// If the solution name does not exist, create a new solution
+			compositeSolutionName = this.addSolutionDefinition(inputSolutionName);
+			var capability = AutoResolutionConstants.ML_CAPBILITIES.COMPOSITE;
+			languageConfigGr = AutoResolutionLanguageHelper.createLanguageConfigRecord(this.getConfigSysId(), languageCode,
+				capability, compositeSolutionName);
+		} else {
+			// If the solution name does exist, update an existing solution
+			isUpdateSuccessful = this.updateSolutionDefinition(compositeSolutionName);
+			languageConfigGr = AutoResolutionLanguageHelper.getLanguageConfigRecordBySolutionName(this.getConfigSysId(), this.getCapability(), compositeSolutionName);
+		}
+
+		if (gs.nil(compositeSolutionName)) {
+			this.LOGGER.error("Failed to create the Composite solution because the Composite solution name does not exist.");
+			return;
+		}
+
+		if (!isUpdateSuccessful) {
+			this.LOGGER.error("Failed to update Composite solution.");
+			return;
+		}
+
+		if (gs.nil(languageConfigGr)) {
+			this.LOGGER.error("Failed to create or update the Composite solution because the language configuration record does not exist.");
+			return;
+		}
+
+		// Set the input solution to be inactive
+		inputLanguageConfigGr.active = false;
+		inputLanguageConfigGr.update();
+
+		// delete any languageX configuration record (if it exist, mainly for Utah --&gt; Vancouver upgrade scenario)
+		AutoResolutionLanguageHelper.deleteLanguageConfiguration(this.getConfigSysId(), AutoResolutionConstants.ML_CAPBILITIES.LANGUAGEX);
+
+		// Update the training results on the language config record
+		var trainingResults = this._getDefaultTrainingResults(compositeSolutionName);
+		AutoResolutionLanguageHelper.updateLanguageConfigRecord(languageConfigGr, trainingResults);
+
+		// Restore the active value of IAR configuration record to which may have been altered due to training
+		if (isConfigActive)
+			AutoResolutionUtil.updateConfigRecord(this.getConfigSysId(), {"active": isConfigActive});
+
+		// Set BR for language configuration active check to active if not so already
+		AutoResolutionUtil.setBRActive(AutoResolutionConstants.LANGUAGE_CONFIG_ACTIVE_CHECK_BR);
+
+	},
+
+	/**
+	 * Returns solution name for the configSysId
+	 */
+	getSolutionName: function(languageCode) {
+		return AutoResolutionLanguageHelper.getSolutionNameForLanguage(languageCode, this.getConfigSysId(), this.getCapability());
+	},
+
+	hasActiveVersion: function(solutionName) {
+		try {
+			if (!this.checkSolutionExists(solutionName))
+				return false;
+			var mlSolution = sn_ml.CompositeSolutionStore.get(solutionName);
+			var solutionVersion = mlSolution.getActiveVersion();
+			return !gs.nil(solutionVersion);
+		} catch(ex) {
+			this.LOGGER.warn('Error checking for ML solution active version: {0}', ex.getMessage());
+			return false;
+		}
+	},
+
+	checkSolutionExists: function(solutionName) {
+		try {
+			if (!gs.nil(solutionName)) {
+				var autoResolutionPISolution = sn_ml.CompositeSolutionStore.get(solutionName);
+				return !gs.nil(autoResolutionPISolution);
+			}
+			return false;
+		} catch(ex) {
+			this.LOGGER.warn('Error checking ML solution exists: name={0}: {1}', solutionName, ex);
+			return false;
+		}
+	},
+
+	predict: function(taskGr, predictionInputFields, options, languageCode) {
+		var solutionName = this.getSolutionName(languageCode);
+		return this.predictBase(sn_ml.CompositeSolutionStore, solutionName, taskGr, predictionInputFields, options);
+	},
+
+	// For Composite capability we don't need to show train UI Action
+	showTrainButton: function() {
+		return false;
+	},
+
+	// For Composite capability we don't need to show refresh or cancel training UI actions
+	showRefreshOrCancelTrainingButton: function() {
+		return false;
+	},
+
+	setCapability: function() {
+		this.capability = AutoResolutionConstants.ML_CAPBILITIES.COMPOSITE;
+	},
+
+	getCapability: function() {
+		return this.capability;
+	},
+
+	/**
+	 * Gets the Composite solution template, by an existing configJSON from the ML solution if it exists, or
+	 * by creating a new configJSON if not.
+	 * @param {string} inputSolutionName	The solution name of a Workflow or Composite solution.
+	 * @return {Object} The Composite Solution template.
+	 */
+	getCompositeSolutionTemplate: function(inputSolutionName, capability) {
+		// Get list of all config sys_ids that use the same Composite solution name
+		var configIdList = AutoResolutionUtil.getConfigIdsWithSameSolutionName(inputSolutionName);
+		var completeNluModelNameList = [];
+
+		// Use the list of config sys_ids to create a set of NLU model names
+		var arrayUtil = new ArrayUtil();
+		configIdList.forEach(function(configId) {
+			var partialNluModelNameList = AutoResolutionUtil.getNLUModelNameListFromConfig(configId);
+			completeNluModelNameList = arrayUtil.concat(completeNluModelNameList, partialNluModelNameList);
+		});
+		completeNluModelNameList = arrayUtil.unique(completeNluModelNameList);
+
+		var configGr = new GlideRecord(AutoResolutionConstants.CONFIG_TABLE_NAME);
+		configGr.get(this.getConfigSysId());
+		var taskType = AutoResolutionUtil.getTaskType(configGr.getValue(AutoResolutionConstants.CONFIGURATION_TABLENAME_FIELD_NAME));
+
+		// Get existing Composite config, if the inputSolutionName refers to a Composite solution
+		// Otherwise, treat the inputSolutionName as a Workflow solution name and create a new config object using this
+		var configJSON = (capability === AutoResolutionConstants.ML_CAPBILITIES.COMPOSITE)
+			? this._getConfigJSONFromMLCapabilitySolutionBaseRecord(inputSolutionName)
+			: this._getDefaultConfigJSON(inputSolutionName, taskType);
+
+		// Add all the NLU model names to the list of custom intents in the configJSON object
+		configJSON.bindings = [];
+		completeNluModelNameList.forEach(function(name) {
+			var obj = {
+				"bindingId": "",
+				"actionReference": "FLOATING",
+				"solutionName": name,
+				"capability": "nlu_trainer",
+				"solutionVersion": "",
+				"parameters": {
+				},
+				"sharedModel": false
+			};
+			configJSON.bindings.push(obj);
+		});
+
+		var solutionTemplate;
+		try {
+			solutionTemplate = new sn_ml.CompositeSolution(configJSON);
+		} catch (error) {
+			this.LOGGER.error("Failed to create a new CompositeSolution template. Error: {0}", error);
+			solutionTemplate = null;
+		}
+
+		return solutionTemplate;
+	},
+
+	/**
+	 * Updates the Composite solution definition in the ml_capability_definition_base table. Should increase the version number by 1.
+	 * @param {string} CompositeSolutionName	The name of the Composite solution.
+	 * @return Whether the solution definition has been successfully updated.
+	 */
+	updateSolutionDefinition: function(compositeSolutionName) {
+		try {
+			var compositeSolutionTemplate = this.getCompositeSolutionTemplate(compositeSolutionName,
+				AutoResolutionConstants.ML_CAPBILITIES.COMPOSITE);
+			sn_ml.CompositeSolutionStore.update(compositeSolutionName, compositeSolutionTemplate);
+			return true;
+
+		} catch (error) {
+			this.LOGGER.error("Failed to update the Composite solution definition. Error: {0}", error);
+		}
+
+		return false;
+	},
+
+	/**
+	 * Updates all solution definitions for all languages that use the Composite capability.
+	 */
+	updateSolutionDefinitionsForAllLanguages: function() {
+		var compositeSolutionNameList = AutoResolutionLanguageHelper.getAllSolutionNamesByCapability(this.getConfigSysId(),
+			this.getCapability());
+
+		// For each solution name, update the solution definition
+		for (var i = 0; i &lt; compositeSolutionNameList.length; i += 1) {
+			var compositeSolutionName = compositeSolutionNameList[i];
+			var isUpdateSuccessful = this.updateSolutionDefinition(compositeSolutionName);
+
+			if (!isUpdateSuccessful) {
+				continue;
+			}
+
+			// Update the training results on the language config record
+			var trainingResults = this._getDefaultTrainingResults(compositeSolutionName);
+			var languageConfigGr = AutoResolutionLanguageHelper.getLanguageConfigRecordBySolutionName(
+				this.getConfigSysId(), this.getCapability(), compositeSolutionName);
+			AutoResolutionLanguageHelper.updateLanguageConfigRecord(languageConfigGr, trainingResults);
+		}
+	},
+
+	/**
+	 * Perform bulk Composite prediction
+	 * @param {string} autoResConfigSysID - the sys_id of IAR Configuration GlideRecord
+	 * @param {Object} requestObjectList - JSON with input parameters for Composite prediction
+	 * @return {Object} The Composite bulk prediction results
+	 */
+	getBulkPrediction: function(requestObjectList, languageCode) {
+		var predictionResults;
+		try {
+			var compositeSolutionName = this.getSolutionName(languageCode);
+			var compositeSolution = sn_ml.CompositeSolutionStore.get(compositeSolutionName);
+			predictionResults = JSON.parse(compositeSolution.getActiveVersion().predict(requestObjectList));
+		}
+		catch (error) {
+			this.LOGGER.error("Failed to perform bulk prediction for the configuration {0} with the Composite solution name {1}",
+				this.getConfigSysId(), compositeSolutionName);
+			predictionResults = null;
+
+		}
+		return predictionResults;
+	},
+
+	/**
+	 * Gets the configuration JSON object from the existing Composite solution definition given the solution name.
+	 * @param {string} compositeSolutionName	The name of the Composite solution.
+	 * @return {Object} JSON object for configuring the Composite solution definition.
+	 * @private
+	 */
+	_getConfigJSONFromMLCapabilitySolutionBaseRecord: function(compositeSolutionName) {
+		var mlDefinitionGr = new GlideRecord("ml_capability_definition_base");
+		mlDefinitionGr.addQuery("solution_name", compositeSolutionName);
+		mlDefinitionGr.query();
+
+		if (!mlDefinitionGr.next()) {
+			this.LOGGER.error("Failed to update the Composite solution definitions for the configuration {0} because there does not exist a Solution Definition record for the Composite solution name {1}",
+				this.getConfigSysId(), compositeSolutionName);
+			return "";
+		}
+
+		// Solution properties will contain the configuration object used to create the Composite solution with
+		var solutionProperties = mlDefinitionGr.getValue("solution_properties");
+		if (gs.nil(solutionProperties)) {
+			this.LOGGER.error("Failed to update the Composite solution definitions for the configuration {0} because the solution properties is empty in the Solution Definition record for the Composite solution name {1}",
+				this.getConfigSysId(), compositeSolutionName);
+			return "";
+		}
+
+		var configJSON;
+		try {
+			configJSON = JSON.parse(solutionProperties);
+		} catch (error) {
+			this.LOGGER.error("Failed to update the Composite solution definitions for the configuration {0} because the solution properties is invalid in the Solution Definition record for the Composite solution name {1}",
+				this.getConfigSysId(), compositeSolutionName);
+			configJSON = "";
+		}
+
+		return configJSON;
+	},
+
+	/**
+	 * Creates the configuration JSON object for creating or updating the Composite solution definition with.
+	 * @param {string} inputSolutionName	The name of the input solution that the Composite solution will wrap around.
+	 * @return {Object} JSON object for configuring the Composite solution definition.
+	 * @private
+	 */
+	_getDefaultConfigJSON: function(inputSolutionName, taskType) {
+		var configJSON = {
+			"languageVersion":"0.2",
+			"solutionName":"Issue Auto-Resolution",
+			"taskType":taskType,
+			"label":"Issue Auto-Resolution",
+			"outputs":{
+				"output":[
+					"agent_zero_workflow"
+				]
+			},
+			"solutionVersion":"1",
+			"inputs":{
+				"input":{
+					"fields":[
+						"short_description"
+					]
+				}
+			},
+			"activities":[
+				{
+					"activityId":"type_adapter_lds",
+					"action":{
+						"actionType":"type_adapter",
+						"boundSolutionConfig":{
+							"solutionName":"",
+							"solutionVersion":""
+						},
+						"parameters":{
+							"concatenateRecordIntoField":"short_description"
+						},
+						"capability":"",
+						"capabilityVersion":{
+							"version":"",
+							"parameters":{
+
+							}
+						},
+						"inputSource":"",
+						"jsonAdapter":{
+							"INPUT":{
+								"type":"sourceField",
+								"value":"",
+								"source":"input.short_description",
+								"jsonPath":"",
+								"isOutputList":false,
+								"outputType":"STRING"
+							}
+						}
+					},
+					"next_activities":[
+						{
+							"activityId":"agent_zero_workflow",
+							"on_condition":{
+
+							},
+							"additionalOutputFields":{
+								"serviceOutput":{
+									"type":"jsonPath",
+									"value":"",
+									"source":"",
+									"jsonPath":"$..predictedValue"
+								},
+								"serviceOutputScore":{
+									"type":"jsonPath",
+									"value":"",
+									"source":"",
+									"jsonPath":"$..confidence"
+								},
+								"serviceModelUsed":{
+									"type":"jsonPath",
+									"value":"",
+									"source":"",
+									"jsonPath":"$..serviceModelUsed"
+								},
+								"service":{
+									"type":"jsonPath",
+									"value":"",
+									"source":"",
+									"jsonPath":"$..service"
+								},
+								"serviceModelSolutionName":{
+									"type":"jsonPath",
+									"value":"",
+									"source":"",
+									"jsonPath":"$..serviceModelSolutionName"
+								},
+								"serviceModelSolutionVersion":{
+									"type":"jsonPath",
+									"value":"",
+									"source":"",
+									"jsonPath":"$..serviceModelSolutionVersion"
+								},
+								"serviceModelParentServiceName":{
+									"type":"sourceField",
+									"value":"",
+									"source":"parameters.serviceModelParentServiceName",
+									"jsonPath":""
+								},
+								"serviceModelParentServiceVersion":{
+									"type":"sourceField",
+									"value":"",
+									"source":"parameters.serviceModelParentServiceVersion",
+									"jsonPath":""
+								}
+							}
+						}
+					]
+				},
+				{
+					"activityId":"agent_zero_workflow",
+					"action":{
+						"actionType":"solution",
+						"boundSolutionConfig":{
+							"solutionName":inputSolutionName
+						},
+						"parameters":{
+							"predictorOutputKey":"ml_prediction_results"
+						},
+						"capability":"workflow_trainer",
+						"capabilityVersion":{
+							"version":"",
+							"parameters":{
+
+							}
+						},
+						"inputSource":"type_adapter_lds",
+						"jsonAdapter":{
+
+						}
+					},
+					"next_activities":[
+
+					]
+				}
+			]
+		};
+		return configJSON;
+	},
+
+	/**
+	 * Creates the object of training result values to set the language configuration record of a Composite solution to. Although it
+	 * doesn't take any time or have a status output because the solution doesn't need to be trained, we still need to make these values
+	 * non-empty to be consistent with the other solutions that do need to be trained.
+	 * @param {string} CompositeSolutionName	Name of the Composite solution.
+	 * @return {Object} JSON object containing a map of the column names on a language configuration record to their corresponding training
+	 *                  status values that need to be updated on the record.
+	 * @private
+	 */
+	_getDefaultTrainingResults: function(compositeSolutionName) {
+		var trainingResults = {};
+		trainingResults.active = true;
+		trainingResults.ml_training_state = "solution_complete";
+		trainingResults.ml_training_progress = 100;
+		trainingResults.ml_status_last_updated = new GlideDateTime();
+		trainingResults.latest_trained_version =
+			this.getActiveSolutionVersionNumberForSolutionName(sn_ml.CompositeSolutionStore, compositeSolutionName);
+		return trainingResults;
+	},
+
+	type: 'AutoResolutionComposite'
+});]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-10-05 23:01:15&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;89006f22775a1110f14a24f1cd5a996b&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;19&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AutoResolutionComposite&lt;/sys_name&gt;
+        &lt;sys_package display_value="Issue Auto-Resolution" source="com.glide.cs.auto_resolution"&gt;81ddf4a03c75311068bcf327dfe37fa6&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_89006f22775a1110f14a24f1cd5a996b&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-03-27 23:04:45&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:44:58</sys_created_on>
+        <sys_id>f478bc1183341210c6695855eeaad304</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AutoResolutionComposite</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_f478bc1183341210c6695855eeaad304</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:44:58</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

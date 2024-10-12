@@ -1,0 +1,232 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>9d83fe74b71101107f033307fe11a928</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_aisearch_global.AisMigrationRecord&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Wrapper around GlideRecord that stages changes rather than committing them to DB&lt;/description&gt;
+        &lt;name&gt;AisMigrationRecord&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var AisMigrationRecord = Class.create();
+AisMigrationRecord.prototype = {
+
+    initialize: function(migrationSysID, targetTableName) {
+        if (!targetTableName)
+            throw 'Cannot create a record without table name';
+
+        if (!migrationSysID)
+            throw 'Cannot create a record without migrationSysID';
+
+        this.targetTableName = targetTableName;
+        this.migrationSysID = migrationSysID;
+        this.queries = [];
+        this.setValues = {};
+        this.conflictResolver = new AisMigrationConflictResolver(migrationSysID);
+    },
+
+    setNeedsReview: function(needsReview) {
+        this.needsReview = needsReview;
+    },
+
+    addQuery: function(key, operator, value) {
+        var query = {
+            key: key,
+            operator: operator,
+            value: value
+        };
+        this.queries.push(query);
+    },
+
+    query: function() {
+        this.targetGr = new GlideRecord(this.targetTableName);
+        for (var i = 0; i &lt; this.queries.length; i++) {
+            var query = this.queries[i];
+            this.targetGr.addQuery(query.key, query.operator, query.value);
+        }
+
+        this.targetGr.query();
+    },
+
+    setValue: function(key, value) {
+        this.setValues[key] = value;
+    },
+
+    insert: function() {
+        // Indexed sources are special. We cannot insert more than one per table.
+        if (this.targetTableName === 'ais_datasource') {
+            var existingStagingGr = this._isIndexedSourceStaged(this.setValues['source']);
+            if (this._indexedSourceExists(this.setValues['source']) &amp;&amp; existingStagingGr != null) {
+                this.conflictResolver.resolveWithStagingRecord(this.targetTableName, existingStagingGr, this.setValues);
+
+                this.setValues = {};
+                return 'sn_aisearch_global_job_staging_' + existingStagingGr.getUniqueValue();
+            }
+        }
+
+        var stagingGr = new GlideRecord('sn_aisearch_global_job_staging');
+        stagingGr.initialize();
+        stagingGr.setValue('table_name', this.targetTableName);
+        stagingGr.setValue('operation', 'insert');
+        stagingGr.setValue('migration_orchestration', this.migrationSysID);
+        if (this.needsReview)
+            stagingGr.setValue('state', 'needs_review');
+
+        var stagingRecordSysID = stagingGr.insert();
+        var values = this.setValues;
+        Object.keys(values).forEach(function(key) {
+            var value = values[key];
+
+            var stagingChangeGr = new GlideRecord('sn_aisearch_global_job_staging_change');
+            stagingChangeGr.initialize();
+            stagingChangeGr.setValue('migration_staging_record', stagingRecordSysID);
+            stagingChangeGr.setValue('field', key);
+            stagingChangeGr.setValue('new_value', value);
+            stagingChangeGr.insert();
+        });
+
+        this.setValues = {};
+        return 'sn_aisearch_global_job_staging_' + stagingRecordSysID; // A special prefix to help us identify generated records
+    },
+
+    update: function() {
+        // Indexed sources are special. We cannot insert more than one per table.
+        if (this.targetTableName === 'ais_datasource') {
+            var existingStagingGr = this._isIndexedSourceStaged(this.setValues['source']);
+            if (existingStagingGr != null) {
+                this.conflictResolver.resolveWithStagingRecord(this.targetTableName, existingStagingGr, this.setValues);
+                this.setValues = {};
+                return;
+            }
+        }
+
+        var stagingGr = new GlideRecord('sn_aisearch_global_job_staging');
+        stagingGr.initialize();
+        if (this.needsReview)
+            stagingGr.setValue('state', 'needs_review');
+
+        stagingGr.setValue('table_name', this.targetTableName);
+
+        stagingGr.setValue('table_sys_id', this.targetGr.getUniqueValue());
+        stagingGr.setValue('operation', 'update');
+
+        stagingGr.setValue('migration_orchestration', this.migrationSysID);
+
+        var stagingRecordSysID = stagingGr.insert();
+        var insertedChanges = 0;
+
+        var values = this.setValues;
+        var targetGr = this.targetGr;
+        Object.keys(values).forEach(function(key) {
+            var value = values[key];
+
+            var stagingChangeGr = new GlideRecord('sn_aisearch_global_job_staging_change');
+            stagingChangeGr.initialize();
+            stagingChangeGr.setValue('migration_staging_record', stagingRecordSysID);
+            stagingChangeGr.setValue('field', key);
+            stagingChangeGr.setValue('previous_value', targetGr.getValue(key));
+            stagingChangeGr.setValue('new_value', value);
+            stagingChangeGr.insert();
+
+            insertedChanges = insertedChanges + 1;
+        });
+
+        // In case of no changes, remove the staging record
+        if (insertedChanges === 0) {
+            gs.info('No changes found for the record. Deleting staged record.');
+            stagingGr.get(stagingRecordSysID);
+            stagingGr.deleteRecord();
+            return;
+        }
+
+        this.setValues = {};
+    },
+
+    next: function() {
+        this.setValues = {};
+        return this.targetGr.next();
+    },
+
+    hasNext: function() {
+        return this.targetGr.hasNext();
+    },
+
+    getValue: function(fieldName) {
+        return this.targetGr.getValue(fieldName);
+    },
+
+    getUniqueValue: function() {
+        return this.targetGr.getUniqueValue();
+    },
+
+    get: function(sysID) {
+        this.addQuery('sys_id', '=', sysID);
+        this.query();
+        this.next();
+    },
+
+    _isIndexedSourceStaged: function(tableName) {
+        var stagingChangeGr = new GlideRecord('sn_aisearch_global_job_staging_change');
+        stagingChangeGr.addQuery('field', 'source');
+
+        stagingChangeGr.addQuery('new_value', tableName);
+        stagingChangeGr.addQuery('migration_staging_record.table_name', 'ais_datasource');
+        stagingChangeGr.orderByDesc('migration_staging_record.sequence');
+        stagingChangeGr.query();
+
+        if (!stagingChangeGr.next()) {
+            gs.info("Found no staging record for table_name" + tableName);
+            return null;
+        }
+
+        gs.info("Found an existing staging record for table_name" + tableName);
+        var stagingGr = new GlideRecord('sn_aisearch_global_job_staging');
+        stagingGr.get(stagingChangeGr.getValue('migration_staging_record'));
+        return stagingGr;
+
+    },
+
+    _indexedSourceExists: function(tableName) {
+        var indexedSourceGR = new GlideRecord('ais_datasource');
+        indexedSourceGR.addQuery('source', tableName);
+        indexedSourceGR.query();
+        if (indexedSourceGR.next())
+            return true;
+
+        return false;
+    },
+    type: 'AisMigrationRecord'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-01-24 20:12:51&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;9d83fe74b71101107f033307fe11a928&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;87&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AisMigrationRecord&lt;/sys_name&gt;
+        &lt;sys_package display_value="AI Search For Next Experience" source="sn_aisearch_global"&gt;3c467b5f0bf130109e0fa4e6e9c4c946&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="AI Search For Next Experience"&gt;3c467b5f0bf130109e0fa4e6e9c4c946&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_9d83fe74b71101107f033307fe11a928&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-04-18 17:48:45&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:46:13</sys_created_on>
+        <sys_id>5bb8b09183341210c6695855eeaad399</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AisMigrationRecord</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_5bb8b09183341210c6695855eeaad399</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:46:13</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

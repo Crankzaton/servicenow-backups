@@ -1,0 +1,200 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>448be62d6b743010d70bc141ee44afd9</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_ex_sp.TopicSecurityUtilSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;[WARNING: Customers should NOT modify this script]&amp;#13;
+&amp;#13;
+The purpose of this script include is to provide default behaviours for the TopicSecurityUtil script include.&amp;#13;
+To change the behaviour of these methods (or add new methods), Customers should override/add new methods to the TopicSecurityUtil script include. &lt;/description&gt;
+        &lt;name&gt;TopicSecurityUtilSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var TopicSecurityUtilSNC = Class.create();
+TopicSecurityUtilSNC.prototype = {
+    initialize: function() {
+        //content type ids for catalog items and knowledge as only they contribute to popularity of topic 
+        this.KNOWLEDGE_CONTENT_TYPE = '4c32a92153622010069addeeff7b12a3';
+        this.CATALOG_CONTENT_TYPE = '98f9a16553622010069addeeff7b1248';
+        this.contentConfigMapGr = this._getContentConfigMap();
+
+    },
+
+    _getContentConfigMap: function() {
+        var contentTypeFilter = this.KNOWLEDGE_CONTENT_TYPE + ',' + this.CATALOG_CONTENT_TYPE;
+        var contentConfigMapGr = new GlideRecord('taxonomy_content_configuration');
+        contentConfigMapGr.addQuery('sys_id', 'IN', contentTypeFilter);
+        contentConfigMapGr.query();
+        return contentConfigMapGr;
+    },
+
+    _canView: function(contentGr, contentType, isMobile) {
+        if (contentType === this.KNOWLEDGE_CONTENT_TYPE) {
+            return new global.KnowledgeContentProcessor().canView(contentGr.knowledge, gs.getUserID(), isMobile);
+        } else if (contentType === this.CATALOG_CONTENT_TYPE) {
+            return new global.CatalogContentProcessor().canView(contentGr.catalog_item, gs.getUserID(), isMobile);
+        } else {
+            return false;
+        }
+    },
+
+    isTopicAdmin: function() {
+        var answer = false;
+        if (gs.getProperty("taxonomy.knowledge.translation.tokyo")) {
+            answer = new global.TopicPermissionUtil().isAnyTopicManager() ||
+                new global.TopicPermissionUtil().isAnyTopicContributor();
+        }
+        return answer;
+    },
+
+    /*
+     * Returns true or false whether a user has access to view the topic
+     * @param String - topicId
+     * @param boolean - isMobile
+     * @return Boolean 
+     */
+    canViewTopic: function(topicId, isMobile) {
+        while (this.contentConfigMapGr.next()) {
+            var contentGr = this._prepareConnectedContentQuery(topicId, this.contentConfigMapGr);
+            contentGr.query();
+            while (contentGr.next()) {
+                var canView = this._canView(contentGr, contentGr.getValue('content_type'), isMobile);
+                if (canView) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    },
+
+
+    canViewTopicAdvanced: function(topicId, isMobile) {
+        while (this.contentConfigMapGr.next()) {
+            if (this.contentConfigMapGr.getUniqueValue() !== this.KNOWLEDGE_CONTENT_TYPE) {
+                var contentGr = this._prepareConnectedContentQuery(topicId, this.contentConfigMapGr);
+                contentGr.query();
+                while (contentGr.next()) {
+                    var canView = this._canView(contentGr, contentGr.getValue('content_type'), isMobile);
+                    if (canView) {
+                        return true;
+                    }
+                }
+            } else {
+                var preferredLanguage = gs.getSession().getLanguage();
+                var fallBackLanguage = gs.getProperty('glide.sys.language');
+                var evaluatedArticles = {};
+                var accessibleKnowledgeBases = this.fetchKnowledgeBaseFromSession();
+
+                var preferredkbGr = this._prepareConnectedContentQuery(topicId, this.contentConfigMapGr);
+                preferredkbGr.addQuery('knowledge.language', preferredLanguage);
+                preferredkbGr.addQuery('knowledge.kb_knowledge_base', 'IN', accessibleKnowledgeBases);
+                preferredkbGr.query();
+                while (preferredkbGr.next()) {
+                    canView = this._canView(preferredkbGr, preferredkbGr.getValue('content_type'), isMobile);
+                    evaluatedArticles[preferredkbGr.getUniqueValue()] = true;
+                    var parentArticle = preferredkbGr.getValue('parent');
+                    if (parentArticle)
+                        evaluatedArticles[parentArticle] = true;
+                    if (canView) {
+                        return true;
+                    }
+                }
+
+                if (preferredLanguage != fallBackLanguage) {
+                    var fallbackKbGr = this._prepareConnectedContentQuery(topicId, this.contentConfigMapGr);
+                    fallbackKbGr.addQuery('knowledge.language', fallBackLanguage);
+                    fallbackKbGr.addQuery('knowledge.kb_knowledge_base', 'IN', accessibleKnowledgeBases);
+                    fallbackKbGr.query();
+                    while (fallbackKbGr.next()) {
+                        if (evaluatedArticles[fallbackKbGr.getValue('parent')])
+                            continue;
+                        canView = this._canView(fallbackKbGr, fallbackKbGr.getValue('content_type'), isMobile);
+                        if (canView) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    },
+
+    _prepareConnectedContentQuery: function(topicId, contentConfigMapGr) {
+        var m2mGr = new GlideRecord('m2m_connected_content');
+        m2mGr.addQuery('topic', topicId);
+        m2mGr.addQuery('content_type', contentConfigMapGr.getUniqueValue());
+        m2mGr.addEncodedQuery(contentConfigMapGr.content_filter);
+        return m2mGr;
+    },
+	
+	/*
+     * Returns accessible knowledge base for a user associated to taxonomy from session
+     * @return Knowledge Bases
+     */
+	
+    fetchKnowledgeBaseFromSession: function() {
+        var session = gs.getSession();
+        var accessibleKnowldgeBase = session.getClientData('taxonomy_knowledge_bases');
+        if (accessibleKnowldgeBase === null) {
+            accessibleKnowldgeBase = this.fetchAcessibleKnowledgeBase();
+            session.putClientData('taxonomy_knowledge_bases', accessibleKnowldgeBase);
+        }
+        return accessibleKnowldgeBase;
+    },
+
+
+    /*
+     * Returns accessible knowledge base for a user associated to taxonomy
+     * @return Knowledge Bases
+     */
+    fetchAcessibleKnowledgeBase: function() {
+        var accessibleKnowldgeBase = [];
+        var kbGr = new GlideAggregate('kb_knowledge');
+        kbGr.addNotNullQuery('taxonomy_topic');
+        kbGr.addQuery('workflow_state', 'published');
+        kbGr.groupBy("kb_knowledge_base");
+        kbGr.query();
+        while (kbGr.next()) {
+            var kbRecord = kbGr.kb_knowledge_base.getRefRecord();
+            if (kbRecord.canRead())
+                accessibleKnowldgeBase.push(kbRecord.sys_id);
+        }
+        return accessibleKnowldgeBase;
+    },
+
+    type: 'TopicSecurityUtilSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-06-17 11:35:03&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;448be62d6b743010d70bc141ee44afd9&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;24&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;TopicSecurityUtilSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Employee Center" source="sn_ex_sp"&gt;4249e63a28d54d61bb6fbf61fd86cccb&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Employee Center"&gt;4249e63a28d54d61bb6fbf61fd86cccb&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_448be62d6b743010d70bc141ee44afd9&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2022-10-13 12:47:14&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:36:24</sys_created_on>
+        <sys_id>9b7634d983f01210c6695855eeaad31c</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>TopicSecurityUtilSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_9b7634d983f01210c6695855eeaad31c</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:36:24</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

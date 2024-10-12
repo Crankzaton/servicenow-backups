@@ -1,0 +1,604 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>36c58c64773230106ee492b01e5a996a</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_ads_setup.SNHelpSetupController&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;SNHelpSetupController&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var SNHelpSetupController = Class.create();
+SNHelpSetupController.prototype = {
+    
+	initialize: function() {
+		var helpService = new global.SNHelpService();
+		this.constants = new sn_ads_setup.SNHelpSetupConstantProvider();
+		this.gc = helpService.helpGuidance;
+		this.gsc = helpService.helpGuidanceStep;
+		this.gic = helpService.helpGuidanceInteraction;
+		this.gsic = helpService.helpGuidanceStepInteraction;
+		this.setupUtil = new sn_ads_setup.SNHelpSetupUtil();
+		this.setupService = new sn_ads_setup.SNHelpSetupService();
+		this.setupDependencyService = new SNHelpSetupDependencyService(); 
+    },
+	
+	getSetupDetails: function(sys_id, task_type) {
+		var setup = this.setupService.getGuidance(sys_id, this.constants.restAPIKeys.setup, task_type);
+		
+		setup = setup &amp;&amp; setup.guidance;
+		
+		return setup;
+	},
+	
+	getSetupDetailsWithStatus: function(sys_id) {
+		var setup = this.getSetupDetails(sys_id), setupItr;
+		var isGlobal;
+		if(!setup) 
+			return null;
+		
+		isGlobal = setup.type === this.constants.setupType.GLOBAL_SETUP;
+		setupItr = this.gic.getByGuidanceId(sys_id, isGlobal);
+		
+		setup.activeSetupType = setupItr &amp;&amp; setupItr.active_setup_type;
+		setup.isComplete = setupItr &amp;&amp; this.setupUtil.isAllMandatoryTasksCompleted(sys_id, setupItr.sys_id, this.constants.playTypeToStepType[setupItr.active_setup_type]);
+		setup.interactionId = setupItr &amp;&amp; setupItr.sys_id;
+		setup.interactionStatus = setupItr &amp;&amp; this.constants.statusToLabel[setupItr.status] ||  this.constants.statusToLabel[this.constants.status.NOTSTARTED];
+
+		
+		if(Array.isArray(setup.steps) &amp;&amp; setup.steps.length &gt; 0  &amp;&amp; setupItr) {
+			var self = this;
+			setup.steps.forEach(function(step) {
+				var interactionId = setupItr &amp;&amp; setupItr.sys_id;
+				var stepItr = self.getInteractionStatus(step, sys_id);
+				step.interactionStatus = stepItr &amp;&amp; self.constants.statusToLabel[stepItr.interaction_status] || self.constants.statusToLabel[self.constants.status.NOTSTARTED];
+				step.interactionId = stepItr &amp;&amp; stepItr.interaction_id;
+				if(step.name.toString().indexOf(self.constants.pluginName) != -1)
+					step.hasChildren =  self.setupUtil.pluginCategoryHasTasks(step.sys_id, self.constants.playTypeToStepType[setupItr.active_setup_type]);
+				else
+step.hasChildren = self.setupUtil.hasChildOfType(step.sys_id, self.constants.playTypeToStepType[setupItr.active_setup_type]);
+				
+				self.populateDependencyInfo(step, interactionId);
+			});
+			//Return only the categories with steps 
+			setup.steps = setup.steps.filter(function(step){ return step.hasChildren != false;});
+		}
+		
+		return setup;
+	},
+	
+	getAllTasksForStep: function(step_id, task_type) {
+		return this.setupService.getSetupSteps(step_id, task_type);
+	},
+	
+	getAllTasksForStepWithStatus: function(step_id, interactionId, task_type) {
+		var tasks = this.getAllTasksForStep(step_id, task_type);
+		var interactionStep, interaction;
+		
+		if(!(Array.isArray(tasks) &amp;&amp; tasks.length &gt; 0))
+			return null;
+		
+		if(this.setupService.isCategoryforPlugins(step_id)){
+			//Filter results based on task type 
+			// Assumption: There will always plugin related tasks will be 
+			//created (basic, advanced, recommnended)
+			
+			task_type = task_type || this.constants.taskType.ADVANCED;
+			tasks = tasks.filter(function(task){
+				return task.task_type == task_type;
+			});
+			
+			if(!(Array.isArray(tasks) &amp;&amp; tasks.length &gt; 0))
+				return null;
+			
+		}
+		if(!interactionId)
+			interactionId = this.getInteractionId(tasks[0].guidance);
+		
+		interactionStep = this.getStepInteraction(step_id, tasks[0].guidance, interactionId);
+		
+		var self = this;
+		tasks.forEach(function(task) {
+			interactionId = interactionId || interactionStep &amp;&amp; interactionStep.user_interaction;
+			var stepItr = self.getInteractionStatus(task, '', interactionId);
+			task.interactionStatus = stepItr &amp;&amp; self.constants.statusToLabel[stepItr.interaction_status];
+			task.interactionId = stepItr &amp;&amp; stepItr.interaction_id;
+			self.populateDependencyInfo(task, interactionId);
+		});
+		
+		return { 
+			tasks : tasks
+			
+		};
+	},
+	
+	/*
+	Add dependency info to step 
+	@param step, a guidance step
+	@param interactinoId for guidance 
+	@return updated step with dependency details if dependent
+	*/
+	populateDependencyInfo : function(step, interactionId) {
+		var isDependent = this.setupUtil.isStepDependent(step.sys_id);
+		
+		if(isDependent) {
+			step.isDependent = true;
+			step.dependencies = this.setupUtil.getDependencies(step.sys_id);
+			if(this.setupUtil.isDependentOnPluginStep(step)) {
+				step.isLocked = !this.setupUtil.isPluginTaskCompleted(step, interactionId);
+			} else {
+				step.isLocked = this.setupUtil.isStepLocked(step.sys_id, interactionId);
+			}
+		} else {
+			step.isDependent = false;
+			step.dependencies = null;
+			step.isLocked = false;	
+		}
+	},
+	
+	getInteractionStatus : function(step, guidanceId, stepItrId){
+		var stepItr, result = {};
+		
+		if(guidanceId)
+			stepItr = this.getStepInteraction(step.sys_id, guidanceId);
+		
+		if(stepItrId)
+			stepItr = this.gsic.getByGuidanceStepId(step.sys_id, stepItrId);
+		
+		if(stepItr){
+			result.interaction_status =  stepItr.status; 
+			result.interaction_id = stepItr.sys_id;
+		}
+		return result; 
+	},
+	
+	getStepDetails : function(sys_id) {
+		var stepDetails = this.setupService.getSetupStep(sys_id);
+
+		if(stepDetails)
+			stepDetails.isPluginCategory = this.setupUtil.hasPluginStep(stepDetails.guidance) == sys_id;
+
+		return stepDetails;
+	},
+	
+	getTaskDetailsWithStatus: function(sys_id, interactionId) {
+		var step = this.getStepDetails(sys_id);
+		if(!step)
+			return null;
+		
+		if(!interactionId)
+			interactionId = this.getInteractionId(step.guidance);
+
+		step.interaction = this.getStepInteraction(sys_id, step.guidance, interactionId);
+		step.interactionStatus = step.interaction &amp;&amp; this.constants.statusToLabel[step.interaction.status];
+		this.populateDependencyInfo(step, interactionId);
+		
+		if (step.dependencies &amp;&amp; Array.isArray(step.dependencies)) {
+            var gr = new GlideRecord("help_setup_dependency");
+            for (var dependency = 0; dependency &lt; step.dependencies.length; dependency++) {
+                gr.get(step.dependencies[dependency].sys_id);
+                step.dependencies[dependency].dependent_on_steps = gr.getDisplayValue("dependent_on_steps");
+            }
+        }
+		return step;
+	},
+	
+	getStepInteraction : function(stepId, guidanceId, interactionId) {
+		var interaction;
+		// if interactionId is not supplied find the interaction and then find the interactionStep 
+		if(!interactionId) {
+			interaction = this.gic.findInteraction(guidanceId, this.gc.isGlobal(guidanceId));
+			if(!interaction)
+				return null;
+			interactionId = interaction &amp;&amp; interaction.sys_id;
+		}
+		
+		return this.gsic.getByGuidanceStepId(stepId, interactionId);
+	},
+
+	getInteractionId : function(guidanceId) {
+		var interaction = this.gic.findInteraction(guidanceId, true);
+
+		if(!interaction)
+			return null;
+
+		return interaction.sys_id;
+	},
+
+	// insert or update new setup step
+	upsertSetupStep: function(setupId, stepId, params) {
+		var setupService = new SNHelpSetupService();
+		var result = {};
+		
+		if(params &amp;&amp; params.guidance !== setupId)
+			params.guidance = setupId;
+		
+		result = setupService.upsertStep(stepId, params);
+		
+		if(result.data)
+			result.data = this.getStepDetails(result.data); 
+		
+		return result;
+	},
+	
+	/*
+		Fetches interaction details of a guidance
+		@param guidanceId 
+		@return interaction detatils object
+	*/
+	
+	selectGuidance: function(sys_id){
+		
+		var setup = {}, surveyStep, setupType = {}, activeSetupType, surveyStepId, questions, stepItr,
+		setupItr = this.gic.getByGuidanceId(sys_id, true);
+		
+		activeSetupType = setupItr &amp;&amp; setupItr.active_setup_type;
+		setup.isComplete = (setupItr &amp;&amp; setupItr.status == this.constants.status.COMPLETE) || (setupItr &amp;&amp; setupItr.status == this.constants.status.AUTOCOMPLETE); 
+		
+		setup.interactionId = setupItr &amp;&amp; setupItr.sys_id;
+		setup.interactionStatus = setupItr &amp;&amp; this.constants.statusToLabel[setupItr.status] ||  this.constants.statusToLabel[this.constants.status.NOTSTARTED];
+		
+		surveyStep = this.setupService.getSurveyStep(sys_id);
+		setup.hasSurvey = false; 
+		
+		if(Array.isArray(surveyStep)  &amp;&amp; surveyStep.length &gt; 0){
+			surveyStepId = surveyStep[0].sys_id;
+			setup.hasSurvey = true;
+			setup.survey = this.getTaskDetailsWithStatus(surveyStepId);
+			setup.surveyId = surveyStepId;
+			//Todo: Survey questions status 
+		}
+		
+		if(setup.interactionId &amp;&amp; activeSetupType) {
+			setupType.type = this.constants.playTypeToStepType[activeSetupType];
+
+			stepItr = this.setupService.getInteractionStepStatusByType(setup.interactionId, setupType.type, sys_id);
+			
+
+			//Override task type status if the setup is complete 
+			if(setup.interactionStatus == this.constants.statusToLabel[this.constants.status.COMPLETE])
+				setupType.status =  this.constants.statusToLabel[this.constants.status.COMPLETE];
+			else 
+				setupType.status =  stepItr &amp;&amp; stepItr.status;
+			setupType.timeStamp = stepItr &amp;&amp; stepItr.timeStamp;
+			setupType.label = this.constants.playType[activeSetupType];
+		}
+		setup.setupType = setupType;
+		
+		return setup; 
+		
+	},
+	
+	/*
+		Fetches interaction details of a guidance
+		@param guidanceId 
+		@return summary of the guidance 
+	*/
+	
+	getGuidanceSummary: function(guidanceId){
+		var self, stepTasks, result = {}, setup, setupSteps,
+			stepsPayload = [], tasksPayload = [], stepPayload, taskPayload, isComplete=false, 
+			dependenciesObj = []; 
+		
+		setup = this.getSetupDetails(guidanceId);
+		
+		if(setup){
+			setupSteps = setup.steps;
+			result.setupID = setup.sys_id;
+			result.setupName = setup.name;
+			result.status = setup.status;
+		}
+			
+		if(Array.isArray(setupSteps) &amp;&amp; setupSteps.length &gt;0 ) {
+			self = this;
+			isComplete = true; // Assumption is all the tasks are done
+			
+			var dbControllerContent = new global.SNHelpDBController(self.constants.tables.content);
+			var content = dbControllerContent.getByEncodedQuery("guidance_step.guidance=" + guidanceId, "", ["guidance_step", "configuration_types"]);
+			var contentObj = {};
+			if (content){
+				for (var ind = 0; ind &lt; content.length; ind++)
+					contentObj[content[ind].guidance_step] = content[ind].configuration_types;
+				}
+			
+			setupSteps.forEach(function(step){
+				stepPayload = {};
+				
+				//If any of the status is not zero, set is complete to true
+				if(step.status != '0')
+					isComplete = false;
+				
+				stepPayload.status = self.constants.stepStatusToLabel[step.status];
+				stepPayload.id = step.sys_id;
+				stepPayload.order = step.order; 
+				stepPayload.name = step.name;
+				stepPayload.type = self.constants.stepType.GROUP; 
+				stepPayload.isPluginCategory = self.setupService.isCategoryforPlugins(step.sys_id);
+				stepPayload.dependencies = [];// we don't support this case; category can not have depedencies
+				stepPayload.dependents = self.setupUtil.getDependentSteps(step.sys_id);
+				stepPayload.dependenciesObj= [];
+				
+				stepTasks = self.getAllTasksForStep(step.sys_id);
+				
+				stepTasks.forEach(function(task){
+					taskPayload = {};
+					taskPayload.id = task.sys_id;
+					taskPayload.order = task.order;
+					taskPayload.name = task.name;
+					taskPayload.type = self.constants.stepType.ACTIVITY;
+					taskPayload.configuration_types = contentObj[task.sys_id];
+					taskPayload.task_type = task.task_type;
+					taskPayload.lane_id = task.parent;
+					taskPayload.status =  self.constants.stepStatusToLabel[task.status];
+					taskPayload.status_value =  task.status;
+					taskPayload.parent = task.parent; 
+					taskPayload.dependenciesObj = []; //value will be Populated in getMatchedtasksDependencies
+					taskPayload.dependencies = self.setupUtil.getDependencies(task.sys_id);
+					taskPayload.dependents = self.setupUtil.getDependentSteps(task.sys_id);
+					tasksPayload.push(taskPayload);
+				});
+				
+				stepsPayload.push(stepPayload);
+			});
+		}
+		result.steps = this.setupUtil.getMatchedDependencies(stepsPayload, tasksPayload);
+		result.tasks = this.setupUtil.getMatchedDependencies(tasksPayload, stepsPayload);
+		result.isComplete = isComplete; 
+		
+		return result;
+	},
+	
+	/*
+		create m2mDependency 
+		@param dependency_id  -1  
+		@step_id step id on which dependency needs to be created 
+		@return sys_id of m2mdependency 
+	*/
+	
+	createM2MDependency : function(dependencyId, stepId, params) {
+		var m2m, 
+			dependency,
+			m2mDependency, 
+			stepName; 
+		
+		if(stepId == "-1" || dependencyId != "-1")
+			return null; 
+		
+		m2m = this.setupDependencyService.getM2MDependency(stepId);
+		if(Array.isArray(m2m) &amp;&amp; m2m.length &gt; 0)
+			return this.updateM2MDependency(stepId, m2m[0].sys_id, params);
+		
+		stepName = this.getStepDetails(stepId);
+		stepName = stepName &amp;&amp; stepName.name; 
+		dependency = this.setupDependencyService.createDependency(params, stepName);
+		if(dependency){
+			m2m = this.setupDependencyService.createM2MDependency({guidance_step: stepId, setup_dependency: dependency});
+			if(!m2m)
+				return null;
+		}
+		m2mDependency = this.setupDependencyService.getM2MDependency(stepId, m2m);
+		
+		if(Array.isArray(m2mDependency) &amp;&amp; m2mDependency.length &gt; 0) 
+			return this.setupDependencyService.getFormattedDependency(m2mDependency[0]);
+		
+		
+		return null; 
+	},
+	
+	/*
+		update m2mDependency 
+		@param dependency_id 
+		@step_id step id
+		@params params 
+		@return sys_id of m2mdependency 
+	*/
+	
+	updateM2MDependency : function(stepId, dependencyId, params) {
+		var m2mDependencies, 
+			dbController, 
+			dependencies; 
+			
+		if(!stepId || ! dependencyId)
+			return null; 
+		
+		dbController = new global.SNHelpDBController(this.constants.tables.m2m_step_dependency);
+		m2mDependencies = dbController.getById(dependencyId, ['sys_id', 'guidance_step', 'setup_dependency']);
+		
+		if(!m2mDependencies)
+			return null;
+		
+		dependencies = this.setupDependencyService.updateDependency(m2mDependencies.setup_dependency, params); 
+		
+		m2mDependencies = this.setupDependencyService.updateM2MDependency(dependencyId, {guidance_step: stepId, setup_dependency: dependencies});
+		
+		if(!m2mDependencies)
+			return null; 
+		
+		m2mDependencies = this.setupDependencyService.getM2MDependency(stepId, dependencyId);
+		
+		if(Array.isArray(m2mDependencies) &amp;&amp; m2mDependencies.length &gt; 0) 
+			return this.setupDependencyService.getFormattedDependency(m2mDependencies[0]);
+		
+		
+		return null;
+	},
+	
+
+	
+	getStepM2MDependency: function(dependencyId, stepId){
+		var dependencies, 
+			dbController, 
+			query='', 
+			orderBy, 
+			dependencyFields, 
+			results = [], 
+			self;
+		
+		if(dependencyId == "-1")
+			query += 'guidance_step.sys_id='+stepId;
+		else
+			query += 'sys_id='+dependencyId;
+		
+		orderBy = 'sys_updated_on';
+		dependencyFields = ['sys_id', 'guidance_step', 'setup_dependency'];
+		
+		dbController = new global.SNHelpDBController(this.constants.tables.m2m_step_dependency);
+		dependencies = dbController.getByEncodedQuery(query, orderBy, dependencyFields);
+		
+		if (!dependencies) 
+			return null; 
+		
+		
+		if(Array.isArray(dependencies) &amp;&amp; dependencies.length &gt; 0){
+			self = this;
+			dependencies.forEach(function(dependency){
+				results.push(self.setupDependencyService.getFormattedDependency(dependency)); 
+			});
+		}
+		
+		return results; 
+		
+	},
+	
+	/*
+		delete m2mDependency 
+		@param dependency_id 
+		@param step_id
+		@return boolean
+	*/
+	
+	deleteM2MDependency: function(dependencyId, stepId){
+		return this.setupDependencyService.deleteM2MDependency(dependencyId, stepId);
+	},
+	
+    reorder: function(setupId, data) {
+        var destinationCategory = data.destination_category;
+        var step = data.step;
+        var sourceCategory = data.source_category;
+        var destinationOrder = data.destination_order;
+        var type = data.type;
+        var result = "";
+        if (!GlideStringUtil.isEligibleSysID(setupId)) {
+            return {
+                status: 400,
+                message: "Invalid setupId",
+                data: data
+            };
+        }
+        if (type != this.constants.stepType.GROUP &amp;&amp; !(GlideStringUtil.isEligibleSysID(step) &amp;&amp; GlideStringUtil.isEligibleSysID(sourceCategory) &amp;&amp; GlideStringUtil.isEligibleSysID(destinationCategory) &amp;&amp; destinationOrder &gt; 0)) {
+            return {
+                status: 400,
+                message: "Invalid order or sys_id of step(s)",
+                data: data
+            };
+        } else {
+            if (!(GlideStringUtil.isEligibleSysID(step) &amp;&amp; destinationOrder &gt; 0)) {
+                return {
+                    status: 400,
+                    message: "Invalid order or sys_id of step",
+                    data: data
+                };
+            }
+	
+        }
+        result = this.setupService.reorderStep(setupId, data);
+        return {
+            status: result.status,
+            message: result.message,
+            data: data
+        };
+    },
+	
+	addInteractionLog: function(setupId, stepId, params) {
+		
+		if(params &amp;&amp; params.guidance !== setupId)
+			params.guidance = setupId;
+		if(params &amp;&amp; params.guidance_step !== stepId)
+			params.guidance_step = stepId;
+
+		return this.setupService.addInteractionLog(params);
+	},
+	
+	/*
+		sets staus of a setup to autocomplete 
+		@param guidance id
+		@return updated record 
+	*/
+	setGuidanceAutoComplete: function(guidanceId){
+		var dbController, query, interaction;
+		query = "guidance="+guidanceId;
+		dbController = new global.SNHelpDBController(this.constants.tables.user_interaction);
+		interaction = dbController.getByEncodedQuery(query, 'sys_updated_on', ['sys_id']);
+		
+		if(Array.isArray(interaction) &amp;&amp; interaction.length &gt; 0){
+			interaction = interaction[0];
+			return dbController.update(interaction.sys_id, {status: this.constants.status.AUTOCOMPLETE});
+		}
+		return null; 
+	}, 
+
+	upsertInteraction: function(guidanceId, steupType) {
+		return this.setupService.upsertInteraction(guidanceId, steupType);
+	},
+
+	configurePluginsForSetupType : function(setupId, pluginCategory, params) {
+		var pluginStep = this.setupUtil.hasPluginStep(setupId);
+		var result = {};
+
+		if(pluginStep != pluginCategory) {
+			result.status = 400;
+			result.message = gs.getMessage("Invalid or duplicate plugin category sys_id {0}", pluginCategory);
+			return result;
+		}
+
+		return this.setupService.configurePluginsForSetupType(setupId, pluginCategory, params);
+	},
+
+	getPluginsBySetupType : function(setupId, pluginCategory) {
+		var pluginStep = this.setupUtil.hasPluginStep(setupId);
+		var result = {};
+
+		if(pluginStep != pluginCategory) {
+			result.status = 400;
+			result.message = gs.getMessage("Invalid or duplicate plugin category sys_id {0}", pluginCategory);
+			return result;
+		}
+
+		return this.setupService.getPluginsBySetupType(setupId, pluginCategory);
+	},
+
+    type: 'SNHelpSetupController'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-09-21 06:07:32&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;36c58c64773230106ee492b01e5a996a&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;375&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;SNHelpSetupController&lt;/sys_name&gt;
+        &lt;sys_package display_value="Guided Setup" source="sn_ads_setup"&gt;1cb77a801b9af01039c155f3604bcb9e&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Guided Setup"&gt;1cb77a801b9af01039c155f3604bcb9e&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_36c58c64773230106ee492b01e5a996a&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-08-07 10:20:52&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:35:48</sys_created_on>
+        <sys_id>ae56f89983f01210c6695855eeaad3b5</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>SNHelpSetupController</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_ae56f89983f01210c6695855eeaad3b5</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:35:48</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

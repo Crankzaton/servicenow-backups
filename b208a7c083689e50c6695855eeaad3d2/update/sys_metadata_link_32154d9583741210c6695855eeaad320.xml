@@ -1,0 +1,426 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>c6059e325b1010101f254d3ba881c7a4</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_fix"&gt;
+    &lt;sys_script_fix action="INSERT_OR_UPDATE"&gt;
+        &lt;before&gt;false&lt;/before&gt;
+        &lt;description&gt;Migrates sys_cb_topic and sys_cs_topic records that were configured in NY or Orlando, to the new NLU topic schema supported in Paris.&lt;/description&gt;
+        &lt;name&gt;VA Migrate Topic NLU Language Bindings&lt;/name&gt;
+        &lt;record_for_rollback&gt;false&lt;/record_for_rollback&gt;
+        &lt;script&gt;&lt;![CDATA[/* Migrates VA topic NLU models, intents, and entities (built before Paris) to sys_cb_topic_language, sys_cs_topic_language */
+
+var SAFE_TO_MIGRATE = gs.getProperty("com.glide.cs.va.paris.nlu_topic.migrate", true);
+var PARLO_PROVIDER_SYSID = _fetchProviderProviderSysId();
+var IBM_WATSON_PROVIDER_SYSID = "6fe7c53a3b33230074bc456993efc4a7";
+var MS_LUIS_PROVIDER_SYSID = "c28301883b04001074bc456993efc4a3";
+_migrateMLSolutions();
+_migrateOldOpenNLUDrivers();
+
+migrateCbTopicLanguageBindings();
+migrateCsTopicLanguageBindings();
+
+function migrateCbTopicLanguageBindings() {
+
+	if (SAFE_TO_MIGRATE != "true") return;
+
+	var _fetchUnMigratedCbTopicsByProvider = function() {
+		var alreadyMigratedCbTopicSysIds = [];
+		var gr = new GlideRecord('sys_cb_topic_language');
+		gr.query();
+		while (gr.next()) {
+			var cbTopicSysId = '' + gr.getValue('cb_topic_id');
+			alreadyMigratedCbTopicSysIds.push(cbTopicSysId);
+		}
+
+		gr = new GlideRecord('sys_cb_topic');
+		gr.initialize();
+		gr.addQuery('sys_id', 'NOT IN', alreadyMigratedCbTopicSysIds.join(","));
+		gr.addActiveQuery();
+		gr.addNotNullQuery('nlu_model');
+		gr.addNullQuery('sys_policy');
+		gr.query();
+		var cbTopicsByProvider = {};
+		while (gr.next()) {
+			var providerSysId = gr.getValue('nlu_provider');
+			if (gs.nil(providerSysId)) {
+				providerSysId = PARLO_PROVIDER_SYSID; // some OLD (like NY) sys_cb_topic records have null provider, in which case we assume it's PARLO
+			}
+			var topicSysId = gr.getUniqueValue();
+			var topicBinding = {
+				'cb_topic_id': topicSysId,
+				'sys_scope': gr.getValue('sys_scope'),
+				'name': gr.getValue('name'),
+				'nlu_provider': providerSysId,
+				'nlu_model': gr.getValue('nlu_model'),
+				'nlu_model_label': gr.getValue('nlu_model_label'),
+				'nlu_intent': gr.getValue('nlu_intent'),
+				'nlu_intent_label': gr.getValue('nlu_intent_label'),
+				'nlu_entities': _buildEntitiesArrayFromCbGraph(JSON.parse(gr.getValue('graph'))),
+				'is_pre_orlando': gs.nil(gr.getValue('nlu_model_label'))
+			};
+
+			var providerTopicBindings = cbTopicsByProvider[providerSysId];
+			if (gs.nil(providerTopicBindings)) {
+				providerTopicBindings = [];
+				cbTopicsByProvider[providerSysId] = providerTopicBindings;
+			}
+			providerTopicBindings.push(topicBinding);
+		}
+		gs.info('NLU sys_cb_topic migration, found these topics to migrate: ' + JSON.stringify(cbTopicsByProvider));
+		return cbTopicsByProvider;
+	};
+
+	var _buildEntitiesArrayFromCbGraph = function(oldCbTopicGraph) {
+		var entities = [];
+		Object.keys(oldCbTopicGraph.goals).forEach(function(goalId) {
+			var goal = oldCbTopicGraph.goals[goalId];
+			Object.keys(oldCbTopicGraph.goals[goalId].nodes).forEach(function(nodeId) {
+				var node = goal.nodes[nodeId];
+				if (!gs.nil(node.entity)) {
+					entities.push(
+						{
+							"node_id": node.id,
+							"variable_name": node.name.toLowerCase().replace(/\W+/g, '_').replace('__', '_'),
+							"nlu_entity": node.entity.id,
+							"nlu_entity_label": node.entity.label
+						}
+					);
+				}
+			});
+		});
+		return entities;
+	};
+
+	var _migrateCbTopicLanguageBindings = function(cbTopic, languageCode) {
+		if (gs.nil(languageCode) || languageCode == null) {
+			languageCode = 'en';
+		}
+
+		var gr = new GlideRecord('sys_cb_topic_language');
+		gr.initialize();
+		gr.setValue('cb_topic_id', cbTopic.cb_topic_id);
+		gr.setValue('sys_scope', cbTopic.sys_scope);
+		gr.setValue('language_code', languageCode);
+		gr.setValue('nlu_provider', cbTopic.nlu_provider);
+		gr.setValue('nlu_model', cbTopic.nlu_model);
+		gr.setValue('nlu_model_label', cbTopic.nlu_model_label);
+		gr.setValue('nlu_intent', cbTopic.nlu_intent);
+		gr.setValue('nlu_intent_label', cbTopic.nlu_intent_label);
+		gr.setValue('nlu_entities', JSON.stringify(cbTopic.nlu_entities));
+		gr.setWorkflow(false);
+		gr.insert();
+
+		gr = new GlideRecord('sys_cb_topic');
+		gr.initialize();
+		if (gr.get(cbTopic.cb_topic_id)) {
+			var topicGraph = JSON.parse(gr.graph);
+			_removeOldNluPropertiesFromCbGraph(topicGraph);
+
+			gr.nlu_provider = "NULL";
+			gr.nlu_model = "NULL";
+			gr.nlu_model_label = "NULL";
+			gr.nlu_intent = "NULL";
+			gr.nlu_intent_label = "NULL";
+			gr.graph = JSON.stringify(topicGraph);
+			gr.setWorkflow(false);
+			gr.update();
+		}
+	};
+
+	var _removeOldNluPropertiesFromCbGraph = function(oldCbTopicGraph) {
+		var entities = [];
+		Object.keys(oldCbTopicGraph.goals).forEach(function(goalId) {
+			var goal = oldCbTopicGraph.goals[goalId];
+			Object.keys(oldCbTopicGraph.goals[goalId].nodes).forEach(function(nodeId) {
+				var node = goal.nodes[nodeId];
+				delete node["entity"];
+			});
+		});
+		return entities;
+	};
+
+	var unMigratedCbTopicsByProvider = _fetchUnMigratedCbTopicsByProvider();
+
+	var cbMigrationCandidates = {};
+	var totalCbMigrationCandidates = 0;
+	Object.keys(unMigratedCbTopicsByProvider).forEach(function(providerSysId) {
+		gs.info('NLU sys_cb_topic migration, fetching models from NLU provider ' + providerSysId);
+		var models = sn_nlu.OpenNluAPI.getModels(providerSysId);
+		gs.info('NLU sys_cb_topic migration, found these NLU models for provider ' + providerSysId + ':' + JSON.stringify(models));
+		if (models.models.length &gt; 0) {
+			var topics = unMigratedCbTopicsByProvider[providerSysId];
+			for (var i = 0; i &lt; topics.length; i++) {
+				cbMigrationCandidates[topics[i].cb_topic_id] = topics[i];
+				totalCbMigrationCandidates++;
+				for (var j = 0; j &lt; models.models.length; j++) {
+					if (!_canBindTopicToModelLanguage(providerSysId, models.models[j], topics[i])) continue;
+					_migrateCbTopicLanguageBindings(topics[i], models.models[j].language);
+					delete cbMigrationCandidates[topics[i].cb_topic_id];
+				}
+			}
+		}
+	});
+	var cbMigrationSummary = "NLU sys_cb_topic migration summary:  " +
+		(totalCbMigrationCandidates - Object.keys(cbMigrationCandidates).length) + " sys_cb_topic records successfully migrated, " +
+		(Object.keys(cbMigrationCandidates).length) + " sys_cb_topic record were NOT migrated.";
+	if (Object.keys(cbMigrationCandidates).length &gt; 0) {
+		cbMigrationSummary += "  Unable to migrate the following sys_cb_topic records: " + JSON.stringify(cbMigrationCandidates);
+	}
+	gs.info(cbMigrationSummary);
+}
+
+function migrateCsTopicLanguageBindings() {
+
+	if (SAFE_TO_MIGRATE != "true") return;
+
+	var _fetchUnMigratedCsTopicsByProvider = function() {
+		var alreadyMigratedCsTopicSysIds = [];
+		var gr = new GlideRecord('sys_cs_topic_language');
+		gr.query();
+		while (gr.next()) {
+			var cbTopicSysId = '' + gr.getValue('cs_topic_id');
+			alreadyMigratedCsTopicSysIds.push(cbTopicSysId);
+		}
+
+		gr = new GlideRecord('sys_cs_topic');
+		gr.initialize();
+		gr.addQuery('sys_id', 'NOT IN', alreadyMigratedCsTopicSysIds.join(","));
+		gr.addActiveQuery();
+		gr.addQuery('published', true);
+		gr.addNotNullQuery('nlu_provider');
+		gr.addNotNullQuery('nlu_model');
+		gr.addNullQuery('sys_policy');
+		gr.query();
+		var topicsByProvider = {};
+		while (gr.next()) {
+			var providerSysId = gr.getValue('nlu_provider');
+			var topicSysId = gr.getUniqueValue();
+			var topicBinding = {
+				'cs_topic_id': topicSysId,
+				'sys_scope': gr.getValue('sys_scope'),
+				'title': gr.getValue('title'),
+				'nlu_provider': providerSysId,
+				'nlu_model': gr.getValue('nlu_model'),
+				'nlu_model_label': gr.getValue('nlu_model_label'),
+				'nlu_intent': gr.getValue('nlu_intent'),
+				'nlu_intent_label': gr.getValue('nlu_intent_label'),
+				'nlu_entities': _buildEntitiesArrayFromCsDefn(JSON.parse(gr.getValue('definition'))),
+				'is_pre_orlando': gs.nil(gr.getValue('nlu_model_label'))
+			};
+
+			var providerTopicBindings = topicsByProvider[providerSysId];
+			if (gs.nil(providerTopicBindings)) {
+				providerTopicBindings = [];
+				topicsByProvider[providerSysId] = providerTopicBindings;
+			}
+			providerTopicBindings.push(topicBinding);
+		}
+
+		gs.info('NLU sys_cs_topic migration, found these topics to migrate: ' + JSON.stringify(topicsByProvider));
+		return topicsByProvider;
+	};
+
+	var _buildEntitiesArrayFromCsDefn = function(oldCsTopicDefn) {
+		var entities = [];
+		for (var i = 0; i &lt; oldCsTopicDefn.tasks.length; i++) {
+			for (var j = 0; j &lt; oldCsTopicDefn.tasks[i].fields.length; j++) {
+				if (gs.nil(oldCsTopicDefn.tasks[i].fields[j].nlu_entity)) continue;
+				entities.push(
+					{
+						"variable_name": oldCsTopicDefn.tasks[i].fields[j].name,
+						"nlu_entity": oldCsTopicDefn.tasks[i].fields[j].nlu_entity,
+						"nlu_entity_label": oldCsTopicDefn.tasks[i].fields[j].nlu_entity
+					}
+				);
+			}
+		}
+		return entities;
+	};
+
+	var _removeOldNluPropertiesFromCsDefn = function(csTopicDefn) {
+		delete csTopicDefn["nlu_provider"];
+		delete csTopicDefn["nlu_model"];
+		delete csTopicDefn["nlu_model_label"];
+		delete csTopicDefn["nlu_intent"];
+		delete csTopicDefn["nlu_intent_label"];
+		for (var i = 0; i &lt; csTopicDefn.tasks.length; i++) {
+			for (var j = 0; j &lt; csTopicDefn.tasks[i].fields.length; j++) {
+				delete csTopicDefn.tasks[i].fields[j]["nlu_entity"];
+				delete csTopicDefn.tasks[i].fields[j]["nlu_entity_label"];
+			}
+		}
+	};
+
+	var _migrateCsTopicLanguageBindings = function(csTopic, languageCode) {
+		if (gs.nil(languageCode) || languageCode == null) {
+			languageCode = 'en';
+		}
+
+		var gr = new GlideRecord('sys_cs_topic_language');
+		gr.initialize();
+		gr.setValue('cs_topic_id', csTopic.cs_topic_id);
+		gr.setValue('sys_scope', csTopic.sys_scope);
+		gr.setValue('language_code', languageCode);
+		gr.setValue('nlu_provider', csTopic.nlu_provider);
+		gr.setValue('nlu_model', csTopic.nlu_model);
+		gr.setValue('nlu_model_label', csTopic.nlu_model_label);
+		gr.setValue('nlu_intent', csTopic.nlu_intent);
+		gr.setValue('nlu_intent_label', csTopic.nlu_intent_label);
+		gr.setValue('nlu_entities', JSON.stringify(csTopic.nlu_entities));
+		gr.setWorkflow(false);
+		gr.insert();
+
+		gr = new GlideRecord('sys_cs_topic');
+		gr.initialize();
+		if (gr.get(csTopic.cs_topic_id)) {
+			var topicDefn = JSON.parse(gr.definition);
+			_removeOldNluPropertiesFromCsDefn(topicDefn);
+
+			gr.nlu_provider = "NULL";
+			gr.nlu_model = "NULL";
+			gr.nlu_model_label = "NULL";
+			gr.nlu_intent = "NULL";
+			gr.nlu_intent_label = "NULL";
+			gr.definition = JSON.stringify(topicDefn);
+			gr.setWorkflow(false);
+			gr.update();
+		}
+	};
+
+	var unMigratedCsTopicsByProvider = _fetchUnMigratedCsTopicsByProvider();
+
+	var csMigrationCandidates = {};
+	var totalCsMigrationCandidates = 0;
+	Object.keys(unMigratedCsTopicsByProvider).forEach(function(providerSysId) {
+		gs.info('NLU sys_cs_topic migration, fetching models from NLU provider ' + providerSysId);
+		var models = sn_nlu.OpenNluAPI.getModels(providerSysId);
+		gs.info('NLU sys_cs_topic migration, found these NLU models for provider ' + providerSysId + ':' + JSON.stringify(models));
+		if (models.models.length &gt; 0) {
+			var topics = unMigratedCsTopicsByProvider[providerSysId];
+			for (var i = 0; i &lt; topics.length; i++) {
+				csMigrationCandidates[topics[i].cs_topic_id] = topics[i];
+				totalCsMigrationCandidates++;
+				for (var j = 0; j &lt; models.models.length; j++) {
+					if (!_canBindTopicToModelLanguage(providerSysId, models.models[j], topics[i])) continue;
+					_migrateCsTopicLanguageBindings(topics[i], models.models[j].language);
+					delete csMigrationCandidates[topics[i].cs_topic_id];
+				}
+			}
+		}
+	});
+	var csMigrationSummary = "NLU sys_cs_topic migration summary:  " +
+		(totalCsMigrationCandidates - Object.keys(csMigrationCandidates).length) + " sys_cs_topic records successfully migrated, " +
+		(Object.keys(csMigrationCandidates).length) + " sys_cs_topic record were NOT migrated.";
+	if (Object.keys(csMigrationCandidates).length &gt; 0) {
+		csMigrationSummary += "  Unable to migrate the following sys_cs_topic records: " + JSON.stringify(csMigrationCandidates);
+	}
+	gs.info(csMigrationSummary);
+}
+
+function _fetchProviderProviderSysId() {
+	var gr = new GlideRecord('open_nlu_driver');
+	gr.initialize();
+	gr.addQuery("provider", "parlo");
+	gr.query();
+	return gr.next() ? gr.getUniqueValue() : null;
+}
+
+function _canBindTopicToModelLanguage(providerSysId, model, topic) {
+	return topic.is_pre_orlando ? model.id == topic.nlu_model : topic.nlu_model_label == model.name;
+}
+
+function _migrateOldOpenNLUDrivers() {
+    // Fix type enums
+	var gr = new GlideRecord('open_nlu_driver');
+	gr.query();
+	while(gr.next()) {
+		var type = gr.getValue('type');
+		if (type == 'script_include_command') {
+			gr.setValue('type', 'external_http');
+			gr.update();
+		}
+		else if (type == 'script_include') {
+			gr.setValue('type', 'glide_ml');
+			gr.update();
+		}
+	}
+
+    // Flip IBM Watson and/or MS Luis back to inactive
+    var setWatsonActive = false;
+    var setLuisActive = false;
+    var gr = new GlideRecord('sys_cs_general_settings');
+    gr.query();
+    if (gr.next() &amp;&amp; !gs.nil(gr.nlu_driver)) {
+        setWatsonActive = IBM_WATSON_PROVIDER_SYSID == gr.nlu_driver;
+        setLuisActive = MS_LUIS_PROVIDER_SYSID == gr.nlu_driver;
+    }
+
+    var watsonGr = new GlideRecord('open_nlu_driver');
+    watsonGr.get(IBM_WATSON_PROVIDER_SYSID);
+    if (watsonGr.isValid()) {
+        watsonGr.active = setWatsonActive;
+        watsonGr.update();
+    }
+
+    var luisGr = new GlideRecord('open_nlu_driver');
+    luisGr.get(MS_LUIS_PROVIDER_SYSID);
+    if (luisGr.isValid()) {
+        luisGr.active = setLuisActive;
+        luisGr.update();
+    }
+}
+
+function _migrateMLSolutions() {
+	var gr = new GlideRecord('ml_solution');
+	gr.get('84060f4f771233005d7b3882a910611a');
+	if (gr.isValid()) {
+		gr.setValue('capability', 'nlu_trainer');
+		gr.update();
+	}
+
+	gr = new GlideRecord('ml_solution');
+	gr.get('db0bb7c25b181010d033d82d9681c71e');
+	if (gr.isValid()) {
+		gr.setValue('capability', 'nlu_trainer');
+		gr.update();
+	}
+
+	gr = new GlideRecord('ml_solution');
+	gr.get('f46bfbc25b181010d033d82d9681c715');
+	if (gr.isValid()) {
+		gr.setValue('capability', 'nlu_trainer');
+		gr.update();
+	}
+}]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_fix&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2020-04-24 17:20:26&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;c6059e325b1010101f254d3ba881c7a4&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;2&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;VA Migrate Topic NLU Language Bindings&lt;/sys_name&gt;
+        &lt;sys_package display_value=""&gt;afc239e293400210b31a30dcebba1086&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_fix_c6059e325b1010101f254d3ba881c7a4&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2020-05-05 15:18:34&lt;/sys_updated_on&gt;
+        &lt;unloadable&gt;false&lt;/unloadable&gt;
+    &lt;/sys_script_fix&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 09:40:16</sys_created_on>
+        <sys_id>32154d9583741210c6695855eeaad320</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>VA Migrate Topic NLU Language Bindings</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_32154d9583741210c6695855eeaad320</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 09:40:16</sys_updated_on>
+        <tablename>sys_script_fix</tablename>
+    </sys_metadata_link>
+</record_update>

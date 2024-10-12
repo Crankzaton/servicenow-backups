@@ -1,0 +1,299 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>76da11a0c3111110a0cd587c1f40dd7d</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.FSMTaskQueryHelper&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;name&gt;FSMTaskQueryHelper&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var FSMTaskQueryHelper = Class.create();
+FSMTaskQueryHelper.prototype = {
+    initialize: function () { 
+        this.isBundlePluginActive = GlidePluginManager.isActive('com.snc.fsm_task_bundle');
+        if(this.isBundlePluginActive)
+            this.FSMTaskBundle = new sn_fsm_task_bundle.FSMTaskBundle();
+    },
+
+    getAgentEvents: function (agent_id, start_date, end_date, excludeTaskId,isDWS, isCrew, taskRecord) {        
+        var tasks = [];
+		var assignedField = isDWS &amp;&amp; isCrew ? "assigned_crew" : "assigned_to";
+		var tasksRaw = this.getTaskHelper([agent_id], start_date, end_date, assignedField);
+
+        if (!gs.nil(excludeTaskId)) {
+            tasks = tasksRaw.filter(function (t) {
+                return t.id != excludeTaskId
+            });
+        } else {
+            tasks = tasksRaw;
+        }
+
+        tasks.sort(function (e1, e2) {
+            return e1.end_time - e2.end_time;
+        });
+
+        //Filtering to make sure that the event is actually visible on the calendar
+        tasks = tasks.filter(function (event) {
+            return (event.start_time &lt; end_date &amp;&amp; event.end_time &gt; start_date) ||
+                (event.start_time &lt; end_date &amp;&amp; event.end_time &gt; end_date) ||
+                (event.start_time &lt; start_date &amp;&amp; event.end_time &gt; start_date)
+        })
+
+        if(isDWS)
+            tasks = this.reCalculateTaskTimes(tasks, taskRecord, start_date, end_date, isCrew);
+        var agentList = [];
+        if (isDWS &amp;&amp; isCrew) {
+            var dateGdt = new GlideDateTime();
+            dateGdt.setNumericValue(start_date);
+            var startDate = dateGdt.getValue();
+
+            dateGdt.setNumericValue(end_date);
+            var endDate = dateGdt.getValue();
+
+            var crewMembersGR = new sn_fsm_crew.DynamicSchedulingCrewImpl().getCrewMembersGR(taskRecord.assigned_crew, startDate, endDate);
+            while (crewMembersGR.next())
+                agentList.push(crewMembersGR.getValue("member"));
+        } else
+            agentList.push(agent_id)
+        var agentPersonalEvents = this.getEvents(agentList, start_date, end_date);
+        agentPersonalEvents.sort(function (e1, e2) {
+            return e1.end_time - e2.end_time;
+        });
+
+        return {
+            "agentPersonalEvents": agentPersonalEvents,
+            "agentTasks": tasks
+        };
+    },
+
+    getEvents: function (agent_ids, start_date, end_date) {
+        var res = [];
+        var eventSpan = new global.AgentScheduleUtil().getEventSpan(agent_ids, start_date, end_date);
+        eventSpan.forEach(function (event) {
+            res.push({
+                "id": event["id"],
+                "user": event["user"],
+                "number": event["name"],
+                "table": "cmn_schedule_span",
+                "start_time": new GlideDateTime(event["start_time"]).getNumericValue(),
+                "mid_time": new GlideDateTime(event["start_time"]).getNumericValue(),
+                "end_time": new GlideDateTime(event["end_time"]).getNumericValue()
+            });
+        });
+        return res;
+    },
+    getTaskHelper: function (agent_ids, start_date, end_date, assignedField) {
+        var taskList = [];
+        // For Assigned/Accepted not On Route tasks
+        // Estimated travel start is before the end of the calendar date range
+        // Estimated work end is after the start of the calendar date range
+        var queryString = assignedField+"IN" + agent_ids + "^stateIN12,16,17^substate=^ORsubstate!=8";
+        this._queryAgentTasks(queryString, "expected_travel_start", "estimated_end", start_date, end_date, taskList);
+        // Accepted + On Route
+        // Actual Travel Start is before the end of the calendar date range
+        // No comparsion for the start of the calendar date range 
+        queryString = assignedField+"IN" + agent_ids + "^state=17^substate=8";
+        this._queryAgentTasks(queryString, "actual_travel_start", "", start_date, end_date, taskList);
+        // For WIP tasks
+        // Actual work start is before the end of the calendar date range
+        // No comparsion for the start of the calendar date range 
+        queryString = assignedField+'IN' + agent_ids + '^state=18';
+        this._queryAgentTasks(queryString, "work_start", "", start_date, end_date, taskList);
+        // Not all WIP  WOTs have actual_travel_start
+        // Check expected_travel_start for the WOT which does no have actual_travel_start
+        queryString = assignedField+'IN' + agent_ids + '^state=18^actual_travel_startISEMPTY';
+        this._queryAgentTasks(queryString, "expected_travel_start", "", start_date, end_date, taskList);
+        return taskList;
+    },  
+
+    reCalculateTaskTimes: function (agentTasks, taskRecord, start_date, end_date) {
+        if (!agentTasks.length &gt; 0) return agentTasks;        
+        
+        var distanceUtils = new global.SMGeoDistanceUtils('field_service');
+        var ret;
+        var smConfigGr = new global.SMCoreConfigCacheManager().getSMConfig("wm_task");
+        var useGoogle = gs.getProperty(smConfigGr.property_prefix + "travel.calculation.manual_assignment", SMConstants.USE_GOOGLE_MAPS_API);
+        var locationId = taskRecord.location;
+        if (global.FSMUtil.taskIsBundle(taskRecord)) {
+            var subTask = this.FSMTaskBundle.getLastSubtask(taskRecord.getValue('sys_id'));
+            if(!gs.nil(subTask))
+                locationId = subTask.location;
+        }
+        var locationRefRecord = locationId.getRefRecord();
+        var sLat;
+        var sLon;
+        for (var i = 0; i &lt; agentTasks.length; i++) {
+            if (i &gt; 0) {
+                sLat = agentTasks[i - 1].lat;
+                sLon = agentTasks[i - 1].lng;
+            } else if (locationRefRecord.isValidRecord()) {
+                sLat = parseFloat(locationRefRecord.getValue("latitude"));
+                sLon = parseFloat(locationRefRecord.getValue("longitude"));
+            }
+            
+            if (i&gt;0 &amp;&amp; agentTasks[i - 1].isBundled == true) {
+                var subTaskRecord = this.FSMTaskBundle.getLastSubtask(agentTasks[i - 1].id);
+                if(!gs.nil(subTaskRecord)) {
+                    var subtaskLocation = subTaskRecord.location.getRefRecord();
+                    if (subtaskLocation.isValidRecord()) {
+                        sLat = parseFloat(subtaskLocation.getValue("latitude"));
+                        sLon = parseFloat(subtaskLocation.getValue("longitude"));
+                    }
+                }
+            }
+            var eLat = agentTasks[i].lat;
+            var eLon = agentTasks[i].lng;
+			
+			var ret;
+			if(sLat &amp;&amp; sLon &amp;&amp; eLon &amp;&amp; eLat)
+				ret = distanceUtils.getTravelTimeDistance(sLat, sLon, eLat, eLon, useGoogle);
+			else{
+				//Current task location not found default to 1 hour
+				if(!eLat || !eLon){
+					ret = {
+						duration: 3600,
+						defVal: 1
+					};
+				}
+				else{
+					var locationFound = false;
+					//Keep looking for prev task that has valid location
+					for(j=i-1; j&gt;-1; j--){
+						if(agentTasks[j] &amp;&amp; agentTasks[j].lat &amp;&amp; agentTasks[j].lng){
+							ret = distanceUtils.getTravelTimeDistance(agentTasks[j].lat, agentTasks[j].lng, eLat, eLon, useGoogle);
+							locationFound= true;
+							break;
+						}
+					}
+					//Location not found so its either the dropped task's location or use agent's / crew's home location or default to 1 hour
+					if(!locationFound){
+						//Check if dropped task has location
+						var sourceLatitude,sourceLongitude;
+						if(locationRefRecord &amp;&amp; locationRefRecord.getValue("latitude") &amp;&amp; locationRefRecord.getValue("longitude")){
+							sourceLatitude = locationRefRecord.getValue("latitude");
+							sourceLongitude = locationRefRecord.getValue("longitude");
+						}
+						else{//Else use agent/crew home location
+							var isCrew = taskRecord.assigned_crew ? true: false;
+
+							if(isCrew){								
+								var crewLocation = taskRecord.assigned_crew.location.getRefRecord();
+								sourceLatitude = crewLocation.getValue("latitude");
+								sourceLongitude = crewLocation.getValue("longitude");
+							}
+							else{
+								var agentLocation = taskRecord.assigned_to.location.getRefRecord();
+								sourceLatitude = agentLocation.getValue("latitude");
+								sourceLongitude = agentLocation.getValue("longitude");
+							}
+						}
+						if(sourceLatitude &amp;&amp; sourceLongitude)
+							ret = distanceUtils.getTravelTimeDistance(sourceLatitude, sourceLongitude, eLat, eLon, useGoogle);
+						else
+							ret = { duration: 3600, defVal: 1};
+					}
+				}
+			}
+            
+            //Final check to avoid NPE
+            if(!ret)
+                ret = { duration: 3600, defVal: 1};
+
+            var gdt = new GlideDateTime();
+            gdt.setValue(agentTasks[i].mid_time);
+            gdt.subtract(parseInt(ret.duration) * 1000);
+            agentTasks[i].start_time = gdt.getNumericValue();            
+        }
+
+        return agentTasks;
+    },
+
+
+    _queryAgentTasks: function (encodedQuery, startTimeField, endTimeField, start_date, end_date, taskList, type) {
+        var scheduleGrabber = new SMScheduleGrabber();
+        var taskRec = new GlideRecord("wm_task");
+        taskRec.addEncodedQuery(encodedQuery);
+        var dateFormat = gs.getDateFormat();
+        var timeFormat = gs.getTimeFormat();
+        if (!gs.nil(startTimeField)) {
+            var endDateGdt = new GlideDateTime();
+            endDateGdt.setNumericValue(end_date);
+            taskRec.addQuery(startTimeField, "&lt;", endDateGdt);
+        }
+        if (!gs.nil(endTimeField)) {
+            var startDateGdt = new GlideDateTime();
+            startDateGdt.setNumericValue(start_date);
+            taskRec.addQuery(endTimeField, "&gt;", startDateGdt);
+        }
+        taskRec.query();
+
+        while (taskRec.next()) {
+            if(!gs.nil(taskRec.getValue("bundle"))) continue;
+            var state = taskRec.getValue("state");
+            var taskObj = {
+                "user": taskRec.getValue("assigned_to"),
+                "start_time": scheduleGrabber.getTravelStart(taskRec),
+                "mid_time": scheduleGrabber.getWorkStart(taskRec),
+                "end_time": scheduleGrabber.getWorkEnd(taskRec),
+                "id": taskRec.getValue("sys_id"),
+                "state": state,
+                "substate": taskRec.getValue("substate"),
+                "number": taskRec.getValue("number"),
+                "window_start": taskRec.window_start ? new GlideDateTime(taskRec.window_start).getNumericValue() : null,
+                "window_end": taskRec.window_end ? new GlideDateTime(taskRec.window_end).getNumericValue() : null,
+                "allow_work_overtime": taskRec.getValue("allow_work_overtime"),
+                "schedule_lock": taskRec.getValue("schedule_lock"),
+                "home_travel_duration": taskRec.getValue("home_travel_duration"),
+                "is_fixed_window": taskRec.getValue("is_fixed_window"),
+                "isBundled":(taskRec.getValue("is_bundle") == true)
+            };
+            if (!gs.nil(taskRec.location)) {
+                var locationRefRecord = taskRec.location.getRefRecord();
+                taskObj.location = taskRec.getValue("location");
+                taskObj.lat = parseFloat(locationRefRecord.getValue("latitude"));
+                taskObj.lng = parseFloat(locationRefRecord.getValue("longitude"));
+            }
+            var isAccessHourActive = new global.FSMGeneralUtil().isAccessHoursAppActive();
+            if (isAccessHourActive == true &amp;&amp; !gs.nil(taskRec.access_hours)) {
+                taskObj.access_hours = taskRec.access_hours.getRefRecord();
+            }
+            taskList.push(taskObj);
+        }
+    },
+
+    type: 'FSMTaskQueryHelper'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-08-10 15:15:21&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;76da11a0c3111110a0cd587c1f40dd7d&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;1&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;FSMTaskQueryHelper&lt;/sys_name&gt;
+        &lt;sys_package display_value="Field Service Management" source="com.snc.work_management"&gt;b66bd6bb4722c210cd4e1ce4316d4387&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_76da11a0c3111110a0cd587c1f40dd7d&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;maint&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-03-10 23:09:25&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:38:55</sys_created_on>
+        <sys_id>8417b85d83f01210c6695855eeaad378</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>FSMTaskQueryHelper</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_8417b85d83f01210c6695855eeaad378</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:38:55</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

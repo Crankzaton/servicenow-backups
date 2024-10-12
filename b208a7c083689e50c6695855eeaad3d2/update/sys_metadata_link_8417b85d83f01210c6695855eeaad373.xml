@@ -1,0 +1,305 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>76d0213153543110f67eddeeff7b129d</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_nb_action.AISearchGeneratorTypeHandler&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Handler for AI Search generator type&lt;/description&gt;
+        &lt;name&gt;AISearchGeneratorTypeHandler&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[            var AISearchGeneratorTypeHandler = Class.create();
+            AISearchGeneratorTypeHandler.prototype = Object.extendsObject(sn_nb_action.GeneratorTypeHandlerBase, {
+                initialize: function() {
+                    this._log = new global.GSLog(Constants.PROP_LOG_LEVEL, this.type);
+                },
+
+                getId: function() {
+                    return Constants.GENERATOR_TYPE_SYS_ID.AI_SEARCH;
+                },
+
+                getOutputSchema: function(param) {
+                    var schemaObjectList = [];
+                    return {
+                        status: Constants.STATUS_SUCCESS,
+                        schema: schemaObjectList,
+                        metaData: {}
+                    };
+                },
+
+                getOutputs: function(param) {
+                    var aisOutputObj = [];
+                    var paginationToken = '';
+                    try {
+                        var inputs = param.inputs;
+                        var searchTerm = inputs &amp;&amp; inputs.search_field ? inputs.search_field : param.searchTerm;
+                        var searchFilter = param.searchFilter;
+                        var currentRecordId = param.contextRecord.getUniqueValue();
+                        var generatorRecord = param.resourceGeneratorRecord;
+                        var context = generatorRecord ? generatorRecord.context.getRefRecord() : param.ruleContext;
+                        var searchContextConfigId = context.search_application_configuration;
+                        if (!searchContextConfigId) {
+                            this._log.error("Search application configuration not added for given context " + context.getUniqueValue());
+                            return false;
+                        }
+                        var searchLimit = searchContextConfigId.search_results_limit;
+                        var topN = inputs &amp;&amp; inputs.top_n_results &amp;&amp; inputs.top_n_results &lt; searchLimit ? inputs.top_n_results : searchLimit;
+                        var searchSources = this._fetchSearchSources(context);
+                        var applicableFilters = this._getSearchFilters(searchContextConfigId, searchSources);
+                        var applicableFiltersIds = [];
+                        for (var i = 0; i &lt; applicableFilters.length; i++) {
+                            applicableFiltersIds.push(applicableFilters[i].id);
+                        }
+                        // if search filter exists use it else get search filters based on search result action mapping table
+                        var filters = searchFilter &amp;&amp; searchFilter.length !== 0 ? searchFilter : applicableFiltersIds;
+                        if (filters.length == 0)
+                            return false;
+
+                        var api = new sn_search.ScriptableSearchAPI();
+                        paginationToken = param.paginationToken ? param.paginationToken : '';
+                        var disableSpellCheck = false;
+                        var facetFilters = [];
+                        var requestedFields = {};
+
+                        var response = api.search(searchContextConfigId, searchTerm, paginationToken, disableSpellCheck, facetFilters, filters, requestedFields);
+
+                        var nextPaginationToken = response.getNextPaginationToken();
+
+                        var filtersWithCounts = this._fetchSearchFiltersWithCounts(response, applicableFiltersIds);
+                        var searchResultsOutput = this._fetchSearchResults(response, topN, currentRecordId, searchLimit);
+                        if (filtersWithCounts.length == 0 &amp;&amp; searchResultsOutput.length != 0)
+                            filtersWithCounts = applicableFilters;
+
+                        if (paginationToken == '') {
+                            var geniusOutput = this._fetchGeniusResults(response, currentRecordId);
+                            aisOutputObj = aisOutputObj.concat(geniusOutput);
+                        }
+                        aisOutputObj = aisOutputObj.concat(searchResultsOutput);
+
+
+                    } catch (ex) {
+                        this._log.error("Failed to fetch results using AI Search API" + "," + "Error: " + ex);
+                        errorDetails = new RAExceptionManager("UNKNOWN_ERROR_OCCURED");
+                        return {
+                            status: Constants.STATUS_ERROR,
+                            errorCode: errorDetails.getCode(),
+                            errorMessage: errorDetails.getMessage()
+                        };
+                    }
+
+                    return {
+                        status: Constants.STATUS_SUCCESS,
+                        outputs: aisOutputObj,
+                        paginationToken: nextPaginationToken,
+                        filters: filtersWithCounts
+                    };
+                },
+                _fetchGeniusResults: function(response, currentRecordId) {
+                    var geniusResults = response.getGeniusResults();
+                    var geniusOutput = [];
+
+                    try {
+                        if (geniusResults.length !== 0) {
+                            for (var i = 0; i &lt; geniusResults.length; i++) {
+                                var geniusData = geniusResults[i].getData();
+                                var actionObject = {};
+                                actionObject[Constants.MODEL_ID] = geniusResults[i].getModelId();
+
+                                for (var j = 0; j &lt; geniusData.length; j++) {
+                                    actionObject[geniusData[j].getFieldName()] = geniusData[j].getValue();
+                                }
+
+                                var sysid = actionObject[Constants.COL_SYS_ID];
+                                if (sysid &amp;&amp; sysid != currentRecordId) {
+                                    var tableName = actionObject[Constants.COL_TABLE];
+                                    if (tableName) {
+                                        var searchOutputRecord = this._fetchSearchResultRecord(tableName, sysid);
+                                        actionObject[Constants.SEARCH_RESULT_OUTPUT_NAME] = searchOutputRecord;
+                                    }
+                                }
+
+                                var teaser = actionObject[Constants.AI_SEARCH_TEASER_TEXT];
+                                if (teaser) {
+                                    teaser = teaser.replaceAll("&lt;highlight&gt;", "&lt;mark&gt;");
+                                    teaser = teaser.replaceAll("&lt;/highlight&gt;", "&lt;/mark&gt;");
+                                    actionObject[Constants.SEARCH_TEASER_TEXT_NAME] = teaser;
+                                } else {
+                                    actionObject[Constants.SEARCH_TEASER_TEXT_NAME] = '';
+                                }
+                                geniusOutput.push(actionObject);
+                            }
+                        }
+                    } catch (ex) {
+                        this._log.error("Error in fetching Genius Results:", ex);
+                        errorDetails = new RAExceptionManager("UNKNOWN_ERROR_OCCURED");
+                        return {
+                            status: Constants.STATUS_ERROR,
+                            errorCode: errorDetails.getCode(),
+                            errorMessage: errorDetails.getMessage()
+                        };
+                    }
+
+                    return geniusOutput;
+                },
+                _fetchSearchResults: function(response, topN, currentRecordId, searchLimit) {
+                    var searchResults = response.getSearchResults();
+                    var searchOutput = [];
+                    var filtersWithCounts = [];
+
+                    try {
+                        if (searchResults.length !== 0) {
+                            for (var index = 0; index &lt; topN; index++) {
+                                if (searchResults[index]) {
+                                    var result = searchResults[index];
+                                    var sysid = result.getSysId();
+
+                                    if (sysid != currentRecordId) {
+                                        var actionObject = {};
+                                        var teaser = result.getText();
+                                        var tableName = result.getTable();
+
+                                        var searchOutputRecord = this._fetchSearchResultRecord(tableName, sysid);
+                                        actionObject[Constants.SEARCH_RESULT_OUTPUT_NAME] = searchOutputRecord;
+
+                                        if (teaser) {
+                                            teaser = teaser.replaceAll("&lt;highlight&gt;", "&lt;mark&gt;");
+                                            teaser = teaser.replaceAll("&lt;/highlight&gt;", "&lt;/mark&gt;");
+                                            actionObject[Constants.SEARCH_TEASER_TEXT_NAME] = teaser;
+                                        } else {
+                                            actionObject[Constants.SEARCH_TEASER_TEXT_NAME] = '';
+                                        }
+                                        searchOutput.push(actionObject);
+                                    } else {
+                                        if (topN &lt; searchLimit)
+                                            topN++;
+
+                                    }
+                                }
+                            }
+                        }
+                    } catch (ex) {
+                        this._log.error("Error in fetching Search Results:", ex);
+                        errorDetails = new RAExceptionManager("UNKNOWN_ERROR_OCCURED");
+                        return {
+                            status: Constants.STATUS_ERROR,
+                            errorCode: errorDetails.getCode(),
+                            errorMessage: errorDetails.getMessage()
+                        };
+                    }
+
+                    return searchOutput;
+
+                },
+
+
+                _fetchSearchResultRecord: function(table, sysid) {
+                    var gr = new GlideRecord(table);
+                    gr.get(sysid);
+                    return gr;
+
+                },
+                // Tables on which the search will be performed
+                _fetchSearchSources: function(context) {
+                    var searchTables = [];
+                    var gr = new GlideRecord(Constants.TBL_SEARCH_RESULT_RA_MAPPING);
+                    gr.addQuery(Constants.COL_CONTEXT, context.getUniqueValue());
+                    gr.addQuery(Constants.COL_MAP_GENIUS_RESULT, Constants.CHOICE_NO);
+                    gr.query();
+                    while (gr.next()) {
+                        searchTables.push(gr.getValue(Constants.COL_SEARCH_SOURCE_TABLE));
+                    }
+                    return searchTables;
+                },
+                _fetchSearchFiltersWithCounts: function(searchResponse, applicableFilters) {
+                    var searchFilters = [];
+                    var totalCount = 0;
+                    try {
+                        var filters = searchResponse.getSearchFilters();
+                        var filtersLength = filters.length;
+                        for (var i = 0; i &lt; filtersLength; i++) {
+                            var filter = filters[i];
+                            var id = filter.getSysId();
+                            var label = filter.getLabel();
+                            var count = filter.getResultCount();
+                            if (label == Constants.ALL || this._hasFilter(applicableFilters, id)) {
+                                searchFilters.push({
+                                    id: id,
+                                    label: label,
+                                    count: count
+                                });
+                                if (label != Constants.ALL) {
+                                    totalCount += count;
+                                }
+                            }
+                        }
+
+                        searchFilters[0].count = totalCount;
+                        return searchFilters;
+                    } catch (ex) {
+                        return searchFilters;
+                    }
+                },
+
+                _hasFilter: function(applicableFilters, id) {
+                    var filterLength = applicableFilters.length;
+                    for (var i = 0; i &lt; filterLength; i++) {
+                        if (applicableFilters[i] == id)
+                            return true;
+                    }
+                    return false;
+                },
+
+                _getSearchFilters: function(searchContextConfigId, searchSources) {
+                    var filters = [];
+                    var searchFilterGr = new GlideRecord(Constants.TBL_SEARCH_FILTER);
+                    searchFilterGr.addQuery(Constants.COL_SEARCH_CONTEXT_CONFIG, searchContextConfigId);
+                    searchFilterGr.addQuery(Constants.COL_ACTIVE, true);
+                    searchFilterGr.addQuery('ais_search_source.datasource.source', 'IN', searchSources);
+                    searchFilterGr.orderBy(Constants.COL_ORDER);
+                    searchFilterGr.query();
+                    while (searchFilterGr.next()) {
+                        var id = searchFilterGr.getUniqueValue();
+                        var label = searchFilterGr.getValue(Constants.COL_LABEL);
+                        filters.push({
+                            id: id,
+                            label: label
+                        });
+                    }
+                    return filters;
+                },
+
+                type: "AISearchGeneratorTypeHandler",
+            });]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-07-28 12:05:49&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;76d0213153543110f67eddeeff7b129d&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;12&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;AISearchGeneratorTypeHandler&lt;/sys_name&gt;
+        &lt;sys_package display_value="Recommended Actions" source="sn_nb_action"&gt;427fe83177221010d7159b71a91061e1&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Recommended Actions"&gt;427fe83177221010d7159b71a91061e1&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_76d0213153543110f67eddeeff7b129d&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-13 06:05:43&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:38:54</sys_created_on>
+        <sys_id>8417b85d83f01210c6695855eeaad373</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>AISearchGeneratorTypeHandler</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_8417b85d83f01210c6695855eeaad373</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:38:54</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,265 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>661051de77c301106fd0c32b8d5a99fa</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_nb_action.ConsolidateActionsImpl&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;This class is responsible for taking care of consolidation of Recommedned Actions and their deduplication.&lt;/description&gt;
+        &lt;name&gt;ConsolidateActionsImpl&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var ConsolidateActionsImpl = Class.create();
+ConsolidateActionsImpl.prototype = {
+    initialize: function() {
+        this._nextBestActionDAO = sn_nb_action.NextBestActionUtil.getNextBestActionDAO();
+        this._log = new global.GSLog(sn_nb_action.Constants.PROP_LOG_LEVEL, this.type);
+    },
+
+    _transformActions: function(existingActions) {
+        var existingRules = {};
+        for (var recommend in existingActions) {
+            if (existingActions.hasOwnProperty(recommend)) {
+                var recommendedAction = existingActions[recommend];
+                for (var k = 0; k &lt; recommendedAction.length; k++) {
+                    var detailObj = recommendedAction[k];
+                    var rules = detailObj.getRules();
+                    for (var ruleSysId in rules) {
+                        if (rules.hasOwnProperty(ruleSysId)) {
+                            if (!existingRules.hasOwnProperty(ruleSysId))
+                                existingRules[ruleSysId] = {};
+                            if (!existingRules[ruleSysId].hasOwnProperty(recommend))
+                                existingRules[ruleSysId][recommend] = [];
+                            existingRules[ruleSysId][recommend].push(detailObj);
+                        }
+                    }
+                }
+            }
+        }
+        return existingRules;
+    },
+
+    consolidateUnsavedChanges: function(existingActions, currentActions, currentRules) {
+        var oldActions = this._transformActions(existingActions);
+        for (var rule in oldActions) {
+            if (oldActions.hasOwnProperty(rule)) {
+                if (!currentRules[rule]) {
+                    for (var recommendedAction in oldActions[rule]) {
+                        if (oldActions[rule].hasOwnProperty(recommendedAction)) {
+                            if (!currentActions[recommendedAction])
+                                currentActions[recommendedAction] = oldActions[rule][recommendedAction];
+                        }
+                    }
+                }
+            }
+        }
+    },
+
+    /*
+     * Returns a JSON Object containing details of NBA Detail records, NBA Detail Order records that need to be 
+     * created or updated after comparing new recommendations with existing recommendations.
+     */
+
+    consolidateActions: function(existingActions, currentActions, currentRules, hasUnsavedChanges) {
+
+        var result = {
+            newActionDetails: false,
+            newActionDetailOrders: false,
+            updateActionDetailOrders: false
+        };
+        var actSysId = null;
+        var currActDetArray;
+
+        var newActionDetails = [];
+        var newActionDetailOrders = [];
+        var updateActionDetailOrders = [];
+
+        for (actSysId in currentActions) {
+            currActDetArray = currentActions[actSysId];
+            if (!existingActions.hasOwnProperty(actSysId))
+                this._addNewAction(currActDetArray, newActionDetails);
+            else {
+                var existingActDetArray = existingActions[actSysId];
+                this._updateExistingActionDetailRecords(existingActDetArray, currActDetArray, newActionDetailOrders, updateActionDetailOrders);
+                this._addActionInputsForExistingAction(existingActDetArray, currActDetArray, newActionDetails);
+            }
+        }
+        if (hasUnsavedChanges)
+            this.consolidateUnsavedChanges(existingActions, currentActions, currentRules);
+        this._deactivateActionDetailRecords(existingActions, currentActions, updateActionDetailOrders);
+
+        if (newActionDetails.length &lt;= 0 &amp;&amp; newActionDetailOrders.length &lt;= 0 &amp;&amp; updateActionDetailOrders.length &lt;= 0)
+            return false;
+
+        if (newActionDetails.length &gt; 0)
+            result.newActionDetails = newActionDetails;
+
+        if (newActionDetailOrders.length &gt; 0)
+            result.newActionDetailOrders = newActionDetailOrders;
+
+        if (updateActionDetailOrders.length &gt; 0)
+            result.updateActionDetailOrders = updateActionDetailOrders;
+
+        return result;
+    },
+
+    // prepare to add new Action recommended in this run
+    _addNewAction: function(currActDetArray, newActionDetails) {
+        for (var i = 0; i &lt; currActDetArray.length; i++) {
+            var currActDetObj = currActDetArray[i];
+            newActionDetails.push(currActDetObj);
+        }
+    },
+
+    // prepare to update Existing Action Detail Records if the Action has been recommended in the new run again
+    _updateExistingActionDetailRecords: function(existingActDetArray, currActDetArray, newActionDetailOrders, updateActionDetailOrders) {
+        for (var i = 0; i &lt; existingActDetArray.length; i++) {
+            var existingActDetObject = existingActDetArray[i];
+            var duplicateActionDetObject = sn_nb_action.NextBestActionUtil.getDuplicateActionDetail(currActDetArray, existingActDetObject);
+            if (duplicateActionDetObject) {
+                this._updateActionDetailOrderObjects(duplicateActionDetObject, existingActDetObject, newActionDetailOrders, updateActionDetailOrders);
+            } else
+                this._deactivateActionDetail(existingActDetObject, updateActionDetailOrders);
+        }
+    },
+
+	// checks if there are any new Actions recommended in new run by comparing actionsbeforeRegeneration and current actions recommended in new run
+	checkNewRARecommended: function(existingActionsBeforeRegeneration, currentActions) {
+		var duplicateActionDetailCount = 0;
+		for (actSysId in currentActions) {
+			currActDetArray = currentActions[actSysId];
+			if (existingActionsBeforeRegeneration.hasOwnProperty(actSysId)) {
+				var existingActDetArray = existingActionsBeforeRegeneration[actSysId];
+				if (this._checkDuplicate(existingActDetArray, currActDetArray))
+					duplicateActionDetailCount++;
+			} else {
+				return true;
+			}
+		}
+		var currentActionsCount = Object.keys(currentActions).length;
+		return currentActionsCount &gt; duplicateActionDetailCount;
+		},
+
+	//checks if there are any duplicate actionDetail objects in currActDetArray &amp; existingActDetArray by comparing action inputs
+	_checkDuplicate: function(existingActDetArray, currActDetArray) {
+		for (var i = 0; i &lt; existingActDetArray.length; i++) {
+            var existingActDetObject = existingActDetArray[i];
+            var duplicateActionDetObject = sn_nb_action.NextBestActionUtil.getDuplicateActionDetail(currActDetArray, existingActDetObject);
+            if (duplicateActionDetObject) {
+				return true;
+            } 
+        }
+		return false;
+	},
+
+    // prepare creating new Action Detail records if new action inputs for existing action have been generated
+    _addActionInputsForExistingAction: function(existingActDetArray, currActDetArray, newActionDetails) {
+        for (var i = 0; i &lt; currActDetArray.length; i++) {
+            var currActDetObj = currActDetArray[i];
+            var duplicateActionDetObject = sn_nb_action.NextBestActionUtil.getDuplicateActionDetail(existingActDetArray, currActDetObj);
+            if (!duplicateActionDetObject)
+                newActionDetails.push(currActDetObj);
+        }
+    },
+
+    // prepare to deactivate existing Action Detail records, not recommended in this run.
+    _deactivateActionDetailRecords: function(existingActions, currentActions, updateActionDetailOrders) {
+        for (var actSysId in existingActions) {
+            if (!currentActions.hasOwnProperty(actSysId)) {
+                var existingActDetArray = existingActions[actSysId];
+                for (var i = 0; i &lt; existingActDetArray.length; i++) {
+                    var existingActDetObject = existingActDetArray[i];
+                    this._deactivateActionDetail(existingActDetObject, updateActionDetailOrders);
+                }
+            }
+        }
+    },
+
+    // prepare to deactivate all Action Detail Order records for existing Action Detail record
+    _deactivateActionDetail: function(existingActDetObject, updateActionDetailOrders) {
+        var existingRulesObject = existingActDetObject.getRules();
+        for (var ruleSysId in existingRulesObject) {
+            var existingActDetOrdObject = existingRulesObject[ruleSysId];
+            if (!existingActDetOrdObject.isActive())
+                continue;
+            existingActDetOrdObject.setActive(false);
+            updateActionDetailOrders.push(existingActDetOrdObject);
+        }
+    },
+
+    // prepare to update Action Detail Order Objects records for existing Action Detail Object
+    _updateActionDetailOrderObjects: function(duplicateActDetObject, existingActDetObject, newActionDetailOrders, updateActionDetailOrders) {
+        var existingActDetOrdObject, curActDetOrderObject;
+        for (var ruleSysId in existingActDetObject.getRules()) {
+            existingActDetOrdObject = existingActDetObject.getActionDetailOrderByRule(ruleSysId);
+            if (duplicateActDetObject.containsRule(ruleSysId)) {
+                // overwrite the existing Action Detail Order info with new Action Detail Order
+                curActDetOrderObject = duplicateActDetObject.getActionDetailOrderByRule(ruleSysId);
+
+                if (!curActDetOrderObject.equals(existingActDetOrdObject)) {
+                    sn_nb_action.ActionDetailOrder.appendGroups(curActDetOrderObject, existingActDetOrdObject.getActionGroups());
+                    curActDetOrderObject.setActionDetail(existingActDetOrdObject.getActionDetail());
+                    curActDetOrderObject.setActionDetailOrderId(existingActDetOrdObject.getActionDetailOrderId());
+                    updateActionDetailOrders.push(curActDetOrderObject);
+                } else {
+                    if (sn_nb_action.ActionDetailOrder.appendGroups(existingActDetOrdObject, curActDetOrderObject.getActionGroups()))
+                        updateActionDetailOrders.push(existingActDetOrdObject);
+                }
+            } else {
+                // Set active to false for existing active Action Detail Order.
+                if (existingActDetOrdObject.isActive()) {
+                    existingActDetOrdObject.setActive(false);
+                    updateActionDetailOrders.push(existingActDetOrdObject);
+                }
+            }
+        }
+        this._addActionDetailOrderForExistingActionDetail(duplicateActDetObject, existingActDetObject, newActionDetailOrders);
+    },
+
+    // prepare to add new Action Detail Order records if new rules suggested the existing action detail record in this run
+    _addActionDetailOrderForExistingActionDetail: function(duplicateActDetObject, existingActDetObject, newActionDetailOrders) {
+        var curActDetOrderObject;
+        for (var ruleSysId in duplicateActDetObject.getRules()) {
+            if (!(existingActDetObject.containsRule(ruleSysId))) {
+                curActDetOrderObject = duplicateActDetObject.getActionDetailOrderByRule(ruleSysId);
+                curActDetOrderObject.setActionDetail(existingActDetObject.getId());
+                newActionDetailOrders.push(curActDetOrderObject);
+            }
+        }
+    },
+
+
+    type: 'ConsolidateActionsImpl'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-04-26 04:30:07&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;661051de77c301106fd0c32b8d5a99fa&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;22&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ConsolidateActionsImpl&lt;/sys_name&gt;
+        &lt;sys_package display_value="Recommended Actions" source="sn_nb_action"&gt;427fe83177221010d7159b71a91061e1&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Recommended Actions"&gt;427fe83177221010d7159b71a91061e1&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_661051de77c301106fd0c32b8d5a99fa&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-03-24 11:42:22&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:38:01</sys_created_on>
+        <sys_id>8bd6f81d83f01210c6695855eeaad3b3</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ConsolidateActionsImpl</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_8bd6f81d83f01210c6695855eeaad3b3</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:38:01</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

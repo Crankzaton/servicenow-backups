@@ -1,0 +1,468 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>7373cb5943422110d68db0e245b8f218</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.PwdEnrollSnapshotUtilSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Util methods related to Password Enrollment Snapshots&lt;/description&gt;
+        &lt;name&gt;PwdEnrollSnapshotUtilSNC&lt;/name&gt;
+        &lt;script&gt;&lt;![CDATA[var PwdEnrollSnapshotUtilSNC = Class.create();
+PwdEnrollSnapshotUtilSNC.prototype = {
+    PWD_ENROLLMENT_SNAPSHOT: "pwd_enrollment_snapshot",
+    PWD_MAP_PROC_TO_VERIFICATION: "pwd_map_proc_to_verification",
+    SYS_USER: "sys_user",
+    PWD_VERIFICATION: "pwd_verification",
+    PWD_PROCESS: "pwd_process",
+    PWD_MAP_PROC_TO_GROUP: "pwd_map_proc_to_group",
+    SYS_USER_GROUP: "sys_user_group",
+    SYS_USER_GRMEMBER: "sys_user_grmember",
+    SYSAUTO_SCRIPT: "sysauto_script",
+    arrayUtil: null,
+    pwdExpirationUtil: null,
+    pwdVerificationManager: null,
+    pwdEnrollmentManager: null,
+    _isDomainSepActive: null,
+    _isEnrollmentSnapshotEnabled: null,
+
+    initialize: function() {
+        this._isDomainSepActive = GlidePluginManager.isRegistered('com.glide.domain.msp_extensions.installer');
+        this._isEnrollmentSnapshotEnabled = GlideProperties.getBoolean('pwd_reset.enable.enrollment_snapshot', true);
+        this.arrayUtil = new ArrayUtil();
+        this.pwdExpirationUtil = new PwdExpirationUtils();
+        this.pwdVerificationManager = new SNC.PwdVerificationManager();
+        this.pwdEnrollmentManager = new SNC.PwdEnrollmentManager();
+    },
+
+    createEnrollmentSnapshotsByProcesses: function(processIds) {
+        var userIds = this.getUsersByProcesses(processIds);
+        for (var i = 0; i &lt; userIds.length; i++) {
+            this.createEnrollmentSnapshot(userIds[i]);
+        }
+    },
+
+    createEnrollmentSnapshot: function(userSysId) {
+        var verifications = this.pwdVerificationManager.getVerificationIdsForUser(userSysId);
+        for (var i = 0; i &lt; verifications.size(); i++) {
+            try {
+                this.createOrUpdateEnrollmentSnapshot(verifications.get(i), userSysId);
+            } catch (ex) {
+                gs.error("[PwdEnrollSnapshotUtilSNC: Create enrollment snaps for a user with sys_id : " + userSysId + ", verification : " + verifications.get(i) + "]. execution error - " + ex);
+            }
+        }
+    },
+
+    //Create or Update enrollment snapshot record.
+    //Status is optional parameter, if it is not passed, then we will fetch it from api
+    createOrUpdateEnrollmentSnapshot: function(verification, user, status) {
+        var gr = new GlideRecord(this.PWD_ENROLLMENT_SNAPSHOT);
+        if (gs.nil(status))
+            status = this.pwdEnrollmentManager.isUserEnrolledByVerificationId(user, verification) ? PwdConstants.ENROLLMENT_ACTIVE_STATUS : PwdConstants.ENROLLMENT_INACTIVE_STATUS;
+
+        // make the inserted record's domain to be current user's domain
+        if (this._isDomainSepActive) {
+            var grUser = new GlideRecord(this.SYS_USER);
+            grUser.get(user);
+            gr.addDomainQuery(grUser);
+        }
+
+        gr.addQuery("verification", verification);
+        gr.addQuery("user", user);
+        gr.query();
+
+        if (gr.next()) {
+            gr.status = status;
+            gr.update();
+        } else {
+            gr.initialize();
+            gr.verification = verification;
+            gr.user = user;
+            gr.status = status;
+            gr.insert();
+        }
+    },
+
+    deleteEnrollmentSnapshotsForInValidUsers: function() {
+        var gr = new GlideRecord(this.PWD_ENROLLMENT_SNAPSHOT);
+        gr.addQuery("user", "");
+        gr.deleteMultiple();
+    },
+
+    deleteEnrollmentSnapshotsByUserId: function(userSysId) {
+        var gr = new GlideRecord(this.PWD_ENROLLMENT_SNAPSHOT);
+        gr.addQuery("user", userSysId);
+        gr.deleteMultiple();
+    },
+
+    deleteEnrollmentSnapshotsForInValidVerifications: function() {
+        var gr = new GlideRecord(this.PWD_ENROLLMENT_SNAPSHOT);
+        gr.addQuery("verification", "");
+        gr.deleteMultiple();
+    },
+
+    deleteEnrollmentSnapshotsByVerifications: function(verificationIds) {
+        var gr = new GlideRecord(this.PWD_ENROLLMENT_SNAPSHOT);
+        gr.addQuery("verification", "IN", verificationIds);
+        gr.deleteMultiple();
+    },
+
+    deleteEnrollmentSnapshotsByUserIdAndVerification: function(userSysId, verification) {
+        var gr = new GlideRecord(this.PWD_ENROLLMENT_SNAPSHOT);
+        gr.addQuery("user", userSysId);
+        gr.addQuery("verification", verification);
+        gr.deleteRecord();
+    },
+
+    deleteInValidEnrollmentSnapshots: function() {
+        var snapshotGr = new GlideAggregate(this.PWD_ENROLLMENT_SNAPSHOT);
+        snapshotGr.groupBy('user');
+        snapshotGr.query();
+        while (snapshotGr.next()) {
+            this.deleteInValidEnrollmentSnapshotsByUserId(snapshotGr.user);
+        }
+    },
+
+    deleteInValidEnrollmentSnapshotsByUserId: function(userSysId) {
+        var currentVerifications = this.pwdVerificationManager.getVerificationIdsForUser(userSysId);
+
+        var gr = new GlideRecord(this.PWD_ENROLLMENT_SNAPSHOT);
+        gr.addQuery("user", userSysId);
+        //Don't delete the enrollment snapshot record for the user-verification pair if the user still associated with that verification via another group
+        gr.addQuery("verification", "NOT IN", currentVerifications);
+        gr.deleteMultiple();
+    },
+
+    getUsersByProcesses: function(processIds) {
+        var userIds = [];
+        var gr = new GlideRecord(this.PWD_PROCESS);
+        gr.addActiveQuery();
+        gr.addQuery("sys_id", "IN", processIds);
+        gr.addQuery('apply_to_all_users', true);
+        gr.query();
+
+        if (gr.next()) { //Apply to all users
+            var grUser = new GlideRecord(this.SYS_USER);
+            grUser.addActiveQuery();
+            grUser.query();
+            while (grUser.next()) {
+                userIds.push(grUser.getValue("sys_id"));
+            }
+        } else { //Apply to group
+            var groupProcessGr = new GlideRecord(this.PWD_MAP_PROC_TO_GROUP);
+            groupProcessGr.addQuery("process", "IN", processIds);
+            groupProcessGr.addQuery("process.active", true);
+            groupProcessGr.addQuery("user_group.active", true);
+            groupProcessGr.query();
+
+            var groupIds = [];
+            while (groupProcessGr.next()) {
+                var group = groupProcessGr.getValue("user_group");
+                if (!this.arrayUtil.contains(groupIds, group)) {
+                    groupIds.push(group);
+                }
+            }
+
+            if (groupIds.length !== 0) {
+                var userGroupMemberGr = this.pwdExpirationUtil.getAllUsersForGroup(groupIds);
+                while (userGroupMemberGr.next()) {
+                    var userId = userGroupMemberGr.getValue("user");
+                    if (!this.arrayUtil.contains(userIds, userId)) {
+                        userIds.push(userId);
+                    }
+                }
+            }
+        }
+        return userIds;
+    },
+
+    getVerificationsByVerificationType: function(verificationType) {
+        var verificationIds = [];
+        var gr = new GlideRecord(this.PWD_VERIFICATION);
+        gr.addQuery("type", verificationType);
+        gr.query();
+
+        while (gr.next()) {
+            verificationIds.push(gr.getValue("sys_id"));
+        }
+        return verificationIds;
+    },
+
+    getManualVerificationsAccociatedWithProcesses: function(processIds) {
+        var gr = new GlideRecord(this.PWD_MAP_PROC_TO_VERIFICATION);
+        gr.addQuery("process", "IN", Object.keys(processIds).join());
+        gr.query();
+
+        var verificationIds = [];
+
+        while (gr.next()) {
+            var verification = gr.getValue("verification");
+            if (!gr.verification.type.auto_enroll &amp;&amp; !this.arrayUtil.contains(verificationIds, verification)) {
+                verificationIds.push(verification);
+            }
+        }
+        return verificationIds;
+    },
+
+    getProcessAccociatedWithVerifications: function(verificationIds) {
+        var gr = new GlideRecord(this.PWD_MAP_PROC_TO_VERIFICATION);
+        gr.addQuery("verification", "IN", verificationIds);
+        gr.addQuery("process.active", true);
+        gr.query();
+
+        var processIds = [];
+
+        while (gr.next()) {
+            processIds.push(gr.getValue("process"));
+        }
+        return processIds;
+    },
+
+    isAutoEnrollVerification: function(verificationId) {
+        var gr = new GlideRecord(this.PWD_VERIFICATION);
+        return gr.get(verificationId) &amp;&amp; gr.type.auto_enroll;
+    },
+
+    isActiveProcess: function(processId) {
+        var gr = new GlideRecord(this.PWD_PROCESS);
+        return gr.get(processId) &amp;&amp; gr.active;
+    },
+
+    isActiveUser: function(userId) {
+        var gr = new GlideRecord(this.SYS_USER);
+        return gr.get(userId) &amp;&amp; gr.active;
+    },
+
+    isActiveGroup: function(groupId) {
+        var gr = new GlideRecord(this.SYS_USER_GROUP);
+        return gr.get(groupId) &amp;&amp; gr.active;
+    },
+
+    manageEnrollmentSnapshotScheduleJobForAProcess: function(processGr) {
+        if (!this._isEnrollmentSnapshotEnabled)
+            return;
+
+        var SYNC_ENROLLMENT_SNAPSHOT_DATA_SCHEDULED_JOB_PREFIX = "Sync enrollment snapshot data for pwd_process_";
+        var processSysId = processGr.getUniqueValue();
+        var startDate = this.getStartDateTime(3600); //1 Hour
+        var currentDate = new GlideDateTime();
+        var jobName = SYNC_ENROLLMENT_SNAPSHOT_DATA_SCHEDULED_JOB_PREFIX + processSysId;
+        var jobScript = "new global.PwdEnrollSnapshotUtil().syncEnrollmentSnapshotDataForProcessId(\"" + processSysId + "\");";
+
+        /* create a new schedule job to create expiration records which will run once after one hour.
+        If job already exists then check if that job is already executed. If yes, update the start time so that the same job will execute again after one hour else dont do anything*/
+        try {
+            var scheduleJobGr = this._findScheduleJob(jobName);
+            if (!gs.nil(scheduleJobGr)) {
+                scheduleJobGr.setValue("active", processGr.active);
+                if (scheduleJobGr.getValue("run_start") &lt; currentDate &amp;&amp; scheduleJobGr.getValue("run_start") &lt; startDate)
+                    scheduleJobGr.setValue("run_start", startDate);
+                scheduleJobGr.update();
+            } else {
+                scheduleJobGr = this.createSyncEnrollmentSnapshotScheduleJob(jobName, jobScript, startDate, "once", "");
+            }
+            startDate = scheduleJobGr.getDisplayValue("run_start");
+            if (processGr.active)
+                gs.addInfoMessage(gs.getMessage("The Sync enrollment snapshot data job for this process will start at {0}", startDate));
+        } catch (ex) {
+            gs.error("[PwdEnrollSnapshotUtil] manageEnrollmentSnapshotScheduleJobForAProcess() for pwd_process_" + processSysId + " execution error - " + ex);
+        }
+    },
+
+    syncEnrollmentSnapshotDataForProcessId: function(processId) {
+        if (!this._isEnrollmentSnapshotEnabled)
+            return;
+
+        if (!this._doesProcessExist(processId)) {
+            gs.error("[PwdEnrollSnapshotUtil] Password Reset process record not found, error while refreshing the enrollment snapshot table data for the process: " + processId);
+            return;
+        }
+        this.createEnrollmentSnapshotsByProcesses([processId]);
+    },
+
+    _findScheduleJob: function(jobName) {
+        var gr = new GlideRecord(this.SYSAUTO_SCRIPT);
+        if (gr.get("name", jobName))
+            return gr;
+        return null;
+    },
+
+    //Returns the current date time and adds the specified seconds in it.
+    getStartDateTime: function(seconds) {
+        var startDate = new GlideDateTime();
+        startDate.addSeconds(seconds);
+        return startDate;
+    },
+
+    createSyncEnrollmentSnapshotScheduleJob: function(jobName, jobScript, startDate, runType, runDay) {
+        var scheduleJobGr = new GlideRecord(this.SYSAUTO_SCRIPT);
+        scheduleJobGr.initialize();
+        scheduleJobGr.setValue("name", jobName);
+        scheduleJobGr.setValue("active", true);
+        scheduleJobGr.setValue("conditional", true);
+        scheduleJobGr.setValue("condition", "GlideProperties.getBoolean('pwd_reset.enable.enrollment_snapshot', true);");
+        scheduleJobGr.setValue("run_type", runType);
+        scheduleJobGr.setValue("script", jobScript);
+
+        switch (runType) {
+            case "monthly":
+                scheduleJobGr.setValue("run_dayofmonth", runDay);
+                break;
+            case "once":
+                scheduleJobGr.setValue("entered_time", new GlideTime());
+                scheduleJobGr.setValue("run_start", startDate);
+                scheduleJobGr.setValue("time_zone", "floating");
+                break;
+        }
+
+        scheduleJobGr.insert();
+        return scheduleJobGr;
+    },
+
+    _doesProcessExist: function(processSysId) {
+        var processGr = new GlideRecord(this.PWD_PROCESS);
+        processGr.addActiveQuery();
+        processGr.addQuery("sys_id", processSysId);
+        processGr.query();
+        if (processGr.next())
+            return true;
+        return false;
+    },
+
+    createOrDeleteEnrollmentSnapshotForMonthlyScheduledJob: function() {
+        var verificationToUserGroupMapping = {};
+        var processVerification = {};
+
+        // get apply to all verifications that are not auto-enroll
+        gr = new GlideAggregate(this.PWD_MAP_PROC_TO_VERIFICATION);
+        gr.groupBy('verification');
+        var qc = gr.addJoinQuery(this.PWD_PROCESS, 'process', 'sys_id');
+        qc.addCondition('active', true);
+        qc.addCondition('apply_to_all_users', true);
+        gr.query();
+        var verifications = {};
+        while (gr.next()) {
+            if (gr.verification.type.auto_enroll) {
+                continue;
+            }
+            verifications[gr.verification] = true;
+        }
+
+        if (Object.keys(verifications).length !== 0) {
+            var users = new GlideRecord(this.SYS_USER);
+            users.addActiveQuery();
+            users.query();
+            while (users.next()) {
+                for (var verification in verifications) {
+                    if (verifications.hasOwnProperty(verification)) {
+                        this.createOrUpdateEnrollmentSnapshot(verification, users.sys_id);
+                    }
+                }
+            }
+        }
+
+        // now on to process that are associated with user groups
+        // first build a verification to groups mapping
+        var processGr = new GlideRecord(this.PWD_PROCESS);
+        processGr.addQuery('apply_to_all_users', false);
+        processGr.addActiveQuery();
+        processGr.query();
+        while (processGr.next()) {
+            processVerification = {};
+            // get verifications first
+            var vers = new GlideRecord(this.PWD_MAP_PROC_TO_VERIFICATION);
+            vers.addQuery('process', processGr.sys_id);
+            vers.query();
+            while (vers.next()) {
+                if (vers.verification.type.auto_enroll || (vers.verification in verifications)) {
+                    continue;
+                }
+                if (!(vers.verification in verificationToUserGroupMapping)) {
+                    verificationToUserGroupMapping[vers.verification] = {};
+                }
+                processVerification[vers.verification] = {};
+            }
+            // get groups next
+            var groups = new GlideRecord(this.PWD_MAP_PROC_TO_GROUP);
+            groups.addQuery('process', processGr.sys_id);
+            groups.query();
+            while (groups.next()) {
+                this.getChildGroups(groups.user_group, verificationToUserGroupMapping, processVerification);
+            }
+        }
+
+        for (var ver in verificationToUserGroupMapping) {
+            if (verificationToUserGroupMapping.hasOwnProperty(ver)) {
+                // get unique user contained in groups for this verification
+                gr = new GlideAggregate(this.SYS_USER_GRMEMBER);
+                var groupIds = [];
+                for (var grp in verificationToUserGroupMapping[ver]) {
+                    if (verificationToUserGroupMapping[ver].hasOwnProperty(grp)) {
+                        groupIds.push(grp);
+                    }
+                }
+
+                gr.addQuery('group', groupIds);
+                gr.addQuery('user.active', true);
+                gr.groupBy('user');
+                gr.query();
+                while (gr.next()) {
+                    this.createOrUpdateEnrollmentSnapshot(ver, gr.user);
+                }
+            }
+        }
+
+        //delete all the snapshot records that are no longer valid 
+        this.deleteInValidEnrollmentSnapshots();
+    },
+
+    getChildGroups: function(groupId, verificationToUserGroupMapping, processVerification) {
+        for (var ver in processVerification) {
+            if (processVerification.hasOwnProperty(ver)) {
+                verificationToUserGroupMapping[ver][groupId] = true;
+            }
+        }
+        var userGroupGr = new GlideRecord(this.SYS_USER_GROUP);
+        userGroupGr.addActiveQuery();
+        userGroupGr.addQuery('parent', groupId);
+        userGroupGr.query();
+        while (userGroupGr.next()) {
+            this.getChildGroups(userGroupGr.getUniqueValue(), verificationToUserGroupMapping, processVerification);
+        }
+    },
+
+    type: 'PwdEnrollSnapshotUtilSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-04-06 09:49:54&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;7373cb5943422110d68db0e245b8f218&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;PwdEnrollSnapshotUtilSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Password Reset" source="com.glideapp.password_reset"&gt;1399f4e43cf1311068bcf327dfe37fe4&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_7373cb5943422110d68db0e245b8f218&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-05-10 07:32:32&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2024-09-21 08:38:43</sys_created_on>
+        <sys_id>9507385d83f01210c6695855eeaad3a7</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>PwdEnrollSnapshotUtilSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_9507385d83f01210c6695855eeaad3a7</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-09-21 08:38:43</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>
