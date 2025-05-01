@@ -28,4 +28,5 @@ If you find yourself unable to import your repository due to the presence of fil
    * System (apps/system1)
    * Customer Service
    * Data Lookup and Record Matching Support
+   * Service Management Basics
    * System Applications Core
