@@ -25,8 +25,7 @@ If you find yourself unable to import your repository due to the presence of fil
    2.3 Re-import the application from source control
    Currently listed dependencies:
    * System Import Sets
-   * System (apps/system1)
    * Customer Service
-   * Data Lookup and Record Matching Support
-   * Service Management Basics
+   * System (apps/system1)
    * System Applications Core
+   * Data Lookup and Record Matching Support
