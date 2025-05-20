@@ -1,0 +1,188 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.hr_PortalUtilCore</api_name>
+        <caller_access>2</caller_access>
+        <client_callable>false</client_callable>
+        <description/>
+        <mobile_callable>false</mobile_callable>
+        <name>hr_PortalUtilCore</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var hr_PortalUtilCore = Class.create();
+// Get the id for a parent case, given sys_id and table name from URL
+hr_PortalUtilCore.getParentFromUrl = function(sysIdParam, tableParam) {
+	var parent = sysIdParam;
+		
+	if (tableParam == 'sn_hr_core_task') {
+		var task = new GlideRecord('sn_hr_core_task');
+		if (task.get(parent))
+			parent = String(task.parent);
+	}
+
+	return parent;
+};
+
+//Default tables
+hr_PortalUtilCore._hrCaseTables = sn_hr_core.hr.TABLE_CASE_EXTENSIONS;
+
+hr_PortalUtilCore._hrTables = hr_PortalUtilCore._hrCaseTables.slice();
+hr_PortalUtilCore._hrTables.push('sn_hr_core_task');
+		
+hr_PortalUtilCore._approvalTables = hr_PortalUtilCore._hrTables.slice();
+hr_PortalUtilCore._approvalTables.push('sc_request');
+
+hr_PortalUtilCore._itTables = new GlideTableHierarchy('sc_request').getAllExtensions();
+hr_PortalUtilCore._smTables = new GlideTableHierarchy('sm_order').getAllExtensions();
+
+hr_PortalUtilCore.prototype = {
+    initialize: function(_gr) {
+		var pluginManager = new GlidePluginManager();
+		
+		this._gr = _gr;
+		this._user = gs.getUserID();
+		this._isAuthorizedSubjectPerson = _gr ? sn_hr_core.hr_Case.userHasSubjectPersonAccess(_gr) : false;
+		this._isLEInstalled = pluginManager.isActive('com.sn_hr_lifecycle_events');
+		this._isSMInstalled = pluginManager.isActive('com.snc.service_management.core');
+		this._caseConfigForTicketPage = this._getCaseConfiguration(_gr);
+		this._caseUtils = new sn_hr_core.hr_CoreUtils();
+		
+		this._maxPersonFields = 6; //Maximum number of Person fields that can be configured
+		this._maxDetailFields = 6; //Maximum number of Detail fields that can be configured
+		
+		this._awaitingAcceptanceState = hr_Constants.CASE_AWAITING_USER_ACCEPTANCE; //Integer for awaiting acceptance state
+		this._draftState = hr_Constants.CASE_DRAFT; //Integer for draft state
+		
+		this._defaultChildTodoLevels = 1; //Default number of levels to display the child todos
+		this._maxChildTodoLevels = 3; //Maximum number of levels to display the child todos
+    },
+	
+	
+	getCaseTitle: function() {
+		var title = this._getTitleFromCaseConfiguration(this._gr, this._caseConfigForTicketPage);
+		if (!gs.nil(title))
+			return title;
+	},
+		
+	/*
+		Return the HR Case Configuration for the user based on conditions :
+		 - If User is Opened For or Approver.
+		 - If User is Subject Person or Task Assignee.
+		 
+	*/
+	_getCaseConfiguration : function(gr) {
+		if (gs.nil(gr) || hr_PortalUtilCore._hrCaseTables.indexOf(gr.sys_class_name.toString()) == -1)
+			return null;
+		var userCaseConfig = new GlideRecord('sn_hr_core_config_case');
+		var isApproverUser = this.isApprovalRequired(String(gr.sys_id), gs.getUserID());
+		var isOpenedForUser = !gs.nil(gr.getElement('opened_for')) ? gs.getUserID() == gr.getElement('opened_for') : false;
+		if (isApproverUser || isOpenedForUser) {
+			if(!gs.nil(gr.hr_service) && !gs.nil(gr.hr_service.header_config_opened_for)) {
+				userCaseConfig.get(String(gr.hr_service.header_config_opened_for));
+				return userCaseConfig;
+			}
+		} 
+		
+		var isSubjectPerson = !gs.nil(gr.getElement('subject_person')) ? gs.getUserID() == gr.getElement('subject_person') : false;
+		var isTaskAssignee = this._isTaskAssignee(String(gr.sys_id));
+		if (isSubjectPerson || isTaskAssignee) {
+			if (!gs.nil(gr.hr_service) && !gs.nil(gr.hr_service.header_config_subject_person)) {
+				userCaseConfig.get(String(gr.hr_service.header_config_subject_person));
+				return userCaseConfig;
+			}
+		}
+
+		if (!gs.nil(userCaseConfig) && !gs.nil(gr.parent) && !gs.nil(gr.hr_service.header_config_subject_person)) 
+			userCaseConfig.get(String(gr.hr_service.header_config_subject_person)); 
+		
+		return userCaseConfig;
+	},
+	
+	_isTaskAssignee : function(caseId){
+		if (GlidePluginManager().isActive('com.glide.granular_service_delegation'))
+			return new hr_Delegation().getDelegatedTasks({ tables: ['sn_hr_core_task'], encoded_query: 'parent=' + caseId }, gs.getUserID(), true).length > 0;
+	
+		var tasks = new GlideRecord('sn_hr_core_task');
+		tasks.addQuery('parent', caseId);
+		tasks.addQuery('assigned_to', gs.getUserID());
+		tasks.setLimit(1);
+		tasks.query();
+		return tasks.hasNext();
+	},
+	
+	_getTitleFromCaseConfiguration : function(caseGr, caseConfiguration) {
+		if (!gs.nil(caseConfiguration)) {
+			if (!gs.nil(caseConfiguration.getValue("custom_title"))) 
+				return new sn_hr_core.hr_Utils().sanitize(String(caseConfiguration.custom_title));
+		
+			if (!gs.nil(caseConfiguration.title)) {
+				var titles = String(caseConfiguration.title).split(',');
+				var fieldTitleString = [];
+				for (var i = 0; i < titles.length ; i++) {
+					var ge = caseGr.getElement(titles[i]+'');
+					if (ge != null && ge.toString() != null && ge.canRead()) 
+						fieldTitleString.push(ge.getDisplayValue());
+				}
+				return String(fieldTitleString.join(' - '));
+			}			
+		}
+		return this._getCaseDescription(String(caseGr.sys_id));
+	},
+	
+	_getCaseDescription: function(caseId) {
+		var gr = new GlideRecord('sn_hr_core_case');
+		var description;
+		if (gr.get(caseId)) {
+			var hr_service = gr.getDisplayValue('hr_service');
+			var subject_person = gr.getDisplayValue('subject_person');
+			var opened_for = gr.getDisplayValue('opened_for');
+			if (!gs.nil(hr_service)) {
+				description = hr_service;
+				if (!gs.nil(subject_person))
+					description = description + ' - ' + subject_person;
+				else if (!gs.nil(opened_for))
+					description = description + ' - ' + opened_for;
+			}
+		}
+		return description;
+	},
+	
+	isOpenedForView: function () {
+		var gr = this._gr;
+		var opened_for = String(gr.opened_for);
+		return opened_for == this._user;
+	},
+
+	getApprovalCount: function(caseId) {
+		var grApproval = new GlideRecordSecure('sysapproval_approver');
+		grApproval.addQuery('sysapproval', caseId);
+		grApproval.query();
+		return grApproval.getRowCount();
+	},
+	
+	isApprovalRequired: function(caseId,userId){
+		var grApprovalRequire = new GlideRecordSecure('sysapproval_approver');
+		grApprovalRequire.addQuery('sysapproval',caseId);
+		grApprovalRequire.addQuery('approver',new sn_hr_core.hr_Utils().getApprovals(userId));
+        grApprovalRequire.setLimit(1);
+		grApprovalRequire.query();
+		return grApprovalRequire.hasNext();
+	},
+				
+    type: 'hr_PortalUtilCore'
+};
+]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2019-04-15 19:02:35</sys_created_on>
+        <sys_id>2b20a3ca233033007e45ff5e17bf6585</sys_id>
+        <sys_mod_count>27</sys_mod_count>
+        <sys_name>hr_PortalUtilCore</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_2b20a3ca233033007e45ff5e17bf6585</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2020-09-01 16:52:53</sys_updated_on>
+    </sys_script_include>
+</record_update>

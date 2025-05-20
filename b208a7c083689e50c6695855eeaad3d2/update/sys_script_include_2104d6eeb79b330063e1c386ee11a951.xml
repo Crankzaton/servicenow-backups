@@ -1,0 +1,230 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>package_private</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.ADTScriptInitiator</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description>Checks if there is an existing execution, 
+if present returns it.
+else 
+1. Create a new Execution log record with hs_tests_context filled,
+2. Initiates a trigger with a call to new HealthScanExecutor.execute(sys_id of #1).
+3. Updates ( creates if doesn't exist )  the execution_status of execution table's record as executing, and hs_execution_log's value with sys_id of #2.
+4. Return the hs_execution_log's sys_id and worker id.
+
+</description>
+        <mobile_callable>false</mobile_callable>
+        <name>ADTScriptInitiator</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var ADTScriptInitiator = Class.create();
+ADTScriptInitiator.prototype = {
+    initialize: function() {},
+
+    triggerHealthScan: function(diagnosticSysID, input) {
+        var healthScanRecord = ADTCRUDHelper.fetchSingleRecordWithSysID(ADTConstants.DIAG_TABLE, diagnosticSysID);
+        var accessibleRoles = healthScanRecord.getValue(ADTConstants.DIAG_COL_ROLE);
+        if(!gs.nil(accessibleRoles) && !gs.getUser().hasRole(accessibleRoles)) {
+            throw new Error(ADTConstants.ERR_MSG_DIAG_UNAUTHORIZED_ACCESS);
+        }
+
+        var existingRecord = this.getExistingHSExecution(diagnosticSysID, input);
+        if (this.isExecutionRunning(existingRecord)) {
+			ADTLogger.log("Found a diagnostic already running", this.type);
+            return this.runningExeResult(existingRecord);
+        } else {
+			ADTLogger.log("Didn't found any running Diagnostic scan so triggering one", this.type);
+            
+            var featureRecord = ADTCRUDHelper.fetchSingleRecordWithSysID(ADTConstants.FEATURE_TABLE, healthScanRecord.getValue(ADTConstants.DIAG_COL_FEATURE));
+            var executionRecord = existingRecord ? existingRecord :
+                this.createAndGetNewExeRecordForHS(diagnosticSysID, input);
+            var executionLogSysID = ADTCRUDHelper.createRecord(ADTConstants.EXEC_LOG_TABLE, {
+                diag_context: JSON.stringify({
+                    applicationSysID: featureRecord.getValue(ADTConstants.FEATURE_COL_APPLICATION),
+                    featureSysID: healthScanRecord.getValue(ADTConstants.DIAG_COL_FEATURE),
+                    diagnosticSysID: diagnosticSysID,
+                    executionSysID: executionRecord.getValue(ADTConstants.SYS_ID),
+                    input: input,
+					type: ADTConstants.EXEC_TYPE_HS_RUN,
+					varSpace: {}
+                })
+            });
+
+            var result = this.assignHealthScanExecutionToWorker(executionLogSysID, healthScanRecord.getValue(ADTConstants.NAME));
+            result.executionLogSysID = executionLogSysID;
+            this.updateStatusAndResultToExeRecord(executionRecord, result);
+            return result;
+        }
+    },
+
+    assignHealthScanExecutionToWorker: function(executionLogSysID, healthScanName) {
+        return this.assignExecutionLogToWorker(executionLogSysID, ADTConstants.PREFIX_HS + healthScanName, ADTConstants.HS_EXECUTOR);
+    },
+
+    assignExecutionLogToWorker: function(executionLogSysID, name, executorName) {
+        var worker = new GlideScriptedHierarchicalWorker();
+        worker.setProgressName(name);
+        worker.setScriptIncludeName(executorName);
+        worker.setScriptIncludeMethod(ADTConstants.EXECUTOR_METHOD);
+        worker.putMethodArg(ADTConstants.EXECUTOR_METHOD_ARG, executionLogSysID);
+        worker.setBackground(true);
+        worker.start();
+		ADTLogger.log("Assigned execution of " +  executionLogSysID + " to " + worker.getProgressID(), this.type);
+        return {
+            sysExecutionTrackerSysID: worker.getProgressID()
+        };
+    },
+
+
+    getExistingHSExecution: function(diagnosticSysID, currentInput) {
+        return this.getExistingExecutionRecord(ADTConstants.EXEC_TYPE_HS_RUN, diagnosticSysID, currentInput);
+    },
+
+    getExistingFSExecution: function(diagnosticSysID, currentInput) {
+        return this.getExistingExecutionRecord(ADTConstants.EXEC_TYPE_FS_RUN, diagnosticSysID, currentInput);
+    },
+
+    getExistingExecutionRecord: function(type, diagnosticSysID, input) {
+        var criteria = {};
+		criteria[ADTConstants.EXEC_COL_TYPE] = type;
+        criteria[ADTConstants.EXEC_COL_SCAN] = diagnosticSysID;
+        criteria[ADTConstants.EXEC_COL_ENTITY_ID] = this.calculateEntityIDs(diagnosticSysID, input);
+        var executionFetcher = ADTCRUDHelper.fetchRecordsWithCriteria(ADTConstants.EXEC_TABLE, criteria);
+		
+        return (executionFetcher.next()) ? executionFetcher : null;
+    },
+
+	calculateEntityIDs: function(diagnosticSysID, input) {
+		var featureSysID = ADTCRUDHelper.fetchSingleRecordWithSysID(ADTConstants.DIAG_TABLE, diagnosticSysID).getValue(ADTConstants.DIAG_COL_FEATURE);
+		ADTLogger.log("Calculating entityID for feature with sys_id: " + featureSysID, this.type);
+		var featureInputFetcher = new GlideRecord(ADTConstants.FTR_INPUTS_TABLE);
+		featureInputFetcher.addQuery(ADTConstants.FTR_INPUTS_COL_FTR, featureSysID);
+		featureInputFetcher.orderBy(ADTConstants.ORDER);
+		featureInputFetcher.query();
+		
+		var entityID = "";
+		while(featureInputFetcher.next()) {
+			entityID += featureInputFetcher.getValue(ADTConstants.FTR_INPUTS_COL_KEY_NAME);
+			entityID += ":";
+			if(!gs.nil(input[featureInputFetcher.getValue(ADTConstants.FTR_INPUTS_COL_KEY_NAME)])) {
+				entityID += input[featureInputFetcher.getValue(ADTConstants.FTR_INPUTS_COL_KEY_NAME)];
+			}
+		}
+		entityID = entityID.substring(0, 1000);
+		ADTLogger.log("Calculated entity_ids as " + entityID, this.type);
+		return entityID;
+	},
+	
+    triggerFixScript: function(diagnosticSysID, input, failedParentSysID) {
+
+        var failureParentRecord = ADTCRUDHelper.fetchSingleRecordWithSysID(ADTConstants.EXEC_LOG_TABLE, failedParentSysID);
+
+        var parentsContext = JSON.parse(failureParentRecord.getValue(ADTConstants.EXEC_LOG_COL_CONTEXT));
+
+        var fixScriptAccessRoles = ADTCRUDHelper.fetchSingleRecordWithSysID(ADTConstants.SCRIPT_TABLE, parentsContext.failureData.scriptSysID).getValue(ADTConstants.SCRIPT_COL_FIX_ACCESS_ROLES);
+
+        if(!gs.nil(fixScriptAccessRoles) && !gs.getUser().hasRole(fixScriptAccessRoles)) {
+            throw new Error(ADTConstants.ERR_MSG_FIX_SCRIPT_UNAUTHORIZED_ACCESS);
+        }
+
+
+        //overriding the current input with diagnostic input
+        input = parentsContext.input;
+
+        var existingRecord = this.getExistingFSExecution(diagnosticSysID, input);
+        if (this.isExecutionRunning(existingRecord)) {
+			ADTLogger.log("Found an already running execution record", this.type);
+            return this.runningExeResult(existingRecord);
+        } else {
+			ADTLogger.log("Didn't find an running execution record", this.type);
+
+            var executionRecord = !gs.nil(existingRecord) ? existingRecord :
+                this.createAndGetExeRecordForFS(diagnosticSysID, parentsContext, failedParentSysID, input);
+
+			ADTLogger.log("Copying the context parameters from parent context " + JSON.stringify(parentsContext), this.type);
+			
+            var executionLogSysID = ADTCRUDHelper.createRecord(ADTConstants.EXEC_LOG_TABLE, {
+                diag_context: JSON.stringify({
+                    applicationSysID: parentsContext.applicationSysID,
+                    featureSysID: parentsContext.featureSysID,
+                    executionSysID: executionRecord.getValue(ADTConstants.SYS_ID),
+                    parentSysID: failedParentSysID,
+					diagnosticSysID: diagnosticSysID,
+                    input: input,
+					type: ADTConstants.EXEC_TYPE_FS_RUN,
+					failedScriptSysID: parentsContext.failureData.scriptSysID,
+					varSpace: parentsContext.varSpace
+                })
+            });
+
+            var result = this.assignFixScriptExecutionToWorker(executionLogSysID, diagnosticSysID);
+            result.executionLogSysID = executionLogSysID;
+
+            executionRecord.setValue(ADTConstants.EXEC_COL_PARENT_FAILURE, failedParentSysID);
+            this.updateStatusAndResultToExeRecord(executionRecord, result);
+
+            return result;
+
+        }
+    },
+
+    assignFixScriptExecutionToWorker: function(executionLogSysID, diagnosticSysID) {
+        return this.assignExecutionLogToWorker(executionLogSysID, ADTConstants.PREFIX_FS + diagnosticSysID, ADTConstants.FS_EXECUTOR);
+    },
+
+    createAndGetNewExeRecordForHS: function(diagnosticSysID, input) {
+        var record = {};
+        record[ADTConstants.EXEC_COL_TYPE] = ADTConstants.EXEC_TYPE_HS_RUN;
+        record[ADTConstants.EXEC_COL_SCAN] = diagnosticSysID;
+        record[ADTConstants.EXEC_COL_ENTITY_ID] = this.calculateEntityIDs(diagnosticSysID, input);
+        return ADTCRUDHelper.createAndGetRecord(ADTConstants.EXEC_TABLE, record);
+    },
+
+    isExecutionRunning: function(executionRecord) {
+        return executionRecord &&
+            ADTConstants.STATUS_EXECUTING === executionRecord.getValue(ADTConstants.EXEC_STATUS);
+    },
+
+    runningExeResult: function(existingRecord) {
+        return {
+            executionLogSysID: existingRecord.getValue(ADTConstants.EXEC_COL_EXECUTION_LOG),
+            sysExecutionTrackerSysID: existingRecord.getValue(ADTConstants.EXEC_COL_SYS_EXE_TRACKER)
+        };
+    },
+
+    createAndGetExeRecordForFS: function(diagnosticSysID, parentsContext, failedParentSysID, input) {
+        var record = {};
+        record[ADTConstants.EXEC_COL_TYPE] = ADTConstants.EXEC_TYPE_FS_RUN;
+        record[ADTConstants.EXEC_COL_SCAN] = diagnosticSysID;
+        record[ADTConstants.EXEC_COL_ENTITY_ID] = this.calculateEntityIDs(diagnosticSysID, input);
+        record[ADTConstants.EXEC_COL_PARENT_FAILURE] = failedParentSysID;
+
+        return ADTCRUDHelper.createAndGetRecord(ADTConstants.EXEC_TABLE, record);
+    },
+
+    updateStatusAndResultToExeRecord: function(executionRecord, result) {
+        executionRecord.setValue(ADTConstants.EXEC_STATUS, ADTConstants.STATUS_EXECUTING);
+        executionRecord.setValue(ADTConstants.EXEC_COL_EXECUTION_LOG, result.executionLogSysID);
+        executionRecord.setValue(ADTConstants.EXEC_COL_SYS_EXE_TRACKER, result.sysExecutionTrackerSysID);
+		ADTLogger.log("Updating status of execution as " + JSON.stringify(result), this.type);
+        executionRecord.update();
+    },
+
+
+
+    type: 'ADTScriptInitiator'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2019-08-19 09:44:51</sys_created_on>
+        <sys_id>2104d6eeb79b330063e1c386ee11a951</sys_id>
+        <sys_mod_count>88</sys_mod_count>
+        <sys_name>ADTScriptInitiator</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_2104d6eeb79b330063e1c386ee11a951</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2019-09-24 19:03:56</sys_updated_on>
+    </sys_script_include>
+</record_update>

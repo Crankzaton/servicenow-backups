@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>package_private</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.FSMInstallBaseUtil</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description/>
+        <mobile_callable>false</mobile_callable>
+        <name>FSMInstallBaseUtil</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var FSMInstallBaseUtil = Class.create();
+FSMInstallBaseUtil.prototype = {
+    initialize: function() {},
+
+    WM_TASK_TABLE: 'wm_task',
+    COMPANY_TABLE: 'core_company',
+    INSTALL_BASE_ITEM_TABLE: 'sn_install_base_item',
+    SOLD_PRODUCT_TABLE: 'sn_install_base_sold_product',
+    INSTALLED_PRODUCT_M2M_TABLE: 'sn_install_base_m2m_installed_product',
+    CUSTOMER_CONTACT_TABLE: 'customer_contact',
+    AFFECTED_INSTALL_BASE_TABLE: 'sn_install_base_m2m_affected_install_base',
+
+    /**
+     * Generates an Install Base Item encoded query to be used as a Reference Qualifier
+     * @param {GlideRecord} current - current Work Order or Work Order Task GlideRecord
+     * @returns {String} encoded query
+     */
+    getInstallBaseItemRefQual: function(current) {
+        var currentOrParent = current.getTableName() === this.WM_TASK_TABLE ? current.parent : current;
+        var installBaseItemGR = new GlideRecord(this.INSTALL_BASE_ITEM_TABLE);
+
+        if (!currentOrParent.account.nil() && !currentOrParent.company.nil() && this._isCompanyAccount(currentOrParent.company)) {
+            installBaseItemGR.addQuery('account', currentOrParent.account).addOrCondition('account', currentOrParent.company);
+        } else if (!currentOrParent.account.nil()) {
+            installBaseItemGR.addQuery('account', currentOrParent.account);
+        } else if (!currentOrParent.company.nil() && this._isCompanyAccount(currentOrParent.company)) {
+            installBaseItemGR.addQuery('account', currentOrParent.company);
+        }
+
+        if (!currentOrParent.contact.nil() && !currentOrParent.caller.nil() && this._isContactUser(currentOrParent.caller)) {
+            installBaseItemGR.addQuery('contact', currentOrParent.contact).addOrCondition('contact', currentOrParent.caller);
+        } else if (!currentOrParent.contact.nil()) {
+            installBaseItemGR.addQuery('contact', currentOrParent.contact);
+        } else if (!currentOrParent.caller.nil() && this._isContactUser(currentOrParent.caller)) {
+            installBaseItemGR.addQuery('contact', currentOrParent.caller);
+        }
+
+        if (!currentOrParent.consumer.nil()) {
+            installBaseItemGR.addQuery('consumer', currentOrParent.consumer);
+        }
+
+        return installBaseItemGR.getEncodedQuery();
+    },
+
+    getSoldProductRefQual: function(current) {
+        var currentOrParent = current.getTableName() === this.WM_TASK_TABLE ? current.parent : current;
+        var soldProductGR = new GlideRecord(this.SOLD_PRODUCT_TABLE);
+
+        if (!current.install_base_item.nil()) {
+            soldProductGR.addQuery('sys_id', 'IN', this.getSoldProductsFromInstallBaseItem(current.install_base_item));
+        }
+
+        if (!currentOrParent.account.nil()) {
+            soldProductGR.addQuery('account', currentOrParent.account);
+        }
+
+        if (!currentOrParent.contact.nil()) {
+            soldProductGR.addQuery('contact', currentOrParent.contact);
+        } else if (!currentOrParent.caller.nil() && this._isContactUser(currentOrParent.caller)) {
+            soldProductGR.addQuery('contact', currentOrParent.caller);
+        }
+
+        if (!currentOrParent.consumer.nil()) {
+            soldProductGR.addQuery('consumer', currentOrParent.consumer);
+        }
+
+        return soldProductGR.getEncodedQuery();
+    },
+
+    getInstallBaseItemsFromSoldProduct: function(soldProduct) {
+        var installBaseItems = [];
+
+        var installedProductM2MGR = new GlideRecord(this.INSTALLED_PRODUCT_M2M_TABLE);
+        installedProductM2MGR.addQuery('sold_product', soldProduct);
+        installedProductM2MGR.query();
+
+        while (installedProductM2MGR.next()) {
+            installBaseItems.push(installedProductM2MGR.getValue('install_base_item'));
+        }
+
+        return installBaseItems;
+    },
+
+    getSoldProductsFromInstallBaseItem: function(installBaseItem) {
+        var soldProducts = [];
+
+        var installedProductM2MGR = new GlideRecord(this.INSTALLED_PRODUCT_M2M_TABLE);
+        installedProductM2MGR.addQuery('install_base_item', installBaseItem);
+        installedProductM2MGR.query();
+
+        while (installedProductM2MGR.next()) {
+            soldProducts.push(installedProductM2MGR.getValue('sold_product'));
+        }
+
+        return soldProducts;
+    },
+
+    getSingleInstallBaseItemFromCase: function(caseSysId) {
+        if (!caseSysId) {
+            return null;
+        }
+
+        var affectedInstallBaseItemGR = new GlideRecord(this.AFFECTED_INSTALL_BASE_TABLE);
+        affectedInstallBaseItemGR.addQuery('csm_case', caseSysId);
+        affectedInstallBaseItemGR.query();
+
+        if (affectedInstallBaseItemGR.getRowCount() === 1 && affectedInstallBaseItemGR.next()) {
+            return FSMUtil.getRecord(this.INSTALL_BASE_ITEM_TABLE, affectedInstallBaseItemGR.getValue('install_base_item'));
+        }
+
+        return null;
+    },
+
+    /**
+     * Get Install Base Item Location from ci, account, or contact, in that order
+     * @param {string} installBaseItemSysId - install base item sys_id
+     * @returns {string} cmn_location sys_id
+     */
+    getInstallBaseItemLocation: function(installBaseItemSysId) {
+        var installBaseItemGR = FSMUtil.getRecord(this.INSTALL_BASE_ITEM_TABLE, installBaseItemSysId);
+        if (!installBaseItemGR) {
+            return null;
+        }
+
+        if (!installBaseItemGR.configuration_item.nil() && !installBaseItemGR.configuration_item.location.nil()) {
+            return installBaseItemGR.configuration_item.location.sys_id + '';
+        }
+
+        if (!installBaseItemGR.account.nil()) {
+            var accountLocation = this._getAccountPrimaryLocation(installBaseItemGR.getValue('account'));
+            if (accountLocation) {
+                return accountLocation.sys_id + '';
+            }
+        }
+
+        if (!installBaseItemGR.contact.nil() && !installBaseItemGR.contact.location.nil()) {
+            return installBaseItemGR.contact.location.sys_id + '';
+        }
+
+        return null;
+    },
+
+    /**
+     * Get Primary Account Location
+     * @param {string} accountSysId - account sys_id
+     * @returns {GlideRecord} cmn_location GlideRecord
+     */
+    _getAccountPrimaryLocation: function(accountSysId) {
+        var accountLocationGR = new GlideRecord(AddressMgmtConstants.TABLE_ACCOUNT_ADDRESS_RELATIONSHIP);
+        accountLocationGR.addQuery('account', accountSysId);
+        accountLocationGR.addQuery('primary', true);
+        accountLocationGR.query();
+        if (accountLocationGR.next()) {
+            return FSMUtil.getRecord('cmn_location', accountLocationGR.location);
+        }
+        return null;
+    },
+
+    _isContactUser: function(user) {
+        if (!user) {
+            return false;
+        }
+        return user.getRefRecord().getTableName() === this.CUSTOMER_CONTACT_TABLE;
+    },
+
+    /**
+     * Determines whether the Company record is an Account
+     * @param {String} company - company sys_id
+     * @returns {Boolean} true when company class is Account
+     */
+    _isCompanyAccount: function(company) {
+    var companyGR = new GlideRecord(this.COMPANY_TABLE);
+        if (!companyGR.get(company))
+            return false;
+        return companyGR.getClassDisplayValue() === 'Account';
+    },
+
+    type: 'FSMInstallBaseUtil'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2022-04-04 22:14:44</sys_created_on>
+        <sys_id>9af07b53c32201102aeda73f9140dd4f</sys_id>
+        <sys_mod_count>1</sys_mod_count>
+        <sys_name>FSMInstallBaseUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_9af07b53c32201102aeda73f9140dd4f</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2022-05-04 16:27:05</sys_updated_on>
+    </sys_script_include>
+</record_update>

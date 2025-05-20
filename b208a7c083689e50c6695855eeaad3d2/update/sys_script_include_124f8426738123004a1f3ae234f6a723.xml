@@ -1,0 +1,202 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.hr_caseMyRequestFilterUtil</api_name>
+        <caller_access>2</caller_access>
+        <client_callable>false</client_callable>
+        <description/>
+        <mobile_callable>false</mobile_callable>
+        <name>hr_caseMyRequestFilterUtil</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var hr_caseMyRequestFilterUtil = Class.create();
+
+//HR Case Extension Tables
+hr_caseMyRequestFilterUtil.hrCaseTables = sn_hr_core.hr.TABLE_CASE_EXTENSIONS.toString();
+
+hr_caseMyRequestFilterUtil.prototype = {
+    initialize: function() {
+        this._user = gs.getUserID();
+        this.cases = [];
+    },
+
+    hr_caseMyRequestFilter: function(checkCompleted) {
+
+        var grCase = new GlideRecord('sn_hr_core_case');
+        grCase.addQuery('opened_for', this._user).addOrCondition('hr_service.subject_person_access', true).addCondition('subject_person', this._user);
+        grCase.addQuery('state', '!=', hr_Constants.CASE_DRAFT);
+        if (checkCompleted) {
+            grCase.addQuery('active', 'false');
+            grCase.addNotNullQuery('closed_at');
+        } else
+            grCase.addActiveQuery();
+
+        grCase.orderBy('number');
+        grCase.query();
+        while (grCase.next())
+            this._hrCaseParent(grCase, checkCompleted);
+
+        var grTask = new GlideRecord('sn_hr_core_task');
+        grTask.addQuery('assigned_to', this._user);
+        grTask.addQuery('state', '!=',hr_Constants.TASK_DRAFT);
+        grTask.addQuery('parent.sys_class_name', 'INSTANCEOF', 'sn_hr_core_case');
+        grTask.addQuery('parent.state', '!=',hr_Constants.CASE_DRAFT);
+        if (checkCompleted) {
+            grTask.addQuery('active', 'false');
+            grTask.addNotNullQuery('closed_at');
+            grTask.addQuery('parent.active', 'false');
+            grTask.orderByDesc('parent.closed_at');
+        } else {
+            grTask.addQuery('parent.active', 'true');
+            grTask.orderBy('number');
+        }
+        grTask.query();
+        while (grTask.next()) {
+            var grCaseParent = grTask.parent.getRefRecord();
+            this._hrCaseParent(grCaseParent, checkCompleted);
+        }
+
+        if (GlidePluginManager.isActive('com.snc.document_templates')) {
+            var grTask = new GlideRecord('sn_doc_task');
+            grTask.addQuery('assigned_to', this._user);
+            grTask.addQuery('state', '!=', hr_Constants.DOCTASK_DRAFT);
+            grTask.addQuery('parent.sys_class_name', 'INSTANCEOF', 'sn_hr_core_case');
+            grTask.addQuery('parent.state', '!=', hr_Constants.CASE_DRAFT);
+            if (checkCompleted) {
+            	var inQuery=[hr_Constants.DOCTASK_CLOSED_COMPLETE,hr_Constants.DOCTASK_CLOSED_INCOMPLETE,hr_Constants.DOCTASK_CANCELLED];
+            	
+                grTask.addQuery('state', 'IN', inQuery);
+                grTask.addQuery('active', 'false');
+                grTask.addNotNullQuery('closed_at');
+                grTask.addQuery('parent.active', 'false');
+                grTask.orderByDesc('parent.closed_at');
+                grTask.orderBy('number');
+            } else {
+            	var inQuery = [hr_Constants.DOCTASK_DRAFT,hr_Constants.DOCTASK_WORK_IN_PROGRESS];
+            	
+                grTask.addQuery('state', 'IN',inQuery);
+                grTask.addQuery('parent.active', 'true');
+                grTask.addQuery('active', 'true');
+                grTask.orderBy('number');
+            }
+            grTask.query();
+            while (grTask.next()) {
+                var grCaseParent = grTask.parent.getRefRecord();
+                this._hrCaseParent(grCaseParent, checkCompleted);
+            }
+        }
+
+        var grApproval = new GlideRecord('sysapproval_approver');
+        grApproval.addQuery('approver', this._user);
+        grApproval.addQuery('sysapproval.sys_class_name', 'INSTANCEOF', 'sn_hr_core_case');
+        if (checkCompleted) {
+            grApproval.addQuery('state', 'IN', 'approved, rejected,not_required');
+            grApproval.addQuery('sysapproval.active', 'false');
+            grApproval.orderByDesc('sysapproval.closed_at');
+        } else {
+            grApproval.addQuery('sysapproval.active', 'true');
+        }
+        grApproval.query();
+        while (grApproval.next()) {
+            var parentRecord = grApproval;
+            parentRecord = parentRecord.sysapproval.getRefRecord();
+            this._hrCaseParent(parentRecord, checkCompleted);
+
+        }
+
+        return this.cases;
+    },
+
+    //consider the case for the input GlideRecord if parent is not already considered. checkCompleted is false for getting open cases and true for closed cases
+    _hrCaseParent: function(grCase, checkCompleted) {
+        var parentRecord = grCase;
+        var addCase = true;
+        var level = 3;
+
+        while (addCase && level >= 1) {
+            level--;
+            if (checkCompleted && (parentRecord.getValue('active') == 1) && (parentRecord.getValue('opened_for') == this._user || sn_hr_core.hr_Case.userHasSubjectPersonAccess(parentRecord)))
+                addCase = false;
+            else if (GlidePluginManager.isActive('com.sn_jny') && parentRecord.getValue('jny_context'))
+                addCase = false;
+            else if (parentRecord.getUniqueValue() && parentRecord.isValidRecord() && (hr_caseMyRequestFilterUtil.hrCaseTables.indexOf(parentRecord.getRecordClassName()) >= 0)) { //Exclude the record for which parents are already considered for display
+                if (this.cases.indexOf(parentRecord.getUniqueValue().toString()) >= 0 && (parentRecord.getValue('opened_for') == this._user || sn_hr_core.hr_Case.userHasSubjectPersonAccess(parentRecord))) // choose not to display case only if its parent already display and is openedFor or Subject Person case
+                    addCase = false;
+                else
+                    parentRecord = parentRecord.parent.getRefRecord();
+            } else
+                break;
+
+        }
+
+        if (addCase)
+            this.cases.push(grCase.getUniqueValue().toString());
+    },
+
+    hr_scRequestMyRequestFilter: function(checkCompleted) {
+        var approvalTable = ['sc_request'];
+
+        var grApproval = new GlideRecord('sysapproval_approver');
+        grApproval.addQuery('approver', this._user);
+        grApproval.addQuery('sysapproval.sys_class_name', 'IN', approvalTable);
+        if (checkCompleted) {
+            grApproval.addQuery('state', 'IN', 'approved, rejected,not_required');
+            grApproval.addQuery('sysapproval.active', 'false');
+            grApproval.orderByDesc('sysapproval.closed_at');
+        } else
+            grApproval.addQuery('sysapproval.active', 'true');
+
+        grApproval.query();
+        while (grApproval.next()) {
+            var parentRecord = grApproval;
+            parentRecord = parentRecord.sysapproval.getRefRecord();
+
+            if (parentRecord.getUniqueValue() && parentRecord.isValidRecord()) {
+                if (this.cases.indexOf(parentRecord.getUniqueValue().toString()) < 0)
+                    this.cases.push(parentRecord.getUniqueValue().toString());
+            }
+        }
+
+        return this.cases;
+    },
+
+    hr_universalRequestMyRequestFilter: function(checkCompleted) {
+        var grCase = new GlideRecord('sn_hr_core_case');
+        grCase.addQuery('hr_service.subject_person_access', true);
+        grCase.addQuery('subject_person', this._user);
+        grCase.addEncodedQuery("opened_forNSAMEASsubject_person");
+        grCase.addQuery('state', '!=', hr_Constants.CASE_DRAFT);
+        grCase.addNotNullQuery('universal_request');
+        if (checkCompleted) {
+            grCase.addQuery('active', 'false');
+            grCase.addQuery('universal_request.active', 'false');
+            grCase.addNotNullQuery('closed_at');
+        } else {
+            grCase.addActiveQuery();
+            grCase.addQuery('universal_request.active', 'true');
+        }
+        grCase.orderBy('number');
+        grCase.query();
+
+        while (grCase.next()) {
+            this.cases.push(grCase.getUniqueValue().toString());
+        }
+
+        return this.cases;
+    },
+    type: 'hr_caseMyRequestFilterUtil'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2018-10-12 07:10:32</sys_created_on>
+        <sys_id>124f8426738123004a1f3ae234f6a723</sys_id>
+        <sys_mod_count>136</sys_mod_count>
+        <sys_name>hr_caseMyRequestFilterUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_124f8426738123004a1f3ae234f6a723</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2022-06-06 18:42:35</sys_updated_on>
+    </sys_script_include>
+</record_update>

@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>package_private</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.TwilioCallbackClient</api_name>
+        <caller_access/>
+        <client_callable>true</client_callable>
+        <description/>
+        <mobile_callable>false</mobile_callable>
+        <name>TwilioCallbackClient</name>
+        <sandbox_callable>true</sandbox_callable>
+        <script><![CDATA[var TwilioCallbackClient = Class.create();
+TwilioCallbackClient.prototype = Object.extendsObject(global.AbstractAjaxProcessor, {
+
+	TABLES: {
+		CALLBACK_TEST: 'sn_twilio_direct_callback_test'
+	},
+
+	CALLBACK_TEST_STATUS: {
+		INIT: 'init',
+		IN_PROGRESS: 'in_progress',
+		SUCCESS: 'success',
+		FAILURE: 'failure',
+		CANCELED: 'canceled',
+		TEST_FAILURE: 'test_failure'
+	},
+
+	getPhoneNumbers: function() {
+		var isNotifyInstalled = GlidePluginManager.isActive('com.snc.notify');
+		if (isNotifyInstalled)
+			return this.getNotifyNumbers();
+		return this.getTwilioNumbers();
+	},
+
+	getTwilioNumbers: function() {
+		var twNumbers = [];
+		var twDirectClient = new TwilioDirectClient();
+		var phs = twDirectClient.getPhoneNumbers()['phs'];
+		for (var i = 0; i < phs.length; i ++) {
+			//keeping the 'name' same as 'number' here as there will be no label available without Notify
+			twNumbers.push({
+				name: phs[i].number,
+				number: phs[i].number,
+				sms: phs[i].hasSms,
+				call: phs[i].hasVoice
+			});
+		}
+		return JSON.stringify(twNumbers);
+	},
+
+	getNotifyNumbers: function() {
+		var notifyNumbers = [];
+		var notifyNumGr = new GlideRecord('notify_number');
+		notifyNumGr.addActiveQuery();
+		notifyNumGr.query();
+		while (notifyNumGr.next()) {
+			notifyNumbers.push({
+				name: notifyNumGr.getValue('name'),
+				number: notifyNumGr.getValue('number'),
+				sms: notifyNumGr.getValue('has_sms_out') === 'yes',
+				call: notifyNumGr.getValue('has_voice_out') === 'yes'
+			});
+		}
+		return JSON.stringify(notifyNumbers);
+	},
+
+	validatePhoneNumber: function() {
+		var response = {
+			isToNumValid: false,
+			errors: []
+		};
+		var e164Regex = /^\+?[1-9]\d{1,14}$/;
+		var isNotifyInstalled = GlidePluginManager.isActive('com.snc.notify');
+		var toPhNum = this.getParameter('sysparm_toPhNum');
+		if (isNotifyInstalled) {
+			var nutils = new global.NotifyUtil();
+
+			if (toPhNum.length > 0 && nutils.validatePhoneNumber(toPhNum))
+				response.isToNumValid = true;
+			else
+				response.errors.push(gs.getMessage("Number entered in the 'To' field is invalid."));
+
+			return JSON.stringify(response);
+		}
+
+		if (toPhNum.match(e164Regex))
+			response.isToNumValid = true;
+		else
+			response.errors.push(gs.getMessage("Number entered in the 'To' field is invalid."));
+
+		return JSON.stringify(response);
+	},
+
+	testSMS: function() {
+		var fromNum = this.getParameter('sysparm_fromNum');
+		var toNum = this.getParameter('sysparm_toNum');
+		var message = this.getParameter('sysparm_message');
+		var startTime = new GlideDateTime();
+		var callbackTestGr = this.createCallbackTestGr(startTime, 'sms');
+		this.registerScheduledEvent(callbackTestGr, startTime);
+		var resp = new TwilioCallbackTestSMSRecipe().start(fromNum, toNum, message, callbackTestGr.getUniqueValue());
+		if (!resp)
+			return "error";
+		this.updateContextOnCallbackTest(callbackTestGr, resp);
+	},
+
+	testCall: function() {
+		var fromNum = this.getParameter('sysparm_fromNum');
+		var toNum = this.getParameter('sysparm_toNum');
+		var message = this.getParameter('sysparm_message');
+		var startTime = new GlideDateTime();
+		var callbackTestGr = this.createCallbackTestGr(startTime, 'call');
+		this.registerScheduledEvent(callbackTestGr, startTime);
+		var resp = new TwilioCallbackTestCallRecipe().start(fromNum, toNum, message, callbackTestGr.getUniqueValue());
+		if (!resp)
+			return "error";
+		this.updateContextOnCallbackTest(callbackTestGr, resp);
+	},
+
+	updateContextOnCallbackTest: function(callbackTestGr, ctxID) {
+		callbackTestGr.setValue('ctx', ctxID);
+		callbackTestGr.update();
+	},
+	createCallbackTestGr: function(startTime, testType) {
+		var callbackTestGr = new GlideRecord(this.TABLES.CALLBACK_TEST);
+		callbackTestGr.setValue('state', this.CALLBACK_TEST_STATUS.IN_PROGRESS);
+		callbackTestGr.setValue('type', testType);
+		callbackTestGr.setValue('started_on', startTime);
+		callbackTestGr.insert();
+		if (callbackTestGr.isValidRecord())
+			return callbackTestGr;
+		return null;
+	},
+
+	registerScheduledEvent: function(callbackTestGr, startTime) {
+		var secondsToWait = parseInt(gs.getProperty('sn_twilio_direct.tw.cbtest.timetowait', '2')) * 60;
+		startTime.addSeconds(secondsToWait);
+		gs.eventQueueScheduled('sn_twilio_direct.fail.callback.test', callbackTestGr, null, null, startTime);
+	},
+
+	cancelActiveTest: function() {
+		var cbTestId = this.getParameter('sysparm_callback_test_id');
+		var callbackTestGr = new GlideRecord(this.TABLES.CALLBACK_TEST);
+		callbackTestGr.get(cbTestId);
+		if (callbackTestGr.getValue('state') + '' === this.CALLBACK_TEST_STATUS.IN_PROGRESS) {
+			callbackTestGr.setValue('state', this.CALLBACK_TEST_STATUS.CANCELED);
+			callbackTestGr.setValue('ended_on', new GlideDateTime());
+			callbackTestGr.update();
+			this.releaseContext(callbackTestGr.getValue('ctx'));
+			return true;
+		}
+		return false;
+	},
+
+	releaseContext: function(ctxID) {
+		var apiCtx = ApiContext.get(ctxID);
+		apiCtx.release();
+	},
+
+	type: 'TwilioCallbackClient'
+});]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2019-01-24 10:32:02</sys_created_on>
+        <sys_id>20b2680887532300560cd61e36cb0b47</sys_id>
+        <sys_mod_count>77</sys_mod_count>
+        <sys_name>TwilioCallbackClient</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_20b2680887532300560cd61e36cb0b47</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2022-08-25 12:58:59</sys_updated_on>
+    </sys_script_include>
+</record_update>

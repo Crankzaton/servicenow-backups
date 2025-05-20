@@ -1,0 +1,180 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.ScrumRollup</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description/>
+        <mobile_callable>false</mobile_callable>
+        <name>ScrumRollup</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var ScrumRollup = Class.create();
+
+ScrumRollup.prototype = {
+    initialize: function() {
+        this.configRollup();
+        this.stateUtil = new ScrumStatesUtil(this.childTable);
+
+        this.map = {
+            'completed_count': this.setCompletedCount,
+            'total_story_count': this.setTotalStoryCount,
+            'total_estimate': this.setTotalEstimate,
+            'completed_estimate': this.setCompletedEstimate,
+            'missing_estimates': this.setMissingEstimates,
+            'percent_complete_by_count': this.setPercentByCount,
+            'percent_complete_by_estimate': this.setPercentByEstimate
+        };
+    },
+
+    configRollup: function() {
+        this.childTable = 'rm_story';
+        this.parentTable = 'rm_epic';
+        this.parentField = 'epic';
+    },
+
+    handleRollupsWhenStoryFieldsChange: function(previous, current) {
+        var rollupFieldsToUpdate = [];
+
+        var hasPointsChanged = current.story_points.changes();
+        var completeStateToggled = this.stateUtil.completeStateToggled(current.getValue('state'), previous.getValue('state'));
+
+        if (hasPointsChanged || completeStateToggled) {
+            rollupFieldsToUpdate.push('completed_estimate');
+            rollupFieldsToUpdate.push('percent_complete_by_estimate');
+        }
+
+        if (hasPointsChanged) {
+            rollupFieldsToUpdate.push('total_estimate');
+            if (current.story_points.nil() || previous.story_points.nil())
+                rollupFieldsToUpdate.push('missing_estimates');
+        }
+
+        if (completeStateToggled) {
+            rollupFieldsToUpdate.push('completed_count');
+            rollupFieldsToUpdate.push('percent_complete_by_count');
+        }
+
+        this.updateRollups(current.getValue(this.parentField), rollupFieldsToUpdate);
+    },
+
+    handleRollupsWhenStoryIsAddedOrRemovedFromParent: function(storyRec, completeStateToggled) {
+        var rollupFieldsToUpdate = [];
+
+        var isPointsNil = storyRec.story_points.nil();
+        var updateCompletedFields = this.stateUtil.isCompletedState(storyRec.getValue('state'));
+
+        if (completeStateToggled)
+            updateCompletedFields = true;
+
+        rollupFieldsToUpdate.push('total_story_count');
+        rollupFieldsToUpdate.push('percent_complete_by_count');
+
+        if (!isPointsNil) {
+            rollupFieldsToUpdate.push('total_estimate');
+            rollupFieldsToUpdate.push('percent_complete_by_estimate');
+        } else
+            rollupFieldsToUpdate.push('missing_estimates');
+
+        if (updateCompletedFields) {
+            rollupFieldsToUpdate.push('completed_count');
+
+            if (!isPointsNil)
+                rollupFieldsToUpdate.push('completed_estimate');
+        }
+
+        this.updateRollups(storyRec.getValue(this.parentField), rollupFieldsToUpdate);
+    },
+
+    updateRollups: function(parentId, rollupFields) {
+        this.parentId = parentId;
+        this.gr = new GlideRecord(this.parentTable);
+        if (this.gr.get(parentId)) {
+            for (var field in this.map)
+                if (rollupFields.indexOf(field) > -1)
+                    this.map[field].call(this);
+
+            this.gr.update();
+        }
+    },
+
+    setCompletedCount: function() {
+        var encodedQuery = "stateIN" + this.stateUtil.getCompletedStates();
+        this.setAggregateValue('completed_count', 'COUNT', null, encodedQuery);
+    },
+
+    setTotalStoryCount: function() {
+        this.setAggregateValue('total_story_count', 'COUNT');
+    },
+
+    setCompletedEstimate: function() {
+        var encodedQuery = "stateIN" + this.stateUtil.getCompletedStates();
+        this.setAggregateValue('completed_estimate', 'SUM', 'story_points', encodedQuery);
+    },
+
+    setTotalEstimate: function() {
+        this.setAggregateValue('total_estimate', 'SUM', 'story_points', null);
+    },
+
+    setPercentByCount: function() {
+        this.setPercentComplete('percent_complete_by_count', 'completed_count', 'total_story_count');
+    },
+
+    setPercentByEstimate: function() {
+        this.setPercentComplete('percent_complete_by_estimate', 'completed_estimate', 'total_estimate');
+    },
+
+    setMissingEstimates: function() {
+        this.setAggregateValue('missing_estimates', 'COUNT', null, "story_points=NULL");
+    },
+
+    setPercentComplete: function(percentageField, completedField, totalField) {
+        var completedCount = this.gr.getValue(completedField);
+        var totalCount = this.gr.getValue(totalField);
+
+        if (totalCount === '0')
+            this.gr.setValue(percentageField, '0');
+        else {
+            var percent = (completedCount / totalCount) * 100;
+            this.gr.setValue(percentageField, percent);
+        }
+    },
+
+    setAggregateValue: function(rollupField, aggregateType, aggregateField, encodedQuery) {
+        var count;
+
+        var ga = new GlideAggregate(this.childTable);
+        ga.addAggregate(aggregateType, aggregateField);
+        ga.addQuery(this.parentField, this.parentId);
+        ga.addQuery('state', 'NOT IN', this.stateUtil.getCancelledStates()).addOrCondition('state', 'NULL');
+        ga.setGroup(false);
+
+        if (encodedQuery)
+            ga.addEncodedQuery(encodedQuery);
+        ga.query();
+
+        if (ga.next())
+            count = ga.getAggregate(aggregateType, aggregateField);
+
+        if (JSUtil.nil(count))
+            count = 0;
+
+        this.gr.setValue(rollupField, count);
+    },
+
+    type: 'ScrumRollup'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2018-12-14 09:31:30</sys_created_on>
+        <sys_id>258bc9f6cbd2230078e8dcbcf7076db0</sys_id>
+        <sys_mod_count>254</sys_mod_count>
+        <sys_name>ScrumRollup</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_258bc9f6cbd2230078e8dcbcf7076db0</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2020-11-11 16:43:46</sys_updated_on>
+    </sys_script_include>
+</record_update>

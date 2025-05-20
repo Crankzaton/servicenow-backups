@@ -1,0 +1,261 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>package_private</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.InstallBaseRecordValidatorSNC</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description>Customers should not change this class directly but override methods in the subclass.&#13;
+This class is never called directly.&#13;
+&#13;
+This class contains validation methods of various attributes: "parent install base item, location, product, Configuration Item, product, and Asset"</description>
+        <mobile_callable>false</mobile_callable>
+        <name>InstallBaseRecordValidatorSNC</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var InstallBaseRecordValidatorSNC = Class.create();
+InstallBaseRecordValidatorSNC.prototype = {
+    initialize: function() {
+        this.ibUtil = new sn_install_base.InstallBaseUtil();
+        this.isServiceOrganizationPluginActive = this.ibUtil.isServiceOrganizationPluginActive();
+        this.isHouseholdPluginActive = this.ibUtil.isHouseHoldPluginActive();
+        if (this.isHouseholdPluginActive) {
+            this.householdApi = new sn_csm_household.HouseHoldUtils();
+        }
+    },
+
+    /*
+     * validate the following attributes:
+     *
+     * 1. parent install base item
+     * 2. Account and contact
+     * 3. Consumer and household member of.
+     * 4. Configuration Item with product/Asset
+     * 5. Asset with configuration Item
+     * 6. Asset Model with product
+     *
+     * @param ibGr - install base item glide record
+     * @returns true - if the validation is succeeded.
+     *          false - if the validation is failed.
+     */
+    validate: function(ibGr) {
+        if (!this.isValidGlideRecord(ibGr)) {
+            gs.addErrorMessage("Invalid install base item glide record.");
+            return false;
+        }
+        var isValid = true;
+        /*
+         * For all non-root install base items, as the root element is valid entry, we are skipping the contact and houshold validations.
+         */
+        if (!gs.nil(ibGr.parent))
+            isValid = this.validateParentInstallBaseItem(ibGr);
+        else {
+            //Account and contact
+            if (!gs.nil(ibGr.contact))
+                isValid = this.validateContact(ibGr);
+            //Household and consumer
+            if (!gs.nil(ibGr.household) & !gs.nil(ibGr.consumer))
+                isValid = isValid && this.validateHouseholdConsumers(ibGr);
+        }
+        //Configuration Item
+        if (!gs.nil(ibGr.configuration_item) && (!gs.nil(ibGr.product) || !gs.nil(ibGr.asset)))
+            isValid = isValid && this.validateConfigurationItem(ibGr);
+        //Asset
+        if (gs.nil(ibGr.configuration_item) && (!gs.nil(ibGr.product) && !gs.nil(ibGr.asset)))
+            isValid = isValid && this.validateAsset(ibGr);
+
+        return isValid;
+    },
+    /*
+     *If Product Model is populated and CI is not populated, Asset model should match the product model
+     */
+    validateAsset: function(ibGr) {
+        if (!this.isValidGlideRecord(ibGr)) {
+            gs.addErrorMessage("Invalid install base item glide record.");
+            return false;
+        }
+        var isValid = true;
+        if (ibGr.asset.model != ibGr.product) {
+            gs.addErrorMessage(gs.getMessage('The {0} product model is not associated with the {1} asset.', [ibGr.product.getDisplayValue(), ibGr.asset.getDisplayValue()]));
+            isValid = false;
+        }
+        return isValid;
+    },
+    /*
+     * Configuration Item validations (If Configuration Item(CI) is populated):
+     *
+     * If Product Model is populated and Asset is not populated, product Model should be associated to CI.
+     * If Asset is populated and it has association to CI then it should match populated CI.
+     * If CI is populated and it has association to Asset then it should match populated Asset.
+     * If Asset is populated and it has no association to CI, skip the CI validation.
+     *
+     * @param ibGr - install base item glide record
+     * @returns true - if the validation is succeeded.
+     *          false - if the validation is failed.
+     */
+    validateConfigurationItem: function(ibGr) {
+        if (!this.isValidGlideRecord(ibGr)) {
+            gs.addErrorMessage("Invalid install base item glide record.");
+            return false;
+        }
+        var isValid = true,
+            product = ibGr.product;
+        if (!gs.nil(product) && ibGr.configuration_item.model_id != product) {
+            gs.addErrorMessage(gs.getMessage('The {0} product model is not associated with the {1} configuration item.', [ibGr.product.getDisplayValue(), ibGr.configuration_item.getDisplayValue()]));
+            isValid = false;
+        }
+        if (!gs.nil(ibGr.asset)) {
+            if (!gs.nil(ibGr.asset.ci) && ibGr.configuration_item != ibGr.asset.ci) {
+                gs.addErrorMessage(gs.getMessage('The {0} asset is not associated with the {1} configuration item.', [ibGr.asset.getDisplayValue(), ibGr.configuration_item.getDisplayValue()]));
+                isValid = false;
+            } else if (!gs.nil(ibGr.configuration_item.asset) && ibGr.configuration_item.asset != ibGr.asset) {
+                gs.addErrorMessage(gs.getMessage('The {0} asset is not associated with the {1} configuration item.', [ibGr.asset.getDisplayValue(), ibGr.configuration_item.getDisplayValue()]));
+                isValid = false;
+            }
+        }
+        return isValid;
+    },
+    /*
+     * If household and consumer are populated then the consumer must be member of the household.
+     *
+     * @param ibGr - install base item glide record
+     * @returns true - if the validation is succeeded.
+     *          false - if the validation is failed.
+     */
+    validateHouseholdConsumers: function(ibGr) {
+        if (!this.isValidGlideRecord(ibGr)) {
+            gs.addErrorMessage("Invalid install base item glide record.");
+            return false;
+        }
+        var consumer = ibGr.consumer + '',
+            isValid = true;
+        var consumerIds = this.householdApi.getCurrentConsumerIdsForHouseholdId(ibGr.household);
+        if (consumerIds != null && consumerIds.indexOf(consumer) == -1) {
+            gs.addErrorMessage(gs.getMessage('{0} consumer is not associated with the {1} household.', [ibGr.consumer.getDisplayValue(), ibGr.household.getDisplayValue()]));
+            isValid = false;
+        }
+        return isValid;
+    },
+
+    /*
+     * Contact validations:
+     *
+     * 1. Check whether account exists
+     * 2. Check whether contact is valid for the account.
+     *
+     * @param ibGr - install base item glide record
+     * @returns true - if the validation is succeeded.
+     *          false - if the validation is failed.
+     */
+    validateContact: function(ibGr) {
+        if (!this.isValidGlideRecord(ibGr)) {
+            gs.addErrorMessage("Invalid install base item glide record.");
+            return false;
+        }
+        var isValid = true;
+        if (gs.nil(ibGr.account)) {
+            gs.addErrorMessage(gs.getMessage('Contact cannot exist without an account for the {0} install base item.', ibGr.getDisplayValue()));
+            isValid = false;
+        }
+        //Check the contact's account is matching with the account.
+        else if (ibGr.contact.account != ibGr.account) {
+            gs.addErrorMessage(gs.getMessage('{0} contact is not associated with the {1} account for the {2} install base item.', [ibGr.contact.getDisplayValue(), ibGr.account.getDisplayValue(), ibGr.getDisplayValue()]));
+            isValid = false;
+        }
+        return isValid;
+    },
+
+    /*
+     * Validate parent install base item:
+     *
+     * i. Parent install base item should not be self referencing.
+     *
+     * ii. Install base item owner fields should match the parent install base item owner fields.
+     *
+     * iii. If the install base item has parent install base item and is associated with 
+     *     1.an Account, should match the parent's account.
+     *     2.an Account/contact, should match the parent's account/contact.
+     *     3.an Consumer, should match the parent's consumer.
+     *     4.an Household, should match the parent's Household.
+     *     5.an Consumer/Household, should match the parent's Consumer/Household.
+     *     6.an service organization, should match the parent's service organization.
+     * 
+     * @param ibGr - install base item glide record
+     * @returns true - if the validation is succeeded.
+     *          false - if the validation is failed.
+     */
+    validateParentInstallBaseItem: function(ibGr) {
+        if (!this.isValidGlideRecord(ibGr)) {
+            gs.addErrorMessage("Invalid install base item glide record.");
+            return false;
+        }
+        if (ibGr.sys_id == ibGr.parent.sys_id) {
+            gs.addErrorMessage(gs.getMessage('The {0} install base item should not be self-referencing', ibGr.getDisplayValue()));
+            return false;
+        }
+        /*Validate the owner fields*/
+        return this.compareFieldsWithParentIB(ibGr);
+    },
+    /*
+     * Compare the owner fields of parent install base item with current install base item
+     */
+    compareFieldsWithParentIB: function(ibGr) {
+        if (!this.isValidGlideRecord(ibGr)) {
+            gs.addErrorMessage("Invalid install base item glide record.");
+            return false;
+        }
+        var rootFields = [],
+            fields = [];
+        var rootGr = new GlideRecord(global.CSMBaseConstants.INSTALL_BASE_ITEM);
+        if (rootGr.get(ibGr.root)) {
+            rootFields = this.ibUtil.getInstallBaseItemOwner(rootGr);
+            fields = this.ibUtil.getInstallBaseItemOwner(ibGr);
+
+            //Check for the owner fields names comparison.
+            if (fields.join() != rootFields.join()) {
+                //parent field Names is empty
+                gs.addErrorMessage(gs.getMessage('The {0} install base item is associated with {1}, whereas the parent is associated with {2}.', [ibGr.getDisplayValue(), this.buildMsg(fields), this.buildMsg(rootFields)]));
+                return false;
+            }
+            //Check for the owner fields values comparison.
+            for (var i = 0, len = fields.length; i < len; i++) {
+                if (ibGr[fields[i]] != rootGr[rootFields[i]]) {
+                    gs.addErrorMessage(gs.getMessage('The {0} install base item is associated with {1} {2}, whereas the parent is associated with {3} {4}.', [ibGr.getDisplayValue(), ibGr[fields[i]].getDisplayValue(), fields[i], rootGr[rootFields[i]].getDisplayValue(), fields[i]]));
+                    return false;
+                }
+            }
+        }
+        return true;
+    },
+    /*
+     * validate install base glide record.
+     */
+    isValidGlideRecord: function(gr) {
+        return (gr && !gs.nil(gr) && gr instanceof GlideRecord);
+    },
+    /*Function to build message*/
+    buildMsg: function(names) {
+        if (names.length > 1) {
+            var str = "";
+            var last = names.pop();
+            str = names.join();
+            str += ' and ' + last;
+        } else
+            str = names.join();
+        return str.charAt(0) == 'a' ? 'an ' + str : str;
+    },
+    type: 'InstallBaseRecordValidatorSNC'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2022-10-03 14:35:03</sys_created_on>
+        <sys_id>4f09d33dc396111021848cab3c40dd8f</sys_id>
+        <sys_mod_count>2</sys_mod_count>
+        <sys_name>InstallBaseRecordValidatorSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_4f09d33dc396111021848cab3c40dd8f</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2022-11-23 08:54:32</sys_updated_on>
+    </sys_script_include>
+</record_update>

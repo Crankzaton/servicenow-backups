@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>package_private</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.CFCommentDataServiceSNC</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description>Customers should not change this script include directly&#13;
+This is never called directly.</description>
+        <mobile_callable>false</mobile_callable>
+        <name>CFCommentDataServiceSNC</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var CFCommentDataServiceSNC = Class.create();
+
+CFCommentDataServiceSNC.prototype = {
+	
+	initialize: function() {
+		this.commentsTable = 'cf_comment';
+	},
+	
+	getNewCommentId: function() {
+		return gs.generateGUID();
+	},
+	
+	getCommentMenuItems: function(commentData) {
+		var _actions = [];
+		if(commentData.canUpdate)
+			_actions.push({
+				label: gs.getMessage('Edit'),
+				type: 'edit'
+			});
+		if(commentData.canDelete)
+			_actions.push({
+				label: gs.getMessage('Delete'),
+				type: 'delete'
+			});
+		return _actions;
+	},
+	
+	getCommentMenuItemsForComment: function(commentId) {
+		var commentGr = CFQueryService.getComment(this.commentsTable, commentId);
+		if(commentGr.isValidRecord()) {
+			return this.getCommentMenuItems({
+				canUpdate: commentGr.canWrite(),
+				canDelete: commentGr.canDelete()
+			});
+		} else {
+			return [];
+		}
+	},
+	
+	getChildCommentsCountForComment: function(commentId) {
+		var childCommentsCount = 0;
+		var commentsAgg = new GlideAggregate(this.commentsTable);
+		commentsAgg.addAggregate('COUNT');
+		commentsAgg.addQuery('parent', commentId);
+		commentsAgg.query();
+		
+		if(commentsAgg.next())
+				childCommentsCount = Number(commentsAgg.getAggregate('count'));
+		return childCommentsCount;
+	},
+	
+	getTopCommentsForParentEntity: function(parentEntitySysId, startOffset, endOffset) {
+		
+		var commentsInfo = {};
+		commentsInfo.commentsList = [];
+		var commentsGr = CFQueryService.getCommentsForParentEntity(this.commentsTable, parentEntitySysId, true, startOffset, endOffset);
+		
+		while(commentsGr.next()) {
+			var commentSysId = commentsGr.getValue('sys_id');
+			var childCommentsCount = this.getChildCommentsCountForComment(commentSysId);
+			var commentData = CFCommonService.getCommentInfo(commentsGr);
+			commentData.childCommentsCount = childCommentsCount;
+			commentData.actions = this.getCommentMenuItems(commentData);
+			commentData.level = 1;
+			commentsInfo.commentsList.push(commentData);
+		}
+		commentsInfo.totalComments = CFCommonService.getTotalCommentCount(this.commentsTable,parentEntitySysId);
+		commentsInfo.totalParentComments = commentsGr.getRowCount();
+		commentsInfo.latestCommentInfo = CFCommonService.getLatestCommentInfo(this.commentsTable, parentEntitySysId);
+		commentsInfo.canCreate = commentsGr.canCreate(); //todo- this needs to be changed
+		return commentsInfo;
+	},
+	
+	getChildComments: function(parentCommentSysId, parentEntitySysId) {
+		var childCommentsList = [];
+		var commentsGr = CFQueryService.getChildComments(parentCommentSysId, this.commentsTable);
+		
+		while(commentsGr.next()) {
+			var commentData = CFCommonService.getCommentInfo(commentsGr);
+			commentData.actions = this.getCommentMenuItems(commentData);
+			childCommentsList.push(commentData);
+		}
+		return {
+			childCommentsList: childCommentsList,
+			latestCommentInfo: CFCommonService.getLatestCommentInfo(this.commentsTable, parentEntitySysId),
+			totalComments: CFCommonService.getTotalCommentCount(this.commentsTable, parentEntitySysId)
+		};
+	},
+	
+	deleteComment: function(commentSysId) {
+		var commentGr = CFQueryService.getComment(this.commentsTable, commentSysId);
+		var _isCommentValid = commentGr.isValidRecord();
+		var _canDeleteComment = commentGr.canDelete();
+		if(_isCommentValid && _canDeleteComment) {
+			commentGr.deleteRecord();
+			return {
+				deletedCommentSysId: commentSysId,
+				status: 'SUCCESS'
+			};
+		} else {
+			return {
+				status: 'FAILED',
+				isValid: _isCommentValid,
+				hasAccess: _canDeleteComment
+			};
+		}
+	},
+	
+	getNestedComments: function(parentEntitySysId) {
+		var commentsGr = new GlideRecord(this.commentsTable);
+		commentsGr.addNotNullQuery('parent');
+		commentsGr.addQuery('source', parentEntitySysId);
+		commentsGr.orderBy('sys_created_on'); //Tree building completely based on this.
+		commentsGr.query();
+		var nestedCommentsTree = {};
+		var commentToIndexMapper = {};
+		var index = 0;
+		var _commentsList = [];
+		
+		while(commentsGr.next()) {
+			var parentCommentId = commentsGr.getValue('parent');
+			var commentData = CFCommonService.getCommentInfo(commentsGr);
+			commentData.actions = this.getCommentMenuItems(commentData);
+			/**
+			* Pushing each comment in temporary _commentsList. So that we will maintain the index of comment
+			**/
+			_commentsList.push(commentData);
+			/**
+			* Storing comment's index w.r.t commentSysId in a mapper. i.e.. comment's index in _commentsList
+			**/
+			commentToIndexMapper[commentData.sysId] = index;
+			/**
+			* Check for comment's parent index in _commentsList
+			* If comment exist in _commentsList - add/push commentData to it's childCommentsList. (adding data to its childList will effect in nestedCommentsTree object as objects work with references in javascript)
+			* If comment doesn't exist in _commentsList - It's a level 1 comment and create a key with comment.parent in nestedCommentsTree and add this comment into it.
+			**/
+			var parentCommentIndex = commentToIndexMapper[commentData.commentParent];
+			if(parentCommentIndex >= 0) {
+				var parentComment = _commentsList[parentCommentIndex];
+				commentData.level = parentComment.level + 1;
+				parentComment.childCommentsList.push(commentData);
+				parentComment.childCommentsCount = parentComment.childCommentsList.length;
+			} else {
+				commentData.level = 2;
+				if(!nestedCommentsTree[commentData.commentParent])
+					nestedCommentsTree[commentData.commentParent] = [commentData];
+				else
+					nestedCommentsTree[commentData.commentParent].push(commentData);
+			}
+			index++;
+		}
+		return nestedCommentsTree;
+	},
+	
+    type: 'CFCommentDataServiceSNC'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2019-03-06 10:28:02</sys_created_on>
+        <sys_id>1dba2fcd734c3300cd69f021c4f6a70c</sys_id>
+        <sys_mod_count>34</sys_mod_count>
+        <sys_name>CFCommentDataServiceSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_1dba2fcd734c3300cd69f021c4f6a70c</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2019-04-23 11:39:08</sys_updated_on>
+    </sys_script_include>
+</record_update>

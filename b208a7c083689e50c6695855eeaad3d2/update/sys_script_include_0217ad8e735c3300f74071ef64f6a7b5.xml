@@ -1,0 +1,277 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>package_private</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.CaseDigestImpl</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description>The implementation layer for case digests functionality.</description>
+        <mobile_callable>false</mobile_callable>
+        <name>CaseDigestImpl</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var CaseDigestImpl = Class.create();
+CaseDigestImpl.prototype = {
+	initialize: function() {
+		this.caseDigestDao = new CaseDigestDao();
+	},
+	
+    canCreatePCR: function(caseGr) {
+		if(!gs.nil(caseGr) && caseGr.isValidRecord()){
+			if (caseGr.state ==  CaseDigestConstants.CASE_STATE_RESOLVED && gs.nil(caseGr.post_case_review) && !(GlidePluginManager.isActive(CaseDigestConstants.MIM_PLUGIN) && caseGr.parent && caseGr.parent.major_case_state == MajorCaseDigestConstants.MAJOR_CASE_STATE_ACCEPTED && gs.getProperty(CaseDigestConstants.PARENT_CHILD_CASE_SYNC, false) == 'true'))
+			return true;
+		}
+		return false;
+	},
+	
+	createPCR: function(caseGr, uiActionHandler) {
+		//Allow create PCR only by users who have create access to PCR
+		if(!caseGr || !caseGr.isValidRecord())return; 
+		if(!this.caseDigestDao.canCreateinTable(CaseDigestConstants.PCR_TABLE, caseGr.sys_id)) return;
+		var pcrObj = this.caseDigestDao.createPCR(caseGr);
+		if(!pcrObj || !pcrObj.isValidRecord())return;
+		gs.addInfoMessage(gs.getMessage("The Post Case Review document for {0} has been created.", caseGr.number));
+		uiActionHandler.openGlideRecord(pcrObj);
+	},
+
+	hasAccessToPCR:function(sysId){
+		return this.caseDigestDao.hasAccessToPCR(sysId);
+	},
+	
+	hasAccessToCAS:function(sysId){
+		return this.caseDigestDao.hasAccessToCAS(sysId);
+	},
+
+	canReopenPCR: function(caseGr) {
+		if(!gs.nil(caseGr) && caseGr.isValidRecord() && caseGr.canRead()){
+			if (caseGr.state ==  CaseDigestConstants.CASE_STATE_RESOLVED && !gs.nil(caseGr.post_case_review) && caseGr.post_case_review.state == CaseDigestConstants.PCR_STATE_CLOSED && this.hasAccessToPCR(caseGr.post_case_review.sys_id))
+			return true;
+		}
+		return false;
+	},
+
+	reopenPCR: function(caseGr, uiActionHandler) {
+		if(!gs.nil(caseGr) && !gs.nil(uiActionHandler) && caseGr.isValidRecord() && caseGr.canRead() && !gs.nil(caseGr.post_case_review) && this.hasAccessToPCR(caseGr.post_case_review.sys_id)){
+			var pcrGr = this.caseDigestDao.getPCRByCase(caseGr);
+			if(pcrGr){
+				this.caseDigestDao.changePCRState(pcrGr, CaseDigestConstants.PCR_STATE_IN_PROGRESS);
+				gs.addInfoMessage(gs.getMessage("Post Case Review {0} re-opened", pcrGr.number));
+				uiActionHandler.openGlideRecord(pcrGr);
+			}
+		}
+	},
+	
+	canCreateCAS: function(caseGr) {
+		if(!caseGr || !caseGr.isValidRecord())return false;
+		var canCreateCAS = false;
+		if (caseGr && caseGr.state !=  CaseDigestConstants.CASE_STATE_NEW && caseGr.state !=  CaseDigestConstants.CASE_STATE_CLOSED)
+			canCreateCAS = true;
+		return canCreateCAS;
+	},
+	
+	createCAS: function(caseGr, uiActionHandler) {
+		//Allow create CAS only by users who have create access to the CAS
+		if(!caseGr || !caseGr.isValidRecord())return; 
+		if(!this.caseDigestDao.canCreateinTable(CaseDigestConstants.CAS_TABLE, caseGr.sys_id)) return;
+		var casObj = this.caseDigestDao.createCAS(caseGr);
+		if(casObj)
+			uiActionHandler.openGlideRecord(casObj);
+	},
+	
+	
+	canRequestApproval: function(pcrGr) {
+		if(!gs.nil(pcrGr) && pcrGr.isValidRecord() && pcrGr.canRead()){
+			if (pcrGr.state ==  CaseDigestConstants.PCR_STATE_IN_PROGRESS && !gs.nil(pcrGr.case_digest_configuration) && !gs.nil(pcrGr.case_digest_configuration.approval_workflow))
+				return true;
+		}
+		return false;
+	},
+	
+	canApproveOrSuggestChanges: function(pcrGr){
+		if(!pcrGr || !this.hasAccessToPCR(pcrGr.sys_id)){
+			return false;
+		}
+		var canApproveOrRejectPCR = false;
+		if(pcrGr.state == CaseDigestConstants.PCR_STATE_AWAITING_APPROVAL && !gs.nil(pcrGr.case_digest_configuration)){
+			if(!gs.nil(pcrGr.approval_group) && gs.getUser().isMemberOf(pcrGr.approval_group+'')){
+				return true;
+			}
+			if(!gs.nil(pcrGr.approval_users) && pcrGr.approval_users.indexOf(gs.getUserID())!=-1){
+				return true;
+			}
+			if(!gs.nil(pcrGr.assigned_to) && !gs.nil(pcrGr.assigned_to.manager) && (pcrGr.assigned_to.manager+'') == gs.getUserID()){
+				return true;
+			}
+		}
+		return false;
+	},
+	
+	requestApproval: function(pcrGr, action) {
+		if(!gs.nil(pcrGr) && !gs.nil(action) && pcrGr.isValidRecord() && pcrGr.canWrite()){
+			this.caseDigestDao.changePCRState(pcrGr, CaseDigestConstants.PCR_STATE_AWAITING_APPROVAL);
+			gs.addInfoMessage(gs.getMessage("This review has been submitted for approval. The approver has not yet taken action."));
+			action.openGlideRecord(pcrGr);
+			var wf = new global.Workflow();
+			wf.cancel(pcrGr);
+			if(pcrGr.case_digest_configuration && pcrGr.case_digest_configuration.approval_workflow)
+				wf.startFlow(pcrGr.case_digest_configuration.approval_workflow, pcrGr, pcrGr.update());
+		}
+	},
+	
+	canPublish: function(pcrGr) {
+		if(!gs.nil(pcrGr) && pcrGr.isValidRecord() && pcrGr.canRead()){
+			var template = pcrGr.case_digest_configuration ? pcrGr.case_digest_configuration.document_template : null;
+			if(template && !gs.nil(pcrGr.case_number) && pcrGr.case_number.getRefRecord().canWrite()){
+				if (pcrGr.state ==  CaseDigestConstants.PCR_STATE_APPROVED || (pcrGr.state ==  CaseDigestConstants.PCR_STATE_IN_PROGRESS && gs.nil(pcrGr.case_digest_configuration.approval_workflow)))
+					return true;
+			}
+		}
+		return false;
+	},
+
+	publish: function(pcrId) {
+		var pcrGr = this.caseDigestDao.getPCRbyId(pcrId);
+		var message = '';
+		if(pcrGr){
+			if(GlidePluginManager.isActive(CaseDigestConstants.MIM_PLUGIN) && pcrGr.case_number && pcrGr.case_number.major_case_state == MajorCaseDigestConstants.MAJOR_CASE_STATE_ACCEPTED){
+				var ep1 = new GlideScriptedExtensionPoint().getExtensions(CaseDigestConstants.MAJOR_PCR_PUBLISH_EXTENSION_POINT);
+				if(ep1.length > 0){
+					message = ep1[0].majorCasePublish(pcrGr);
+				}
+			}
+			else{
+				var ep2 = new GlideScriptedExtensionPoint().getExtensions(CaseDigestConstants.PCR_PUBLISH_EXTENSION_POINT);
+				if(ep2.length > 0){
+					message = ep2[0].publish(pcrGr);
+				}
+			}
+		}
+		return message;
+	},
+	
+	canPublishCAS: function(casGr) {
+		if(!casGr || !this.hasAccessToCAS(casGr.sys_id)){
+			return false;
+		}
+		var template = casGr.case_digest_configuration ? casGr.case_digest_configuration.document_template : null;
+		if (template && casGr.state ==  CaseDigestConstants.CAS_STATE_IN_PROGRESS)
+			return true;
+		return false;
+	},
+	
+	fetchCaseDigestConfiguration: function(caseGr, tableName) {
+		if(!caseGr || !caseGr.isValidRecord())return '';
+		return this.caseDigestDao.fetchCaseDigestConfiguration(caseGr, tableName);
+	},
+	
+	getCaseState: function(caseId){
+		if(!caseId)
+			return "";
+		return this.caseDigestDao.getCaseState(caseId);
+	},
+	
+	closePCR: function(pcrGr) {
+		this.caseDigestDao.changePCRState(pcrGr, CaseDigestConstants.PCR_STATE_CLOSED);
+	},
+	
+	addAdditionalCommenttoCase: function(caseId, comment) {
+		this.caseDigestDao.addAdditionalCommenttoCase(caseId, comment);
+	},
+	
+	addWorkNotetoCase: function(caseId, workNote) {
+		this.caseDigestDao.addWorkNotetoCase(caseId, workNote);
+	},
+	
+	saveForm: function(tableName, sysId, fieldInfo) {
+		if(!tableName || !sysId || !fieldInfo)return;
+		return this.caseDigestDao.saveForm(tableName, sysId, fieldInfo);
+	},
+	
+	checkIfCommentsAreAddedByUser: function(pcrId) {
+		var pcrGr = this.caseDigestDao.getPCRbyId(pcrId);
+		var latestWorkNotes = pcrGr.work_notes.getJournalEntry(1);
+		//work notes format will be as below
+		/*2019-04-06 18:20:33 - <User Display Name> (Work notes)
+		<work notes comment>*/
+		if(latestWorkNotes){
+			var latestWorkNotesMetaInfo = latestWorkNotes.split("\n");
+			if(latestWorkNotesMetaInfo.length > 0){
+				latestWorkNotesMetaInfo = latestWorkNotesMetaInfo[0];
+				if(latestWorkNotesMetaInfo.indexOf(gs.getUserDisplayName()) >= 0){
+					return true;
+				}
+			}
+		}
+		return false;
+	},
+	
+	updatePostCaseReviewStateToInProgress: function(pcrId){
+		var pcrGr = this.caseDigestDao.getPCRbyId(pcrId);
+		pcrGr.state = CaseDigestConstants.PCR_STATE_IN_PROGRESS;
+		pcrGr.update();
+	},
+	
+	getTemplateId: function(tableName, sysId){
+		if(!tableName || !sysId)
+			return;
+		return this.caseDigestDao.getTemplateId(tableName, sysId);
+	},
+	
+	publishCAStoCase: function(sysId, sendEmail) {
+		var ep = new GlideScriptedExtensionPoint().getExtensions(CaseDigestConstants.CAS_PUBLISH_EXTENSION_POINT);
+		if(ep.length > 0) {
+			var point = ep[0];
+			return point.publishCAStoCase(sysId, sendEmail);
+		}
+	},
+	
+	validateReadOnlyFields : function(current, previous){
+		if(!previous || !current || current.state != previous.state)
+			return;
+		var states = [
+			CaseDigestConstants.PCR_STATE_AWAITING_APPROVAL,
+			CaseDigestConstants.PCR_STATE_APPROVED,
+			CaseDigestConstants.PCR_STATE_CLOSED,
+			CaseDigestConstants.PCR_STATE_CANCELLED ];
+		if(states.indexOf(previous.state.toString()) == -1)
+			return;
+		var readOnlyFields = ["number", "case_number", "assigned_to", "approval_users", "short_description", "summary", "symptoms", "root_cause_analysis", "solution_provided", "preventive_measures_taken", "commitment_date", "assignment_group", "approval_group"];
+		var len = readOnlyFields.length;
+		for (var i = 0; i < len; i++) {
+			if (current.getValue(readOnlyFields[i]) != previous.getValue(readOnlyFields[i])){
+				var message = gs.getMessage("You cannot make changes to the post case review.");
+				gs.addErrorMessage(message);
+				current.setAbortAction(true);
+				break;
+			}
+		}
+	},
+	
+	//Do not allow updates to the fields when CAS is in closed state.
+	blockCASFieldsUpdateInClosedState: function(current, previous) {
+		if (!current || !previous || !current.isValidRecord() || !previous.isValidRecord() || current.state.changes() || current.state != CaseDigestConstants.CAS_STATE_CLOSED) return;
+		var readOnlyFields = CaseDigestConstants.CAS_CLOSED_STATE_READ_ONLY_FIELDS;
+		for (var i = 0, len = readOnlyFields.length; i < len; i++) {
+			if (current.getValue(readOnlyFields[i]) != previous.getValue(readOnlyFields[i])) {
+				gs.addErrorMessage(gs.getMessage("You cannot make changes to the closed case action summary."));
+				current.setAbortAction(true);
+				break;
+			}
+		}
+	},
+	
+    type: 'CaseDigestImpl'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2019-03-21 13:43:58</sys_created_on>
+        <sys_id>0217ad8e735c3300f74071ef64f6a7b5</sys_id>
+        <sys_mod_count>40</sys_mod_count>
+        <sys_name>CaseDigestImpl</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_0217ad8e735c3300f74071ef64f6a7b5</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2021-07-26 10:22:46</sys_updated_on>
+    </sys_script_include>
+</record_update>

@@ -1,0 +1,236 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>package_private</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.WFChangeConflictsApprovalUtils</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description>Utils that facilitate generation and checks for Approvals generated using the Change Conflicts, such as Blackout Schedules.</description>
+        <mobile_callable>false</mobile_callable>
+        <name>WFChangeConflictsApprovalUtils</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var WFChangeConflictsApprovalUtils = Class.create();
+WFChangeConflictsApprovalUtils.prototype = {
+	initialize: function () {
+		this._cacheGroupData = {};
+	},
+
+	getPlannedBlackoutScheduleApprovals: function (grChange) {
+		grChange = this._getChangeRecord(grChange);
+
+		var result = {
+			approvalGroups: null,
+			approvalUsers: null,
+			blackoutSchedules: null,
+			isInvalid: false
+		};
+
+		/* Check-01: Do not proceed if invalid */
+		if (!grChange.isValidRecord()) {
+			return result;
+		}
+		/* Check-02: Do not proceed if not Production Change */
+		if (!this._isMatch(grChange, { 'production_system': true })) {
+			return result;
+		}
+
+		/* Continue with operation */
+		var assignmentGroup = grChange.getValue('assignment_group');
+		var conflictBlackouts = this._getPlannedBlackoutIdsFromConflicts(grChange.getUniqueValue());
+
+		var approvalGroups = [];
+		var blackoutSchedules = [];
+		var isInvalid = false;
+
+		var grBlackout = new GlideRecord('cmn_schedule_blackout');
+		grBlackout.addQuery('sys_id', 'IN', conflictBlackouts);
+		grBlackout.addNotNullQuery('u_additional_approvals');
+		grBlackout.query();
+		while (grBlackout.next()) {
+			var boId = grBlackout.getUniqueValue();
+			var boApprTypes = grBlackout.getValue('u_additional_approvals');
+			var boApprGroups = this._getGroupListOfTypesInHierarchy(assignmentGroup, boApprTypes);
+
+			approvalGroups = approvalGroups.concat(boApprGroups);
+			blackoutSchedules.push(boId);
+		}
+
+		/* If there are null entries meaning that group hierarchy is wrong, then it is invalid */
+		if (approvalGroups.indexOf(null) > -1) {
+			isInvalid = true;
+		} else {
+			approvalGroups = new global.ArrayUtil().unique(approvalGroups);
+			var approvalGroupsLength = approvalGroups.length;
+			for (var i = 0; i < approvalGroupsLength; i++) {
+				var groupId = approvalGroups[i];
+				if (!this._IsGroupValidWithActiveMembers(groupId)) {
+					isInvalid = true;
+					break;
+				}
+			}
+		}
+
+		result.approvalGroups = approvalGroups;
+		result.blackoutSchedules = blackoutSchedules;
+		result.isInvalid = isInvalid;
+		return result;
+	},
+
+
+	/*****************************************************************
+	 * Fetch conflicts created by specific types
+	 *****************************************************************/
+
+	_getPlannedBlackoutIdsFromConflicts: function (chgSysId, blackoutType) {
+		blackoutType = blackoutType || 'planned';
+
+		var schedules = [];
+
+		var grConflict = new GlideRecord('conflict');
+		grConflict.addQuery('change', chgSysId);
+		grConflict.addQuery('type', 'blackout');
+		grConflict.addQuery('schedule.ref_cmn_schedule_blackout.u_planned_unplanned', blackoutType);
+		grConflict.query();
+		while (grConflict.next()) {
+			schedules.push(grConflict.getValue('schedule'));
+		}
+		return schedules;
+	},
+
+
+	/*****************************************************************
+	 * Private Support Methods
+	 *****************************************************************/
+
+	/**
+	 * Returns the sys_ids of the first matching group of types from current group and parents
+	 */
+	_getGroupListOfTypesInHierarchy: function (groupSysId, groupTypes) {
+		groupTypes = String(groupTypes || '').split(',');
+
+		var groupList = [];
+		var groupTypesLength = groupTypes.length;
+		for (var i = 0; i < groupTypesLength; i++) {
+			groupList.push(this._getGroupOfTypeInHierarchy(groupSysId, groupTypes[i]));
+		}
+		return groupList;
+	},
+	
+	_getGroupOfTypeInHierarchy: function (groupSysId, groupType) {
+		groupType = this._getGroupTypeInternalValue(groupType) || '';
+
+		var grGroup = this._getGroupRecord(groupSysId);
+		while (grGroup.isValidRecord()) {
+			var gpData = {
+				sys_id: String(grGroup.getUniqueValue() || ''),
+				type: String(grGroup.getValue('type') || '').split(','),
+				parent: String(grGroup.getValue('parent') || '')
+			};
+
+			var cacheData = this._cacheGetMatchedGroup(gpData, 'type', groupType);
+			if (cacheData.type.indexOf(groupType) > -1)
+				return cacheData.sys_id;
+
+			grGroup = this._getGroupRecord(cacheData.parent);
+		}
+
+		return null;
+	},
+
+	_IsGroupValidWithActiveMembers: function (groupSysId) {
+		var grGroup = new GlideRecord('sys_user_group');
+
+		/* Case 01: Is Group SysId Passed? */
+		if (!groupSysId) {
+			return false;
+		}
+
+		/* Case 02: Does group exist? */
+		if (!grGroup.get(groupSysId)) {
+			return false;
+		}
+
+		/* Case 03: Is group active? */
+		if (grGroup.getValue('active') !== '1') {
+			return false;
+		}
+
+		/* Case 04: Does the group have at least 1 active member? */
+		var grGpMember = new GlideRecord('sys_user_grmember');
+		grGpMember.addQuery('group', groupSysId);
+		grGpMember.addQuery('user.active', true);
+		grGpMember.setLimit(1);
+		grGpMember.query();
+		if (!grGpMember.hasNext()) {
+			return false;
+		}
+
+		return true;
+	},
+
+	_isMatch: function (grChange, queryStr) {
+		if (JSUtil.typeOf(queryStr) === 'object') {
+			var strArr = [];
+			for (var o in queryStr)
+				strArr.push(o + '=' + queryStr[o]);
+			queryStr = strArr.join('^');
+		}
+		return GlideFilter.checkRecord(grChange, queryStr);
+	},
+
+	_getChangeRecord: function (grChange) {
+		return this._getGlideRecordFromId('change_request', grChange);
+	},
+	_getGroupRecord: function (grGroup) {
+		return this._getGlideRecordFromId('sys_user_group', grGroup);
+	},
+	_getGlideRecordFromId: function (tableName, grRecordId) {
+		if (grRecordId instanceof GlideRecord)
+			return grRecordId;
+
+		var gr = new GlideRecord(tableName);
+		gr.get(grRecordId);
+		return gr;
+	},
+
+	_getGroupTypeInternalValue: function (groupTypeName) {
+		var grType = new GlideRecord('sys_user_group_type');
+		grType.addQuery('sys_id', groupTypeName).addOrCondition('name', groupTypeName);
+		grType.query();
+		if (grType.next()) {
+			return grType.getUniqueValue();
+		}
+		return null;
+	},
+
+	_cacheGetMatchedGroup: function (data, key, value) {
+		while (this._cacheGroupData[data.sys_id]) {
+			if (data[key].indexOf(value) > -1) {
+				break; /* If match is found, then return */
+			} else if (!this._cacheGroupData[data.parent]) {
+				break; /* If parent is not cached, then return */
+			} else {
+				data = this._cacheGroupData[data.parent]; /* Else proceed to parent to find match */
+			}
+		}
+
+		this._cacheGroupData[data.sys_id] = data;
+		return data;
+	},
+
+	type: 'WFChangeConflictsApprovalUtils'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>K018836</sys_created_by>
+        <sys_created_on>2023-09-21 08:57:17</sys_created_on>
+        <sys_id>456b735bdbd97950653d1a5913961977</sys_id>
+        <sys_mod_count>15</sys_mod_count>
+        <sys_name>WFChangeConflictsApprovalUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_456b735bdbd97950653d1a5913961977</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2024-02-04 17:24:07</sys_updated_on>
+    </sys_script_include>
+</record_update>

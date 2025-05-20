@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>package_private</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.RFRecommendations</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description>This class is for Generate Recommendations API, it gives response in format expected by graphQL.</description>
+        <mobile_callable>false</mobile_callable>
+        <name>RFRecommendations</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var RFRecommendations = Class.create();
+
+RFRecommendations.hasSideComponentRecommendations = function(table) {
+    if (!table) {
+        return false;
+    }
+    var gAggr = RFRecommendations.getRulesForTableAndTypes(table, [RFConstants.experienceType.MESSAGE_CARD, RFConstants.experienceType.RECORD_CARD]);
+    while (gAggr.next()) {
+        var ruleId = gAggr.recommendation_rule;
+        var propValue = RFRuleService.isActivePropertyCheck(ruleId);
+        if (propValue === undefined || propValue === true) {
+            return true;
+        }
+    }
+    return false;
+};
+
+RFRecommendations.getRulesForTableAndTypes = function(table, types) {
+    var gAggr = new GlideAggregate(RFConstants.tables.SN_RF_RECOMMENDATION_EXPERIENCE);
+    gAggr.addAggregate(RFConstants.queryConstants.COUNT);
+    gAggr.addQuery(RFConstants.fields.SN_RF_RECOMMENDATION_EXPERIENCE_SHOW_AS, RFConstants.queryConstants.IN, types);
+    gAggr.addQuery(RFConstants.fields.SN_RF_RECOMMENDATION_EXPERIENCE_TABLE, table);
+    gAggr.addQuery(RFConstants.fields.SN_RF_RECOMMENDATION_EXPERIENCE_ACTIVE, true);
+    gAggr.addQuery(RFConstants.fields.SN_RF_RECOMMENDATION_EXPERIENCE_RULE_ACTIVE, true);
+    gAggr.groupBy(RFConstants.fields.SN_RF_RECOMMENDATION_EXPERIENCE_RULE);
+    gAggr.query();
+    return gAggr;
+};
+
+RFRecommendations.getTypes = function(recommendExperience) {
+    return RFConstants.experienceToTypes[recommendExperience.toLowerCase()];
+};
+
+RFRecommendations.prototype = {
+    initialize: function(contextRecord, recommendExperience, options) {
+        this.types = RFRecommendations.getTypes(recommendExperience);
+        this.options = options || {};
+        this.contextRecord = contextRecord;
+        if (this.options.updatedFields) {
+            var updatedFields = this.options.updatedFields;
+            for (var idx = 0; idx < updatedFields.length; idx++) {
+                var updatedField = updatedFields[idx];
+                this.contextRecord.setValue(updatedField.fieldName, updatedField.fieldValue);
+            }
+        }
+    },
+
+    generateRecommendations: function(gAggregateRules) {
+        var recommendations = [];
+        var allReEvaluationFields = [];
+        var arrayUtil = new global.ArrayUtil();
+
+        var gAggr = gAggregateRules || RFRecommendations.getRulesForTableAndTypes(this.contextRecord.getTableName(), this.types);
+        while (gAggr.next()) {
+            var rule = new RFRuleService(gAggr.recommendation_rule.getRefRecord());
+            var reEvaluationFields = rule.getReEvaluationFields();
+            allReEvaluationFields = arrayUtil.union(allReEvaluationFields, reEvaluationFields);
+            if (this.options && this.options.triggerFieldNames && this.options.triggerFieldNames.length > 0) {
+                if (reEvaluationFields.indexOf(this.options.triggerFieldNames[0]) == -1) {
+                    continue;
+                }
+            }
+            var ruleDetails = rule.getDetails(this.contextRecord, this.types);
+            if (ruleDetails) {
+                recommendations.push(ruleDetails);
+            }
+        }
+        if (recommendations.length > 0) {
+            recommendations.sort(RFRuleService.sortComparator());
+        }
+        return {
+            "recommendationGroups": recommendations,
+            "reEvaluationFields": allReEvaluationFields
+        };
+    },
+
+    generateStampRecommendations: function() {
+        try {
+            var stampRecommendations = [];
+            var result = this.generateRecommendations();
+            var recommendationGroups = result.recommendationGroups;
+            var isFieldStamped = {};
+            var fieldStampIdxMap = {};
+            for (var groupIdx = 0; groupIdx < recommendationGroups.length; groupIdx++) {
+                var recommendations = recommendationGroups[groupIdx].recommendations;
+                for (var recomIdx = 0; recomIdx < recommendations.length; recomIdx++) {
+                    var recommendation = recommendations[recomIdx];
+                    var showAs = recommendation[RFConstants.experienceDetails.SHOW_AS];
+                    var field = recommendation[RFConstants.experienceDetails.ON_FIELD];
+                    var expStampDetails = recommendation[RFConstants.experienceDetails.STAMP_DETAILS];
+                    if (showAs != RFConstants.experienceType.FIELD_LEVEL || !field || !expStampDetails) {
+                        continue;
+                    }
+                    if (!(field in isFieldStamped)) {
+                        isFieldStamped[field] = false;
+                        var stampDetails = {};
+                        stampDetails[RFConstants.stampResponse.FIELD_NAME] = field;
+                        stampDetails[RFConstants.stampResponse.IS_CONFIDENT] = RFConstants.FALSE;
+                        stampRecommendations.push(stampDetails);
+                        fieldStampIdxMap[field] = stampRecommendations.length - 1;
+                    }
+                    if (!isFieldStamped[field]) {
+                        var confident = expStampDetails[RFConstants.experienceDetails.IS_CONFIDENT];
+                        if (confident) {
+                            stampDetails = stampRecommendations[fieldStampIdxMap[field]];
+                            stampDetails[RFConstants.stampResponse.FIELD_VALUE] = expStampDetails[RFConstants.experienceDetails.VALUE];
+                            stampDetails[RFConstants.stampResponse.IS_CONFIDENT] = RFConstants.TRUE;
+                            isFieldStamped[field] = true;
+                        }
+                    }
+                }
+            }
+            var res = {};
+            res[RFConstants.STATUS] = RFConstants.SUCCESS;
+            res[RFConstants.stampResponse.RECOMMENDATIONS] = stampRecommendations;
+            return res;
+        } catch (e) {
+            res = new RFExceptionManager('UNKNOWN_ERROR').getJSON();
+            res[RFConstants.STATUS] = RFConstants.ERROR;
+            return res;
+        }
+    },
+
+    type: 'RFRecommendations'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2021-11-11 22:36:10</sys_created_on>
+        <sys_id>081bc605c7333010dd7ab6c427c26089</sys_id>
+        <sys_mod_count>10</sys_mod_count>
+        <sys_name>RFRecommendations</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_081bc605c7333010dd7ab6c427c26089</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2022-02-11 13:21:43</sys_updated_on>
+    </sys_script_include>
+</record_update>
