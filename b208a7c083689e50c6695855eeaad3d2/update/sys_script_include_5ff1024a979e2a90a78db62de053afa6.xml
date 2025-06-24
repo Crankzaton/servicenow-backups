@@ -1,0 +1,388 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>package_private</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.MSSCustodyBulkFileUpload</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description>v1</description>
+        <mobile_callable>false</mobile_callable>
+        <name>MSSCustodyBulkFileUpload</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var MSSCustodyBulkFileUpload = Class.create();
+MSSCustodyBulkFileUpload.prototype = {
+    initialize: function() {},
+    /*
+Schema for Bulk Level and Trade Level File upload functions
+
+bulkLevelParse   ------>   bulkErrorValidation ------>  createBulkCaseTask  ------> Creates case and flow starts triggering due to case creation
+(Reads the Excel)			(Segregation of Valid/		(Case Creation for			
+                                invalid Trades)			valid trades)
+                                   |
+                                   |
+                                   |--------------------> populateErrorRecord ------> Populates the new field (TBD) in bulk for audit
+
+
+tradeLevelParse   ------>   bulkErrorValidation ------>  createBulkCaseTask  ------> Creates case and flow starts triggering due to case creation
+(Reads the Excel)			(Segregation of Valid/		(Case Creation for			
+                                invalid Trades)			valid trades)
+                                   |
+                                   |
+                                   |--------------------> populateErrorRecord ------> Populates the new field (TBD) in bulk for audit
+*/
+
+
+    bulkLevelParse: function(bulkRecID, owningBusiness) {
+        /*
+
+        This function will be called from the bulk File Uplaod record producer which will parse all the contents of the excel and return
+        an array of elements. This will be used for the upload type of BUlk Upload
+        
+        
+        Sample output Format
+        {
+        "TradeReference": "R-42342-00-00",
+        "OwningBusiness": "DCC HK"
+        }, {
+        "tradeReference": "R-42223-00-01",
+            "OwningBusiness": "DCC HK"
+        }, {
+            "tradeReference": "R-23242-00-02",
+        "OwningBusiness": "DCC HK"
+        }
+
+        */
+
+        try {
+
+            var bulkexcelRowArray = [];
+            //getting the attachment
+            var bulkgetAttachment = new GlideRecord('sys_attachment');
+            bulkgetAttachment.addEncodedQuery('table_sys_id=' + bulkRecID);
+            bulkgetAttachment.query();
+            if (bulkgetAttachment.next()) {
+                var bulkattachmentRec = bulkgetAttachment.getValue('sys_id');
+            }
+            //getting attachment
+
+            var bulkattachment = new GlideSysAttachment(); //method to get the contents of the attachment
+            var bulkattachmentDetails = bulkattachment.getContentStream(bulkattachmentRec); //getting content of the EXcel
+
+            var bulkparser = new sn_impex.GlideExcelParser(); //method to parse the content of the Excel
+            bulkparser.setSource(bulkattachmentDetails); //setting the source to parse the content from the stream
+
+            var bulkgetSheet = bulkparser.getSheetNames(); //getting the sheet name to fetch details
+            bulkparser.setSheetName(bulkgetSheet); //setting the sheet to parse
+
+            if (bulkparser.parse()) { //converting into readable format using parse
+
+                while (bulkparser.next()) { //iterating over each row
+                    var bulkgetRows = bulkparser.getRow(); //reading row by row
+                    bulkgetRows.business = owningBusiness.toString(); //add the owning business for each array item which will be used for error validation which will be from record producer
+                    var bulkrowObj = JSON.stringify(bulkgetRows); //holds the rows of Excel as comma sepearated
+                    bulkexcelRowArray.push(bulkrowObj + '');
+
+                }
+            }
+
+            gs.info("Total Records " + bulkexcelRowArray.toString());
+
+
+            this.bulkErrorValidation(bulkexcelRowArray, bulkRecID, owningBusiness);
+
+        } catch (ex) {
+            gs.info('Error Received from bulkLevelParse ' + ex);
+        }
+
+
+    },
+
+
+
+    tradeLevelParse: function(bulkRecID) {
+
+        /*
+        This function will be called from the bulk File Uplaod record producer which will parse all the contents of the excel and return
+        an array of elements. This will be used for the upload type of Trade Upload
+
+        Output Sample Format
+
+        [{
+        "TradeRef": "R-205-3345",
+            "TradeID": "HK-HSBC-212121212-2323",
+        "LegacyStatus": "CONF",
+        "OwningBusiness": "DCC HK"
+        }, {
+        "TradeRef": "D-238-2233",
+        "TradeID": "AU-HSBC-212121212-2323",
+        "LegacyStatus": "MATCH",
+        "OwningBusiness": "DCC AU"
+        }]
+        */
+        try {
+
+            var excelRowArray = [];
+
+            //getting the attachment
+            var getAttachment = new GlideRecord('sys_attachment');
+            getAttachment.addEncodedQuery('table_sys_id=' + bulkRecID);
+            getAttachment.query();
+            if (getAttachment.next()) {
+                var attachmentRec = getAttachment.getValue('sys_id');
+            }
+            //getting attachment
+
+            var attachment = new GlideSysAttachment(); //method to get the contents of the attachment
+            var attachmentDetails = attachment.getContentStream(attachmentRec); //getting content of the EXcel
+
+            var parser = new sn_impex.GlideExcelParser(); //method to parse the content of the Excel
+            parser.setSource(attachmentDetails); //setting the source to parse the content from the stream
+
+            var getSheet = parser.getSheetNames(); //getting the sheet name to fetch details
+            parser.setSheetName(getSheet); //setting the sheet to parse
+
+            if (parser.parse()) { //converting into readable format using parse
+
+                while (parser.next()) { //iterating over each row
+                    var getRows = parser.getRow(); //reading row by row
+                    var rowObj = JSON.stringify(getRows); //holds the rows of Excel as comma sepearated
+                    excelRowArray.push(rowObj + '');
+
+                }
+            }
+
+            return excelRowArray;
+
+        } catch (ex) {
+            gs.info('Error Received from tradeLevelParse ' + ex);
+        }
+
+
+    },
+
+
+    errorRecordReasons: function(invalidKey) {
+
+        var errorReason = '';
+
+        switch (invalidKey) {
+
+            case 'invalidTransRef':
+                errorReason = 'Trade Reference provided does not exist for ';
+                break;
+
+
+            case 'unavailableTrade':
+                errorReason = 'Trade Reference provided does not exist in iQube Database.';
+                break;
+
+            case 'default':
+                errorReason = '';
+                break;
+
+        }
+
+        return errorReason;
+
+
+
+    },
+
+
+    bulkErrorValidation: function(bulkexcelRowArray, bulkRecID, owningBusiness) {
+
+        /*
+        	This function will segregate the valid and invalid records received from bulkLevelParse or tradeLevelParse functions and
+        	pass to createBulkCaseTask and populateErrorRecord for for valid records & invalid records respectively
+
+        	Sample Output for Error Records
+
+        	[{
+        	"tradeRef": "D-2025167-00-0",
+        	"tradeMarket": "DCC HK",
+        	"inValidReason": "Trade Reference provided does not exist in iQube Database"
+        	}, {
+        	"tradeRef": "D-076352-00-0",
+            "tradeMarket": "DCC HK",
+            "inValidReason": "Trade Reference provided does not exist for DCC HK"
+        	}]
+        	---------------------------------------------------------------------
+        	Sample output for valid Records
+        	[{
+        	"tradeID": "8e9d44ec3b0d62d0fca5a7da26e45a86",
+        	"tradeMarket": "DCC HK"
+        	}, {
+        		"tradeID": "46ad8c243bcd2a10092ed79704e45ade",
+        	"tradeMarket": "DCC HK"
+        	}]
+        */
+
+        try {
+            var errorObj = {};
+            var errorRecords = [];
+            var validRecords = [];
+            var filterArray = new global.ArrayUtil();
+
+
+            for (var i = 0; i < bulkexcelRowArray.length; i++) {
+
+                (function executeRow(index) {
+
+                    var getData = JSON.parse(bulkexcelRowArray[i]);
+                    var trdRef = getData.tradeReference; //Change name as per Excel Sheet
+                    var trdMarket = owningBusiness.toString(); //Change name as per Excel Sheet
+
+                    var getTradeData = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                    getTradeData.addEncodedQuery('transaction_reference=' + trdRef + '^owning_business=' + trdMarket);
+                    getTradeData.query();
+                    if (getTradeData.next()) {
+
+                        var countOfTrades = parseInt(getTradeData.getRowCount());
+
+                        if (countOfTrades == 1) {
+                            validRecords.push(getTradeData.sys_id);
+
+                        } else { //Duplicate Trades
+
+                            //Error Records
+                            errorObj.tradeRef = trdRef.toString();
+                            errorObj.tradeMarket = trdMarket.toString();
+                            errorObj.inValidReason = 'Duplicate Trade Reference found for ' + trdRef.toString() + '.';
+                            errorRecords.push(JSON.stringify(errorObj) + ' ');
+                            //Error Records
+                        }
+
+                    } else {
+                        //Reason Logic
+
+                        var reasonCode = '';
+                        var validateTrade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                        validateTrade.addEncodedQuery('transaction_reference=' + trdRef);
+                        validateTrade.query();
+                        if (validateTrade.next()) {
+                            //Valid trade reference but belongs to different market than selected
+                            if (validateTrade.owning_business.toString() != trdMarket.toString()) {
+                                reasonCode = 'Trade Reference provided does not exist for ' + trdMarket.toString() + '.';
+
+                            }
+                        } else { //InValid trade reference not avialable with reference to iQube
+                            reasonCode = 'Trade Reference provided does not exist in iQube Database.';
+                        }
+                        //Error Records
+                        errorObj.tradeRef = trdRef.toString();
+                        errorObj.tradeMarket = trdMarket.toString();
+                        errorObj.inValidReason = reasonCode.toString();
+                        errorRecords.push(JSON.stringify(errorObj) + ' ');
+                        //Error Records
+                    }
+                })(i);
+
+            }
+
+			errorRecords = filterArray.unique(errorRecords);
+			validRecords = filterArray.unique(validRecords);
+
+            //update bulk with error record
+
+            //this.createBulkCaseTask(validRecords, bulkRecID);
+            //this.populateErrorRecord(errorRecords, bulkRecID);
+            //this.populateErrorRecord(errorRecords);
+
+
+            gs.info('errorRecords ' + errorRecords.toString());
+            gs.info('validRecords ' + validRecords.toString());
+
+        } catch (ex) {
+            gs.info('Error Received from bulkErrorValidation ' + ex);
+        }
+
+    },
+
+
+    createBulkCaseTask: function(validRecords, bulkRecID) {
+        for (var i = 0; i < validRecords.length; i++) {
+
+            (function createBulkCase(index) {
+                var grcustodycase = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_case");
+                grcustodycase.initialize();
+                grcustodycase.short_description = 'Manually triggered by Bulk processing';
+                grcustodycase.description = 'Manually triggered by Bulk processing';
+                grcustodycase.trade_id = validRecords[i];
+                grcustodycase.bulk_id = bulkRecID;
+                grcustodycase.state = 2;
+                grcustodycase.triggered_by = '19c79fbb1ba30a10c6ada6c7b04bcbd5';
+                grcustodycase.case_status = 'ec34a3731b270a10c6ada6c7b04bcb7a';
+                var caseSysId = grcustodycase.insert();
+                gs.info('Created custody case: ' + caseSysId);
+            })(i);
+
+        }
+
+    },
+
+    populateErrorRecord: function(errorRecords, bulkRecID) {
+
+        /* The array of invalid trades received from bulkErrorValidation 
+        will be utilized to populate the new field(TBD) in submitted bulk which will be utilized for the display of audit log*/
+
+        try {
+
+            var populateErrorBulk = new GlideRecord('x_hsb11_hsbc_mss_o_hsbc_bulk_transaction');
+            populateErrorBulk.get(bulkRecID);
+            populateErrorBulk.short_description = "[" + errorRecords.toString() + "]";
+            populateErrorBulk.update();
+
+        } catch (ex) {
+            gs.info('Error Received from populateErrorRecord ' + ex);
+        }
+    },
+
+
+    getAssignmentGroup: function(roleName) {
+        // var assignmentGroup = '';
+        var grMember = new GlideRecord('sys_user_grmember');
+        grMember.addQuery('user', gs.getUserID());
+        grMember.addEncodedQuery('group.typeLIKE2269529d1b844650ff37eb14b24bcb19');
+        grMember.query();
+        while (grMember.next()) {
+            var grGroupRole = new GlideRecord('sys_group_has_role');
+            grGroupRole.addQuery('group', grMember.group);
+            grGroupRole.addQuery('role.name', roleName);
+            grGroupRole.query();
+            if (grGroupRole.next()) {
+                assignmentGroup = grGroupRole.group;
+                break;
+            }
+        }
+        return assignmentGroup;
+    },
+
+    selectTaskTemplate: function(tempNum) {
+        var taskTemplate = new GlideRecord('x_hsb11_mss_c_proc_custody_trade_task_template');
+        taskTemplate.addQuery('template_id', tempNum);
+        taskTemplate.query();
+        if (taskTemplate.next()) {
+            var tempContents = {
+                "description": taskTemplate.getValue("template_description"),
+                "shortDescription": taskTemplate.getValue("template_short_description")
+            };
+            return JSON.stringify(tempContents);
+        }
+    },
+
+    type: 'MSSCustodyBulkFileUpload'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2025-06-24 07:47:37</sys_created_on>
+        <sys_id>5ff1024a979e2a90a78db62de053afa6</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>MSSCustodyBulkFileUpload</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_5ff1024a979e2a90a78db62de053afa6</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2025-06-24 07:47:37</sys_updated_on>
+    </sys_script_include>
+</record_update>
