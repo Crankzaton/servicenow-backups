@@ -1,53 +1,156 @@
 <?xml version="1.0" encoding="UTF-8"?><record_update table="sys_ui_page">
     <sys_ui_page action="INSERT_OR_UPDATE">
         <category>general</category>
-        <client_script><![CDATA[// Function to show a warning about the update feature limitation
-// This function replaces the old updateIncidents()
-function updateCommentsWarning() {
-    alert('Due to browser security, records selected within the embedded list cannot be directly accessed for updates from this page. This functionality requires a different approach, such as a List UI Action on the native Incident list or a Service Portal widget.');
+        <client_script><![CDATA[function updateIncidents() {
+    var selectedIncidents = [];
+    var checkboxes = document.querySelectorAll('.incident-checkbox:checked');
+    checkboxes.forEach(function(checkbox) {
+        selectedIncidents.push(checkbox.value);
+    });
+
+    if (selectedIncidents.length === 0) {
+        alert('Please select at least one incident to update.');
+        return;
+    }
+
+    var comments = document.getElementById('commentsInput').value;
+    if (!comments.trim()) {
+        alert('Please enter comments to update.');
+        return;
+    }
+
+    var ga = new GlideAjax('x_938076_now_utils.OptionProcessorAjax');
+    ga.addParam('sysparm_name', 'updateIncidentComments');
+    ga.addParam('sysparm_incident_sys_ids', selectedIncidents.join(','));
+    ga.addParam('sysparm_comments', comments);
+    ga.getXML(function(response) {
+        var answer = response.responseXML.documentElement.getAttribute('answer');
+        if (answer === 'success') {
+            alert('Incidents updated successfully!');
+            refreshIncidentList(); // Re-run filter/search to show updated comments
+            document.getElementById('commentsInput').value = ''; // Clear comments box
+            document.getElementById('selectAll').checked = false; // Uncheck select all
+        } else {
+            alert('Error updating incidents: ' + answer);
+        }
+    });
 }
 
-// Function to filter the iframe based on keyword
-function filterIframeList() {
+function searchIncidents() {
+    // Clear any active encoded query when performing a keyword search
+    document.getElementById('encodedQueryInput').value = '';
+    refreshIncidentList();
+}
+
+function applyEncodedQuery() {
+    // Clear any active keyword search when applying an encoded query
+    document.getElementById('searchInput').value = '';
+    refreshIncidentList();
+}
+
+function refreshIncidentList() {
     var searchKeyword = document.getElementById('searchInput').value;
-    var iframe = document.getElementById('incidentListIframe');
-    
-    var baseURL = 'incident_list.do?sysparm_view=default';
-    var encodedQuery = '';
+    var encodedQuery = document.getElementById('encodedQueryInput').value;
 
-    if (searchKeyword) {
-        // Construct an encoded query to search across multiple fields for the keyword
-        // Using LIKE for broader search, and ^OR for "any of these fields"
-        encodedQuery = 'commentsLIKE' + encodeURIComponent(searchKeyword) +
-                       '^ORwork_notesLIKE' + encodeURIComponent(searchKeyword) +
-                       '^ORshort_descriptionLIKE' + encodeURIComponent(searchKeyword);
-    }
+    var ga = new GlideAjax('x_938076_now_utils.OptionProcessorAjax');
+    ga.addParam('sysparm_name', 'getFilteredIncidents');
+    ga.addParam('sysparm_keyword', searchKeyword);
+    ga.addParam('sysparm_encoded_query', encodedQuery);
+    ga.getXML(function(response) {
+        var incidents = JSON.parse(response.responseXML.documentElement.getAttribute('answer'));
+        var tableBody = document.getElementById('incidentTableBody');
+        tableBody.innerHTML = ''; // Clear existing list
+        var noIncidentsMessage = document.getElementById('noIncidentsMessage');
 
-    var finalQuery = 'ORDERBYsys_created_onDESC'; // Default sort
-    if (encodedQuery) {
-        finalQuery += '^' + encodedQuery; // Combine with keyword query
-    }
-    
-    // Set the iframe's src to load the filtered list
-    iframe.src = baseURL + '&sysparm_query=' + encodeURIComponent(finalQuery);
+        if (incidents.length > 0) {
+            incidents.forEach(function(incident) {
+                var row = tableBody.insertRow();
+                row.setAttribute('data-sysid', incident.sys_id);
+
+                var checkboxCell = row.insertCell();
+                checkboxCell.innerHTML = '<input type="checkbox" class="incident-checkbox" value="' + incident.sys_id + '"/>';
+
+                var numberCell = row.insertCell();
+                numberCell.innerHTML = '<a href="incident.do?sys_id=' + incident.sys_id + '" target="_blank">' + incident.number + '</a>';
+
+                var shortDescriptionCell = row.insertCell();
+                shortDescriptionCell.innerText = incident.short_description;
+
+                var stateCell = row.insertCell();
+                stateCell.innerText = incident.state;
+
+                var commentsCell = row.insertCell();
+                commentsCell.innerText = incident.comments;
+            });
+            noIncidentsMessage.style.display = 'none';
+        } else {
+            noIncidentsMessage.style.display = 'block';
+        }
+        document.getElementById('selectAll').checked = false;
+    });
 }
 
-// Function to clear the filter in the iframe
-function clearIframeFilter() {
-    document.getElementById('searchInput').value = ''; 
-    var iframe = document.getElementById('incidentListIframe');
-    iframe.src = 'incident_list.do?sysparm_view=default&sysparm_query=ORDERBYsys_created_onDESC'; // Reset to default view
+function clearKeywordSearchAndReload() {
+    document.getElementById('searchInput').value = '';
+    refreshIncidentList();
 }
 
-// --- IMPORTANT: Remove any other old functions from previous iterations here ---
-// If you have functions like refreshIncidentList, searchIncidents (that populated a custom table),
-// toggleAllCheckboxes, openNativeFilterBuilder, updateFilterDisplay, etc.,
-// please ensure they are removed from your Client Script. They are not used in this iframe approach.]]></client_script>
+function clearEncodedQueryAndReload() {
+    document.getElementById('encodedQueryInput').value = '';
+    refreshIncidentList();
+}
+
+// Function to open the native filter builder for the Incident table
+function openNativeFilterBuilder() {
+    var queryInput = document.getElementById('encodedQueryInput');
+    var tableName = 'incident';
+
+    var g_filter_builder = new GwtFilterBuilder(tableName, queryInput.id);
+    g_filter_builder.setReadOnly(false);
+    g_filter_builder.showDialog();
+
+    // Use a MutationObserver to automatically apply the filter when the input's value changes
+    // This makes the "Build Query" experience more seamless.
+    var observer = new MutationObserver(function(mutations) {
+        mutations.forEach(function(mutation) {
+            if (mutation.type === 'attributes' && mutation.attributeName === 'value') {
+                // Input value has changed, likely from the filter builder
+                // Disconnect observer to prevent infinite loops or multiple calls
+                observer.disconnect();
+                // Automatically apply the filter
+                applyEncodedQuery();
+            }
+        });
+    });
+
+    // Start observing the 'value' attribute of the encodedQueryInput
+    observer.observe(queryInput, { attributes: true });
+}
+
+
+function toggleAllCheckboxes(source) {
+    var checkboxes = document.querySelectorAll('.incident-checkbox');
+    checkboxes.forEach(function(checkbox) {
+        checkbox.checked = source.checked;
+    });
+}
+
+// Initial load of incidents when the page loads
+addLoadEvent(function() {
+    refreshIncidentList();
+});]]></client_script>
         <description/>
         <direct>false</direct>
         <endpoint>x_938076_now_utils_update_incidents.do</endpoint>
         <html><![CDATA[<?xml version="1.0" encoding="utf-8" ?>
 <j:jelly trim="false" xmlns:j="jelly:core" xmlns:g="glide" xmlns:j2="null" xmlns:g2="null">
+    <g:evaluate var="jvar_incidents_list" object="true">
+        // Initialize an empty array or fetch initial incidents if needed
+        var incidents = [];
+        // This initial evaluation block is mostly for placeholder, actual data loading is via client script.
+        incidents;
+    </g:evaluate>
+
     <g:ui_form>
         <table width="100%">
             <tr>
@@ -61,37 +164,65 @@ function clearIframeFilter() {
                         </tr>
                         <tr>
                             <td style="padding-bottom: 20px;">
-                                <button type="button" class="btn btn-primary" onclick="alert('Due to browser security, records selected within the embedded list cannot be directly accessed for updates from this page. This functionality requires a different approach, such as a List UI Action on the native Incident list or a Service Portal widget.')">Update Comments for Selected</button>
-                                <p style="color: red; font-size: 0.9em; margin-top: 5px;">*Note: Please refer to the alert for information on updates from the embedded list.</p>
+                                <button type="button" class="btn btn-primary" onclick="updateIncidents()">Update Comments</button>
                             </td>
                         </tr>
-
                         <tr>
                             <td style="padding-bottom: 10px;">
-                                <label for="searchInput" class="control-label">Search Incidents (filters embedded list):</label>
-                                <input type="text" id="searchInput" name="searchInput" class="form-control" style="width: 100%;" placeholder="Enter keyword in comments, work notes, or short description"/>
+                                <label for="searchInput" class="control-label">Search Incidents (in Comments/Work notes/Short Description):</label>
+                                <input type="text" id="searchInput" name="searchInput" class="form-control" style="width: 100%;" placeholder="Enter keyword to search in comments"/>
                             </td>
                         </tr>
                         <tr>
                             <td style="padding-bottom: 20px;">
-                                <button type="button" class="btn btn-default" onclick="filterIframeList()">Search Keyword</button>
-                                <button type="button" class="btn btn-link" onclick="clearIframeFilter()">Clear Filter</button>
-                                <p style="font-size: 0.9em; margin-top: 5px;">Use the filter controls directly within the "Incident List (Native View)" below to build advanced queries.</p>
+                                <button type="button" class="btn btn-default" onclick="searchIncidents()">Search Keyword</button>
+                                <button type="button" class="btn btn-link" onclick="clearKeywordSearchAndReload()">Clear Keyword Search</button>
                             </td>
                         </tr>
 
-                    </table>
+                        <tr>
+                            <td style="padding-top: 20px; padding-bottom: 10px;">
+                                <label for="encodedQueryInput" class="control-label">Filter Incidents (Encoded Query):</label>
+                                <input type="text" id="encodedQueryInput" name="encodedQueryInput" class="form-control" style="width: 100%;" placeholder="e.g., active=true^state=1" title="Enter a ServiceNow encoded query string."/>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="padding-bottom: 20px;">
+                                <button type="button" class="btn btn-default" onclick="applyEncodedQuery()">Apply Filter</button>
+                                <button type="button" class="btn btn-link" onclick="clearEncodedQueryAndReload()">Clear Filter</button>
+                                <button type="button" class="btn btn-info" onclick="openNativeFilterBuilder()">Build Query</button>
+                            </td>
+                        </tr>
+                        </table>
                 </td>
             </tr>
             <tr>
                 <td colspan="2">
                     <div style="margin-top: 20px;">
-                        <h3>Incident List (Native View)</h3>
-                        <iframe id="incidentListIframe"
-                                src="incident_list.do?sysparm_view=default&amp;sysparm_query=ORDERBYsys_created_onDESC"
-                                style="width: 100%; height: 600px; border: 1px solid #ccc;"
-                                frameborder="0">
-                        </iframe>
+                        <h3>Incident List</h3>
+                        <table id="incidentListTable" class="table table-hover table-striped">
+                            <thead>
+                                <tr>
+                                    <th><input type="checkbox" id="selectAll" onclick="toggleAllCheckboxes(this)"/></th>
+                                    <th>Number</th>
+                                    <th>Short Description</th>
+                                    <th>State</th>
+                                    <th>Comments (Work notes)</th>
+                                </tr>
+                            </thead>
+                            <tbody id="incidentTableBody">
+                                <j:forEach items="${jvar_incidents_list}" var="jvar_incident">
+                                    <tr data-sysid="${jvar_incident.sys_id}">
+                                        <td><input type="checkbox" class="incident-checkbox" value="${jvar_incident.sys_id}"/></td>
+                                        <td><a href="incident.do?sys_id=${jvar_incident.sys_id}" target="_blank">${jvar_incident.number}</a></td>
+                                        <td>${jvar_incident.short_description}</td>
+                                        <td>${jvar_incident.state}</td>
+                                        <td>${jvar_incident.comments}</td>
+                                    </tr>
+                                </j:forEach>
+                            </tbody>
+                        </table>
+                        <p id="noIncidentsMessage" style="display: none; text-align: center; color: #888;">No incidents found matching your criteria.</p>
                     </div>
                 </td>
             </tr>
@@ -104,13 +235,13 @@ function clearIframeFilter() {
         <sys_created_by>admin</sys_created_by>
         <sys_created_on>2025-07-04 07:11:04</sys_created_on>
         <sys_id>6e79199597aa2a10a78db62de053af14</sys_id>
-        <sys_mod_count>12</sys_mod_count>
+        <sys_mod_count>5</sys_mod_count>
         <sys_name>update_incidents</sys_name>
         <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
         <sys_policy/>
         <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
         <sys_update_name>sys_ui_page_6e79199597aa2a10a78db62de053af14</sys_update_name>
         <sys_updated_by>admin</sys_updated_by>
-        <sys_updated_on>2025-07-04 08:16:45</sys_updated_on>
+        <sys_updated_on>2025-07-04 07:23:30</sys_updated_on>
     </sys_ui_page>
 </record_update>
