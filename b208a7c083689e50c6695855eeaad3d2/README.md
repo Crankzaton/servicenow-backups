@@ -24,8 +24,9 @@ If you find yourself unable to import your repository due to the presence of fil
    2.2 Activate/install all required dependencies
    2.3 Re-import the application from source control
    Currently listed dependencies:
-   * System (apps/system1)
    * System Import Sets
-   * System Applications Core
    * Customer Service
+   * System (apps/system1)
+   * System Applications Core
    * Data Lookup and Record Matching Support
+   * Incident
