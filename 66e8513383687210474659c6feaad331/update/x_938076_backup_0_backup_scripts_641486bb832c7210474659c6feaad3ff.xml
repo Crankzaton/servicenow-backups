@@ -1,0 +1,167 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="x_938076_backup_0_backup_scripts">
+    <x_938076_backup_0_backup_scripts action="INSERT_OR_UPDATE">
+        <active>true</active>
+        <description>This copies Spaces of type "Conference room" to the Room table, it sets the locations on existing reservations to the newly created rooms.
+If a reservation cannot be updated (to the new location) the existing space will not be deactivated.
+If all reservations are moved successfully the original room is deactivated.
+Warnings are logged if some spaces or reservations could not be updated correctly.</description>
+        <name>Copy Conference Room Space To Room Fix</name>
+        <order>100</order>
+        <script><![CDATA[var CONF_ROOM_TYPE = 'conference_room';
+var ROOM_TYPE = 'room';
+var ROOM_LOC_TYPE_ID = '20713b83eb512010b89bfdfc9c522899';
+var SPACE_TABLE = 'sn_wsd_core_space';
+var ROOM_TABLE = 'sn_wsd_core_room';
+var CORE_RSV_TABLE = 'sn_wsd_core_reservation';
+var SCRIPT_NAME = 'Copy Conference Room Space To Room Fix - ';
+var TABLE_CHOICE = 'sys_choice';
+
+init();
+
+/**
+ * entry point for this fix script
+ */
+function init() {
+	// get spaces of type conference room
+	var spacesGr = new GlideRecord(SPACE_TABLE);
+	spacesGr.addQuery('space_type', CONF_ROOM_TYPE);
+	spacesGr.addQuery('active', true);
+	spacesGr.addQuery('sys_class_name', 'sn_wsd_core_space');
+	spacesGr.query();
+
+// get fields that should be copied to new table
+	var fieldsToCopy = getFields(spacesGr);
+
+	while (spacesGr.next()) {
+		// copy to new room
+		var newSpaceId = createRoomFromSpace(fieldsToCopy, spacesGr);
+		if (!newSpaceId) {
+			gs.warn(SCRIPT_NAME + 'Could not move sn_wsd_core_space ' + spacesGr.getValue('sys_id') + ' to new table');
+			continue;
+		}
+		// move reservations
+		var reservationGr = getReservationsForLocation(spacesGr.getValue('sys_id'));
+		var updateResult = updateReservationLocations(reservationGr, newSpaceId);
+
+		if (!updateResult.success) {
+			var msg = SCRIPT_NAME + 'Could not update all reservations from sn_wsd_core_space ';
+			msg += spacesGr.getValue('sys_id') + ' to sn_wsd_core_room ' + newSpaceId.getValue('sys_id');
+			msg += ' migrated rooms:\n';
+			msg += updateResult.failures.join(',');
+			gs.warn(msg);
+
+			if (!disableRoom(newSpaceId))
+				gs.warn(SCRIPT_NAME + 'Failed to deactivate newly created room, the sn_wsd_core_space ' + spacesGr.getValue('sys_id') +
+					' and sn_wsd_core_room ' + newSpaceId + ' refer to the same physicial space');
+
+			continue;
+		}
+		// deactivate old room
+		spacesGr.active = false;
+		spacesGr.setValue('name', spacesGr.getValue('name') + ' [deprecated]');
+
+		if (!spacesGr.update())
+			gs.warn(SCRIPT_NAME + 'Failed to deactivate sn_wsd_core_space ' + spacesGr.getValue('sys_id'));
+	}
+}
+
+
+/**
+ * returns a list of fields that should be copied
+ * @param {GlideRecord} gr
+ * @return {string[]}
+ */
+function getFields(gr) {
+	var fields = [];
+	var elements = gr.getElements();
+	for (var i = 0; i < elements.length; i++) {
+		var element = elements[i];
+		var ed = element.getED();
+		var field = ed.getName();
+
+		if (field.indexOf('sys') !== 0 && field !== 'number') // dont overwrite sys fields
+			fields.push(field);
+	}
+	return fields;
+}
+
+/**
+ *
+ * @param {string} id - sys_id of room to disable
+ * @return {string|null}
+ */
+function disableRoom(id) {
+	var spaceGr = new GlideRecord(ROOM_TABLE);
+	if (spaceGr.get(id)) {
+		spaceGr.active = false;
+		return spaceGr.update();
+	}
+	return null;
+}
+
+/**
+ * Copies a space to the room table
+ * @param {string[]} fields
+ * @param {GlideRecord} spaceGr
+ * @return {string}
+ */
+function createRoomFromSpace(fields, spaceGr) {
+	var roomGr = new GlideRecord(ROOM_TABLE);
+	for (var i = 0; i < fields.length; i++) {
+		var field = fields[i];
+		roomGr.setValue(field, spaceGr.getValue(field));
+	}
+	roomGr.number = '';
+	roomGr.setValue('space_type', ROOM_TYPE);
+	roomGr.setValue('location_type', ROOM_LOC_TYPE_ID);
+
+	return roomGr.insert();
+}
+
+/**
+ * updates locations of a set of reservations to a new location
+ * returns sys_ids of reservations it fails to update
+ * @param {GlideRecord} reservationGr
+ * @param {string} locationId
+ * @return {{failures: string[], success: boolean}}
+ */
+function updateReservationLocations(reservationGr, locationId) {
+	var result = {success: true, failures: []};
+	while (reservationGr.next()) {
+		reservationGr.setValue('location', locationId);
+		reservationGr.setWorkflow(false);
+		var id = reservationGr.update();
+		if (!id) {
+			result.failures.push(reservationGr.getValue('sys_id'));
+			result.success = false;
+		}
+	}
+	return result;
+}
+
+/**
+ * gets reservations for specific location
+ * @param {string} id
+ * @return {GlideRecord}
+ */
+function getReservationsForLocation(id) {
+	var reservationGr = new GlideRecord(CORE_RSV_TABLE);
+	reservationGr.addQuery('location', id);
+	reservationGr.query();
+	return reservationGr;
+}
+]]></script>
+        <sys_class_name>x_938076_backup_0_backup_scripts</sys_class_name>
+        <sys_created_by>oauth.profile</sys_created_by>
+        <sys_created_on>2025-10-19 14:46:46</sys_created_on>
+        <sys_id>641486bb832c7210474659c6feaad3ff</sys_id>
+        <sys_mod_count>2</sys_mod_count>
+        <sys_name>100</sys_name>
+        <sys_package display_value="Backup Scripts" source="x_938076_backup_0">66e8513383687210474659c6feaad331</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Backup Scripts">66e8513383687210474659c6feaad331</sys_scope>
+        <sys_update_name>x_938076_backup_0_backup_scripts_641486bb832c7210474659c6feaad3ff</sys_update_name>
+        <sys_updated_by>oauth.profile</sys_updated_by>
+        <sys_updated_on>2025-10-19 15:15:07</sys_updated_on>
+    </x_938076_backup_0_backup_scripts>
+</record_update>
