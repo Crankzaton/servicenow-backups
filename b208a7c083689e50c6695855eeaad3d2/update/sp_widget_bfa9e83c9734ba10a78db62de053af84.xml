@@ -1,68 +1,110 @@
 <?xml version="1.0" encoding="UTF-8"?><record_update table="sp_widget">
     <sp_widget action="INSERT_OR_UPDATE">
         <category>custom</category>
-        <client_script><![CDATA[function UserTicketLookupController($scope, $rootScope, $timeout, spUtil) {
+        <client_script><![CDATA[api.controller = function() {
+  /* widget controller */
     var c = this;
 
-    // Initialize the reference field object for sn-record-picker
-    // IMPORTANT: This structure is required by the sn-record-picker directive.
-    c.userRefField = {
-        displayValue: '', // The user-friendly name displayed
-        value: '', // The sys_id (value-field) used in server-side queries
-        name: 'user_reference' // Internal name for the field
-    };
+    // Initialize loading state
+    c.loading = false; 
+
+    // Field object for sn-record-picker (initialized by Server Script)
+    c.user_picker = c.data.user_picker;
+
+    // Watch for changes in the user_picker value
+    $scope.$watch('c.user_picker.field.value', function (newValue, oldValue) {
+        // If the user is changed (or cleared), we might need to reset search results
+        if (newValue !== oldValue) {
+            // Optionally clear existing results when the selected user changes
+            // c.data.results = { incidents: [], changes: [], problems: [], hasSearched: false };
+            c.data.error = null;
+        }
+    });
 
     c.searchTickets = function() {
-        // Client-side validation: check for the sys_id value from the reference picker
-        // If the 'value' property is empty, block the search and show an error.
-        if (!c.userRefField.value) {
-            c.data.error = "Please select a User (Name or ID) to search.";
-            c.data.results = null; // Clear old results
+        var userId = c.user_picker.field.value;
+        c.data.error = null;
+
+        if (!userId) {
+            // If user ID is empty, set an error and disable loading
+            c.data.error = "Please select a user to search for tickets.";
+            c.data.results = { incidents: [], changes: [], problems: [], hasSearched: false };
+            c.loading = false; // MUST ensure loading is turned off
             return;
         }
 
-        c.data.error = '';
-        c.data.loading = true;
+        c.loading = true;
 
-        // Send the reference object's value (the sys_id) to the server
-        c.data.inputs = {
-            userSysId: c.userRefField.value
-        };
-
-        // Call server.update() to send the inputs and run the server script logic
-        c.server.update().then(function(response) {
-            c.data.loading = false;
-            // The server response populates c.data.results and c.data.error
-        });
-    };
-
-    c.closeTicket = function(sys_id, table_name) {
-        if (!confirm("Are you sure you want to close this ticket (" + sys_id + ")?")) {
-            return;
-        }
-
-        c.data.loading = true;
-
+        // Send the user ID to the server for the 'search' action
         c.server.get({
-            action: 'close_ticket',
-            sys_id: sys_id,
-            table_name: table_name
+            action: 'search',
+            userId: userId
         }).then(function(response) {
-            c.data.loading = false;
-            if (response.data.success) {
-                spUtil.addInfoMessage("Ticket " + sys_id + " closed successfully.");
-                c.searchTickets(); // Re-run search to refresh the list
-            } else {
-                spUtil.addErrorMessage("Failed to close ticket " + sys_id + ".");
-            }
+            // The server response updates c.data automatically
+            // If the server set an error, it will show up via ng-if
+            c.loading = false; // Turn off loading indicator
+        }).catch(function(error) {
+            // Handle HTTP or server-side error
+            c.data.error = "An unexpected error occurred during search.";
+            console.error("Server search error:", error);
+            c.loading = false; // Always turn off loading on error
         });
     };
 
-    // Initial update to populate data properties if needed
-    c.server.update();
-}]]></client_script>
+    // Helper function to build the native list view URL
+    c.getListViewUrl = function(type, userId) {
+        var table = '';
+        var userField = '';
+        if (type === 'incidents') {
+            table = 'incident';
+            userField = 'caller_id';
+        } else if (type === 'changes') {
+            table = 'change_request';
+            userField = 'requested_by'; // Or 'assigned_to', depending on requirement
+        } else if (type === 'problems') {
+            table = 'problem';
+            userField = 'assigned_to'; // Using assigned_to for problems
+        }
+        
+        if (table && userId) {
+            // URL to open the list view filtered by user's sys_id
+            return table + '_list.do?sysparm_query=' + userField + '=' + userId;
+        }
+        return '#'; // Return hash if data is missing
+    };
+
+    // The ng-init logic in HTML runs c.searchTickets() on load if hasSearched is false.
+    // If the widget loads with a pre-filled user (due to Server Script initialization), 
+    // the initial search will now run and disable the loading spinner correctly.
+};]]></client_script>
         <controller_as>c</controller_as>
-        <css/>
+        <css>/*&#13;
+ * Custom styles for the User Ticket Lookup widget.&#13;
+ * Using .state-active and .state-closed to ensure the label colors are consistent&#13;
+ * across different ServiceNow themes/styles, which can sometimes override the &#13;
+ * standard label-success/label-danger if not specific enough.&#13;
+ */&#13;
+&#13;
+.state-active {&#13;
+    background-color: #5cb85c !important; /* Green */&#13;
+    color: #fff !important;&#13;
+}&#13;
+&#13;
+.state-closed {&#13;
+    background-color: #d9534f !important; /* Red */&#13;
+    color: #fff !important;&#13;
+}&#13;
+&#13;
+/* Ensure the widget content is constrained nicely */&#13;
+.panel-body {&#13;
+    padding: 15px;&#13;
+}&#13;
+&#13;
+/* Styling for the record picker to fill its space */&#13;
+.sn-record-picker {&#13;
+    width: 100%;&#13;
+}&#13;
+</css>
         <data_table>sp_instance</data_table>
         <demo_data/>
         <description/>
@@ -79,210 +121,269 @@
         <public>false</public>
         <roles/>
         <script><![CDATA[(function() {
-    /**
-
-    Server Script for User Ticket Lookup Widget.
-
-    Handles searching for tickets by user sys_id and closing tickets.
-    */
-
-    // Check if the client script sent an action request to close a ticket
-    if (input && input.action === 'close_ticket') {
-        data.success = closeTicket(input.sys_id, input.table_name);
-        return; // Exit after closing the ticket operation is complete
-    }
-
-    // --- Default Action: Search for tickets ---
-    data.hasSearched = false;
-    data.error = '';
-    data.results = {
-        incidents: [],
-        changes: [],
-        problems: []
-    };
-
-    // Only run the search if we have the user Sys ID input from the client
-    if (input && input.inputs && input.inputs.userSysId) {
-        data.hasSearched = true;
-        var userSysId = input.inputs.userSysId;
-
-        // Search different tables using the retrieved user Sys ID
-        // Note: Using appropriate caller fields for each table
-        data.results.incidents = getRecords('incident', 'caller_id', userSysId);
-        data.results.changes = getRecords('change_request', 'requested_by', userSysId);
-        data.results.problems = getRecords('problem', 'opened_by', userSysId);
-    }
-
-    // --- Helper Functions ---
-
-    /**
-     * Fetches tickets from a specified table where the caller field matches the userSysId.
-     * @param {string} tableName - The table to query (e.g., 'incident').
-     * @param {string} fieldName - The field to query against (e.g., 'caller_id').
-     * @param {string} userSysId - The sys_id of the user.
-     * @returns {Array} An array of simplified record objects, including display and raw state values.
+    /*
+     * This script handles two modes:
+     * 1. Initialization (Input is null): Sets up the current user's details for the initial search.
+     * 2. Data Fetch (Input is present): Executes GlideRecord queries based on the user's sys_id.
      */
-    function getRecords(tableName, fieldName, userSysId) {
-        var records = [];
+
+    // Helper function to query a table and return a result array
+    function getRecords(tableName, userId, limit) {
+        var results = [];
         var gr = new GlideRecord(tableName);
 
-        gr.addQuery(fieldName, userSysId);
+        // Query condition: Tickets where the user is the caller or requested for (adjust as needed)
+        var userField = (tableName === 'change_request') ? 'requested_by' : 'caller_id';
+        
+        gr.addQuery(userField, userId);
         gr.orderByDesc('sys_created_on');
+        gr.setLimit(limit); // Limit to 10 records for display
         gr.query();
 
         while (gr.next()) {
-            // Capture both the display value and the raw integer value of the state
-            var stateDisplay = gr.getDisplayValue('state');
-            var stateValue = gr.getValue('state');
-
-            records.push({
-                sys_id: {
-                    value: gr.sys_id.toString(),
-                    label: 'Sys ID'
-                },
-                number: {
-                    value: gr.number.toString(),
-                    label: 'Number'
-                },
-                short_description: {
-                    value: gr.short_description.toString(),
-                    label: 'Short Description'
-                },
-                state: {
-                    value: stateDisplay,
-                    raw_value: stateValue,
-                    label: 'State'
-                }
+            results.push({
+                number: gr.getDisplayValue('number'),
+                sys_id: gr.getValue('sys_id'),
+                short_description: gr.getValue('short_description'),
+                state_value: gr.getValue('state'), // Raw value for logic
+                state_display: gr.getDisplayValue('state'), // Display value for UI
+                is_active: gr.getValue('active') // Boolean indicator
             });
         }
-        return records;
+        return results;
     }
 
-    /**
-     * Updates the state of the ticket to "Resolved" (3) or an equivalent closed state.
-     * @param {string} sysId - The sys_id of the ticket to close.
-     * @param {string} tableName - The table the ticket belongs to.
-     * @returns {boolean} True if the ticket was successfully updated.
-     */
-    function closeTicket(sysId, tableName) {
-        var gr = new GlideRecord(tableName);
-        if (gr.get(sysId)) {
-            // State 3 is typically Resolved/Closed in many tables.
-            gr.setValue('state', 3);
-            gr.setValue('active', false);
-            return gr.update();
+    // --- 1. Initialization (Runs on widget load) ---
+    if (!input) {
+        var userId = gs.getUserID();
+        
+        // Lookup user's display name explicitly
+        var userName = 'Unknown User';
+        var userGR = new GlideRecord('sys_user');
+        if (userGR.get(userId)) {
+             // Use explicit field name for safety
+            userName = userGR.getDisplayValue('name'); 
         }
-        return false;
+
+        // Pre-populate the user picker field with the current user's data
+        data.user_picker = {
+            field: {
+                value: userId,
+                displayValue: userName
+            }
+        };
+        // Initialize results structure
+        data.results = {
+            hasSearched: false,
+            incidents: [],
+            changes: [],
+            problems: []
+        };
+        data.foundUserName = userName;
+        data.userId = userId;
+        return;
     }
-})();]]></script>
+
+    // --- 2. Data Fetch (Runs when c.searchTickets() is called) ---
+    if (input && input.action === 'search') {
+        var userId = input.userId;
+        data.error = null;
+
+        if (!userId) {
+            data.error = "Please select a user to search for tickets.";
+            data.results = { incidents: [], changes: [], problems: [], hasSearched: true };
+            return;
+        }
+
+        // Fetch User Name for display in the header
+        var userGR = new GlideRecord('sys_user');
+        if (userGR.get(userId)) {
+            // Use explicit field name for safety
+            data.foundUserName = userGR.getDisplayValue('name'); 
+            data.userId = userId;
+        } else {
+            data.foundUserName = "User Not Found";
+            data.error = "The selected user ID does not exist.";
+            data.results = { incidents: [], changes: [], problems: [], hasSearched: true };
+            return;
+        }
+
+        // Fetch the tickets
+        var limit = 10;
+        data.results = {
+            incidents: getRecords('incident', userId, limit),
+            changes: getRecords('change_request', userId, limit),
+            problems: getRecords('problem', userId, limit),
+            hasSearched: true // Indicate that a search has been executed
+        };
+        
+        data.userId = userId; 
+    }
+
+})();
+]]></script>
         <servicenow>false</servicenow>
         <sys_class_name>sp_widget</sys_class_name>
         <sys_created_by>admin</sys_created_by>
         <sys_created_on>2025-10-22 10:48:23</sys_created_on>
         <sys_id>bfa9e83c9734ba10a78db62de053af84</sys_id>
-        <sys_mod_count>15</sys_mod_count>
+        <sys_mod_count>22</sys_mod_count>
         <sys_name>User Ticket Lookup</sys_name>
         <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
         <sys_policy/>
         <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
         <sys_update_name>sp_widget_bfa9e83c9734ba10a78db62de053af84</sys_update_name>
         <sys_updated_by>admin</sys_updated_by>
-        <sys_updated_on>2025-10-22 12:30:22</sys_updated_on>
-        <template><![CDATA[<div>
-    <div class="panel panel-default">
-        <div class="panel-heading">User Ticket Lookup</div>
-        <div class="panel-body">
+        <sys_updated_on>2025-10-24 11:14:03</sys_updated_on>
+        <template><![CDATA[<div class="panel panel-default" ng-init="!c.data.results.hasSearched && c.searchTickets()">
+    <div class="panel-heading" style="background-color: #00796B; color: white; font-weight: bold; font-size: 1.2em;">
+        User Ticket Lookup
+    </div>
+    <div class="panel-body">
+        <!-- START: Restored Row and Column Structure for sn-record-picker -->
+        <div class="row">
+            <div class="col-xs-10">
+                <!-- sn-record-picker (the reference search box) is correctly included here -->
+                <sn-record-picker field="c.user_picker"
+                                  table="'sys_user'"
+                                  display-field="'name'"
+                                  value-field="'sys_id'"
+                                  search-fields="'name,email'"
+                                  placeholder="Select a user...">
+                </sn-record-picker>
+            </div>
+            <div class="col-xs-2">
+                <!-- Search Button now uses c.loading correctly -->
+                <button class="btn btn-primary" ng-click="c.searchTickets()" ng-disabled="c.loading">
+                    <span ng-if="!c.loading"><i class="fa fa-search"></i> Search</span>
+                    <span ng-if="c.loading"><i class="fa fa-spinner fa-spin"></i> Loading</span>
+                </button>
+            </div>
+        </div>
+        <!-- END: Restored Row and Column Structure -->
+        
+        <div class="alert alert-danger" ng-if="c.data.error" style="margin-top: 15px;">
+            {{c.data.error}}
+        </div>
+    </div>
+</div>
 
-            <!-- Search Fields and Button (Compact Layout) -->
-            <div class="row m-b-md">
-                <!-- Reference Picker Field -->
-                <div class="col-sm-9">
-                    <label for="user_reference_picker">User ID</label>
-                    <sn-record-picker
-                        id="user_reference_picker"
-                        field="c.userRefField"
-                        table="'sys_user'"
-                        display-field="'name'"
-                        value-field="'sys_id'"
-                        search-fields="'name,user_name,email'"
-                        page-size="10"
-                        placeholder="Search by name, ID, or email..."
-                        ></sn-record-picker>
-                </div>
+<div class="alert alert-info" ng-if="!c.data.results.hasSearched && !c.loading" style="margin-top: 15px;">
+    Enter a user's ID or name and click "Search" to find their related tickets.
+</div>
 
-                <!-- Search Button -->
-                <div class="col-sm-3" style="padding-top: 25px;">
-                    <button class="btn btn-primary btn-block"
-                            ng-click="c.searchTickets()"
-                            ng-disabled="!c.userRefField.value || c.data.loading">
-                        <span ng-if="!c.data.loading">Search</span>
-                        <span ng-if="c.data.loading"><i class="fa fa-spinner fa-spin"></i> Searching...</span>
-                    </button>
-                </div>
-            </div>
+<div ng-if="c.data.results.hasSearched">
+    <div class="panel panel-default" style="margin-top: 20px;">
+        <div class="panel-body">
+            <h4 class="text-center" style="font-weight: bold;">Assigned Tickets for: {{c.data.foundUserName}}</h4>
+        </div>
+    </div>
 
-            <!-- Error Message Display -->
-            <div ng-if="c.data.error" class="alert alert-danger">{{c.data.error}}</div>
+    <!-- Incident Table -->
+    <div class="panel panel-default">
+        <div class="panel-heading text-center" style="background-color: #ff3333; color: white; font-size: 1.1em; font-weight: bold; padding: 10px 15px;">
+            Incidents ({{c.data.results.incidents.length}})
+        </div>
+        <div class="panel-body">
+            <div ng-if="c.data.results.incidents.length > 0">
+                <table class="table table-striped table-hover">
+                    <thead>
+                        <tr>
+                            <th>Number</th>
+                            <th>Description</th>
+                            <th>State</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr ng-repeat="ticket in c.data.results.incidents">
+                            <td>
+                                <a href="nav_to.do?uri=incident.do?sys_id={{ticket.sys_id}}" target="_blank">
+                                    {{ticket.number}}
+                                </a>
+                            </td>
+                            <td>{{ticket.short_description}}</td>
+                            <td><span class="label" ng-class="{'label-success': ticket.is_active == 'false', 'label-info': ticket.is_active == 'true'}">{{ticket.state_display}}</span></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <a ng-href="{{c.getListViewUrl('incidents', c.data.userId)}}" target="_blank" class="pull-right small">View All Incidents</a>
+            </div>
+            <div class="alert alert-warning text-center" ng-if="c.data.results.incidents.length === 0">
+                No Incidents found for this user.
+            </div>
+        </div>
+    </div>
 
-            <!-- Instructions/Initial Message -->
-            <div ng-if="!c.data.hasSearched && !c.data.error" class="alert alert-info">
-                Enter a user's name or ID and click Search to find related tickets.
-            </div>
+    <!-- Change Request Table -->
+    <div class="panel panel-default">
+        <div class="panel-heading text-center" style="background-color: #ff3333; color: white; font-size: 1.1em; font-weight: bold; padding: 10px 15px;">
+            Change Requests ({{c.data.results.changes.length}})
+        </div>
+        <div class="panel-body">
+            <div ng-if="c.data.results.changes.length > 0">
+                <table class="table table-striped table-hover">
+                    <thead>
+                        <tr>
+                            <th>Number</th>
+                            <th>Description</th>
+                            <th>State</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr ng-repeat="ticket in c.data.results.changes">
+                            <td>
+                                <a href="nav_to.do?uri=change_request.do?sys_id={{ticket.sys_id}}" target="_blank">
+                                    {{ticket.number}}
+                                </a>
+                            </td>
+                            <td>{{ticket.short_description}}</td>
+                            <td><span class="label" ng-class="{'label-success': ticket.is_active == 'false', 'label-info': ticket.is_active == 'true'}">{{ticket.state_display}}</span></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <a ng-href="{{c.getListViewUrl('changes', c.data.userId)}}" target="_blank" class="pull-right small">View All Change Requests</a>
+            </div>
+            <div class="alert alert-warning text-center" ng-if="c.data.results.changes.length === 0">
+                No Change Requests found for this user.
+            </div>
+        </div>
+    </div>
 
-            <div ng-if="c.data.hasSearched">
-                <!-- Incident Results -->
-                <h4>Incidents Raised ({{c.data.results.incidents.length}})</h4>
-                <div ng-if="c.data.results.incidents.length > 0">
-                    <table class="table table-striped">
-                        <thead>
-                            <tr>
-                                <th>Number</th>
-                                <th>Description</th>
-                                <th>State</th>
-                                <th>Action</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            <tr ng-repeat="item in c.data.results.incidents">
-                                <td>{{item.number.value}}</td>
-                                <td>{{item.short_description.value}}</td>
-                                <td>{{item.state.value}}</td>
-                                <td style="min-width: 150px;">
-                                    <!-- Open Button: Uses an anchor tag to open the record -->
-                                    <a href="/nav_to.do?uri=incident.do?sys_id={{item.sys_id.value}}"
-                                        target="_blank"
-                                        class="btn btn-default btn-xs m-r-xs">Open</a>
-
-                                    <!-- Close Button: Only show if state is Open/New (e.g., raw_value < 3) -->
-                                    <button ng-if="item.state.raw_value < 3"
-                                            class="btn btn-danger btn-xs"
-                                            ng-click="c.closeTicket(item.sys_id.value, 'incident')">Close</button>
-                                </td>
-                            </tr>
-                        </tbody>
-                    </table>
-                </div>
-                <div ng-if="c.data.results.incidents.length == 0" class="alert alert-warning">
-                    No Incidents found for this user.
-                </div>
-               
-                <!-- Change Results -->
-                <h4>Changes Raised ({{c.data.results.changes.length}})</h4>
-                <div ng-if="c.data.results.changes.length == 0" class="alert alert-warning">
-                    No Changes found for this user.
-                </div>
-                <!-- Change table structure (optional: implement table similar to incidents if needed) -->
-
-                <!-- Problem Results -->
-                <h4>Problems Raised ({{c.data.results.problems.length}})</h4>
-                <div ng-if="c.data.results.problems.length == 0" class="alert alert-warning">
-                    No Problems found for this user.
-                </div>
-                <!-- Problem table structure (optional: implement table similar to incidents if needed) -->
-            </div>
-        </div>
-    </div>
-
-</div>]]></template>
+    <!-- Problem Table -->
+    <div class="panel panel-default">
+        <div class="panel-heading text-center" style="background-color: #ff3333; color: white; font-size: 1.1em; font-weight: bold; padding: 10px 15px;">
+            Problems ({{c.data.results.problems.length}})
+        </div>
+        <div class="panel-body">
+            <div ng-if="c.data.results.problems.length > 0">
+                <table class="table table-striped table-hover">
+                    <thead>
+                        <tr>
+                            <th>Number</th>
+                            <th>Description</th>
+                            <th>State</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr ng-repeat="ticket in c.data.results.problems">
+                            <td>
+                                <a href="nav_to.do?uri=problem.do?sys_id={{ticket.sys_id}}" target="_blank">
+                                    {{ticket.number}}
+                                </a>
+                            </td>
+                            <td>{{ticket.short_description}}</td>
+                            <td><span class="label" ng-class="{'label-success': ticket.is_active == 'false', 'label-info': ticket.is_active == 'true'}">{{ticket.state_display}}</span></td>
+                        </tr>
+                    </tbody>
+                </table>
+                <a ng-href="{{c.getListViewUrl('problems', c.data.userId)}}" target="_blank" class="pull-right small">View All Problems</a>
+            </div>
+            <div class="alert alert-warning text-center" ng-if="c.data.results.problems.length === 0">
+                No Problems found for this user.
+            </div>
+        </div>
+    </div>
+</div>
+]]></template>
     </sp_widget>
 </record_update>
