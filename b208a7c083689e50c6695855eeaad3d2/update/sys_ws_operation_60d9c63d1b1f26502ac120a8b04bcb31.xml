@@ -1,0 +1,207 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_ws_operation">
+    <sys_ws_operation action="INSERT_OR_UPDATE">
+        <active>true</active>
+        <consumes>application/json,application/xml,text/xml,application/x-www-form-urlencoded</consumes>
+        <consumes_customized>true</consumes_customized>
+        <default_operation_uri/>
+        <enforce_acl>cf9d01d3e73003009d6247e603f6a990</enforce_acl>
+        <http_method>POST</http_method>
+        <name>el_inbound_event_taskize_automated</name>
+        <operation_script><![CDATA[(function process( /*RESTAPIRequest*/ request, /*RESTAPIResponse*/ response) {
+
+    try {
+		////
+        var formData = request.queryParams;
+
+        var requestBody = gs.base64Decode(formData.request);
+        requestBody = decodeURIComponent(requestBody);
+        //var requestBody = formData.request;
+        var data = {};
+
+        var reqBody = JSON.parse(requestBody);
+        var tradeid = reqBody.tradeid;
+        var market = reqBody.market;
+        var clientidentifier = reqBody.clientidentifier;
+        var eventdatetime = reqBody.eventdatetime;
+        var responseBody = {};
+
+        if (tradeid == '' || tradeid == undefined) {
+            responseBody.message = 'Missing Trade Id';
+            response.setBody(responseBody);
+            response.setStatus(400);
+            return;
+        }
+
+        if (market == '' || market == undefined) {
+            responseBody.message = 'Missing Market';
+            response.setBody(responseBody);
+            response.setStatus(400);
+            return;
+        }
+
+        if (clientidentifier == '' || clientidentifier == undefined) {
+            responseBody.message = 'Missing Client Identifier';
+            response.setBody(responseBody);
+            response.setStatus(400);
+            return;
+        }
+
+        if (eventdatetime == '' || eventdatetime == undefined) {
+            responseBody.message = 'Missing Event Date/Time';
+            response.setBody(responseBody);
+            response.setStatus(400);
+            return;
+        }
+
+        var grWidget;
+        grWidget = new GlideRecord('x_hsb11_hsbc_mss_o_mss_widget_inbound');
+        grWidget.initialize();
+        grWidget.object_id = tradeid;
+        grWidget.object_version = '1';
+        grWidget.object_type = 'AUTOMATED_QUERY_REQUEST';
+        //grWidget.object_id_type = requestData.objectidtype;
+        grWidget.event_status = 'AUTOMATED_QUERY';
+        grWidget.source = 'TASKIZE';
+        grWidget.message_id = tradeid;
+        grWidget.event_type = 'TASKIZE_AUTOMATED_QUERY';
+        grWidget.payload = JSON.stringify(reqBody);
+
+        //mapping table to check access with clientidentifier and market
+        var authenticateQuery = new GlideRecord('x_hsb11_mss_taskiz_mss_taskize_automated_query_authentication');
+        authenticateQuery.addEncodedQuery('lei=' + clientidentifier /*+ '^market=' + market*/);
+        authenticateQuery.query();
+        if (authenticateQuery.next()) {
+            var grTrade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+            grTrade.addEncodedQuery('transaction_reference=' + tradeid + '^owning_business=' + market + '^NQcustomer_reference=' + tradeid + '^owning_business=' + market);
+			grTrade.orderByDesc('sys_created_on');
+			grTrade.setLimit(1);
+            grTrade.query();
+            if (grTrade.next()) {
+				
+                if ((grTrade.mis_group == authenticateQuery.mis_group) && (grTrade.enitity_code == authenticateQuery.entity_code)) {
+
+                    responseBody.transaction_reference = grTrade.transaction_reference ? grTrade.transaction_reference.toString() : "";
+                    responseBody.customer_reference = grTrade.customer_reference ? grTrade.customer_reference.toString() : "";
+                    responseBody.securities_account = grTrade.securities_account ? grTrade.securities_account.toString() : "";
+                    responseBody.trade_date = grTrade.trade_date ? grTrade.trade_date.toString() : "";
+                    responseBody.settlement_date = grTrade.settlement_date ? grTrade.settlement_date.toString() : "";
+                    responseBody.isin = grTrade.isin ? grTrade.isin.toString() : "";
+                    responseBody.reason_code = grTrade.reason_code.getDisplayValue() ? grTrade.reason_code.getDisplayValue().toString() : "";
+                    responseBody.reason_description = grTrade.reason_description_remarks_unex ? grTrade.reason_description_remarks_unex.toString() : "";
+                    responseBody.transaction_type = grTrade.transaction_type.getDisplayValue() ? grTrade.transaction_type.getDisplayValue().toString() : "";
+                    responseBody.security_id = grTrade.security_id ? grTrade.security_id.toString() : "";
+                    responseBody.settlement_quantity = grTrade.settlement_quantity ? grTrade.settlement_quantity.toString() : "";
+                    responseBody.settlement_amount = grTrade.settlement_amount ? grTrade.settlement_amount.toString() : "";
+                    responseBody.settlement_amount_currency = grTrade.settlement_amount_currency.getDisplayValue() ? grTrade.settlement_amount_currency.getDisplayValue().toString() : "";
+                    responseBody.counterparty_name = grTrade.counterparty_name ? grTrade.counterparty_name.toString() : "";
+                    responseBody.trade_lifecycle_status = grTrade.trade_lifecycle_status.getDisplayValue() ? grTrade.trade_lifecycle_status.getDisplayValue().toString() : "";
+
+                    response.setBody(responseBody);
+                    response.setStatus(200);
+
+                    data.response = responseBody;
+                    data.clientname = authenticateQuery.client_name.toString();
+					//data.owningbusiness = authenticateQuery.owning_business.toString();
+					data.owningbusiness = market.toString();
+
+                    grWidget.status = 'Success';
+                    grWidget.additional_attributes = JSON.stringify(data);
+                    grWidget.event_date_time = new GlideDateTime();
+                    grWidget.insert();
+
+					gs.eventQueue('x_hsb11_mss_taskiz.create_taskize_case', grWidget, grWidget.event_status, grWidget.sys_id);
+
+                    return;
+
+                } else {
+					
+                    //responseBody.message = 'Client does not have access to view trade details';
+					responseBody.message = 'Could not find any trade details matching the information provided. Kindly raise a manual query for further assistance';
+                    response.setBody(responseBody);
+                    response.setStatus(400);
+
+					data.response = responseBody;
+                    data.clientname = authenticateQuery.client_name.toString();
+					data.owningbusiness = market.toString();
+
+                    grWidget.status = 'Error';
+                    grWidget.additional_attributes = JSON.stringify(data);
+                    grWidget.event_date_time = new GlideDateTime();
+                    grWidget.insert();
+
+					gs.eventQueue('x_hsb11_mss_taskiz.create_taskize_case', grWidget, grWidget.event_status, grWidget.sys_id);
+
+                    return;
+                }
+            } else {
+				
+                responseBody.message = 'Could not find any trade details matching the information provided. Kindly raise a manual query for further assistance';
+                response.setBody(responseBody);
+                response.setStatus(400);
+
+				data.response = responseBody;
+                data.clientname = authenticateQuery.client_name.toString();
+				data.owningbusiness = market.toString();
+
+                grWidget.status = 'Error';
+                grWidget.additional_attributes = JSON.stringify(data);
+                grWidget.event_date_time = new GlideDateTime();
+                grWidget.insert();
+
+				gs.eventQueue('x_hsb11_mss_taskiz.create_taskize_case', grWidget, grWidget.event_status, grWidget.sys_id);
+
+                return;
+            }
+        } else {
+			
+            //responseBody.message = 'Client is not onboarded in iQube or CLient does not have access to specified market';
+			responseBody.message = 'Could not find any trade details matching the information provided. Kindly raise a manual query for further assistance';
+            response.setBody(responseBody);
+            response.setStatus(400);
+
+			data.response = responseBody;
+            data.clientname = authenticateQuery.client_name ? authenticateQuery.client_name.toString() : "";
+			data.owningbusiness = market ? market.toString() : "";
+
+            grWidget.status = 'Error';
+            grWidget.additional_attributes = JSON.stringify(data);
+            grWidget.event_date_time = new GlideDateTime();
+            grWidget.insert();
+
+			gs.eventQueue('x_hsb11_mss_taskiz.create_taskize_case', grWidget, grWidget.event_status, grWidget.sys_id);
+			
+            return;
+        }
+    } catch (e) {
+        gs.info('Scripted REST API Resource - el_inbound_event_taskize_automated : Unkonwn exception while processing Taskize Automated Request ' + e.message);
+        response.setError(new sn_ws_err.BadRequestError(e.message));
+        response.setStatus(400);
+        return;
+    }
+
+})(request, response);]]></operation_script>
+        <operation_uri>/api/x_hsb11_hsbc_mss_o/el_inbound_event_full/el_inbound_event_taskize_automated</operation_uri>
+        <produces>application/json,application/xml,text/xml</produces>
+        <produces_customized>false</produces_customized>
+        <relative_path>/el_inbound_event_taskize_automated</relative_path>
+        <request_example/>
+        <requires_acl_authorization>true</requires_acl_authorization>
+        <requires_authentication>true</requires_authentication>
+        <requires_snc_internal_role>true</requires_snc_internal_role>
+        <short_description>Event Layer Endpoint for Automated Query</short_description>
+        <sys_class_name>sys_ws_operation</sys_class_name>
+        <sys_created_by>45341303@hsbc.com</sys_created_by>
+        <sys_created_on>2025-08-12 06:49:05</sys_created_on>
+        <sys_id>60d9c63d1b1f26502ac120a8b04bcb31</sys_id>
+        <sys_mod_count>51</sys_mod_count>
+        <sys_name>el_inbound_event_taskize_automated</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_ws_operation_60d9c63d1b1f26502ac120a8b04bcb31</sys_update_name>
+        <sys_updated_by>45341303@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-12-10 14:15:34</sys_updated_on>
+        <web_service_definition display_value="el_inbound_event_full">e90fb95f1bb71994ff37eb14b24bcbd0</web_service_definition>
+        <web_service_version/>
+    </sys_ws_operation>
+</record_update>

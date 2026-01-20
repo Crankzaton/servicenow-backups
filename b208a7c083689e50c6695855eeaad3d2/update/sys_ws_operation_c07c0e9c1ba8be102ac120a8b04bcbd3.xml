@@ -1,0 +1,304 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_ws_operation">
+    <sys_ws_operation action="INSERT_OR_UPDATE">
+        <active>true</active>
+        <consumes>application/json,application/xml,text/xml</consumes>
+        <consumes_customized>false</consumes_customized>
+        <default_operation_uri/>
+        <enforce_acl>cf9d01d3e73003009d6247e603f6a990</enforce_acl>
+        <http_method>GET</http_method>
+        <name>taskize_surveillance_data</name>
+        <operation_script><![CDATA[(function process( /*RESTAPIRequest*/ request, /*RESTAPIResponse*/ response) {
+
+    try {
+
+        var startEpoch = request.queryParams.start_date;
+        var endEpoch = request.queryParams.end_date;
+        var useremail = request.queryParams.username;
+        var username;
+
+        if (useremail) {
+            var getUserName = new GlideRecord('sys_user');
+            getUserName.addQuery('email', useremail);
+            getUserName.query();
+            if (getUserName.next()) {
+                username = getUserName.user_name;
+            }
+        }
+
+        if (!startEpoch || !endEpoch) {
+            response.setStatus(400);
+            response.setBody({
+                error: "start_date and end_date are required as query parameters"
+            });
+            return;
+        }
+
+        var startDateTime = new GlideDateTime();
+        startDateTime.setNumericValue(startEpoch * 1000);
+
+        var endDateTime = new GlideDateTime();
+        endDateTime.setNumericValue(endEpoch * 1000);
+
+
+        //validate if user has any records
+
+        if (useremail) {
+
+            //sys_created_onBETWEENjavascript:gs.dateGenerate('2025-11-07','00:00:00')@javascript:gs.dateGenerate('2026-01-07','23:59:59')^userSTARTSWITH45341303@hsbc.com^tablename=x_hsb11_mss_taskiz_mss_taskize_case
+            var preCheck = new GlideAggregate('sys_audit');
+            preCheck.addEncodedQuery('tablename=x_hsb11_mss_taskiz_mss_taskize_case^sys_created_onBETWEEN' + startDateTime.getValue() + '@' + endDateTime.getValue() + '^userSTARTSWITH' + username);
+            preCheck.query();
+
+            if (!preCheck.next()) {
+                response.setStatus(400);
+                response.setBody({
+                    error: "User specified holds no data for the provided duration"
+                });
+                return;
+            }
+
+        }
+        //validate if user has any records
+
+
+        var finalCaseData = [];
+        var searchQuery = 'tablename=x_hsb11_mss_taskiz_mss_taskize_case^sys_created_onBETWEEN' + startDateTime.getValue() + '@' + endDateTime.getValue();
+        if (useremail) {
+            searchQuery += '^userSTARTSWITH' + username;
+        }
+
+        var grAuditCase = new GlideAggregate('sys_audit');
+        grAuditCase.addEncodedQuery(searchQuery);
+        grAuditCase.groupBy('documentkey');
+        grAuditCase.query();
+        
+        while (grAuditCase.next()) {
+            
+            var caseData = {};
+            caseData.CaseID = grAuditCase.getValue('documentkey');
+
+            var assignmentGroupsArray = [];
+
+            var grAudit = new GlideRecord('sys_audit');
+            grAudit.addEncodedQuery('documentkey=' + grAuditCase.documentkey + '^fieldname=assignment_group^newvalueISNOTEMPTY');
+            grAudit.query();
+            while (grAudit.next()) {
+                assignmentGroupsArray.push(grAudit.getValue('newvalue') + "");
+            }
+            caseData.ADGroups = assignmentGroupsArray;
+            
+            var grAuditCaseComments = new GlideRecord('sys_audit');
+            var finalSearch = 'sys_created_onBETWEEN' + startDateTime.getValue() + '@' + endDateTime.getValue() + '^fieldname=comments^ORfieldname=account_number^ORfieldname=event_id^ORfieldname=u_event_type^ORfieldname=instruction_type^ORfieldname=instrument_id^ORfieldname=instrument_name^ORfieldname=source_record_id^ORfieldname=trade_id^ORfieldname=ampid^ORfieldname=haircut^ORfieldname=match_id^ORfieldname=trade_confirmation_reference^ORfieldname=trader^ORfieldname=triresolve_ref^documentkey=' + grAuditCase.documentkey;
+            if (useremail) {
+                finalSearch += '^userSTARTSWITH' + username;
+            }
+            grAuditCaseComments.addEncodedQuery(finalSearch);
+            grAuditCaseComments.query();
+
+            var info = [];
+
+            while (grAuditCaseComments.next()) {
+                
+                var body = {};
+                var senderDetails = {};
+                var receiverDetails = {};
+
+                var caseId = new GlideRecord('x_hsb11_mss_taskiz_mss_taskize_case');
+                if (caseId.get(grAuditCase.getValue('documentkey'))) {
+                   
+                    var getUserData = new GlideRecord('sys_user');
+                    getUserData.addQuery('user_name', grAuditCaseComments.getValue('user'));
+                    getUserData.query();
+
+
+                    if (grAuditCaseComments.user != 'system') { //from servicenow to taskize
+                        
+                        if (getUserData.next()) {
+                            senderDetails.Name = getUserData.getDisplayValue();
+                            senderDetails.Email = getUserData.email;
+                            senderDetails.UserId = getUserData.user_name;
+                            senderDetails.isHSBC = "Y";
+                        }
+
+                        try {
+
+                            var recClientFun = caseId.getValue('client_function') ? caseId.getValue('client_function').toString().toLowerCase().replace(' ', '') : "";
+                            var recClientOrg = caseId.getValue('client_organization_name') ? caseId.getValue('client_organization_name').toString().toLowerCase().replace(' ', '') + '.com' : "";
+                            receiverDetails.Email = recClientFun + '@' + recClientOrg;
+                            receiverDetails.isHSBC = "N";
+
+                            body.Receiver = receiverDetails;
+                            body.Sender = senderDetails;
+                            
+                        } catch (ex) {
+                            gs.info('Error from taskize_surveillance_api while adding data sent out to Taskize : ' + ex);
+                        }
+
+                    } else { //from taskize toservicenow
+
+                        try {
+                           
+                            var clientFunName = caseId.getValue('client_function') ? caseId.getValue('client_function').toString().toLowerCase().replace(' ', '') : "";
+                            var clientOrgName = caseId.getValue('client_organization_name') ? caseId.getValue('client_organization_name').toString().toLowerCase().replace(' ', '') : "";
+                            senderDetails.Email = clientFunName + '@' + clientOrgName + '.com';
+                            senderDetails.isHSBC = "N";
+
+                        } catch (ex) {
+                            gs.info('Error from taskize_surveillance_api while adding data received from Taskize : ' + ex);
+                        }
+
+                        if (caseId.assigned_to) {
+                            receiverDetails.Name = caseId.assigned_to.getDisplayValue();
+                            receiverDetails.Email = caseId.assigned_to.email;
+                            receiverDetails.UserId = caseId.assigned_to.user_name;
+                            receiverDetails.isHSBC = "Y";
+                        } else { //when case is unassigned
+                            receiverDetails.ADGroupId = caseId.assignment_group.sys_id;
+                            receiverDetails.isHSBC = "Y";
+                        }
+
+                       
+                        body.Receiver = receiverDetails;
+                        body.Sender = senderDetails;
+
+                    }
+
+                }
+
+                body.MessageType = 'TEXT';
+                body.Message = grAuditCaseComments.getValue('newvalue');
+                body.Metadata = grAuditCaseComments.getValue('fieldname');
+                body.Created = grAuditCaseComments.getValue('sys_created_on');
+                
+                info.push(body);
+            }
+
+            var attachments = [];
+            var att = new GlideRecord('sys_attachment');
+            att.addEncodedQuery('sys_created_onBETWEEN' + startDateTime.getValue() + '@' + endDateTime.getValue() + '^table_sys_idSTARTSWITH' + grAuditCase.getValue('documentkey'));
+
+            if (useremail) {
+                att.addQuery('sys_created_by', username);
+            }
+
+            att.query();
+
+            while (att.next()) {
+                
+                var attachmentSender = {};
+                var attachmentReceiver = {};
+
+                var getUserData = new GlideRecord('sys_user');
+                getUserData.addQuery('user_name', att.sys_created_by);
+                getUserData.query();
+
+                var grCase = new GlideRecord('x_hsb11_mss_taskiz_mss_taskize_case');
+
+                if (att.sys_created_by != 'system') { //from servicenow to taskize
+
+                    if (getUserData.next()) {
+                        attachmentSender.Name = getUserData.getDisplayValue();
+                        attachmentSender.Email = getUserData.email;
+                        attachmentSender.UserId = getUserData.user_name;
+                        attachmentSender.isHSBC = "Y";
+                    }
+
+                    if (grCase.get(grAuditCase.getValue('documentkey'))) {
+                        try {
+                            var attachRecFun = grCase.getValue('client_function') ? grCase.getValue('client_function').toString().toLowerCase().replace(' ', '') : "";
+                            var attachRecOrg = grCase.getValue('client_organization_name') ? grCase.getValue('client_organization_name').toString().toLowerCase().replace(' ', '') + '.com' : "";
+                            attachmentReceiver.Email = attachRecFun + '@' + attachRecOrg;
+                            attachmentReceiver.isHSBC = "N";
+
+                        } catch (ex) {
+                            gs.info('Error from taskize_surveillance_api while adding attachment data sent out to Taskize : ' + ex);
+                        }
+                    }
+                   
+
+                } else {
+
+                    if (grCase.get(grAuditCase.getValue('documentkey'))) {
+
+                        try {
+
+                            var attchSendFun = grCase.getValue('client_function') ? grCase.getValue('client_function').toString().toLowerCase().replace(' ', '') : "";
+                            var attchSendOrg = grCase.getValue('client_organization_name') ? grCase.getValue('client_organization_name').toString().toLowerCase().replace(' ', '') + '.com' : "";
+                            attachmentSender.Email = attchSendFun + '@' + attchSendOrg;
+                            attachmentSender.isHSBC = "N";
+                        } catch (ex) {
+                            gs.info('Error from taskize_surveillance_api while adding attachment data received from Taskize : ' + ex);
+                        }
+
+
+                        if (grCase.assigned_to) {
+                            attachmentReceiver.Name = grCase.assigned_to.getDisplayValue();
+                            attachmentReceiver.Email = grCase.assigned_to.email;
+                            attachmentReceiver.UserId = grCase.assigned_to.user_name;
+                            attachmentReceiver.isHSBC = "Y";
+                        } else { //when case is unassigned
+                            attachmentReceiver.ADGroupId = grCase.assignment_group.sys_id;
+                            attachmentReceiver.isHSBC = "Y";
+                        }
+
+                    }
+                    
+                }
+
+                attachments.push({
+                    id: att.getValue('sys_id'),
+                    size_bytes: att.getValue('size_bytes'),
+                    file_name: att.getValue('file_name'),
+                    download_link: gs.getProperty('glide.servlet.uri') + 'api/now/attachment/' + att.getValue('sys_id') + '/file',
+                    Sender: attachmentSender,
+                    Receiver: attachmentReceiver,
+                    sent_timestamp: att.getValue('sys_created_on')
+                });
+            }
+
+            if ((info.length > 0) || (attachments.length > 0)) {
+                caseData.Data = info;
+                caseData.Attachment = attachments;
+                finalCaseData.push(caseData);
+            }
+
+        }
+        
+        response.setStatus(200);
+        response.setBody(finalCaseData);
+
+        
+    } catch (error) {
+        response.setStatus(400);
+        response.setBody({
+            error: error.message
+        });
+        
+    }
+
+})(request, response);]]></operation_script>
+        <operation_uri>/api/x_hsb11_mss_taskiz/taskize_surveillance_data</operation_uri>
+        <produces>application/json,application/xml,text/xml</produces>
+        <produces_customized>false</produces_customized>
+        <relative_path>/</relative_path>
+        <request_example/>
+        <requires_acl_authorization>true</requires_acl_authorization>
+        <requires_authentication>true</requires_authentication>
+        <requires_snc_internal_role>true</requires_snc_internal_role>
+        <short_description/>
+        <sys_class_name>sys_ws_operation</sys_class_name>
+        <sys_created_by>45423105@hsbc.com</sys_created_by>
+        <sys_created_on>2025-10-08 18:28:18</sys_created_on>
+        <sys_id>c07c0e9c1ba8be102ac120a8b04bcbd3</sys_id>
+        <sys_mod_count>48</sys_mod_count>
+        <sys_name>taskize_surveillance_data</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_ws_operation_c07c0e9c1ba8be102ac120a8b04bcbd3</sys_update_name>
+        <sys_updated_by>45341303@hsbc.com</sys_updated_by>
+        <sys_updated_on>2026-01-19 05:57:27</sys_updated_on>
+        <web_service_definition display_value="taskize_surveillance_data">49c274101b20be102ac120a8b04bcb1a</web_service_definition>
+        <web_service_version/>
+    </sys_ws_operation>
+</record_update>

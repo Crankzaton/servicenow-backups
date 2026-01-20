@@ -1,0 +1,291 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_ws_operation">
+    <sys_ws_operation action="INSERT_OR_UPDATE">
+        <active>true</active>
+        <consumes>application/json,application/xml,text/xml</consumes>
+        <consumes_customized>false</consumes_customized>
+        <default_operation_uri/>
+        <enforce_acl>cf9d01d3e73003009d6247e603f6a990</enforce_acl>
+        <http_method>POST</http_method>
+        <name>el_custody_inbound_event</name>
+        <operation_script><![CDATA[(function process( /*RESTAPIRequest*/ request, /*RESTAPIResponse*/ response) {
+    try { //MSSOTIQUBE-305
+        var requestData = request.body.data;
+        var grtrade, current_trd, current_payload, current_addAttributes, respBody = {},
+            respText = '',
+            validFlag = true,
+            errFlag = true,
+            resObj = {},
+            errObj = {},
+            failureDescription, createEventForWidgetFailure;
+
+
+        resObj.success = {};
+        resObj.success.messageIds = [];
+        resObj.failure = [];
+
+        var workernodes = gs.getProperty('x_hsb11_mss_custod.mss.custody.numberof.worker.nodes');
+        var limit = gs.getProperty('x_hsb11_mss_custod.CustodyInboundPayloadSize');
+        var encodeObj = gs.base64Encode(JSON.stringify(requestData));
+        var size = (encodeObj.length) * 3 / 4;
+        if (size > limit) {
+            response.setStatus(413);
+            respBody.status = 'Unable to serve request because the request payload is more than ' + limit / 1000 + ' KB';
+            response.setBody(respBody);
+            return;
+        }
+		gs.info("api 27 ");
+        //Need to check if the below is required and what should be the limit iof required 
+        if (requestData.length > 50) {
+            response.setError(new sn_ws_err.BadRequestError('Too many elements in the array (<50)'));
+            return;
+        }
+
+        for (var i = 0; i < requestData.length; i++) {
+            current_trd = requestData[i].HEADER;
+            current_payload = requestData[i].PAYLOAD;
+			gs.info("api 37 id: "+current_trd.ObjectID);
+            //Technical UUID - Unique event ID for every single event - SN will use this to identify duplicate events
+            if (current_trd.MessageID == '' || current_trd.MessageID == undefined) {
+                errObj = {};
+                errObj.messageId = current_trd.MessageID.toString();
+                errObj.errorMessage = 'Rejected due to missing MessageID';
+                resObj.failure.push(errObj);
+                validFlag = false;
+                //respText += '  Record ' + i + ' has been rejected due to missing MessageID  ';
+            }
+            //Event Type - `FOL Event` (updates status)
+            else if (current_trd.EventType == '' || current_trd.EventType == undefined) {
+                errObj = {};
+                errObj.messageId = current_trd.MessageID.toString();
+                errObj.errorMessage = 'Rejected due to missing EventType';
+                resObj.failure.push(errObj);
+                validFlag = false;
+            }
+            //Source System - Originating system (e.g., GHSS HK DCC, GHSS HK GC, QTRACK, CFS) - required to differentiate GC/DCC, originating CFS utility etc.
+            else if (current_trd.Source == '' || current_trd.Source == undefined) {
+                errObj = {};
+                errObj.messageId = current_trd.MessageID.toString();
+                errObj.errorMessage = 'Rejected due to missing Source';
+                resObj.failure.push(errObj);
+                validFlag = false;
+            }
+            //Object Type - "Trade"
+            else if (current_trd.ObjectType == '' || current_trd.ObjectType == undefined) {
+                errObj = {};
+                errObj.messageId = current_trd.MessageID.toString();
+                errObj.errorMessage = 'Rejected due to missing ObjectType';
+                resObj.failure.push(errObj);
+                validFlag = false;
+            } else if (current_trd.ObjectIDType == '' || current_trd.ObjectIDType == undefined) {
+                errObj = {};
+                errObj.messageId = current_trd.MessageID.toString();
+                errObj.errorMessage = 'Rejected due to missing ObjectIDType';
+                resObj.failure.push(errObj);
+                validFlag = false;
+
+            }
+            //Object ID - Trade ID (is this different or copy of the unique object GHSS transaction ID?)
+            else if (current_trd.ObjectID == '' || current_trd.ObjectID == undefined) {
+                errObj = {};
+                errObj.messageId = current_trd.MessageID.toString();
+                errObj.errorMessage = 'Rejected due to missing ObjectID';
+                resObj.failure.push(errObj);
+                validFlag = false;
+            }
+            //Business Event Status - Business Event (Financial Object Level Event) - the to-be status field that will drive the process in Orchestration
+            else if (current_trd.EventStatus == '' || current_trd.EventStatus == undefined) {
+                errObj = {};
+                errObj.messageId = current_trd.MessageID.toString();
+                errObj.errorMessage = 'Rejected due to missing EventStatus';
+                resObj.failure.push(errObj);
+                validFlag = false;
+            }
+            //Trade Date - GHSS: Date where the trade taken place
+            else if (current_trd.EventDateTime == '' || current_trd.EventDateTime == undefined) {
+                errObj = {};
+                errObj.messageId = current_trd.MessageID.toString();
+                errObj.errorMessage = 'Rejected due to missing EventDateTime';
+                resObj.failure.push(errObj);
+                validFlag = false;
+            } else {
+				//MSSOTIQUBE-1649 - Remove logging
+				//gs.info('el_custody_inbound_event - Received Message ID - ' + current_trd.MessageID); //MSSOTIQUBE-305
+                var grEvent = new GlideRecord('x_hsb11_mss_custod_mss_custody_event_inbound_staging');
+                grEvent.addQuery('technical_uuid', current_trd.MessageID);
+                grEvent.addQuery('source_system', current_trd.Source);
+                grEvent.query();
+                if (grEvent.next()) {
+                    errObj = {};
+                    errObj.messageId = current_trd.MessageID.toString();
+                    errObj.errorMessage = 'Rejected due to having a duplicate';
+                    resObj.failure.push(errObj);
+                    validFlag = false;
+                } else {
+					gs.info("api 115 id: "+current_trd.ObjectID);
+                    grEvent = new GlideRecord('x_hsb11_mss_custod_mss_custody_event_inbound_staging');
+                    grEvent.initialize();
+                    //Mapping to corresponding fields from Header part to Inbound staging table
+                    grEvent.technical_uuid = current_trd.MessageID;
+                    grEvent.event_type = current_trd.EventType;
+                    grEvent.source_system = current_trd.Source;
+                    grEvent.object_type = current_trd.ObjectType;
+                    grEvent.object_id = current_trd.ObjectID;
+                    grEvent.object_version = current_trd.ObjectVersion;
+                    grEvent.object_id_type = current_trd.ObjectIDType;
+                    grEvent.business_event_status = current_trd.EventStatus;
+                    grEvent.unity_updated_timestamp = current_trd.EventDateTime;
+                    grEvent.trade_details = JSON.stringify(requestData[i].PAYLOAD);
+                    //Below script is to add the information in Payload to corresponding fields
+                    var _tradedetails = JSON.stringify(requestData[i].PAYLOAD);
+                    var _trdParser = requestData[i].PAYLOAD; //Code to parse the information in Trade Details field
+                    //Mapping to corresponding fields from Trade Details is in the below script
+                    grEvent.source_system_timestamp = _trdParser.SourceSystemLastUpdatedDateTimeUtc;
+                    grEvent.instruction_receipt_date_time = _trdParser.InstructionDateTimeUtc;
+                    grEvent.source_system_date = _trdParser.SourceSystemLastUpdatedDateTimeUtc;
+                    grEvent.legacy_status = _trdParser.SourceSystemTradeStatus;
+                    grEvent.cash_hold_indicator = _trdParser.CashHoldStatus;
+                    grEvent.script_hold_indicator = _trdParser.ScripHoldStatus;
+                    grEvent.stock_business_event_status = _trdParser.TradeEconomicAvailabilityStatus;
+                    // condition added as a part of GR5 
+
+                    if (_trdParser.SourceSystemName == "GCS UK") {
+                        grEvent.legacy_sub_status = _trdParser.SourceSystemTradeState;
+
+                        //var tt =  _trdParser.SourceSystemLastUpdatedDateTime; //pass received source system time stamp
+                        //var instructionDateTime = _trdParser.InstructionDateTime;
+                        var owningBusiness = _trdParser.SourceSystemName; // add owning business dynamically
+                        var gmtDiff = '';
+                        if (owningBusiness.indexOf('UK') > -1) {
+                            gmtDiff = -3600; //1 hour difference from UTC
+                        }
+                        // var utcValue = getUTCTime(_trdParser.SourceSystemLastUpdatedDateTime, gmtDiff);
+                        // //var instructionDateTime = getUTCTime(_trdParser.InstructionDateTime,gmtDiff);
+                        // grEvent.source_system_timestamp = utcValue;
+
+						grEvent.source_system_timestamp = _trdParser.SourceSystemLastUpdatedDateTime; // updated as a apart of GR11 P2
+                        //grEvent.instruction_receipt_date_time = instructionDateTime;
+
+                        // if (_trdParser.OwningBusinessName.toString() == 'GC UK') {
+                        //     grEvent.legacy_reason_code = _trdParser.SwiftStatus1Reason1Code;
+                        // } else {
+                        //     var unexecutionReasonCode = _trdParser.UnexecutionReasonCode ? _trdParser.UnexecutionReasonCode : "";
+                        //     var cancellationReasonCode = _trdParser.CancellationReasonCode ? _trdParser.CancellationReasonCode : "";
+                        //     grEvent.legacy_reason_code = unexecutionReasonCode + cancellationReasonCode;
+                        // }
+                        var swiftStatus1Reason1Code = _trdParser.SwiftStatus1Reason1Code;
+                        if (swiftStatus1Reason1Code) {
+                            var str = _trdParser.SwiftStatus1Reason1Code;
+                            var reasonCode = str.slice(-4);
+                            grEvent.legacy_reason_code = reasonCode;
+                        }
+
+                    } else {
+
+                        grEvent.legacy_sub_status = _trdParser.MaintenanceFunctionType;
+                        grEvent.legacy_reason_code = _trdParser.UnexecutionReasonCode;
+                        grEvent.gdi_indicator = _trdParser.GenerateDepositoryInstructionIndicator;
+                    }
+
+                    var custodyQueueID = custodySetQueue(current_trd.ObjectID);
+                    if (!isNaN(custodyQueueID)) {
+                        grEvent.queue_id = parseInt(custodyQueueID).toString();
+                    }
+
+                    if (!grEvent.insert()) {
+                        //MSSOTIQUBE-305
+                        //log the error and send xMatter alert
+						//MSSOTIQUBE-1544 adjust error description and uplift the severity
+                        gs.error('Custody Event Inbound record insert failed in  scripted rest api el_custody_inbound_event/batch, event messageid:' + requestData.messageid + ', objectid:' + requestData.objectid + ', eventstatus:' + requestData.eventstatus);
+                        failureDescription = "iQube Custody Event Inbound record insert failure in scripted rest api el_custody_inbound_event/batch, event messageid - " + requestData.messageid + " objectid - " + requestData.objectid + " eventstatus - " + requestData.eventstatus;
+                        createEventForWidgetFailure = new x_hsb11_hsbc_mss_t.hsbcWidgetFailureHandler().createITIDEvent('MAJOR', failureDescription, 'MSSiQubeCustody_EventInbound');
+                        response.setStatus(500);
+                        eventsArray.push({
+                            'messageId': requestData.messageid,
+                            'errorMessage': 'Record Not Inserted Properly.',
+                            'status': 'failure'
+                        });
+                    } else {
+                        response.setStatus(200);
+                        respBody.status = 'All the events have been successfully processed';
+                    }
+
+                    resObj.success.messageIds.push(current_trd.MessageID.toString());
+                    errFlag = false;
+                }
+            }
+        }
+
+        if (validFlag == false && errFlag == false) {
+            response.setStatus(207);
+            respBody = resObj;
+        } else if (validFlag == false && errFlag == true) {
+            response.setStatus(400);
+            respBody = resObj.failure;
+        }
+
+    response.setBody(respBody);
+
+    } catch (exp) { //MSSOTIQUBE-305
+	//MSSOTIQUBE-1544 adjust error description and uplift the severity
+        gs.error("Unexpected error from scripted rest api el_custody_inbound_event/batch, Name: " + exp.name + ", Message: " + exp.message);
+        failureDescription = "iQube Custody unexpected error from Event Inbound scripted rest api el_custody_inbound_event/batch, Name: " + exp.name + ", Message: " + exp.message;
+        createEventForWidgetFailure = new x_hsb11_hsbc_mss_t.hsbcWidgetFailureHandler().createITIDEvent('MAJOR', failureDescription, 'MSSiQubeCustody_EventInbound');
+        response.setStatus(500);
+        response.setBody({
+            'errorMessage': 'unexpected error Name: ' + exp.name + 'Message: ' + exp.message,
+            'status': 'failure'
+        });
+    }
+
+
+    //GR5
+    function getUTCTime(tt, gmtDiff) {
+        //converting canada time to UTC + GMT 1
+        var recTime = new GlideDateTime(); //record time
+        recTime.setValue(tt); // pass the updated time
+        recTime.addSeconds(gmtDiff); //UTC conversion
+
+        return recTime.getValue();
+    }
+
+    function custodySetQueue(objId) {
+        var reg = objId.replace(/[a-zA-Z-]/g, "");
+        // As part of GC UK trade format
+        // MSSCUSTODY-4097
+        //var trucobjID = reg.substring(0, 6);
+        var trucobjID;
+        if (objId.indexOf('GB-HBEU') > -1) {
+            trucobjID = reg.substr(-7);
+        } else {
+            trucobjID = reg.substr(0, 6);
+        }
+        var queue = (trucobjID % workernodes) + 1;
+        return queue;
+    }
+
+})(request, response);]]></operation_script>
+        <operation_uri>/api/x_hsb11_mss_custod/el_custody_inbound_event/batch</operation_uri>
+        <produces>application/json,application/xml,text/xml</produces>
+        <produces_customized>false</produces_customized>
+        <relative_path>/batch</relative_path>
+        <request_example/>
+        <requires_acl_authorization>false</requires_acl_authorization>
+        <requires_authentication>true</requires_authentication>
+        <requires_snc_internal_role>true</requires_snc_internal_role>
+        <short_description/>
+        <sys_class_name>sys_ws_operation</sys_class_name>
+        <sys_created_by>45336668@hsbc.com</sys_created_by>
+        <sys_created_on>2023-06-07 11:14:33</sys_created_on>
+        <sys_id>521ca29d1b13a1106ed00e1ad34bcb65</sys_id>
+        <sys_mod_count>198</sys_mod_count>
+        <sys_name>el_custody_inbound_event</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_ws_operation_521ca29d1b13a1106ed00e1ad34bcb65</sys_update_name>
+        <sys_updated_by>45375609@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-12-08 13:53:34</sys_updated_on>
+        <web_service_definition display_value="el_custody_inbound_event">daeb229d1b13a1106ed00e1ad34bcb40</web_service_definition>
+        <web_service_version/>
+    </sys_ws_operation>
+</record_update>
