@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.checkBandLimit</api_name>
+        <caller_access/>
+        <client_callable>true</client_callable>
+        <description>This script is created for MSSCUSTODY-2530 which compares the band limit w.r.t nominal settlement amount and settlement amount in USD
+
+Code Description:
+
+The code evaluates for any Checker task of trade outcomes with "Settle or Confirm Trade" if the selected user holds the respective access groups and USD authorization limits to work on the task
+
+Client Scripts Utlizing the script: 
+1) Check Band Limit on Change of Assignee
+2) Check Band Limit on Load of Assignee</description>
+        <mobile_callable>false</mobile_callable>
+        <name>checkBandLimit</name>
+        <sandbox_callable>true</sandbox_callable>
+        <script><![CDATA[var checkBandLimit = Class.create();
+checkBandLimit.prototype = Object.extendsObject(global.AbstractAjaxProcessor, {
+
+    trdTransType: function() {
+        var trdUniqVal = this.getParameter('sysparm_trdVal');
+        var trdRec = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+        trdRec.get(trdUniqVal);
+        return trdRec.transaction_type; //DVP or RVP
+
+    },
+
+    //MSSCUSTODY-6691
+    //modified as part of 6352
+    isTradeAboveBandLimit: function(tradeSysId, userSysId) {
+        var grTrade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+        if (!grTrade.get(tradeSysId)) return {
+            aboveLimit: true,
+            group: null,
+            trade: null
+        };
+
+        var nomAmt = grTrade.nominal_settlement_amount_in_usd; //nominal_settlement_amount_in_usd
+        var setAmt = grTrade.settlement_amount_in_usd; //settlement_amount_in_usd
+        var transType = grTrade.getValue('transaction_type'); //DVP or RVP
+        var owningBusiness = grTrade.owning_business; //trade owning business
+
+        //commented as part of MSSCUSTODY-6352
+        // var trdType = new GlideRecord('sys_user_group_type'); ////Fetching the Group type in sys_user_group_type table based on the Trade owning business
+        // trdType.get(owningBusiness); 
+        // var typeID = trdType.sys_id;
+
+        var grUser = new GlideRecord('sys_user'); ////Fetching the user associated groups to check if user belongs to the trade owning business group
+        grUser.get(userSysId);
+        var userMarket = grUser.u_associated_business_markets; //associated markets of user
+        var usrBand = grUser.u_user_band; //user band
+        //Fetching the user associated groups to check if user belongs to the trade owning business group
+
+        var aboveLimit = false;
+        var grGroup = null;
+
+        if ((userMarket.indexOf(owningBusiness) > -1) && (usrBand != '')) { //added to restrict users not having any band
+            grGroup = new GlideRecord("u_market_limit"); //earlier table was "sys_user_group"
+            // grGroup.addEncodedQuery('typeLIKE' + typeID + '^u_group_location=Onshore^u_associated_group_band=' + usrBand); //Considering only access groups
+            grGroup.addEncodedQuery('u_market=' + owningBusiness + '^u_band=' + usrBand);
+            grGroup.orderByDesc('u_local_limit');
+            grGroup.query();
+            if (grGroup.next()) {
+                if (transType == 'DVP' || transType == 'RVP') {
+                    if (setAmt > grGroup.u_usd_converted_limit.getReferenceValue()) {
+                        aboveLimit = true;
+                    }
+                } else if (transType == 'RFP' || transType == 'DFP') {
+                    if (nomAmt > grGroup.u_usd_converted_limit.getReferenceValue()) {
+                        aboveLimit = true;
+                    }
+                }
+            } else {
+                aboveLimit = true;
+            }
+        } else {
+            aboveLimit = true;
+        }
+
+        return {
+            aboveLimit: aboveLimit,
+            group: grGroup,
+            trade: grTrade
+        };
+    },
+
+    //Modified as part of MSSCUSTODY-6691
+    bandLimitCheck: function() { // for DVP, RVP settlement amount in USD
+        try {
+
+
+            var outcome = this.getParameter('sysparm_tskOutCome');
+            var tskType = this.getParameter('sysparm_tskType');
+            var tskID = this.getParameter('sysparm_tskID');
+
+            var cusTask = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_task');
+            cusTask.get(tskID);
+            var tskStatus = cusTask.active;
+
+            if (
+                tskType == 'Checker' && (outcome == 'Confirm Trade' || outcome == 'Amend and CONF' || outcome == 'Settle Trade' || outcome == 'Confirm Trade manually in GHSS') && tskStatus == true) {
+                var tradeID = this.getParameter('sysparm_trdID');
+                var userID = this.getParameter('sysparm_usrID');
+                var result = this.isTradeAboveBandLimit(tradeID, userID);
+                if (result.aboveLimit) return false;
+            }
+        } catch (ex) {
+            gs.info('Failure from Band Limit Check ' + tradeID + " " + ex.message + " " + bandLimitLogs.toString());
+
+
+        }
+
+    },
+
+
+    // bandLimitLogs: function() {
+
+    //     try {
+
+    //         var bandLimitDetailsLogs = [];
+
+    //         var outcome = this.getParameter('sysparm_logtskOutCome'); //task Outcome
+    //         var tskType = this.getParameter('sysparm_logtskType'); //trade task type
+    //         var tskID = this.getParameter('sysparm_logtskID'); //task ID
+    //         var resp = this.getParameter('sysparm_logtskresponse'); //task ID
+
+    //         bandLimitDetailsLogs.push('Band Limit Check Client Details Outcome =' + outcome + '\n');
+    //         bandLimitDetailsLogs.push('Band Limit Check Client Details Task Type =' + tskType + '\n');
+    //         bandLimitDetailsLogs.push('Band Limit Check Client Details Task ID =' + tskID + '\n');
+    //         bandLimitDetailsLogs.push('Band Limit Check Client Details response received =' + resp + '\n');
+
+    //         var bandLoggingFlag = gs.getProperty('x_hsb11_mss_c_proc.tradeBandLimitLogging');
+
+    //         if (bandLoggingFlag) {
+    //             gs.info('Band Limit Check Client Details ' + '\n' + bandLimitDetailsLogs.toString());
+    //         }
+
+    //     } catch (ex) {
+
+    //         gs.info('Error from bandLimitLogs Client details ' + ex);
+    //     }
+
+
+    // },
+
+    type: 'checkBandLimit'
+});]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>45348820@hsbc.com</sys_created_by>
+        <sys_created_on>2024-05-02 09:30:56</sys_created_on>
+        <sys_id>7fb0b92f1bf50e946ed00e1ad34bcb6d</sys_id>
+        <sys_mod_count>177</sys_mod_count>
+        <sys_name>checkBandLimit</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_7fb0b92f1bf50e946ed00e1ad34bcb6d</sys_update_name>
+        <sys_updated_by>45423148@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-10-08 13:30:18</sys_updated_on>
+    </sys_script_include>
+</record_update>

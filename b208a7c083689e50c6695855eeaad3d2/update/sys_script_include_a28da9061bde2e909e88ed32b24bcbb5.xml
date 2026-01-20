@@ -1,0 +1,1512 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.MSSCustodyBulkFileUpload</api_name>
+        <caller_access/>
+        <client_callable>true</client_callable>
+        <description/>
+        <mobile_callable>false</mobile_callable>
+        <name>MSSCustodyBulkFileUpload</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var MSSCustodyBulkFileUpload = Class.create();
+MSSCustodyBulkFileUpload.prototype = Object.extendsObject(global.AbstractAjaxProcessor, {
+
+    /*
+Schema for Bulk Level and Trade Level File upload functions
+
+bulkLevelParse   ------>   bulkErrorValidation ------>  createBulkCaseTask  ------> Creates case and flow starts triggering due to case creation
+(Reads the Excel)			(Segregation of Valid/		(Case Creation for			
+                                invalid Trades)			valid trades)
+                                   |
+                                   |
+                                   |--------------------> populateErrorRecord ------> Populates the new field (TBD) in bulk for audit
+
+
+tradeLevelParse   ------>   bulkErrorValidation ------>  createBulkCaseTask  ------> Creates case and flow starts triggering due to case creation
+(Reads the Excel)			(Segregation of Valid/		(Case Creation for			
+                                invalid Trades)			valid trades)
+                                   |
+                                   |
+                                   |--------------------> populateErrorRecord ------> Populates the new field (TBD) in bulk for audit
+*/
+
+
+    handleTradeReference: function(trdRef, trdMarket) {
+
+        try {
+
+            //Handling trade Reference Format
+
+            var charRegex = /[^a-zA-Z0-9\s]/g; //removal of special characters
+            var tradeRefRegex = /^[A-Z]-\d{6}-\d{2}-\d$/; //Trade Format Regex
+            var possibleTradeRegex = /^[A-Z]\d{9}$/i;
+            var checkFormat = tradeRefRegex.test(trdRef);
+            var possiblyTrade = possibleTradeRegex.test(trdRef);
+
+            if (((!checkFormat) && (trdMarket.indexOf('UK') == -1)) || ((possiblyTrade) && (trdMarket.indexOf('UK') > -1))) { //checking if the trade is not in format of R-655012-00-0 else formatting the trade reference and if trade is from GHSS
+
+                trdRef = trdRef.replace(/\s/g, ""); //remove any spaces inbetween
+                trdRef = trdRef.replace(charRegex, ''); //remove any special characters
+                trdRef = trdRef.trim();
+                var tradeSec1 = trdRef.substring(0, 1);
+                var tradeSec2 = trdRef.substring(1, 7);
+                var tradeSec3 = trdRef.substring(7, 9);
+                var tradeSec4 = trdRef.substring(9, 11);
+                var generatedTradeRef = tradeSec1 + "-" + tradeSec2 + "-" + tradeSec3 + "-" + tradeSec4;
+                trdRef = generatedTradeRef; //formatted version
+
+            } else { //if GHSS and UK owning business selected
+
+                trdRef = trdRef.trim(); //handling for UK trade
+
+            }
+
+
+            return trdRef;
+            //Handling Trade Reference Format
+
+        } catch (ex) {
+
+            gs.info('Error received from File Upload handleTradeReference ' + ex);
+
+        }
+
+    },
+
+
+
+    //Widgets
+    //Bulk Level Fil Upload
+    validateBulkFileUpload: function() {
+
+        /* The array of invalid trades received from bulkErrorValidation 
+        will be utilized to populate the new field(TBD) in submitted bulk which will be utilized for the display of audit log*/
+
+        try {
+            //gs.info('Bulk Validation File read - started for 500 records at ' + new GlideDateTime().getDisplayValue());
+            var owningBusiness = this.getParameter('sysparm_market');
+            var outcomeSelected = this.getParameter('sysparm_outcome');
+            var bulkexcelRowArray = [];
+            var errorObj = {};
+            var errorRecords = [];
+            var validRecords = [];
+            var bulkFileUploadLogs = [];
+            var count = 0;
+            var filterArray = new global.ArrayUtil();
+            var reasonCodeOutcome = '';
+            var bpiOutcome = '';
+            var currentUser = gs.getUser().getName(); //to fetch the right attachment by user
+            var errorRate = parseFloat(gs.getProperty('x_hsb11_hsbc_mss_o.hsbcBulkFileUploadErrorRateAcceptance'));
+            var maxLimit = parseInt(gs.getProperty('x_hsb11_hsbc_mss_o.hsbcBulkFileUploadMaxUploadLimit'));
+            var bulkUploadErrorLogs = gs.getProperty('x_hsb11_hsbc_mss_o.hsbcBulkFileUploadLogs');
+            var rejectionReasons = gs.getProperty('x_hsb11_hsbc_mss_o.bulkFileUploadErrorReasons');
+            rejectionReasons = JSON.parse(rejectionReasons);
+            //for reason Code and Business Process Stages
+            switch (outcomeSelected) {
+                case 'Resume Trade':
+                    reasonCodeOutcome = 'NA';
+                    bpiOutcome = 'resume_trade';
+                    break;
+
+                case 'Settle Trade':
+                    reasonCodeOutcome = 'NA';
+                    bpiOutcome = 'settle_trade';
+                    break;
+
+                case 'Confirm Trade':
+                    reasonCodeOutcome = 'NA';
+                    bpiOutcome = 'confirm_trade';
+                    break;
+
+                case 'Process Trade Cancellation':
+                    reasonCodeOutcome = 'Cancel';
+                    bpiOutcome = 'process_trade_cancellation';
+                    break;
+
+                case 'Put Trade On-Hold':
+                    reasonCodeOutcome = 'Put On Hold';
+                    bpiOutcome = 'put_trade_on_hold';
+                    break;
+
+            }
+            //for reason Code and Business Process Stages
+
+            //getting the attachment
+            var getTempAttachment = new GlideRecord("sys_attachment");
+            getTempAttachment.addEncodedQuery("table_name=ZZ_YYsc_cart_item^sys_created_by=" + currentUser);
+            getTempAttachment.orderByDesc('sys_created_on');
+            getTempAttachment.query();
+            if (getTempAttachment.next()) {
+
+                var attachmentSysId = getTempAttachment.getValue('sys_id');
+                var attachmentName = getTempAttachment.getValue('file_name'); // MSSCUSTODY 6700 - Fetching file size and type
+                var attachmentSize = getTempAttachment.getValue('size_bytes'); // MSSCUSTODY 6700 - Fetching file size and type
+
+                // Validate file type
+                if (!attachmentName.endsWith('.xlsx')) {
+                    bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + ' Result Retured Invalid file type' + '\n');
+                    if (bulkUploadErrorLogs) { //Log for debugging
+                        gs.info("Bulk File Upload " + '\n' + bulkFileUploadLogs.toString());
+                    }
+                    return "Invalid file type";
+                }
+
+                // Validate file size
+                if (attachmentSize > (10 * 1024 * 1024)) {
+                    bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + ' Result Retured File size exceeded' + '\n');
+                    if (bulkUploadErrorLogs) { //Log for debugging
+                        gs.info("Bulk File Upload " + '\n' + bulkFileUploadLogs.toString());
+                    }
+                    return "File size exceeded";
+                }
+            }
+            //getting attachment
+
+            var bulkattachment = new GlideSysAttachment(); //method to get the contents of the attachment
+            var bulkattachmentDetails = bulkattachment.getContentStream(attachmentSysId); //getting content of the EXcel
+
+            var bulkparser = new sn_impex.GlideExcelParser(); //method to parse the content of the Excel
+            bulkparser.setSource(bulkattachmentDetails); //setting the source to parse the content from the stream
+
+            var bulkgetSheet = bulkparser.getSheetNames(); //getting the sheet name to fetch details
+            bulkparser.setSheetNumber(0); //setting the sheet to parse
+
+            if (bulkparser.parse()) { //converting into readable format using parse
+
+                while (bulkparser.next()) { //iterating over each row
+                    var bulkgetRows = bulkparser.getRow(); //reading row by row
+                    bulkgetRows.business = owningBusiness.toString(); //add the owning business for each array item which will be used for error validation which will be from record producer
+                    var bulkrowObj = JSON.stringify(bulkgetRows); //holds the rows of Excel as comma sepearated
+                    bulkexcelRowArray.push(bulkrowObj + '');
+
+                }
+            }
+
+            //gs.info('Bulk Validation File read - Completion for 500 records at ' + new GlideDateTime().getDisplayValue());
+
+
+            if (bulkexcelRowArray.length > 0) {
+                //gs.info('Bulk Validation Evaluation started for 500 records at ' + new GlideDateTime().getDisplayValue());
+
+
+                for (var i = 0; i < bulkexcelRowArray.length; i++) {
+
+                    (function executeRow(index) {
+
+                        var getData = JSON.parse(bulkexcelRowArray[i]);
+                        //Inputs from Excel
+                        var trdRef = getData.tradeReference; //Change name as per Excel Sheet
+                        //Inputs from Excel
+                        var trdMarket = owningBusiness.toString(); //paramter from record producer
+
+                        bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + ' Received Trade Reference before modification ' + trdRef + 'Selected market ' + trdMarket + ' ' + '\n'); //optimiser 2511050923036567
+
+                        if (trdRef != null && trdRef != undefined && trdRef != '') { //ignoring all null trade references
+
+                            trdRef = new x_hsb11_hsbc_mss_o.MSSCustodyBulkFileUpload().handleTradeReference(trdRef, trdMarket);
+
+                            bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + ' Received Trade Reference after modification ' + trdRef + 'Selected market ' + trdMarket + ' ' + '\n'); //optimiser 2511050923036567
+
+
+                            var getTradeData = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                            getTradeData.addEncodedQuery('transaction_reference=' + trdRef + '^owning_business=' + trdMarket + '^case_type=no_open_case' + '^trade_lifecycle_status!=TradSttld^trade_lifecycle_status!=TradCanc');
+                            getTradeData.query();
+                            if (getTradeData.next()) {
+
+                                var countOfTrades = parseInt(getTradeData.getRowCount());
+
+                                bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + ' Count of records for  ' + trdRef + ' and Selected market ' + trdMarket + ' ' + countOfTrades + '\n'); //optimiser 2511050923036567
+
+
+                                if (countOfTrades == 1) { //Valid Records Count == 1
+
+                                    var grBulkEvents = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_stage'); //check for the matching record in BPS table
+                                    grBulkEvents.addEncodedQuery('business_process.process_name=Trade Lifecycle Status^market=' + owningBusiness + '^ctac_code=' + getTradeData.trade_lifecycle_status + '^' + bpiOutcome + '=true');
+                                    grBulkEvents.setLimit(1);
+                                    grBulkEvents.query();
+                                    if (grBulkEvents.next()) {
+                                        validRecords.push(getTradeData.sys_id.toString() + '');
+
+                                    } else { //Business process is not enabled
+                                        //Error Records
+
+                                        bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + ' Business process is not enabled for   ' + getTradeData.trade_lifecycle_status + ' reference ' + trdRef + ' and Selected market ' + trdMarket + ' ' + countOfTrades + '\n'); //optimiser 2511050923036567
+
+                                        errorObj.tradeRef = trdRef.toString();
+                                        errorObj.tradeMarket = trdMarket.toString();
+                                        errorObj.inValidReason = outcomeSelected + ' is not enabled for Life Cycle Status ' + getTradeData.trade_lifecycle_status.getDisplayValue(); //duplicateTrades
+                                        errorRecords.push(JSON.stringify(errorObj) + ' ');
+                                        //Error Records
+
+                                    }
+
+
+                                } else { //Duplicate Trades Count >1
+                                    //Error Records
+                                    errorObj.tradeRef = trdRef.toString();
+                                    errorObj.tradeMarket = trdMarket.toString();
+                                    errorObj.inValidReason = rejectionReasons.duplicateTrades.toString(); //duplicateTrades
+                                    errorRecords.push(JSON.stringify(errorObj) + ' ');
+                                    //Error Records
+                                }
+
+
+                            } else {
+                                //Invalid Trade Reference
+                                var inValidTrade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                                inValidTrade.addEncodedQuery('transaction_reference=' + trdRef + '^owning_business=' + trdMarket); // MSSCUSTODY-8253 Added owning business
+                                inValidTrade.query();
+                                if (inValidTrade.next()) {
+
+
+                                    // Commented as part of MSSCUSTODY-8253
+                                    //Valid trade reference but belongs to different market than selected
+                                    /*if (inValidTrade.owning_business.toString() != trdMarket.toString()) {
+
+                                        bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + ' invalidMarket Category ' + trdRef + 'Selected market ' + trdMarket + ' ' + 'Trade market ' + inValidTrade.owning_business + '\n'); //optimiser 2511050923036567
+
+
+                                        errorObj.tradeRef = trdRef.toString();
+                                        errorObj.tradeMarket = trdMarket.toString();
+                                        errorObj.inValidReason = rejectionReasons.invalidMarket.toString(); //different market than record producer
+                                        errorRecords.push(JSON.stringify(errorObj) + ' ');
+
+                                    }*/
+                                    if (inValidTrade.case_type.toString() != 'no_open_case') { //Has Active Case 
+
+                                        //bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + ' no_open_case Category ' + trdRef + 'Selected market ' + trdMarket + ' ' + 'Case Type of Case ' + inValidTrade.case_type.toString() + '\n'); //optimiser 2511050923036567
+
+                                        //Error Records
+                                        errorObj.tradeRef = trdRef.toString();
+                                        errorObj.tradeMarket = trdMarket.toString();
+                                        errorObj.inValidReason = rejectionReasons.activeOpenCase.toString();
+                                        errorRecords.push(JSON.stringify(errorObj) + ' ');
+                                        //Error Records
+
+                                    } else if (inValidTrade.trade_lifecycle_status == 'TradSttld') {
+
+                                        bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + ' Trade Settled Category ' + trdRef + 'Selected market ' + trdMarket + ' ' + 'Case Life Cycle ' + inValidTrade.trade_lifecycle_status + '\n'); //optimiser 2511050923036567
+
+                                        //Error Records
+                                        errorObj.tradeRef = trdRef.toString();
+                                        errorObj.tradeMarket = trdMarket.toString();
+                                        errorObj.inValidReason = rejectionReasons.tradeSettled.toString();
+                                        errorRecords.push(JSON.stringify(errorObj) + ' ');
+                                        //Error Records
+
+
+                                    } else if (inValidTrade.trade_lifecycle_status == 'TradCanc') {
+
+                                        bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + ' Trade Cancelled Category ' + trdRef + 'Selected market ' + trdMarket + ' ' + 'Case Life Cycle ' + inValidTrade.trade_lifecycle_status + '\n'); //optimiser 2511050923036567
+
+                                        //Error Records
+                                        errorObj.tradeRef = trdRef.toString();
+                                        errorObj.tradeMarket = trdMarket.toString();
+                                        errorObj.inValidReason = rejectionReasons.tradeCancelled.toString();
+                                        errorRecords.push(JSON.stringify(errorObj) + ' ');
+                                        //Error Records
+
+
+                                    }
+                                } else { //InValid trade reference not avialable with reference to iQube
+                                    // Commented as part of MSSCUSTODY-8253
+                                    /*bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + ' unAvailableTrade Category ' + trdRef + 'Selected market ' + trdMarket + '\n'); //optimiser 2511050923036567
+                                    errorObj.tradeRef = trdRef.toString();
+                                    errorObj.tradeMarket = trdMarket.toString();
+                                    errorObj.inValidReason = rejectionReasons.unAvailableTrade.toString(); // not available in database
+                                    errorRecords.push(JSON.stringify(errorObj) + ' ');*/
+
+                                    // MSSCUSTODY-8253 - Additional check for trade reference in any market
+                                    var notAvailable = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                                    notAvailable.addEncodedQuery('transaction_reference=' + trdRef);
+                                    notAvailable.query();
+                                    if (notAvailable.next()) {
+                                        if (notAvailable.owning_business.toString() != trdMarket.toString()) {
+
+
+                                            bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + ' invalidMarket Category ' + trdRef + 'Selected market ' + trdMarket + ' ' + 'Trade market ' + notAvailable.owning_business + '\n');
+                                            errorObj.tradeRef = trdRef.toString();
+                                            errorObj.tradeMarket = trdMarket.toString();
+                                            errorObj.inValidReason = rejectionReasons.invalidMarket.toString();
+                                            errorRecords.push(JSON.stringify(errorObj) + ' ');
+                                        }
+                                    } else {
+                                        bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + ' unAvailableTrade Category ' + trdRef + 'Selected market ' + trdMarket + '\n');
+                                        errorObj.tradeRef = trdRef.toString();
+                                        errorObj.tradeMarket = trdMarket.toString();
+                                        errorObj.inValidReason = rejectionReasons.unAvailableTrade.toString();
+                                        errorRecords.push(JSON.stringify(errorObj) + ' ');
+                                    }
+                                }
+
+                            }
+
+                        }
+                    })(i);
+
+                }
+
+                //Trade Life Cycle Status dynamically sending to the record producer
+
+                //gs.info('Bulk Validation Evaluation Completed for 500 records at ' + new GlideDateTime().getDisplayValue());
+
+
+                errorData = filterArray.unique(errorRecords);
+
+                var summaryTotalCount = parseInt(errorRecords.length) + parseInt(validRecords.length);
+                var summaryErrorRecords = parseInt(errorRecords.length);
+                var summaryValidRecords = parseInt(validRecords.length);
+                var finalErrorRate = (summaryErrorRecords / summaryTotalCount) * 100; // converting to percentage
+
+
+                bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + 'Total Records ' + summaryTotalCount + '\n');
+                bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + 'Error Records ' + summaryErrorRecords + '\n');
+                bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + 'Valid Records ' + summaryValidRecords + '\n');
+                bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + 'Error Rate ' + errorRate + '\n');
+                bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + 'Error Percentage of records ' + finalErrorRate + '%' + '\n');
+
+                if (summaryTotalCount == 0) { //unable to read due to any file error
+
+                    bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + 'Entered Invalid Entries Loop ' + '\n');
+                    bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + 'Entered Invalid Entries Loop ' + ' Result Retured = Invalid Entries' + '\n');
+                    if (bulkUploadErrorLogs) { //Log for debugging
+                        gs.info("Bulk File Upload " + '\n' + bulkFileUploadLogs.toString());
+                    }
+                    return 'Invalid Entries' + "/" + summaryTotalCount + "/" + summaryErrorRecords + "/" + summaryValidRecords + "/" + errorData; //data of errors
+                }
+
+                if ((summaryTotalCount > 0) && (summaryTotalCount < maxLimit)) {
+
+                    if ((summaryErrorRecords > 0) && (summaryTotalCount > 0)) {
+
+                        if (finalErrorRate > errorRate) { //More that 10% errors
+
+                            bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + 'Entered more than 10% Error Loop ' + '\n');
+                            bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + 'Entered more than 10% Error Loop ' + ' Result Retured = Validation Failed' + '\n');
+                            if (bulkUploadErrorLogs) { //Log for debugging
+                                gs.info("Bulk File Upload " + '\n' + bulkFileUploadLogs.toString());
+                            }
+                            return 'Validation Failed' + "/" + summaryTotalCount + "/" + summaryErrorRecords + "/" + summaryValidRecords + "/" + errorData; //data of errors
+
+                        } else { //Less that 50% errors
+                            bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + 'Entered less than 10% Error Loop ' + '\n');
+                            bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + 'Entered less than 10% Error Loop ' + ' Result Retured =  Validation Successful' + '\n');
+                            if (bulkUploadErrorLogs) { //Log for debugging
+                                gs.info("Bulk File Upload " + '\n' + bulkFileUploadLogs.toString());
+                            }
+                            return 'Validation Successful' + "/" + summaryTotalCount + "/" + summaryErrorRecords + "/" + summaryValidRecords + "/" + errorData; ///data of errors;
+
+                        }
+
+                    } else { //No errors
+
+                        bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + ' Result Retured = No Errors' + '\n');
+                        if (bulkUploadErrorLogs) { //Log for debugging
+                            gs.info("Bulk File Upload " + '\n' + bulkFileUploadLogs.toString());
+                        }
+                        return 'No Errors' + "/" + summaryTotalCount + "/" + summaryErrorRecords + "/" + summaryValidRecords + "/" + errorData; ///data of errors;
+                    }
+
+                } else {
+
+                    if (bulkUploadErrorLogs) { //Log for debugging
+                        gs.info("Bulk File Upload " + '\n' + bulkFileUploadLogs.toString());
+                    }
+                    return 'Limit Exceeded' + "/" + summaryTotalCount + "/" + summaryErrorRecords + "/" + summaryValidRecords + "/" + errorData;
+
+                }
+
+
+            }
+            bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + ' Result Retured = No records Found' + '\n');
+            if (bulkUploadErrorLogs) { //Log for debugging
+                gs.info("Bulk File Upload by " + currentUser + '\n' + bulkFileUploadLogs.toString());
+            }
+            return 'No records Found'; //empty file
+
+        } catch (ex) {
+            gs.info('Error Received from bulkLevelParse Client' + ex);
+        }
+    },
+
+    //Bulk Level File Upload
+
+
+
+
+    //Trade Level Fil Upload
+    validateTradeFileUpload: function() {
+
+        /* The array of invalid trades received from bulkErrorValidation 
+        will be utilized to populate the new field(TBD) in submitted bulk which will be utilized for the display of audit log*/
+
+        try {
+            var owningBusiness = this.getParameter('sysparm_market');
+            var outcomeSelected = this.getParameter('sysparm_outcome');
+            var bulkexcelRowArray = [];
+            var errorObj = {};
+            var validObj = {};
+            var errorRecords = [];
+            var validRecords = [];
+            var bulkFileUploadLogs = [];
+            var count = 0;
+            var filterArray = new global.ArrayUtil();
+            var reasonCodeOutcome = '';
+            var bpiOutcome = '';
+            var currentUser = gs.getUser().getName(); //to fetch the right attachment by user
+            var errorRate = parseFloat(gs.getProperty('x_hsb11_hsbc_mss_o.hsbcBulkFileUploadErrorRateAcceptance'));
+            var maxLimit = parseInt(gs.getProperty('x_hsb11_hsbc_mss_o.hsbcBulkFileUploadMaxUploadLimit'));
+            var bulkUploadErrorLogs = gs.getProperty('x_hsb11_hsbc_mss_o.hsbcBulkFileUploadLogs');
+            var rejectionReasons = gs.getProperty('x_hsb11_hsbc_mss_o.bulkFileUploadErrorReasons');
+            rejectionReasons = JSON.parse(rejectionReasons);
+
+
+            //for reason Code and Business Process Stages
+            switch (outcomeSelected) {
+                case 'Resume Trade':
+                    reasonCodeOutcome = 'NA';
+                    bpiOutcome = 'resume_trade';
+                    break;
+
+                case 'Settle Trade':
+                    reasonCodeOutcome = 'NA';
+                    bpiOutcome = 'settle_trade';
+                    break;
+
+                case 'Confirm Trade':
+                    reasonCodeOutcome = 'NA';
+                    bpiOutcome = 'confirm_trade';
+                    break;
+
+                case 'Process Trade Cancellation':
+                    reasonCodeOutcome = 'Cancel';
+                    bpiOutcome = 'process_trade_cancellation';
+                    break;
+
+                case 'Put Trade On-Hold':
+                    reasonCodeOutcome = 'Put On Hold';
+                    bpiOutcome = 'put_trade_on_hold';
+                    break;
+
+            }
+            //for reason Code and Business Process Stages
+
+            //getting the attachment
+            var getTempAttachment = new GlideRecord("sys_attachment");
+            getTempAttachment.addEncodedQuery("table_name=ZZ_YYsc_cart_item^sys_created_by=" + currentUser);
+            getTempAttachment.orderByDesc('sys_created_on');
+            getTempAttachment.query();
+            if (getTempAttachment.next()) {
+
+                var attachmentSysId = getTempAttachment.getValue('sys_id');
+                var attachmentName = getTempAttachment.getValue('file_name'); // MSSCUSTODY 6700 - Fetching file size and type
+                var attachmentSize = getTempAttachment.getValue('size_bytes'); // MSSCUSTODY 6700 - Fetching file size and type
+
+                // Validate file type
+                if (!attachmentName.endsWith('.xlsx')) {
+                    bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + ' Result Retured Invalid file type' + '\n');
+                    if (bulkUploadErrorLogs) { //Log for debugging
+                        gs.info("Trade File Upload " + '\n' + bulkFileUploadLogs.toString());
+                    }
+                    return "Invalid file type";
+                }
+
+                // Validate file size
+                if (attachmentSize > (10 * 1024 * 1024)) {
+                    bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + ' Result Retured File size exceeded' + '\n');
+                    if (bulkUploadErrorLogs) { //Log for debugging
+                        gs.info("Trade File Upload " + '\n' + bulkFileUploadLogs.toString());
+                    }
+                    return "File size exceeded";
+                }
+            }
+            //getting attachment
+
+            var bulkattachment = new GlideSysAttachment(); //method to get the contents of the attachment
+            var bulkattachmentDetails = bulkattachment.getContentStream(attachmentSysId); //getting content of the EXcel
+
+            var bulkparser = new sn_impex.GlideExcelParser(); //method to parse the content of the Excel
+            bulkparser.setSource(bulkattachmentDetails); //setting the source to parse the content from the stream
+
+            var bulkgetSheet = bulkparser.getSheetNames(); //getting the sheet name to fetch details
+            bulkparser.setSheetNumber(0); //setting the sheet to parse
+
+            if (bulkparser.parse()) { //converting into readable format using parse
+
+                while (bulkparser.next()) { //iterating over each row
+                    var bulkgetRows = bulkparser.getRow(); //reading row by row
+                    bulkgetRows.business = owningBusiness.toString(); //add the owning business for each array item which will be used for error validation which will be from record producer
+                    var bulkrowObj = JSON.stringify(bulkgetRows); //holds the rows of Excel as comma sepearated
+                    bulkexcelRowArray.push(bulkrowObj + '');
+
+                }
+            }
+
+
+            if (bulkexcelRowArray.length > 0) {
+
+                for (var i = 0; i < bulkexcelRowArray.length; i++) {
+
+                    (function executeRow(index) {
+
+                        var getData = JSON.parse(bulkexcelRowArray[i]);
+                        //Inputs from Excel
+                        var trdRef = getData.tradeReference ? getData.tradeReference.trim() : ""; //Change name as per Excel Sheet
+                        var reasonCode = getData.reasonCode ? getData.reasonCode.trim() : ""; //reason Code
+                        //Inputs from Excel
+                        var trdMarket = owningBusiness.toString(); //paramter from record producer
+
+                        bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + ' Received Trade Reference before modification ' + trdRef + 'Selected market ' + trdMarket + ' ' + '\n'); //optimiser 2511050923036567
+
+
+
+                        if (trdRef != null && trdRef != undefined && trdRef != '') { //ignoring all null trade references
+
+                            //Handling trade Reference Format
+                            trdRef = new x_hsb11_hsbc_mss_o.MSSCustodyBulkFileUpload().handleTradeReference(trdRef, trdMarket);
+                            //Handling Trade Reference Format
+
+                            bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + ' Received Trade Reference after modification ' + trdRef + 'Selected market ' + trdMarket + ' ' + '\n'); //optimiser 2511050923036567
+
+
+                            //reason code modification
+                            if ((reasonCode != "") && (reasonCode != undefined) && (reasonCode != null)) {
+                                var modifiedReasonCode = reasonCode.split('-')[0].trim().toString();
+                            } else {
+                                modifiedReasonCode = 'NOT AVAILABLE';
+                            }
+                            //reason code modification
+
+                            var getTradeData = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                            getTradeData.addEncodedQuery('transaction_reference=' + trdRef + '^owning_business=' + trdMarket + '^case_type=no_open_case' + '^trade_lifecycle_status!=TradSttld^trade_lifecycle_status!=TradCanc');
+                            getTradeData.query();
+                            if (getTradeData.next()) {
+
+                                var countOfTrades = parseInt(getTradeData.getRowCount());
+
+                                bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + ' Count of records for  ' + trdRef + ' and Selected market ' + trdMarket + ' ' + countOfTrades + '\n'); //optimiser 2511050923036567
+
+
+                                if (countOfTrades == 1) { //Valid Records Count == 1
+
+                                    var grBulkEvents = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_stage'); //check for the matching record in BPS table
+                                    grBulkEvents.addEncodedQuery('business_process.process_name=Trade Lifecycle Status^market=' + owningBusiness + '^ctac_code=' + getTradeData.trade_lifecycle_status + '^' + bpiOutcome + '=true');
+                                    grBulkEvents.setLimit(1);
+                                    grBulkEvents.query();
+                                    if (grBulkEvents.next()) {
+
+                                        //Checking if the Reason Code Provided Exisits 
+                                        var getReasonCode = new GlideRecord("x_hsb11_mss_c_proc_custody_reason_code");
+                                        getReasonCode.addEncodedQuery("owning_business=" + trdMarket + "^reason_codeSTARTSWITH" + modifiedReasonCode + '^reason_code_type=' + reasonCodeOutcome);
+                                        getReasonCode.setLimit(1);
+                                        getReasonCode.query();
+                                        if (getReasonCode.next()) {
+                                            validObj.tradeRef = trdRef.toString();
+                                            validObj.reasonCode = getReasonCode.sys_id.toString();
+                                            validObj.reasonDesc = getReasonCode.reason_description.toString();
+                                            validRecords.push(JSON.stringify(validObj) + '');
+
+                                        } else { //When reason code is not available 
+                                            //Error Records
+                                            bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + ' Business process is not enabled for   ' + getTradeData.trade_lifecycle_status + ' reference ' + trdRef + ' and Selected market ' + trdMarket + ' ' + countOfTrades + '\n'); //optimiser 2511050923036567
+                                            errorObj.tradeRef = trdRef.toString();
+                                            errorObj.tradeMarket = trdMarket.toString();
+                                            errorObj.inValidReason = modifiedReasonCode + " reason code does not exist for " + outcomeSelected; //duplicateTrades
+                                            errorRecords.push(JSON.stringify(errorObj) + ' ');
+                                            //Error Records
+                                        }
+
+
+
+                                    } else { //Business process is not enabled
+                                        //Error Records
+                                        errorObj.tradeRef = trdRef.toString();
+                                        errorObj.tradeMarket = trdMarket.toString();
+                                        errorObj.inValidReason = outcomeSelected + ' is not enabled for Life Cycle Status ' + getTradeData.trade_lifecycle_status.getDisplayValue(); //duplicateTrades
+                                        errorRecords.push(JSON.stringify(errorObj) + ' ');
+                                        //Error Records
+
+                                    }
+
+
+                                } else { //Duplicate Trades Count >1
+                                    //Error Records
+                                    errorObj.tradeRef = trdRef.toString();
+                                    errorObj.tradeMarket = trdMarket.toString();
+                                    errorObj.inValidReason = rejectionReasons.duplicateTrades.toString(); //duplicateTrades
+                                    errorRecords.push(JSON.stringify(errorObj) + ' ');
+                                    //Error Records
+                                }
+
+
+                            } else {
+                                //Invalid Trade Reference
+                                var inValidTrade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                                inValidTrade.addEncodedQuery('transaction_reference=' + trdRef);
+                                inValidTrade.query();
+                                if (inValidTrade.next()) {
+
+                                    //bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + ' Invalid Trade Reference Start ' + trdRef + 'Selected market ' + trdMarket + ' ' + '\n'); //optimiser 2511050923036567
+
+                                    // Commented as part of MSSCUSTODY-8253
+                                    //Valid trade reference but belongs to different market than selected
+                                    // if (inValidTrade.owning_business.toString() != trdMarket.toString()) {
+
+                                    //     bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + ' invalidMarket Category ' + trdRef + 'Selected market ' + trdMarket + ' ' + 'Trade market ' + inValidTrade.owning_business + '\n'); //optimiser 2511050923036567
+
+                                    //     errorObj.tradeRef = trdRef.toString();
+                                    //     errorObj.tradeMarket = trdMarket.toString();
+                                    //     errorObj.inValidReason = rejectionReasons.invalidMarket.toString(); //different market than record producer
+                                    //     errorRecords.push(JSON.stringify(errorObj) + ' ');
+
+                                    // } 
+                                    if (inValidTrade.case_type.toString() != 'no_open_case') { //Has Active Case 
+
+                                        bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + ' no_open_case Category ' + trdRef + 'Selected market ' + trdMarket + ' ' + 'Case Type of Case ' + inValidTrade.case_type.toString() + '\n'); //optimiser 2511050923036567
+
+                                        //Error Records
+                                        errorObj.tradeRef = trdRef.toString();
+                                        errorObj.tradeMarket = trdMarket.toString();
+                                        errorObj.inValidReason = rejectionReasons.activeOpenCase.toString();
+                                        errorRecords.push(JSON.stringify(errorObj) + ' ');
+                                        //Error Records
+
+                                    } else if (inValidTrade.trade_lifecycle_status == 'TradSttld') {
+
+                                        bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + ' Trade Settled Category ' + trdRef + 'Selected market ' + trdMarket + ' ' + 'Case Life Cycle ' + inValidTrade.trade_lifecycle_status + '\n'); //optimiser 2511050923036567
+
+                                        //Error Records
+                                        errorObj.tradeRef = trdRef.toString();
+                                        errorObj.tradeMarket = trdMarket.toString();
+                                        errorObj.inValidReason = rejectionReasons.tradeSettled.toString();
+                                        errorRecords.push(JSON.stringify(errorObj) + ' ');
+                                        //Error Records
+
+
+                                    } else if (inValidTrade.trade_lifecycle_status == 'TradCanc') {
+
+
+                                        bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + ' Trade Cancelled Category ' + trdRef + 'Selected market ' + trdMarket + ' ' + 'Case Life Cycle ' + inValidTrade.trade_lifecycle_status + '\n'); //optimiser 2511050923036567
+
+                                        //Error Records
+                                        errorObj.tradeRef = trdRef.toString();
+                                        errorObj.tradeMarket = trdMarket.toString();
+                                        errorObj.inValidReason = rejectionReasons.tradeCancelled.toString();
+                                        errorRecords.push(JSON.stringify(errorObj) + ' ');
+                                        //Error Records
+
+
+                                    }
+                                } else { //InValid trade reference not avialable with reference to iQube
+                                    /*bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + ' unAvailableTrade Category ' + trdRef + 'Selected market ' + trdMarket + '\n'); //optimiser 2511050923036567
+
+                                    errorObj.tradeRef = trdRef.toString();
+                                    errorObj.tradeMarket = trdMarket.toString();
+                                    errorObj.inValidReason = rejectionReasons.unAvailableTrade.toString(); // not available in database
+                                    errorRecords.push(JSON.stringify(errorObj) + ' ');*/
+
+                                    var notAvailable = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                                    notAvailable.addEncodedQuery('transaction_reference=' + trdRef);
+                                    notAvailable.query();
+                                    if (notAvailable.next()) {
+                                        if (notAvailable.owning_business.toString() != trdMarket.toString()) {
+                                            bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + ' invalidMarket Category ' + trdRef + 'Selected market ' + trdMarket + ' ' + 'Trade market ' + notAvailable.owning_business + '\n');
+                                            errorObj.tradeRef = trdRef.toString();
+                                            errorObj.tradeMarket = trdMarket.toString();
+                                            errorObj.inValidReason = rejectionReasons.invalidMarket.toString();
+                                            errorRecords.push(JSON.stringify(errorObj) + ' ');
+                                        }
+                                    } else {
+                                        bulkFileUploadLogs.push('Bulk File Upload for attachment =' + attachmentSysId + " " + ' unAvailableTrade Category ' + trdRef + 'Selected market ' + trdMarket + '\n');
+                                        errorObj.tradeRef = trdRef.toString();
+                                        errorObj.tradeMarket = trdMarket.toString();
+                                        errorObj.inValidReason = rejectionReasons.unAvailableTrade.toString();
+                                        errorRecords.push(JSON.stringify(errorObj) + ' ');
+                                    }
+                                }
+
+                            }
+
+                        }
+                    })(i);
+
+                }
+
+
+                //Trade Life Cycle Status dynamically sending to the record producer
+
+                errorData = filterArray.unique(errorRecords);
+
+                var summaryTotalCount = parseInt(errorRecords.length) + parseInt(validRecords.length);
+                var summaryErrorRecords = parseInt(errorRecords.length);
+                var summaryValidRecords = parseInt(validRecords.length);
+                var finalErrorRate = (summaryErrorRecords / summaryTotalCount) * 100; // converting to percentage
+
+                bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + 'Total Records ' + summaryTotalCount + '\n');
+                bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + 'Error Records ' + summaryErrorRecords + '\n');
+                bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + 'Valid Records ' + summaryValidRecords + '\n');
+                bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + 'Error Rate ' + errorRate + '\n');
+                bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + 'Error Percentage of records ' + finalErrorRate + '%' + '\n');
+
+
+                if (summaryTotalCount == 0) { //unable to read due to any file error
+
+                    bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + 'Entered Invalid Entries Loop ' + '\n');
+                    bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + 'Entered Invalid Entries Loop ' + ' Result Retured = Invalid Entries' + '\n');
+                    if (bulkUploadErrorLogs) { //Log for debugging
+                        gs.info("Trade File Upload " + '\n' + bulkFileUploadLogs.toString());
+                    }
+                    return 'Invalid Entries' + "/" + summaryTotalCount + "/" + summaryErrorRecords + "/" + summaryValidRecords + "/" + errorData; //data of errors
+                }
+
+                if ((summaryTotalCount > 0) && (summaryTotalCount < maxLimit)) {
+
+                    if ((summaryErrorRecords > 0) && (summaryTotalCount > 0)) {
+
+                        if (finalErrorRate > errorRate) { //More that 10% errors
+
+                            bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + 'Entered more than 10% Error Loop ' + '\n');
+                            bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + 'Entered more than 10% Error Loop ' + ' Result Retured = Validation Failed' + '\n');
+                            if (bulkUploadErrorLogs) { //Log for debugging
+                                gs.info("Trade File Upload " + '\n' + bulkFileUploadLogs.toString());
+                            }
+                            return 'Validation Failed' + "/" + summaryTotalCount + "/" + summaryErrorRecords + "/" + summaryValidRecords + "/" + errorData; //data of errors
+
+                        } else { //Less that 50% errors
+                            bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + 'Entered less than 10% Error Loop ' + '\n');
+                            bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + 'Entered less than 10% Error Loop ' + ' Result Retured =  Validation Successful' + '\n');
+                            if (bulkUploadErrorLogs) { //Log for debugging
+                                gs.info("Trade File Upload " + '\n' + bulkFileUploadLogs.toString());
+                            }
+                            return 'Validation Successful' + "/" + summaryTotalCount + "/" + summaryErrorRecords + "/" + summaryValidRecords + "/" + errorData; ///data of errors;
+
+                        }
+
+                    } else { //No errors
+
+                        bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + ' Result Retured = No Errors' + '\n');
+                        if (bulkUploadErrorLogs) { //Log for debugging
+                            gs.info("Trade File Upload " + '\n' + bulkFileUploadLogs.toString());
+                        }
+                        return 'No Errors' + "/" + summaryTotalCount + "/" + summaryErrorRecords + "/" + summaryValidRecords + "/" + errorData; ///data of errors;
+                    }
+
+                } else {
+
+                    if (bulkUploadErrorLogs) { //Log for debugging
+                        gs.info("Trade File Upload " + '\n' + bulkFileUploadLogs.toString());
+                    }
+                    return 'Limit Exceeded' + "/" + summaryTotalCount + "/" + summaryErrorRecords + "/" + summaryValidRecords + "/" + errorData;
+
+                }
+
+
+            }
+            bulkFileUploadLogs.push('Trade File Upload for attachment =' + attachmentSysId + " " + ' Result Retured = No records Found' + '\n');
+            if (bulkUploadErrorLogs) { //Log for debugging
+                gs.info("Trade File Upload by " + currentUser + '\n' + bulkFileUploadLogs.toString());
+            }
+            return 'No records Found'; //empty file
+
+        } catch (ex) {
+            gs.info('Error Received from TradeLevel Client' + ex);
+        }
+    },
+
+    //Trade Level File Upload
+
+
+
+
+    createCreateBulkCaseBulkFielUpload: function(bulkRecID, owningBusiness, tskoutcome) { //used in on submit of record producer
+
+        try {
+
+            //table_nameSTARTSWITHZZ_YYx_hsb11_hsbc_mss_o_hsbc_bulk_transaction^sys_created_bySTARTSWITH45381533@hsbc.com
+
+            var bulkexcelRowArray = [];
+            var validRecords = [];
+            var filterArray = new global.ArrayUtil();
+            var currentUser = gs.getUser().getName(); //to fetch the right attachment by user
+            var getOwningBusiness = new GlideRecord('sys_user_group_type');
+            getOwningBusiness.get(owningBusiness);
+            var market = getOwningBusiness.name;
+            var bpiOutcome = "";
+
+            tskoutcome = tskoutcome.toString().trim();
+
+            gs.info('Bulk File Upload Array Trade Received Outcome from RP' + tskoutcome);
+            gs.info('Bulk File Upload Array Trade Received Outcome from RP' + typeof(tskoutcome));
+
+
+            gs.info('Bulk File Upload Array Trade Received Outcome from RP after trimming' + tskoutcome);
+
+
+            switch (tskoutcome) {
+                case 'Resume Trade':
+                    bpiOutcome = 'resume_trade';
+                    break;
+
+                case 'Settle Trade':
+                    bpiOutcome = 'settle_trade';
+                    break;
+
+                case 'Confirm Trade':
+                    bpiOutcome = 'confirm_trade';
+                    break;
+
+                case 'Process Trade Cancellation':
+                    bpiOutcome = 'process_trade_cancellation';
+                    break;
+
+                case 'Put Trade On-Hold':
+                    bpiOutcome = 'put_trade_on_hold';
+                    break;
+
+            }
+
+            gs.info('Bulk File Upload Array Trade Received Outcome ' + tskoutcome + ' BPIOutcome converted to ' + bpiOutcome);
+
+            //getting the attachment
+            var bulkgetAttachment = new GlideRecord('sys_attachment');
+            bulkgetAttachment.addEncodedQuery('table_nameSTARTSWITHZZ_YY^sys_created_bySTARTSWITH' + currentUser);
+            bulkgetAttachment.orderByDesc('sys_created_on');
+            bulkgetAttachment.query();
+            if (bulkgetAttachment.next()) {
+                var bulkattachmentRec = bulkgetAttachment.getValue('sys_id');
+
+            }
+            //getting attachment
+
+            var bulkattachment = new GlideSysAttachment(); //method to get the contents of the attachment
+            var bulkattachmentDetails = bulkattachment.getContentStream(bulkattachmentRec); //getting content of the EXcel
+
+            var bulkparser = new sn_impex.GlideExcelParser(); //method to parse the content of the Excel
+            bulkparser.setSource(bulkattachmentDetails); //setting the source to parse the content from the stream
+
+            var bulkgetSheet = bulkparser.getSheetNames(); //getting the sheet name to fetch details
+            bulkparser.setSheetNumber(0); //setting the first shee to parse
+
+            if (bulkparser.parse()) { //converting into readable format using parse
+
+                while (bulkparser.next()) { //iterating over each row
+                    var bulkgetRows = bulkparser.getRow(); //reading row by row
+                    bulkgetRows.business = market.toString(); //add the owning business for each array item which will be used for error validation which will be from record producer
+                    var bulkrowObj = JSON.stringify(bulkgetRows); //holds the rows of Excel as comma sepearated
+                    bulkexcelRowArray.push(bulkrowObj + '');
+
+                }
+            }
+
+            //find only validrecords
+
+            for (var i = 0; i < bulkexcelRowArray.length; i++) {
+
+                (function executeRow(index) {
+
+                    var getData = JSON.parse(bulkexcelRowArray[i]);
+                    var trdRef = getData.tradeReference; //Change name as per Excel Sheet
+
+                    if (trdRef != null && trdRef != undefined && trdRef != '') { //ignoring all null trade references
+
+                        var trdMarket = getData.business.toString(); //Change name as per Excel Sheet
+                        //Handling trade Reference Format
+                        trdRef = new x_hsb11_hsbc_mss_o.MSSCustodyBulkFileUpload().handleTradeReference(trdRef, trdMarket);
+                        //Handling Trade Reference Format
+
+                        var getTradeData = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                        getTradeData.addEncodedQuery('transaction_reference=' + trdRef + '^owning_business=' + trdMarket + '^case_type=no_open_case' + '^trade_lifecycle_status!=TradSttld^trade_lifecycle_status!=TradCanc');
+                        getTradeData.query();
+                        if (getTradeData.next()) {
+
+                            var countOfTrades = parseInt(getTradeData.getRowCount());
+
+                            if (countOfTrades == 1) { //Valid Records Count == 1
+
+                                var grBulkEvents = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_stage'); //check for the matching record in BPS table
+                                grBulkEvents.addEncodedQuery('business_process.process_name=Trade Lifecycle Status^market=' + owningBusiness + '^ctac_code=' + getTradeData.trade_lifecycle_status + '^' + bpiOutcome + '=true');
+                                grBulkEvents.setLimit(1);
+                                grBulkEvents.query();
+                                if (grBulkEvents.next()) {
+                                    validRecords.push(getTradeData.sys_id.toString() + '');
+
+                                }
+                            }
+                        }
+
+                    }
+                })(i);
+
+            }
+
+            //find only validrecords
+
+            validRecords = filterArray.unique(validRecords); //unique records
+
+            //write function to create case and link to bulk
+
+
+            var tradeCount = validRecords.length;
+            var threshold = gs.getProperty('x_hsb11_mss_c_proc.bulk_threshold_event_queue');
+            var uploadtype = 'bulk_level';
+            var parm1 = bulkRecID + '|' + tskoutcome + '/' + uploadtype + '@' + owningBusiness;
+
+
+            var grCustodyTrade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+            grCustodyTrade.addQuery('sys_id', 'IN', validRecords.join(','));
+            grCustodyTrade.query();
+
+            if (parseInt(tradeCount, 10) > parseInt(threshold, 10) && gs.getProperty('x_hsb11_mss_c_proc.BulkEventQueue') == 'true') {
+                //If number of trades in the bulk is larger than threshold, use asyn event queue approach
+                var tradesArray = [],
+                    i = 0,
+                    tradesInSingleEvt = gs.getProperty('x_hsb11_mss_c_proc.number_of_items_in_bulk_event'); //number of trades to be processed via a single event for case creation
+
+                while (grCustodyTrade.next()) {
+                    tradesArray.push(grCustodyTrade.sys_id.toString());
+                    i++;
+                    if (i == tradesInSingleEvt) {
+                        gs.eventQueue("x_hsb11_hsbc_mss_o.upload_case_creation", null, parm1, tradesArray.join(','));
+                        //reset to initial
+                        i = 0;
+                        tradesArray = [];
+                    }
+                }
+
+                //create event for the remainings after loop completes
+                if (i > 0) {
+                    gs.eventQueue("x_hsb11_hsbc_mss_o.upload_case_creation", null, parm1, tradesArray.join(','));
+                }
+
+            } else {
+
+                for (var j = 0; j < validRecords.length; j++) {
+                    var tradeSysId = validRecords[j];
+
+                    // Update the trade record
+                    var grcustodytrade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                    if (grcustodytrade.get(tradeSysId)) {
+                        grcustodytrade.case_type = 'manual';
+                        grcustodytrade.update();
+                    }
+
+                    // Create the custody case
+                    var grcustodycase = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_case");
+                    grcustodycase.initialize();
+                    grcustodycase.reinitiate_process = false;
+                    grcustodycase.state = 1;
+                    grcustodycase.short_description = 'Manually triggered by Bulk processing';
+                    grcustodycase.description = 'Manually triggered by Bulk processing';
+                    grcustodycase.trade_id = tradeSysId;
+                    grcustodycase.bulk_id = bulkRecID; // Use the bulk record ID passed to the function
+                    grcustodycase.triggered_by = '19c79fbb1ba30a10c6ada6c7b04bcbd5'; // Static sys_id as per your logic
+                    grcustodycase.case_status = 'ec34a3731b270a10c6ada6c7b04bcb7a';
+                    grcustodycase.insert();
+
+                    var caseObj = grcustodycase;
+                    var caseRec = grcustodycase.sys_id;
+
+
+                    try {
+                        var inputs = {};
+                        inputs['current'] = caseObj; // GlideRecord of table: 
+                        inputs['table_name'] = 'x_hsb11_mss_c_proc_mss_custody_case';
+                        var flowName = 'x_hsb11_mss_c_proc.hsbccustodymanual_bulk_task_generic_flow';
+
+                        // Starts the flow asynchronously.
+                        var contextId = sn_fd.FlowAPI.startFlow(flowName, inputs);
+
+                        //Identifier for the flow context
+                        var updateCase = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_case");
+                        updateCase.get(caseRec);
+                        updateCase.work_notes = 'Flow Executed for the bulk File Upload with Execution ID ' + contextId;
+                        updateCase.update();
+                        //Identifier for the flow context
+
+
+                    } catch (ex) {
+                        //var message = ex.getMessage();
+                        gs.info("Error Triggering Manual Flow ABCD " + ex.message);
+                    }
+
+
+                }
+            }
+
+
+
+            return validRecords.length;
+
+
+
+        } catch (ex) {
+            gs.info('Error Received from createCreateBulkCaseBulkFielUpload ' + ex);
+        }
+
+    },
+
+
+    createBulkCaseTradeFileUpload: function(bulkRecID, owningBusiness, outcome) { //used on submit of record producer
+
+        try {
+            // MSSCUSTODY-6821
+            var bulkexcelRowArray = [];
+            var validObj = {};
+            var caseArr = [];
+            var validRecords = [];
+            var reasonCodeOutcome = '';
+            var filterArray = new global.ArrayUtil();
+            var currentUser = gs.getUser().getName(); //to fetch the right attachment by user
+            var modifiedReasonCode;
+
+            outcome = outcome.toString().trim();
+
+            gs.info('Trade File Upload Array Trade Received Outcome from RP' + outcome);
+            gs.info('Trade File Upload Array Trade Received Outcome from RP' + typeof(outcome));
+
+
+            gs.info('Trade File Upload Array Trade Received Outcome from RP after trimming' + outcome);
+
+
+            var bpiOutcome = "";
+
+
+            switch (outcome) {
+                case 'Resume Trade':
+                    reasonCodeOutcome = 'NA';
+                    bpiOutcome = 'resume_trade';
+                    break;
+
+                case 'Settle Trade':
+                    reasonCodeOutcome = 'NA';
+                    bpiOutcome = 'settle_trade';
+                    break;
+
+                case 'Confirm Trade':
+                    reasonCodeOutcome = 'NA';
+                    bpiOutcome = 'confirm_trade';
+                    break;
+
+                case 'Process Trade Cancellation':
+                    reasonCodeOutcome = 'Cancel';
+                    bpiOutcome = 'process_trade_cancellation';
+                    break;
+
+                case 'Put Trade On-Hold':
+                    reasonCodeOutcome = 'Put On Hold';
+                    bpiOutcome = 'put_trade_on_hold';
+                    break;
+
+            }
+
+            gs.info('Trade File Upload Array Trade Received Outcome ' + outcome + ' BPIOutcome converted to ' + bpiOutcome);
+
+
+            //getting attachment
+            var getTempAttachment = new GlideRecord("sys_attachment");
+            getTempAttachment.addEncodedQuery("table_name=ZZ_YYsc_cart_item^sys_created_by=" + currentUser);
+            getTempAttachment.orderByDesc('sys_created_on');
+            getTempAttachment.query();
+            if (getTempAttachment.next()) {
+                var attachmentSysId = getTempAttachment.getValue('sys_id');
+            }
+
+            var bulkattachment = new GlideSysAttachment(); //method to get the contents of the attachment
+            var bulkattachmentDetails = bulkattachment.getContentStream(attachmentSysId); //getting content of the Excel
+
+            var bulkparser = new sn_impex.GlideExcelParser(); //method to parse the content of the Excel
+            bulkparser.setSource(bulkattachmentDetails); //setting the source to parse the content from the stream
+
+            var bulkgetSheet = bulkparser.getSheetNames(); //getting the sheet name to fetch details
+            bulkparser.setSheetNumber(0); //setting the sheet to parse
+
+            if (bulkparser.parse()) { //converting into readable format using parse
+                while (bulkparser.next()) { //iterating over each row
+                    var bulkgetRows = bulkparser.getRow(); //reading row by row
+                    bulkgetRows.business = owningBusiness.toString(); //add the owning business for each array item which will be used for error validation which will be from record producer
+                    var bulkrowObj = JSON.stringify(bulkgetRows); //holds the rows of Excel as comma separated
+                    bulkexcelRowArray.push(bulkrowObj + '');
+                }
+            }
+
+            gs.info('Ttotal Array Trade ' + bulkexcelRowArray.toString());
+
+            if (bulkexcelRowArray.length > 0) {
+
+                for (var i = 0; i < bulkexcelRowArray.length; i++) {
+
+                    (function executeRow(index) {
+
+                        var getData = JSON.parse(bulkexcelRowArray[i]); //Inputs from Excel
+                        var trdRef = getData.tradeReference ? getData.tradeReference.trim() : ""; //trade reference
+                        var reasonCode = getData.reasonCode ? getData.reasonCode.trim() : ""; //reason Code
+                        var reasonDesc = getData.reasonDescription;
+                        if (outcome == 'Process Trade Cancellation') {
+                            var cancellationRef = getData.cancellationReference ? getData.cancellationReference : "";
+                        }
+
+
+                        if (trdRef != null && trdRef != undefined && trdRef != '') { //ignoring all null trade references
+
+                            var trdMarket = owningBusiness.toString(); //owning business
+                            //Handling trade Reference Format
+                            trdRef = new x_hsb11_hsbc_mss_o.MSSCustodyBulkFileUpload().handleTradeReference(trdRef, trdMarket);
+                            //Handling Trade Reference Format
+
+                            //reason code modification
+                            if ((reasonCode != "") && (reasonCode != undefined) && (reasonCode != null)) {
+                                modifiedReasonCode = reasonCode.split('-')[0].trim().toString();
+                            } else {
+                                modifiedReasonCode = 'NOT AVAILABLE';
+                            }
+                            //reason code modification
+
+
+                            var getTradeData = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                            getTradeData.addEncodedQuery('transaction_reference=' + trdRef + '^owning_business=' + trdMarket + '^case_type=no_open_case' + '^trade_lifecycle_status!=TradSttld^trade_lifecycle_status!=TradCanc');
+                            getTradeData.query();
+                            if (getTradeData.next()) {
+                                gs.info('Trade File Upload ' + 'business_process.process_name=Trade Lifecycle Status^market=' + owningBusiness + '^ctac_code=' + getTradeData.trade_lifecycle_status + '^' + bpiOutcome + '=true');
+
+                                var grBulkEvents = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_stage'); //check for the matching record in BPS table
+                                grBulkEvents.addEncodedQuery('business_process.process_name=Trade Lifecycle Status^market=' + owningBusiness + '^ctac_code=' + getTradeData.trade_lifecycle_status + '^' + bpiOutcome + '=true');
+                                grBulkEvents.setLimit(1);
+                                grBulkEvents.query();
+                                if (grBulkEvents.next()) { //added as part of active trade count mismatch
+
+                                    var countOfTrades = parseInt(getTradeData.getRowCount());
+
+                                    if (countOfTrades == 1) { //Valid Records Count == 1
+
+                                        //Checking if the Reason Code Provided Exisits 
+                                        var getReasonCode = new GlideRecord("x_hsb11_mss_c_proc_custody_reason_code");
+                                        getReasonCode.addEncodedQuery("owning_business=" + trdMarket + "^reason_codeSTARTSWITH" + modifiedReasonCode + '^reason_code_type=' + reasonCodeOutcome); //new line
+                                        getReasonCode.setLimit(1);
+                                        getReasonCode.query();
+                                        if (getReasonCode.next()) {
+                                            validObj.tradeReference = trdRef.toString();
+                                            validObj.reasonCode = getReasonCode.sys_id.toString();
+
+                                            if (reasonDesc != null && reasonDesc != undefined && reasonDesc != '') { //pick up Excel reason code
+                                                validObj.reasonDescription = reasonDesc.toString();
+                                            } else { //if empty then pick up from table
+                                                validObj.reasonDescription = getReasonCode.reason_description.toString();
+                                            }
+
+                                            if (outcome == 'Process Trade Cancellation') {
+                                                validObj.cancellationReference = cancellationRef.toString();
+                                            }
+                                            validRecords.push(JSON.stringify(validObj) + '');
+                                        }
+                                    }
+                                }
+
+                            }
+
+                        }
+
+                    })(i);
+
+                }
+
+                validRecords = filterArray.unique(validRecords);
+                //gs.info('6821 File read completed: ' + new GlideDateTime());
+            }
+
+            var tradeCount = validRecords.length;
+            var threshold = gs.getProperty('x_hsb11_mss_c_proc.bulk_threshold_event_queue');
+            var uploadtype = 'trade_level';
+            var parm1 = bulkRecID + '|' + outcome + '/' + uploadtype + '@' + owningBusiness;
+
+
+
+            if (parseInt(tradeCount, 10) > parseInt(threshold, 10) && gs.getProperty('x_hsb11_mss_c_proc.BulkEventQueue') == 'true') {
+                //If number of trades in the bulk is larger than threshold, use asyn event queue approach
+                var tradesArray = [],
+                    j = 0,
+                    tradesInSingleEvt = gs.getProperty('x_hsb11_mss_c_proc.number_of_items_in_bulk_event');
+
+                for (var idx = 0; idx < validRecords.length; idx++) {
+                    tradesArray.push(validRecords[idx]);
+                    j++;
+                    if (j == tradesInSingleEvt) {
+                        gs.eventQueue("x_hsb11_hsbc_mss_o.upload_case_creation", null, parm1, JSON.stringify(tradesArray));
+                        j = 0;
+                        tradesArray = [];
+                    }
+                }
+
+                //create event for the remainings after loop completes
+                if (j > 0) {
+                    gs.eventQueue("x_hsb11_hsbc_mss_o.upload_case_creation", null, parm1, JSON.stringify(tradesArray));
+                }
+            } else {
+                for (var l = 0; l < validRecords.length; l++) {
+
+                    (function executeRow(index) {
+
+                        var tradeRecords = JSON.parse(validRecords[l]);
+                        var tradeSysId = tradeRecords.tradeReference;
+                        var reasonCode = tradeRecords.reasonCode;
+                        var reasonDescription = tradeRecords.reasonDescription;
+                        if (outcome == 'Process Trade Cancellation') {
+                            var cancellationReference = tradeRecords.cancellationReference;
+                        }
+                        // Update the trade record
+                        var grcustodytrade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                        grcustodytrade.addEncodedQuery('transaction_referenceSTARTSWITH' + tradeSysId + '^owning_business=' + owningBusiness);
+                        grcustodytrade.setLimit(1);
+                        grcustodytrade.query();
+                        if (grcustodytrade.next()) {
+                            grcustodytrade.case_type = 'manual';
+                            grcustodytrade.update();
+                            var tradeID = grcustodytrade.sys_id;
+                        }
+
+                        // Create the custody case
+                        var grcustodycase = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_case");
+                        grcustodycase.initialize();
+                        grcustodycase.reinitiate_process = false;
+                        grcustodycase.state = 1;
+                        grcustodycase.short_description = 'Manually triggered by Bulk processing';
+                        grcustodycase.description = 'Manually triggered by Bulk processing';
+                        grcustodycase.trade_id = tradeID;
+                        grcustodycase.bulk_id = bulkRecID; // Use the bulk record ID passed to the function
+                        grcustodycase.triggered_by = '19c79fbb1ba30a10c6ada6c7b04bcbd5'; // Static sys_id
+                        grcustodycase.case_status = 'ec34a3731b270a10c6ada6c7b04bcb7a';
+                        grcustodycase.insert();
+
+                        var caseObj = grcustodycase;
+                        var caseRec = grcustodycase.sys_id;
+
+                        var caseArrObj = {};
+                        caseArrObj.caseSysId = caseRec.toString();
+                        caseArrObj.tradeSysId = tradeSysId.toString();
+                        caseArrObj.reasonCode = reasonCode.toString();
+                        caseArrObj.reasonDescription = reasonDescription.toString();
+                        if (outcome == 'Process Trade Cancellation') {
+                            caseArrObj.cancellationReference = cancellationReference.toString();
+                        }
+                        caseArr.push(caseArrObj);
+
+                        try {
+                            var inputs = {};
+                            inputs['current'] = caseObj; // GlideRecord of table: 
+                            inputs['table_name'] = 'x_hsb11_mss_c_proc_mss_custody_case';
+                            var flowName = 'x_hsb11_mss_c_proc.hsbccustodymanual_bulk_task_generic_flow';
+                            // Starts the flow asynchronously.
+                            var contextId = sn_fd.FlowAPI.startFlow(flowName, inputs);
+                            //Identifier for the flow context
+                            var updateCase = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_case");
+                            updateCase.get(caseRec);
+                            updateCase.work_notes = 'Flow Executed for the bulk File Upload with Execution ID ' + contextId;
+                            updateCase.update();
+                            //Identifier for the flow context
+                        } catch (ex) {
+                            gs.info("Error triggering manual flow for Trade File upload:" + ex.message);
+                        }
+
+                    })(l);
+                }
+            }
+
+            //gs.info('6821 case creation & flow trigger completed: ' + new GlideDateTime());
+
+            // Updating the tasks with reason code and reason description
+            while (caseArr.length > 0) {
+                for (var k = 0; k < caseArr.length; k++) {
+                    (function executeRow(index) {
+                        var getData = caseArr[index]; // Parse the current case data
+                        var tradeRef = getData.tradeSysId;
+                        var caseRef = getData.caseSysId;
+                        var reasonCode = getData.reasonCode;
+                        var reasonDesc = getData.reasonDescription;
+                        if (outcome == 'Process Trade Cancellation') {
+                            var cancellationRef = getData.cancellationReference;
+                        }
+                        var grTask = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_task');
+                        grTask.addEncodedQuery('trade_case_id.sys_idSTARTSWITH' + caseRef + '^trade_id.transaction_referenceSTARTSWITH' + tradeRef + ' ^trade_task_type=Maker');
+                        grTask.query();
+                        if (grTask.next()) {
+                            grTask.reason_code = reasonCode;
+                            grTask.reason_description = reasonDesc;
+                            if (outcome == 'Process Trade Cancellation') {
+                                grTask.cancellation_reference = cancellationRef;
+                            }
+                            grTask.update();
+                            caseArr.splice(index, 1);
+                        }
+                    })(k);
+                }
+            }
+            //gs.info('6821 Task updation completed: ' + new GlideDateTime());
+            // return once all tasks are updated
+            return validRecords.length;
+
+        } catch (ex) {
+            gs.info('Error from createBulkCaseTradeFileUpload : ' + ex.message);
+        }
+
+    },
+
+
+    createBulkCaseTask: function(validRecords, bulkRecID) {
+
+
+        try {
+            for (var i = 0; i < validRecords.length; i++) {
+
+
+
+                (function createBulkCase(index) {
+                    var grcustodycase = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_case");
+                    grcustodycase.initialize();
+                    grcustodycase.short_description = 'Manually triggered by Bulk processing';
+                    grcustodycase.description = 'Manually triggered by Bulk processing';
+                    grcustodycase.trade_id = validRecords[i];
+                    grcustodycase.bulk_id = bulkRecID;
+                    grcustodycase.state = 2;
+                    grcustodycase.triggered_by = '19c79fbb1ba30a10c6ada6c7b04bcbd5';
+                    grcustodycase.case_status = 'ec34a3731b270a10c6ada6c7b04bcb7a';
+                    var caseSysId = grcustodycase.insert();
+                })(i);
+
+            }
+
+            //updating active Trade Count
+            var updateBulk = new GlideRecord('x_hsb11_hsbc_mss_o_hsbc_bulk_transaction');
+            updateBulk.get(bulkRecID);
+            updateBulk.active_trade_count = parseInt(validRecords.length);
+            updateBulk.update();
+            //updating active Trade Count
+        } catch (ex) {
+            gs.info('Error Received from createBulkCaseTask ' + ex);
+        }
+
+    },
+
+    populateErrorRecord: function(errorRecords, bulkRecID) {
+
+        /* The array of invalid trades received from bulkErrorValidation 
+        will be utilized to populate the new field(TBD) in submitted bulk which will be utilized for the display of audit log*/
+
+        try {
+
+            var populateErrorBulk = new GlideRecord('x_hsb11_hsbc_mss_o_hsbc_bulk_transaction');
+            populateErrorBulk.get(bulkRecID);
+            populateErrorBulk.error_flag = "[" + errorRecords.toString() + "]";
+            populateErrorBulk.update();
+
+        } catch (ex) {
+            gs.info('Error Received from populateErrorRecord ' + ex);
+        }
+    },
+
+
+    getAssignmentGroup: function(roleName, owningBusiness) {
+        var grMember = new GlideRecord('sys_user_grmember');
+        grMember.addQuery('user', gs.getUserID());
+        grMember.addEncodedQuery('group.typeLIKE2269529d1b844650ff37eb14b24bcb19^group.typeLIKE' + owningBusiness + '^group.nameLIKEMaker');
+        grMember.query();
+
+        while (grMember.next()) {
+            var grGroupRole = new GlideRecord('sys_group_has_role');
+            grGroupRole.addQuery('group', grMember.group);
+            grGroupRole.addQuery('role.name', 'x_hsb11_mss_custod.custody_maker');
+            grGroupRole.orderByDesc('group.name');
+            grGroupRole.query();
+            if (grGroupRole.next()) {
+                assignmentGroup = grGroupRole.group;
+                break;
+            }
+
+        }
+        return assignmentGroup;
+    },
+
+    selectTaskTemplate: function(tempNum) {
+        var taskTemplate = new GlideRecord('x_hsb11_mss_c_proc_custody_trade_task_template');
+        taskTemplate.addQuery('template_id', tempNum);
+        taskTemplate.query();
+        if (taskTemplate.next()) {
+            var tempContents = {
+                "description": taskTemplate.getValue("template_description"),
+                "shortDescription": taskTemplate.getValue("template_short_description")
+            };
+            return JSON.stringify(tempContents);
+        }
+    },
+
+
+
+
+
+    getUserOwningBusiness: function() {
+
+        var getUserData = new GlideRecord('sys_user');
+        getUserData.get(gs.getUserID());
+
+        //return getUserData.u_associated_business_markets.toString();
+
+		//MSSCUSTODY - 8543
+        var userMarketsRaw = getUserData.u_associated_business_markets.toString().split(','); // Fetch user associated markets 
+
+        var unavailableMarketsRaw = gs.getProperty('x_hsb11_mss_c_proc.custody_swift_unavailable_markets', '').split(','); // Get unavailable markets from system property
+
+        var userMarkets = [];
+        for (var i = 0; i < userMarketsRaw.length; i++) {
+            var market = userMarketsRaw[i].replace(/^\s+|\s+$/g, '');
+            if (market !== '') {
+                userMarkets.push(market);
+            }
+        }
+
+        var unavailableMarkets = [];
+        for (var j = 0; j < unavailableMarketsRaw.length; j++) {
+            var unMarket = unavailableMarketsRaw[j].replace(/^\s+|\s+$/g, '');
+            if (unMarket !== '') {
+                unavailableMarkets.push(unMarket);
+            }
+        }
+		// Filter out unavailable markets
+        var filteredMarkets = [];
+        for (var k = 0; k < userMarkets.length; k++) {
+            if (unavailableMarkets.indexOf(userMarkets[k]) === -1) {
+                filteredMarkets.push(userMarkets[k]);
+            }
+        }
+
+        return filteredMarkets.join(',');
+
+
+    },
+
+
+
+    getBulkFileUploadRecordProducer: function() {
+
+        try {
+            return gs.getProperty('x_hsb11_hsbc_mss_o.hsbcBulkFileUploadRecordProducer');
+
+        } catch (ex) {
+            gs.info('Error Received from getBulkFileUploadRecordProducer ' + ex);
+        }
+
+    },
+    type: 'MSSCustodyBulkFileUpload'
+});]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>45180553@hsbc.com</sys_created_by>
+        <sys_created_on>2025-06-24 06:18:02</sys_created_on>
+        <sys_id>a28da9061bde2e909e88ed32b24bcbb5</sys_id>
+        <sys_mod_count>257</sys_mod_count>
+        <sys_name>MSSCustodyBulkFileUpload</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_a28da9061bde2e909e88ed32b24bcbb5</sys_update_name>
+        <sys_updated_by>45180553@hsbc.com</sys_updated_by>
+        <sys_updated_on>2026-01-14 11:40:27</sys_updated_on>
+    </sys_script_include>
+</record_update>

@@ -1,0 +1,187 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="sys_script">
+    <sys_script action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection>x_hsb11_hsbcmss_eh_parent_aggregated_trade_email_queue</collection>
+        <condition/>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition table="x_hsb11_hsbcmss_eh_parent_aggregated_trade_email_queue">contact_email_idISEMPTY^EQ<item endquery="true" field="" goto="false" newquery="false" operator="=" or="false" value=""/>
+        </filter_condition>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>HSBC-Update Email ID from Contact DB </name>
+        <order>100</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function executeRule(current, previous /*null when async*/ ) {
+
+    /*
+	Comment Date: 01/11/2023
+	Comment Author: scott.douglas@hsbc.com
+	
+    OK, so this BR needs to check that there is a valid email address for a Contact when a Parent Aggregated Email record is created.
+    This version is a significant re-write to fix defect MSSRBXCE-302.
+    Changes are:
+    
+    - Removed any customer_contact GlideRecord addQuery references to .addQuery('account', current.trade_case_number.financial_object.account_id); account is not populated on the Customer Contact database so this is redundant
+    - Fix the while loop that would both update the Parent Aggregated Email record with a valid email account, and create a Task saying that a valid Contact could not be found
+    - Only update the record or create an exception if we are sure that we have evaluated true or false
+    - Make everything more readable
+    - !!TO DO!! I'm not entirely sure that the the close automation task works consistently, because I am not sure the Short Description is always consistent
+    
+    */
+    //set variables
+    var emailAutomation = '';
+    var emailID = '';
+    var tradeCaseStatus = '';
+    var tradeCaseBusinessProcess = '';
+    var counterParty = '';
+    var grChildRecords = new GlideRecord('x_hsb11_hsbcmss_eh_aggregated_trade_email_queue');
+    grChildRecords.addQuery('parent', current.sys_id);
+    grChildRecords.query();
+    //MSSRBXCE-241 : Looping over child records to create Contact missing task on all child cases instead of only first child
+    while (grChildRecords.next()) {
+        tradeCaseStatus = grChildRecords.trade_status;
+        tradeCaseBusinessProcess = grChildRecords.trade_case.u_business_process_instance.business_process_definition;
+        counterParty = grChildRecords.trade_case.client;
+        var emailClientManually = gs.getProperty("x_hsb11_hsbcmss_eh.hsbc.short.description.contact db for No");
+        var noActiveRecord = gs.getProperty("x_hsb11_hsbcmss_eh.hsbc.short.description.contact db for yes");
+        var count = 0,
+            maxCount = 1;
+        if (counterParty == '')
+            maxCount = 3;
+        var payLoad = '';
+        var client = '';
+        while (count < maxCount) {
+            //Let's GlideRecord to get the Contact Record.  
+            var grCustomerContact = new GlideRecord('customer_contact');
+            grCustomerContact.addActiveQuery();
+            grCustomerContact.addNotNullQuery('email');
+            grCustomerContact.addQuery('u_counterparty_code', counterParty);
+            grCustomerContact.addQuery('u_business_process', tradeCaseBusinessProcess);
+            grCustomerContact.addQuery('u_email_type', tradeCaseStatus).addOrCondition('u_email_type', 'Generic').addOrCondition('u_email_type', ' ');
+            grCustomerContact.addQuery('u_contact_type', '!=', 'Escalation Contact');
+            grCustomerContact.query();
+
+            //counterParty = current.trade_case_number.client;
+            if (counterParty == '') {
+                count++;
+                var endSleep = new GlideDuration().getNumericValue() + 5000;
+                while (new GlideDuration().getNumericValue() < endSleep) {
+                    //wait 
+                }
+                var grTradeCaseTable = new GlideRecord('x_hsb11_hsbc_mss_t_trade_case');
+                grTradeCaseTable.addQuery('number', grChildRecords.trade_case.number);
+                grTradeCaseTable.query();
+                if (grTradeCaseTable.next()) {
+                    var BPI = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_instance');
+                    BPI.addQuery('number', grTradeCaseTable.u_business_process_instance.number);
+                    BPI.query();
+                    if (BPI.next()) {
+                        payLoad = BPI.payload;
+                        var jsonObj = JSON.parse(payLoad.toString());
+                        var obj = jsonObj.data[0].payload.CTAC_TRADE_AUDIT;
+                        client = obj[0].COUNTERPARTY_CODE;
+                    }
+                }
+                counterParty = client;
+            } else
+                count = maxCount;
+        }
+
+
+        //Populate emailID and emailAutomation if we get a record
+        if (grCustomerContact.next()) {
+            emailID = grCustomerContact.email;
+            emailAutomation = grCustomerContact.u_email_automation;
+        }
+
+        if (emailID == '' && emailAutomation == '') {
+            createExceptionWorkItem(noActiveRecord);
+        } else if (emailID && tradeCaseStatus != 'Trade Affirmed' && emailAutomation == 'No') {
+            createExceptionWorkItem(emailClientManually);
+        } else {
+            current.contact_email_id = grCustomerContact.email;
+            //current.update();
+        }
+
+    }
+
+    function createExceptionWorkItem(shortDesc) {
+        //Create Work Item Logic here ...
+        var getAssignmentGrp = new GlideRecord('sys_user_group');
+        //getAssignmentGrp.get('name', 'HBAP CE Clearing and Settlement - MOCS');
+		getAssignmentGrp.get('name', 'CE Clearing and Settlement - MOCS'); //added as part of MSSRBXCE-1074 (Global Rollout)
+        var desc = gs.getProperty("x_hsb11_hsbcmss_eh.Update description for Email Automation No");
+        var createExceptionTask = new GlideRecord('x_hsb11_hsbc_mss_t_trade_task');
+        createExceptionTask.initialize();
+        createExceptionTask.short_description = shortDesc;
+        createExceptionTask.description = desc;
+        createExceptionTask.assignment_group = getAssignmentGrp.sys_id;
+        createExceptionTask.setValue('parent', grChildRecords.trade_case);
+        // Check if a task already exists if not then only create a new task
+        if (checkTaskAlreadyExists(grChildRecords.trade_case, shortDesc) == false)
+            createExceptionTask.insert();
+
+        // Update the existing email trigger task to closed rejected as we were not able to process that email.
+        var TradeTask = new GlideRecord('x_hsb11_hsbc_mss_t_trade_task');
+        var ShortDescEmailHandler = gs.getProperty("x_hsb11_hsbcmss_eh.Trigger_email_communication_handler");
+        TradeTask.addQuery("short_description", ShortDescEmailHandler);
+        TradeTask.addQuery("parent", grChildRecords.trade_case);
+        TradeTask.query();
+        if (TradeTask.next()) {
+            TradeTask.state = 4; // closed rejected, we cannot cancel this task as this is the email automation task
+            TradeTask.update();
+        }
+    }
+
+
+
+    function checkTaskAlreadyExists(tradeCaseRef, shortDesc) {
+
+        // Function takes trade case reference and short description as parameters and returns true/false if a task already exists on the same trade case
+        var checkTaskExists = new GlideRecord('x_hsb11_hsbc_mss_t_trade_task');
+        checkTaskExists.addEncodedQuery('parent=' + tradeCaseRef + '^short_description=' + shortDesc);
+        checkTaskExists.query();
+        if (checkTaskExists.next())
+            return true;
+        else
+            return false;
+    }
+
+})(current, previous);]]></script>
+        <sys_class_name>sys_script</sys_class_name>
+        <sys_created_by>45236398@hsbc.com</sys_created_by>
+        <sys_created_on>2023-03-14 17:12:12</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>6afee04e1b61255cff37eb14b24bcb46</sys_id>
+        <sys_mod_count>97</sys_mod_count>
+        <sys_name>HSBC-Update Email ID from Contact DB </sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_6afee04e1b61255cff37eb14b24bcb46</sys_update_name>
+        <sys_updated_by>45423137@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-11-24 07:00:55</sys_updated_on>
+        <template/>
+        <when>before</when>
+    </sys_script>
+    <sys_translated_text action="delete_multiple" query="documentkey=6afee04e1b61255cff37eb14b24bcb46"/>
+</record_update>

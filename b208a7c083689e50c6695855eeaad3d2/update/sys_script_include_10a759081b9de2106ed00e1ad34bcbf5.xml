@@ -1,0 +1,429 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.MSSCustodyOnDemandCallUtils</api_name>
+        <caller_access/>
+        <client_callable>true</client_callable>
+        <description>This re-usable script was created part of MSSOTIQUBE-1816 with the intent of having one script include for all on demand API calls - Updated as part of 1813.</description>
+        <mobile_callable>false</mobile_callable>
+        <name>MSSCustodyOnDemandCallUtils</name>
+        <sandbox_callable>true</sandbox_callable>
+        <script><![CDATA[var MSSCustodyOnDemandCallUtils = Class.create();
+MSSCustodyOnDemandCallUtils.prototype = Object.extendsObject(global.AbstractAjaxProcessor, {
+
+    //MSSOTIQUBE-1816 && //MSSCUSTODY-6650 //MSSOTIQUBE-2982
+    refreshTradeDataAPICall: function(uiActionTriggerTime) {
+		
+        try {
+            //1st precedence to API call
+            var eventOnDemandenv = gs.getProperty('x_hsb11_mss_custod.eventCustodyonDemand_uri');
+            var mssonDemandToken = gs.getProperty('x_hsb11_mss_custod.hsbcmss_EventLayercustodyonDemand_api_token');
+            var requestBody = 'HSBCTransactionIdentifications=' + encodeURIComponent(current.trade_id);
+            var restMessageTradeData = new sn_ws.RESTMessageV2('MSS OnDemand API Send', 'Get');
+            restMessageTradeData.setStringParameterNoEscape('event_OnDemand_env', eventOnDemandenv);
+            restMessageTradeData.setStringParameterNoEscape('mssOnDemand_token', mssonDemandToken);
+            restMessageTradeData.setStringParameterNoEscape('requestbody', requestBody);
+            restMessageTradeData.setEccCorrelator(current.sys_id);
+            restMessageTradeData.executeAsync();
+
+            //2nd precedence to staging table record creation
+            var createProcessonDemand = new GlideRecord('x_hsb11_mss_custod_mss_custody_unity_ondemand_staging');
+            createProcessonDemand.initialize();
+            createProcessonDemand.request_body = 'HSBCTransactionIdentifications=' + encodeURIComponent(current.trade_id);
+            createProcessonDemand.state = 'Processsing';
+            //createProcessonDemand.trade_id = current.sys_id;
+            createProcessonDemand.trade_base = current.sys_id; //Custody Redesign
+            createProcessonDemand.request_date = new GlideDateTime();
+            createProcessonDemand.refresh_start_time = uiActionTriggerTime;
+            createProcessonDemand.insert();
+        } catch (exp) {
+            gs.info("Script Include - MSSCustodyOnDemandCallUtils - Unexpected error while processing" + exp.message);
+        }
+    },
+
+    //MSSCUSTODY-6650//MSSOTIQUBE-2982
+    refreshTradeDataClientAPICall: function() {
+
+        try {
+            var tradeID = this.getParameter('sysparm_tradeID');
+            var tradeSysID = this.getParameter('sysparm_tradeSysID');
+
+            var createRec = new global.hsbcTimeUtils().evalIfStagingRecordAvailable(tradeSysID);
+
+            if (createRec) {
+                //to cover the on_load refresh in Active Trade and also Historical Trade form
+                var baseTrade = new GlideRecord('sn_bom_trade');
+                if (baseTrade.get(tradeSysID)) {
+                    var grTrade = new GlideRecord(baseTrade.sys_class_name);
+                    grTrade.get(tradeSysID);
+                    grTrade.attribute_sync = 'Attribute Sync is in Progress';
+                    grTrade.update();
+                }
+
+                var eventOnDemandenv = gs.getProperty('x_hsb11_mss_custod.eventCustodyonDemand_uri');
+                var mssonDemandToken = gs.getProperty('x_hsb11_mss_custod.hsbcmss_EventLayercustodyonDemand_api_token');
+                var requestBody = 'HSBCTransactionIdentifications=' + encodeURIComponent(tradeID.toString());
+                var restMessageTradeData = new sn_ws.RESTMessageV2('MSS OnDemand API Send', 'Get');
+                restMessageTradeData.setStringParameterNoEscape('event_OnDemand_env', eventOnDemandenv);
+                restMessageTradeData.setStringParameterNoEscape('mssOnDemand_token', mssonDemandToken);
+                restMessageTradeData.setStringParameterNoEscape('requestbody', requestBody);
+                restMessageTradeData.setEccCorrelator(tradeSysID.toString());
+                restMessageTradeData.executeAsync();
+
+                //2nd precedence to staging table record creation
+                var createProcessonDemand = new GlideRecord('x_hsb11_mss_custod_mss_custody_unity_ondemand_staging');
+                createProcessonDemand.initialize();
+                createProcessonDemand.request_body = 'HSBCTransactionIdentifications=' + encodeURIComponent(tradeID);
+                createProcessonDemand.state = 'Processsing';
+                //createProcessonDemand.trade_id = tradeSysID;
+                createProcessonDemand.trade_base = tradeSysID;
+                createProcessonDemand.request_date = new GlideDateTime();
+                createProcessonDemand.refresh_start_time = new GlideDateTime();
+                createProcessonDemand.insert();
+            }
+
+        } catch (exp) {
+            gs.info("Error from Script Include MSSCustodyOnDemandCallUtils - refreshTradeDataClientAPICall " + exp.message);
+        }
+
+    },
+
+    //MSSOTIQUBE-1813
+    refreshSwiftMessageAPICall: function() {
+        //Passed trade_id even when calling from task
+        var tradeSysId = this.getParameter("sysparm_id");
+        var tradeAttribute = this.getParameter("sysparm_attribute_sync");
+
+
+        if (tradeAttribute == "Attribute Sync is in progress")
+            return "Attribute Sync is in progress";
+        var refresh_start = new GlideDateTime();
+        try {
+            var reqBodySI;
+            var TradeRecord = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_trade");
+            if (TradeRecord.get(tradeSysId)) {
+                if (TradeRecord.source_system == "GHSS" || TradeRecord.source_system == "GCS") //Completed API call
+                    reqBodySI = 'hsbcTransactionIdentification=' + encodeURIComponent(TradeRecord.trade_id) + '&messageProcessingStatus=completed';
+                else
+                    reqBodySI = 'messageSourceIdentification=' + encodeURIComponent(TradeRecord.trade_id) + '&owningBusinessName=' + encodeURIComponent(TradeRecord.owning_business.toString()) + '&messageSourceSystemName=' + TradeRecord.source_system;
+            }
+            // FOr GHSS and GCS we have comp event prev. format for reqBody as given above
+            // For anyother source we have swift_reje event . format as above..
+            TradeRecord.swift_attribute_sync = "Attribute Sync is in progress";
+            TradeRecord.update();
+            var swiftOnDemandenv = gs.getProperty('x_hsb11_mss_c_swft.hsbcmss_el_custodySwiftonDemand_api_url');
+            var mssSwiftonDemandToken = gs.getProperty('x_hsb11_mss_c_swft.hsbcmss_el_custodySwiftonDemand_api_token');
+            var restMessageSwiftData = new sn_ws.RESTMessageV2('x_hsb11_mss_c_swft.MSS Swift OnDemand API Send', 'Fetch Swift Messages');
+            restMessageSwiftData.setStringParameterNoEscape('mssSwiftOnDemand_token', mssSwiftonDemandToken);
+            restMessageSwiftData.setStringParameterNoEscape('eventoutbound_base_uri', swiftOnDemandenv);
+            restMessageSwiftData.setStringParameterNoEscape('requestbody', reqBodySI);
+            var agentCorrelator = TradeRecord.sys_id + "/TradeForm";
+            restMessageSwiftData.setEccCorrelator(agentCorrelator);
+            restMessageSwiftData.executeAsync();
+
+
+            //After the API Call we need to add the record in the staging table -1813 MSSOTIUQBE
+            var createSwiftOnDemand = new GlideRecord('x_hsb11_mss_c_swft_mss_custody_swift_ondemand_staging');
+            createSwiftOnDemand.initialize();
+            createSwiftOnDemand.refresh_start_time = refresh_start;
+
+            createSwiftOnDemand.trade_reference = tradeSysId;
+            createSwiftOnDemand.request_body = reqBodySI;
+            createSwiftOnDemand.insert();
+
+
+        } catch (apiCallErr) {
+            gs.info("1813 - Script Include - MSSCustodyOnDemandCallUtils (Refresh Swift) - Unexpected error while processing" + apiCallErr.message);
+        }
+    },
+
+    //MSSOTIQUBE-2406
+    refreshSwiftMessageAPICallTask: function(tradeSysId, tradeAttribute, taskSysId) {
+        //Passed trade_id even when calling from task
+        //  var tradeSysId = this.getParameter("sysparm_id");
+        //  var tradeAttribute = this.getParameter("sysparm_attribute_sync");
+        //  var taskSysId = this.getParameter("sysparm_task_id");
+
+        //    if (tradeAttribute == "Attribute Sync is in progress")
+        //       return "Attribute Sync is in progress";
+        var refresh_start = new GlideDateTime();
+        try {
+            var reqBodySI;
+
+            var TradeRecord = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_trade");
+            if (TradeRecord.get(tradeSysId)) {
+                if (TradeRecord.source_system == "GHSS" || TradeRecord.source_system == "GCS") //Completed API call
+                    reqBodySI = 'hsbcTransactionIdentification=' + encodeURIComponent(TradeRecord.trade_id) + '&messageProcessingStatus=completed';
+                else
+                    reqBodySI = 'messageSourceIdentification=' + encodeURIComponent(TradeRecord.trade_id) + '&owningBusinessName=' + encodeURIComponent(TradeRecord.owning_business.toString()) + '&messageSourceSystemName=' + TradeRecord.source_system;
+            }
+            // FOr GHSS and GCS we have comp event prev. format for reqBody as given above
+            // For anyother source we have swift_reje event . format as above..
+            // TradeRecord.swift_attribute_sync = "Attribute Sync is in progress";
+            // TradeRecord.update();
+            var TaskRecord = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_task");
+            TaskRecord.get(taskSysId);
+            // TaskRecord.swift_attribute_sync = "Attribute Sync is in progress";
+            // TaskRecord.update();
+
+            var swiftOnDemandenv = gs.getProperty('x_hsb11_mss_c_swft.hsbcmss_el_custodySwiftonDemand_api_url');
+            var mssSwiftonDemandToken = gs.getProperty('x_hsb11_mss_c_swft.hsbcmss_el_custodySwiftonDemand_api_token');
+            var restMessageSwiftData = new sn_ws.RESTMessageV2('x_hsb11_mss_c_swft.MSS Swift OnDemand API Send', 'Fetch Swift Messages');
+            restMessageSwiftData.setStringParameterNoEscape('mssSwiftOnDemand_token', mssSwiftonDemandToken);
+            restMessageSwiftData.setStringParameterNoEscape('eventoutbound_base_uri', swiftOnDemandenv);
+            restMessageSwiftData.setStringParameterNoEscape('requestbody', reqBodySI);
+            var agentCorrelator = TaskRecord.sys_id + "/TaskForm";
+            restMessageSwiftData.setEccCorrelator(agentCorrelator);
+            restMessageSwiftData.executeAsync();
+
+
+            //After the API Call we need to add the record in the staging table -1813 MSSOTIUQBE
+            var createSwiftOnDemand = new GlideRecord('x_hsb11_mss_c_swft_mss_custody_swift_ondemand_staging');
+            createSwiftOnDemand.initialize();
+            createSwiftOnDemand.refresh_start_time = refresh_start;
+            createSwiftOnDemand.task_reference = taskSysId;
+            createSwiftOnDemand.trade_reference = tradeSysId;
+            createSwiftOnDemand.request_body = reqBodySI;
+            createSwiftOnDemand.insert();
+
+
+        } catch (apiCallErr) {
+            gs.info("1813 - Script Include - MSSCustodyOnDemandCallUtils (Refresh Swift) - Unexpected error while processing" + apiCallErr.message);
+        }
+    },
+
+    //MSSOTIQUBE-1902,2042
+    refreshPositionDataAPICall: function() {
+
+        var tradeSysId = this.getParameter("sysparm_id");
+        var tradeAttribute = this.getParameter("sysparm_attribute_sync");
+        if (tradeAttribute == "Attribute Sync is in progress")
+            return "Attribute Sync is in progress";
+
+        var refresh_start_time = new GlideDateTime();
+
+
+        var TradeRecord = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_trade");
+        if (TradeRecord.get(tradeSysId)) {
+            if (TradeRecord.securities_account == '' || TradeRecord.security_id == '') {
+                return "security account or security id is empty";
+            } else { //API Call
+                //DeLink all existing Position Details with this Trade ID
+                var positionDetail = new GlideRecord("x_hsb11_mss_pos_custody_positions_details");
+                positionDetail.addQuery("trade_id", TradeRecord.sys_id);
+                positionDetail.query();
+                while (positionDetail.next()) {
+                    positionDetail.trade_id = "";
+                    positionDetail.trade_base = ""; //Custody Redesign
+                    positionDetail.update();
+                }
+                TradeRecord.position_attribute_sync = "Attribute Sync is in progress";
+                TradeRecord.update();
+                var sec_acc = TradeRecord.securities_account;
+                var countryTerritoryLocationCodes = sec_acc.substring(0, 2);
+                var groupMemberIdentification = sec_acc.substring(3, 7);
+                var safekeepingAccountIdentifications = sec_acc.substring(8, 22);
+                var requestBody = 'countryTerritoryLocationCode=' + countryTerritoryLocationCodes + '&groupMemberIdentification=' + groupMemberIdentification + '&safekeepingAccountIdentifications=' + safekeepingAccountIdentifications + '&hsbcIdentifiers=' + encodeURIComponent(TradeRecord.security_id) + '&reportType=DETAIL';
+
+
+
+
+                var mssPositiononDemandToken = gs.getProperty('x_hsb11_mss_pos.hsbcmss_el_custodyPositionSummaryonDemand_api_token');
+                try {
+                    var positionOnDemandenv = gs.getProperty('x_hsb11_mss_pos.hsbcmss_el_custodyPositionDetailonDemand_api_url');
+                    var r = new sn_ws.RESTMessageV2('x_hsb11_mss_pos.MSS Position Detail OnDemand API Send', 'Fetch Position Detail');
+                    r.setStringParameterNoEscape('mssPositionDetail_token', mssPositiononDemandToken);
+                    r.setStringParameterNoEscape('eventoutbound_base_uri', positionOnDemandenv);
+                    r.setStringParameterNoEscape('requestbody', requestBody);
+                    var agentCorrelator = TradeRecord.sys_id + "/TradeForm";
+                    r.setEccCorrelator(agentCorrelator); // To Know in the response that we have called from Trade Form
+                    r.executeAsync();
+
+
+                    var requestBodySum = 'countryTerritoryLocationCode=' + countryTerritoryLocationCodes + '&groupMemberIdentification=' + groupMemberIdentification + '&safekeepingAccountIdentifications=' + safekeepingAccountIdentifications + '&hsbcIdentifiers=' + encodeURIComponent(TradeRecord.security_id) + '&reportType=SUMMARY'; //Required For retry
+
+                    //After the API Call we need to add the record in the staging table
+                    var createPosOndemand = new GlideRecord('x_hsb11_mss_pos_mss_custody_position_ondemand_staging');
+                    createPosOndemand.initialize();
+                    createPosOndemand.refresh_start_time = refresh_start_time;
+                    createPosOndemand.trade_reference = tradeSysId;
+                    createPosOndemand.request_body_for_detail = requestBody;
+                    createPosOndemand.request_body_for_summary = requestBodySum;
+                    createPosOndemand.insert();
+                } catch (apiCallErr) {
+                    gs.info("1902 - Script Include - MSSCustodyOnDemandCallUtils (Refresh Holdings Data) - Unexpected error while processing" + apiCallErr.message);
+                }
+
+            }
+        }
+    },
+
+
+    refreshPositionDataAPICallTask: function(tradeSysId, tradeAttribute, taskSysId) {
+
+        // var tradeSysId = this.getParameter("sysparm_id");
+        // var tradeAttribute = this.getParameter("sysparm_attribute_sync");
+        // var taskSysId = this.getParameter("sysparm_task_id");
+
+        // if (tradeAttribute == "Attribute Sync is in progress")
+        //     return "Attribute Sync is in progress";
+
+        var refresh_start_time = new GlideDateTime();
+
+
+        var TradeRecord = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_trade");
+        if (TradeRecord.get(tradeSysId)) {
+            if (TradeRecord.securities_account == '' || TradeRecord.security_id == '') {
+                return "security account or security id is empty";
+            } else { //API Call
+                //DeLink all existing Position Details with this Trade ID
+                var positionDetail = new GlideRecord("x_hsb11_mss_pos_custody_positions_details");
+                positionDetail.addQuery("trade_id", TradeRecord.sys_id);
+                positionDetail.query();
+                while (positionDetail.next()) {
+                    positionDetail.trade_id = "";
+                    positionDetail.trade_base = ""; //Custody Redesign
+                    positionDetail.update();
+                }
+                //    TradeRecord.position_attribute_sync = "Attribute Sync is in progress";
+                //    TradeRecord.update();
+
+                var TaskRecord = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_task");
+                TaskRecord.get(taskSysId);
+                // TaskRecord.position_attribute_sync = "Attribute Sync is in progress";
+                // TaskRecord.update();
+
+
+                var sec_acc = TradeRecord.securities_account;
+                var countryTerritoryLocationCodes = sec_acc.substring(0, 2);
+                var groupMemberIdentification = sec_acc.substring(3, 7);
+                var safekeepingAccountIdentifications = sec_acc.substring(8, 22);
+                var requestBody = 'countryTerritoryLocationCode=' + countryTerritoryLocationCodes + '&groupMemberIdentification=' + groupMemberIdentification + '&safekeepingAccountIdentifications=' + safekeepingAccountIdentifications + '&hsbcIdentifiers=' + encodeURIComponent(TradeRecord.security_id) + '&reportType=DETAIL';
+
+
+
+
+                var mssPositiononDemandToken = gs.getProperty('x_hsb11_mss_pos.hsbcmss_el_custodyPositionSummaryonDemand_api_token');
+                try {
+                    var positionOnDemandenv = gs.getProperty('x_hsb11_mss_pos.hsbcmss_el_custodyPositionDetailonDemand_api_url');
+                    var r = new sn_ws.RESTMessageV2('x_hsb11_mss_pos.MSS Position Detail OnDemand API Send', 'Fetch Position Detail');
+                    r.setStringParameterNoEscape('mssPositionDetail_token', mssPositiononDemandToken);
+                    r.setStringParameterNoEscape('eventoutbound_base_uri', positionOnDemandenv);
+                    r.setStringParameterNoEscape('requestbody', requestBody);
+                    var agentCorrelator = TaskRecord.sys_id + "/TaskForm";
+                    r.setEccCorrelator(agentCorrelator); // To Know in the response that we have called from Task Form
+                    r.executeAsync();
+
+
+                    var requestBodySum = 'countryTerritoryLocationCode=' + countryTerritoryLocationCodes + '&groupMemberIdentification=' + groupMemberIdentification + '&safekeepingAccountIdentifications=' + safekeepingAccountIdentifications + '&hsbcIdentifiers=' + encodeURIComponent(TradeRecord.security_id) + '&reportType=SUMMARY'; //Required For retry
+
+                    //After the API Call we need to add the record in the staging table
+                    var createPosOndemand = new GlideRecord('x_hsb11_mss_pos_mss_custody_position_ondemand_staging');
+                    createPosOndemand.initialize();
+                    createPosOndemand.refresh_start_time = refresh_start_time;
+                    createPosOndemand.trade_reference = tradeSysId;
+                    createPosOndemand.task_reference = taskSysId;
+                    createPosOndemand.request_body_for_detail = requestBody;
+                    createPosOndemand.request_body_for_summary = requestBodySum;
+                    createPosOndemand.insert();
+                } catch (apiCallErr) {
+                    gs.info("1902 - Script Include - MSSCustodyOnDemandCallUtils (Refresh Holdings Data) - Unexpected error while processing" + apiCallErr.message);
+                }
+
+            }
+        }
+    },
+
+
+    refreshPositionDataAPICallHoldingList: function() {
+
+        var tradeSysId = this.getParameter("sysparm_id");
+        var tradeAttribute = this.getParameter("sysparm_attribute_sync");
+        var taskSysId = this.getParameter("sysparm_task_id");
+
+        //  if (tradeAttribute == "Attribute Sync is in progress")
+        //      return "Attribute Sync is in progress";
+
+        var refresh_start_time = new GlideDateTime();
+
+
+        var TradeRecord = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_trade");
+        if (TradeRecord.get(tradeSysId)) {
+            if (TradeRecord.securities_account == '' || TradeRecord.security_id == '') {
+                return "security account or security id is empty";
+            } else { //API Call
+                //DeLink all existing Position Details with this Trade ID
+                var positionDetail = new GlideRecord("x_hsb11_mss_pos_custody_positions_details");
+                positionDetail.addQuery("trade_id", TradeRecord.sys_id);
+                positionDetail.query();
+                while (positionDetail.next()) {
+                    positionDetail.trade_id = "";
+                    positionDetail.trade_base = ""; //Custody Redesign
+                    positionDetail.update();
+                }
+                //    TradeRecord.position_attribute_sync = "Attribute Sync is in progress";
+                //    TradeRecord.update();
+
+                var TaskRecord = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_task");
+                TaskRecord.get(taskSysId);
+                TaskRecord.position_attribute_sync = "Attribute Sync is in progress";
+                TaskRecord.update();
+
+
+                var sec_acc = TradeRecord.securities_account;
+                var countryTerritoryLocationCodes = sec_acc.substring(0, 2);
+                var groupMemberIdentification = sec_acc.substring(3, 7);
+                var safekeepingAccountIdentifications = sec_acc.substring(8, 22);
+                var requestBody = 'countryTerritoryLocationCode=' + countryTerritoryLocationCodes + '&groupMemberIdentification=' + groupMemberIdentification + '&safekeepingAccountIdentifications=' + safekeepingAccountIdentifications + '&hsbcIdentifiers=' + encodeURIComponent(TradeRecord.security_id) + '&reportType=DETAIL';
+
+
+
+
+                var mssPositiononDemandToken = gs.getProperty('x_hsb11_mss_pos.hsbcmss_el_custodyPositionSummaryonDemand_api_token');
+                try {
+                    var positionOnDemandenv = gs.getProperty('x_hsb11_mss_pos.hsbcmss_el_custodyPositionDetailonDemand_api_url');
+                    var r = new sn_ws.RESTMessageV2('x_hsb11_mss_pos.MSS Position Detail OnDemand API Send', 'Fetch Position Detail');
+                    r.setStringParameterNoEscape('mssPositionDetail_token', mssPositiononDemandToken);
+                    r.setStringParameterNoEscape('eventoutbound_base_uri', positionOnDemandenv);
+                    r.setStringParameterNoEscape('requestbody', requestBody);
+                    var agentCorrelator = TaskRecord.sys_id + "/TaskForm";
+                    r.setEccCorrelator(agentCorrelator); // To Know in the response that we have called from Task Form
+                    r.executeAsync();
+
+
+                    var requestBodySum = 'countryTerritoryLocationCode=' + countryTerritoryLocationCodes + '&groupMemberIdentification=' + groupMemberIdentification + '&safekeepingAccountIdentifications=' + safekeepingAccountIdentifications + '&hsbcIdentifiers=' + encodeURIComponent(TradeRecord.security_id) + '&reportType=SUMMARY'; //Required For retry
+
+                    //After the API Call we need to add the record in the staging table
+                    var createPosOndemand = new GlideRecord('x_hsb11_mss_pos_mss_custody_position_ondemand_staging');
+                    createPosOndemand.initialize();
+                    createPosOndemand.refresh_start_time = refresh_start_time;
+                    createPosOndemand.trade_reference = tradeSysId;
+                    createPosOndemand.task_reference = taskSysId;
+                    createPosOndemand.request_body_for_detail = requestBody;
+                    createPosOndemand.request_body_for_summary = requestBodySum;
+                    createPosOndemand.insert();
+                } catch (apiCallErr) {
+                    gs.info("1902 - Script Include - MSSCustodyOnDemandCallUtils (Refresh Holdings Data) - Unexpected error while processing" + apiCallErr.message);
+                }
+
+            }
+        }
+    },
+
+    type: 'MSSCustodyOnDemandCallUtils'
+});]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>45349115@hsbc.com</sys_created_by>
+        <sys_created_on>2025-04-29 06:31:42</sys_created_on>
+        <sys_id>10a759081b9de2106ed00e1ad34bcbf5</sys_id>
+        <sys_mod_count>87</sys_mod_count>
+        <sys_name>MSSCustodyOnDemandCallUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_10a759081b9de2106ed00e1ad34bcbf5</sys_update_name>
+        <sys_updated_by>43722084@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-10-31 04:46:34</sys_updated_on>
+    </sys_script_include>
+</record_update>

@@ -1,0 +1,365 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.MSS_Event_Utils</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description>Event processing scripts</description>
+        <mobile_callable>false</mobile_callable>
+        <name>MSS_Event_Utils</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var MSS_Event_Utils = Class.create();
+MSS_Event_Utils.prototype = {
+
+    initialize: function() {
+        /**
+         * MSSOTIQUBE-1243
+         * System property to enable/disable logging events
+         */
+        enableLogging = gs.getProperty('x_hsb11_hsbc_mss_o.MSS_Event_Utils_enableLogging', 'false') === 'true';
+
+        // Cache information based on Stage CTAC Status
+        var businessProcessStageStatus = {};
+
+        //MSSOTIQUBE-1243
+        try {
+            var bPSt = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_stage');
+            bPSt.addQuery('ctac_code', '!=', '');
+            bPSt.query();
+            invalid_order_type = gs.getProperty("x_hsb11_hsbc_mss_o.invalid_order_types"); //MSSRBXCE-559
+
+            /**
+             * MSSOTIQUBE-1243
+             * Processes a list of business process stages(bPSt) 
+             * Populates an object (businessProcessStageStatus) with details about each stage
+             */
+            while (bPSt.next()) {
+                businessProcessStageStatus[bPSt.ctac_code] = {
+                    isexception: bPSt.is_exception.toString(),
+                    dur: bPSt.expected_duration.toString(),
+                    dur_ts: new GlideDateTime(bPSt.expected_duration).getNumericValue(), //get Timestamp from expected duration field
+                    busProcess: bPSt.business_process.toString(),
+                    status: bPSt.status.toString(),
+                    status_sys_id: bPSt.sys_id.toString()
+                };
+            }
+            this.businessProcessStageStatus = businessProcessStageStatus;
+
+        } catch (e) {
+            gs.error('[MSS EVENT UTIL] Exception in initialize(): ' + e.message + "\n" + e.stack); //MSSOTIQUBE-1243
+        }
+
+
+    },
+
+    /**
+     * MSSOTIQUBE-1243
+     * Processes a queue of event that are in 'Processing' status
+     * Retrieves events from a specified queue
+     * Extracts relevant information and updates their status based on the processing logic
+     */
+    processEventQueue: function(queue) { //loop to process events that are in Processing status from selected queue.
+
+        var currentStatus;
+        var order_type = ""; //MSSRBXCE-559
+        var isOrderTypeAvailabe = true; //MSSRBXCE-559
+        var etc_service = '';
+        var addAttrObj = {};
+        var mssevt = new GlideRecord('x_hsb11_hsbc_mss_o_mss_event_inbound');
+        mssevt.addQuery('queue', queue);
+        mssevt.addQuery('processing_status', 'Processing');
+        mssevt.query();
+
+        while (mssevt.next()) {
+            //MSSOTIQUBE-1243
+            try {
+                addAttrObj = JSON.parse(mssevt.additional_attributes);
+                etc_service = addAttrObj['ETC_Service'].toString(); //populate etc_service value from parsed JSON string.
+
+                if (typeof(addAttrObj['ORDER_TYPE']) !== "undefined") {
+                    
+                    order_type = addAttrObj['ORDER_TYPE'].toString(); //populate order_type value from parsed JSON string. MSSRBXCE-559
+                    var counterpart_code = '';
+                    if (addAttrObj['COUNTERPARTY_CODE']) {
+                        counterpart_code = addAttrObj['COUNTERPARTY_CODE'].toString();
+                    }
+
+                } else {
+                    
+                    isOrderTypeAvailabe = false;
+                }
+                invalid_order_type = gs.getProperty("x_hsb11_hsbc_mss_o.invalid_order_types");
+                //MSSRBXCE-559 - added ordertype and is ordertype available
+
+                currentStatus = this.executeEvent(mssevt.objectid, mssevt.eventstatus, mssevt.eventdatetime, mssevt.eventdatetime_integer, etc_service, mssevt.additional_attributes, mssevt.messageid, mssevt.source, mssevt.objectversion, mssevt.eventtype, mssevt.objectidtype, mssevt.objecttype, order_type, isOrderTypeAvailabe, counterpart_code, invalid_order_type);
+                mssevt.processing_status = currentStatus;
+                mssevt.update();
+
+                //**code to create an anomaly case in case of unknown ctac received ***
+                if (mssevt.processing_status == 'Error') {
+                    gs.eventQueue('x_hsb11_hsbc_mss_o.ctacNotFound', mssevt, '', '');
+                }
+            } catch (e) {
+                gs.error("[MSS Event Utils] Exception while processing event ID: " + mssevt.messageid + ", Error: " + e.message + "\n" + e.stack); //MSSOTIQUBE-1243
+            }
+        }
+
+    },
+
+    //MSSRBXCE-559 - added ordertype and is ordertype available
+
+    /**
+     * MSSOTIQUBE-1243
+     * executeEvent:function()
+     * Processes an event by checking if a valid CTAC exists for the event
+     * Updates the BPI with the latest event data
+     * IF no BPI exists,it creates a new BPI and associates it with the event
+     * Updates or creates trade records in sync with the BPI updates
+     * Skips processing for events with invalid order types,ensuring data integrity and compliance with business rules
+     */
+    executeEvent: function(objectid, eventstatus, eventdatetime, edt_integer, etcService, attribute, mId, source, objectversion, eventtype, objectidtype, objecttype, order_type, isOrderTypeAvailabe, counterpart_code, invalid_order_type) {
+        try {
+            //check if CTAC code exists for the event else event will be ignored
+            if (this.businessProcessStageStatus[eventstatus] != undefined) {
+                //create required variables
+                var stg_time = this.businessProcessStageStatus[eventstatus]['dur_ts'];
+                var gdt = parseInt(edt_integer) + parseInt(stg_time); // add eventdatetime to expectedtransition to calculate SLA
+                var is_exception = this.businessProcessStageStatus[eventstatus]["isexception"];
+                var stg_status = this.businessProcessStageStatus[eventstatus]["status_sys_id"];
+                var businessProcess = this.businessProcessStageStatus[eventstatus]["busProcess"];
+                var available_for_all_counterpart_code = gs.getProperty("x_hsb11_hsbc_mss_o.available_for_all_counterpart_code");
+                var existBPI = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_instance'); //find an existing BPI for this object_id
+                existBPI.addQuery('financial_object_id', objectid);
+                existBPI.query();
+                if (existBPI.next()) { // if BPI is exist
+
+                    var shouldUpdateBPI = false;
+                    var hasDifferentMessageID = this._compareMessageID(existBPI.messageid, mId);
+                    if (hasDifferentMessageID) {
+
+                        if (isOrderTypeAvailabe) {
+
+                            if (available_for_all_counterpart_code.includes(counterpart_code)) {
+                                shouldUpdateBPI = true; // update BPI if counterpart code is in available for all list
+                            } else {
+                                if (!invalid_order_type.includes(order_type)) {
+                                    shouldUpdateBPI = true; // update BPI if order type is not in invalid list
+                                }
+                            }
+                        } else {
+                            shouldUpdateBPI = true; // update BPI if order type is not available;
+                        }
+                        if (shouldUpdateBPI) {
+
+                            this.updateBPI(gdt, objectid, businessProcess, stg_status, eventdatetime, etcService, attribute, edt_integer, mId, source, objectversion, eventtype, objectidtype, objecttype, is_exception);
+                            this.updateTradeRecord(objectid, objectversion, stg_status); //MSSOTIQUBE-2307
+                            return 'Processed'; //returning status to the event table
+                        } else {
+
+                            return 'Ignored';
+                        }
+                    } else {
+
+                        return 'Ignored'; //return ignored if message id is same;
+                    }
+                } else { // BPI is not exist
+
+                    var shouldCreateBPI = false;
+                    if (isOrderTypeAvailabe) {
+
+                        if (available_for_all_counterpart_code.includes(counterpart_code)) {
+                            shouldCreateBPI = true;
+                        } else {
+
+                            if (!invalid_order_type.includes(order_type)) {
+                                shouldCreateBPI = true;
+                            }
+                        }
+                    } else {
+                        shouldCreateBPI = true;
+                    }
+                    if (shouldCreateBPI == true) {
+                        var obj_sys_id = this.insertTradeRecord(objectid, objectversion, stg_status); //MSSOTIQUBE-2307
+                        this.createBPI(gdt, obj_sys_id, businessProcess, stg_status, eventdatetime, etcService, attribute, edt_integer, objectid, mId, source, objectversion, eventtype, objectidtype, objecttype, is_exception);
+                        return 'Processed'; //returning status to the event table
+                    } else {
+
+                        return 'Ignored'; //return ignored status to the event tabpe
+                    }
+                }
+            } else {
+                return 'Error'; //return error - ctac code invalid
+            }
+        } catch (e) {
+            gs.error("[MSS_EVENT_UTIL] Exception in executeEvent(): " + " " + e.message + "\n" + e.stack); //MSSOTIQUBE-1243
+            return "Error";
+        }
+    },
+
+    /**
+	 * test for script 
+     * MSSOTIQUBE-1243
+     * Updates the version of a trade record in the "x_hsb11_hsbc_mss_t_hsbc_trade" table if the provided object version is different from the existing version.
+     */
+    //MSSOTIQUBE-2307 --> Modify the function to update trade status field of trade record
+    updateTradeRecord: function(objectid, objectversion, tradestatus) {
+        var trade = new GlideRecord("x_hsb11_hsbc_mss_t_hsbc_trade");
+        trade.addQuery('u_id', objectid);
+        trade.query();
+        if (trade.next()) {
+            if (trade.u_version != objectversion) {
+                trade.u_version = objectversion;
+            }
+            trade.u_trade_status = tradestatus; //set updated trade status for the trade
+            trade.update();
+        }
+    },
+
+    /**
+     * MSSOTIQUBE-1243
+     * Inserts a new trade record into the "x_hsb11_hsbc_mss_t_hsbc_trade" table with the provided objectid and objectversion
+     */
+    //MSSOTIQUBE-2307 --> Modify the function to update trade status field of trade record
+    insertTradeRecord: function(objectid, objectversion, tradestatus) {
+        var trade = new GlideRecord("x_hsb11_hsbc_mss_t_hsbc_trade");
+        trade.initialize();
+        trade.u_id = objectid;
+        trade.u_version = objectversion;
+        // MSSOTIQUBE-2307 --> set updated trade status for the trade
+        trade.u_trade_status = tradestatus;
+
+        return trade.insert();
+    },
+
+    /**
+     * MSSOTIQUBE-1243
+     * This function ensures that an existing BPI is updated with the latest event data,including timestamps,status and metadata.
+     * Plays a critical role in maintaining the accuracy and consistency of business process records in the system
+     */
+    updateBPI: function(gdt, objectid, businessProcess, businessProcessInstanceCtacStatus, executionTime, etcService, attribute, int, mId, source, objectversion, eventtype, objectidtype, objecttype, is_exception) {
+        var initGdt = new GlideDateTime();
+        initGdt.setValue(gdt);
+        var execGdt = new GlideDateTime();
+        execGdt.setValue(parseInt(int));
+
+        var updBPI = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_instance');
+        updBPI.addQuery('financial_object_id', objectid);
+        updBPI.query();
+        if (updBPI.next()) {
+
+            updBPI.expected_transition_timestamp = gdt;
+            updBPI.expected_transition_time = initGdt;
+            updBPI.business_process_definition = businessProcess;
+            updBPI.status = businessProcessInstanceCtacStatus;
+            updBPI.execution_time = execGdt;
+            updBPI.execution_timestamp = int;
+            updBPI.additional_attributes = attribute;
+            updBPI.etc_service = this.mapETCService(etcService);
+            updBPI.messageid = mId;
+            updBPI.source = source;
+            updBPI.object_version = objectversion;
+            updBPI.event_type = eventtype;
+            updBPI.objectid_type = objectidtype;
+            updBPI.object_type = objecttype;
+            if (is_exception == "true") {
+                updBPI.is_exception = true;
+            } else {
+                updBPI.is_exception = false;
+            }
+            updBPI.update();
+        }
+    },
+
+    /**
+     * MSSOTIQUBE-1243
+     * The function creates and inserts a new business process instance record
+     * It initializes timestamps,assigns attributes,maps services,checks for exceptions and saves the record 
+     */
+    createBPI: function(gdt, objectid, businessProcess, businessProcessInstanceCtacStatus, executionTime, etcService, attribute, int, obj_id, mId, source, objectversion, eventtype, objectidtype, objecttype, is_exception) {
+
+        var initGdt = new GlideDateTime();
+        initGdt.setValue(gdt);
+        var execGdt = new GlideDateTime();
+        execGdt.setValue(parseInt(int));
+
+        var crtBPI = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_instance');
+        crtBPI.initialize();
+        crtBPI.financial_object_record = objectid;
+        crtBPI.financial_object_id = obj_id;
+        crtBPI.expected_transition_timestamp = gdt;
+        crtBPI.expected_transition_time = initGdt;
+        crtBPI.business_process_definition = businessProcess;
+        crtBPI.status = businessProcessInstanceCtacStatus;
+        crtBPI.execution_time = execGdt;
+        crtBPI.execution_timestamp = int;
+        crtBPI.additional_attributes = attribute;
+        crtBPI.etc_service = this.mapETCService(etcService);
+        crtBPI.messageid = mId;
+        crtBPI.source = source;
+        crtBPI.object_version = objectversion;
+        crtBPI.event_type = eventtype;
+        crtBPI.objectid_type = objectidtype;
+        crtBPI.object_type = objecttype;
+        if (is_exception == "true") {
+            crtBPI.is_exception = true;
+        } else {
+            crtBPI.is_exception = false;
+        }
+        crtBPI.insert();
+
+
+    },
+
+    /**
+     * MSSOTIQUBE-1243
+     * this function takes two message IDs, extracts the first 11 digits into an integer and then determines if the record being processed is newer than the existing record
+     */
+    _compareMessageID: function(existingMsgID, newMsgID) {
+
+        var msgIDRegex = new RegExp("^[0-9]{11}"); //Regex to find first 11 digits at the start of the string
+
+        var existingMsgIDInteger = Number(existingMsgID.toString().match(msgIDRegex)); //write matched strings as integers
+        var newMsgIDInteger = Number(newMsgID.toString().match(msgIDRegex));
+
+        if (newMsgIDInteger > existingMsgIDInteger) { //compare the values and return true if the new value is greated
+            return true;
+        } else {
+            return false;
+        }
+
+
+    },
+
+    mapETCService: function(input) {
+        switch (input) {
+            case "MANUAL":
+                return "Manual Client";
+            case "CTM BLOCK":
+                return "CTM Client";
+            case "FIX":
+                return "FIX Client";
+            case "SWIFT":
+                return "SWIFT Client";
+            default:
+                return "Unknown";
+        }
+    },
+
+
+    type: 'MSS_Event_Utils'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>45210425@hsbc.com</sys_created_by>
+        <sys_created_on>2023-02-15 14:29:19</sys_created_on>
+        <sys_id>67966a5d1b01ad50ff37eb14b24bcbd7</sys_id>
+        <sys_mod_count>163</sys_mod_count>
+        <sys_name>MSS_Event_Utils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_67966a5d1b01ad50ff37eb14b24bcbd7</sys_update_name>
+        <sys_updated_by>43702064@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-11-10 03:18:20</sys_updated_on>
+    </sys_script_include>
+</record_update>

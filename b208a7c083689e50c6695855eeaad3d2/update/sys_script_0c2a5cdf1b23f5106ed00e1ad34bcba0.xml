@@ -1,0 +1,348 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="sys_script">
+    <sys_script action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection>ecc_queue</collection>
+        <condition>current.agent=="RESTClient" &amp;&amp; current.queue=="input" &amp;&amp; (current.state=="ready" || current.state=="error" || current.state=="processed" ) &amp;&amp; current.source.indexOf(gs.getProperty("x_hsb11_mss_pos.hsbcmss_el_custodyPositionDetailonDemand_api_url"))&gt;-1</condition>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition table="ecc_queue">sourceLIKEDETAIL^EQ<item endquery="false" field="source" goto="false" newquery="false" operator="LIKE" or="false" value="DETAIL"/>
+            <item endquery="true" field="" goto="false" newquery="false" operator="=" or="false" value=""/>
+        </filter_condition>
+        <is_rest>false</is_rest>
+        <message><![CDATA[<p>MSS Custody Swift SensorOnDemandResponse</p>]]></message>
+        <name>MSS Custody SensorDetailOndemandResponse</name>
+        <order>100</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function executeRule(current, previous /*null when async*/ ) {
+
+    try {
+
+        var agentCorrelator = current.response_to.agent_correlator.toString();
+        var splitArr = agentCorrelator.split("/");
+        var trade_sys_id;
+        var sys_id = splitArr[0];
+        var Form = splitArr[1];
+        if (Form == "TaskForm") {
+            var Task = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_task");
+            Task.get(sys_id);
+            trade_sys_id = Task.trade_id;
+        } else {
+            trade_sys_id = sys_id;
+        }
+        var response = "";
+
+        var xmlDoc = new XMLDocument2();
+        xmlDoc.parseXML(current.payload.toString());
+
+
+        response = xmlDoc.getNodeText("//result/output");
+
+        var httpCodeNode = xmlDoc.getNode("//parameters/parameter");
+        var httpCode = httpCodeNode.getAttribute('value');
+
+        if (Form == "TradeForm") {
+            if (httpCode == "200") {
+                var tradeData = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                if (tradeData.get(trade_sys_id)) {
+                    //Do the API Call for summary
+                    var sec_acc = tradeData.securities_account;
+                    var countryTerritoryLocationCodes = sec_acc.substring(0, 2);
+                    var groupMemberIdentification = sec_acc.substring(3, 7);
+                    var safekeepingAccountIdentifications = sec_acc.substring(8, 22);
+                    var requestBody = 'countryTerritoryLocationCode=' + countryTerritoryLocationCodes + '&groupMemberIdentification=' + groupMemberIdentification + '&safekeepingAccountIdentifications=' + safekeepingAccountIdentifications + '&hsbcIdentifiers=' + encodeURIComponent(tradeData.security_id) + '&reportType=SUMMARY';
+                    var mssPositiononDemandToken = gs.getProperty('x_hsb11_mss_pos.hsbcmss_el_custodyPositionSummaryonDemand_api_token');
+                    try {
+                        var positionOnDemandenv = gs.getProperty('x_hsb11_mss_pos.hsbcmss_el_custodyPositionSummaryonDemand_api_url');
+                        var r = new sn_ws.RESTMessageV2('x_hsb11_mss_pos.MSS Position Summary API Send', 'Fetch Position Summary');
+                        r.setStringParameterNoEscape('mssPositionSummary_token', mssPositiononDemandToken);
+                        r.setStringParameterNoEscape('eventoutbound_base_uri', positionOnDemandenv);
+                        r.setStringParameterNoEscape('requestbody', requestBody);
+                        var correlator = trade_sys_id + "/TradeForm"; //API Call as per new flow - MSSOTIQUBE-1902 2042
+                        r.setEccCorrelator(correlator);
+                        r.executeAsync();
+                    } catch (ex) {
+                        var message = ex.message;
+                        gs.info("1902 - Error while doing the api call for Summary" + message);
+                        tradeData.position_attribute_sync = "Response Un-Successful - Error";
+                        tradeData.last_positions_refresh_date_time = new GlideDateTime();
+                        tradeData.update();
+                    }
+
+                    //Create the position details records as per the response
+                    var responsebody = response.toString();
+                    var respBody = JSON.parse(responsebody);
+                    for (var i = 0; i < respBody.data.length; i++) {
+                        for (var j = 0; j < respBody.data[i].holdings.length; j++) {
+                            var positionDetail = new GlideRecord("x_hsb11_mss_pos_custody_positions_details");
+                            positionDetail.initialize();
+                            positionDetail.holding_event_type = respBody.data[i].holdings[j].type;
+                            positionDetail.security_account = respBody.data[i].safekeepingAccountIdentification;
+                            positionDetail.isin = respBody.data[i].financialInstrumentIdentification.isin;
+                            positionDetail.security_id = respBody.data[i].financialInstrumentIdentification.hsbcIdentifier;
+                            positionDetail.currency = respBody.data[i].financialInstrumentIdentification.currency;
+                            positionDetail.quantity_available = respBody.data[i].holdings[j].quantity;
+                            positionDetail.registration_code = respBody.data[i].holdings[j].registrationCode;
+                            positionDetail.location_id = respBody.data[i].holdings[j].locationCode;
+                            //Updated as part of MSSOTIQUBE-1902 and 2042.
+                            positionDetail.account_name = respBody.data[i].safekeepingAccountName;
+                            positionDetail.security_name = respBody.data[i].financialInstrumentIdentification.description;
+                            positionDetail.trade_id = trade_sys_id;
+                            positionDetail.trade_base = trade_sys_id; //Custody Redesign
+                            positionDetail.market_value_in_security_curr = respBody.data[i].holdings[j].marketValueInSecurityCurrency;
+                            positionDetail.market_value_in_report_value = respBody.data[i].holdings[j].marketValueInReportCurrency;
+                            positionDetail.type = 'Trade';
+                            positionDetail.insert();
+                        }
+                    }
+                }
+            } else {
+                var tradeDataErr = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                if (tradeDataErr.get(trade_sys_id)) {
+                    tradeDataErr.position_attribute_sync = "Response Un-Successful - Error";
+                    tradeDataErr.last_positions_refresh_date_time = new GlideDateTime();
+                    tradeDataErr.update();
+                }
+
+                var grPosOnDemandDetail = new GlideRecord("x_hsb11_mss_pos_mss_custody_position_ondemand_staging");
+                grPosOnDemandDetail.addEncodedQuery('refresh_end_timeISEMPTY^trade_reference=' + trade_sys_id);
+                grPosOnDemandDetail.query();
+                if (grPosOnDemandDetail.next()) {
+                    grPosOnDemandDetail.refresh_end_time = new GlideDateTime();
+                    grPosOnDemandDetail.response_body_for_detail = response;
+                    grPosOnDemandDetail.state_for_detail = "error"; // Have retry if error from detail
+                    grPosOnDemandDetail.error_body_for_detail = response;
+                    grPosOnDemandDetail.update();
+                }
+            }
+        } else if (Form == "TradeFormPassive") {
+
+            if (httpCode == "200") {
+                var tradeData = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade_passive');
+                if (tradeData.get(trade_sys_id)) {
+                    //Do the API Call for summary
+                    var sec_acc = tradeData.securities_account;
+                    var countryTerritoryLocationCodes = sec_acc.substring(0, 2);
+                    var groupMemberIdentification = sec_acc.substring(3, 7);
+                    var safekeepingAccountIdentifications = sec_acc.substring(8, 22);
+                    var requestBody = 'countryTerritoryLocationCode=' + countryTerritoryLocationCodes + '&groupMemberIdentification=' + groupMemberIdentification + '&safekeepingAccountIdentifications=' + safekeepingAccountIdentifications + '&hsbcIdentifiers=' + encodeURIComponent(tradeData.security_id) + '&reportType=SUMMARY';
+                    var mssPositiononDemandToken = gs.getProperty('x_hsb11_mss_pos.hsbcmss_el_custodyPositionSummaryonDemand_api_token');
+                    try {
+                        var positionOnDemandenv = gs.getProperty('x_hsb11_mss_pos.hsbcmss_el_custodyPositionSummaryonDemand_api_url');
+                        var r = new sn_ws.RESTMessageV2('x_hsb11_mss_pos.MSS Position Summary API Send', 'Fetch Position Summary');
+                        r.setStringParameterNoEscape('mssPositionSummary_token', mssPositiononDemandToken);
+                        r.setStringParameterNoEscape('eventoutbound_base_uri', positionOnDemandenv);
+                        r.setStringParameterNoEscape('requestbody', requestBody);
+                        var correlator = trade_sys_id + "/TradeFormPassive"; //API Call as per new flow - MSSOTIQUBE-1902 2042
+                        r.setEccCorrelator(correlator);
+                        r.executeAsync();
+                    } catch (ex) {
+                        var message = ex.message;
+                        gs.info("1902 - Error while doing the api call for Summary" + message);
+                        tradeData.position_attribute_sync = "Response Un-Successful - Error";
+                        tradeData.last_positions_refresh_date_time = new GlideDateTime();
+                        tradeData.update();
+                    }
+
+                    //Create the position details records as per the response
+                    var responsebody = response.toString();
+                    var respBody = JSON.parse(responsebody);
+                    for (var i = 0; i < respBody.data.length; i++) {
+                        for (var j = 0; j < respBody.data[i].holdings.length; j++) {
+                            var positionDetail = new GlideRecord("x_hsb11_mss_pos_custody_positions_details");
+                            positionDetail.initialize();
+                            positionDetail.holding_event_type = respBody.data[i].holdings[j].type;
+                            positionDetail.security_account = respBody.data[i].safekeepingAccountIdentification;
+                            positionDetail.isin = respBody.data[i].financialInstrumentIdentification.isin;
+                            positionDetail.security_id = respBody.data[i].financialInstrumentIdentification.hsbcIdentifier;
+                            positionDetail.currency = respBody.data[i].financialInstrumentIdentification.currency;
+                            positionDetail.quantity_available = respBody.data[i].holdings[j].quantity;
+                            positionDetail.registration_code = respBody.data[i].holdings[j].registrationCode;
+                            positionDetail.location_id = respBody.data[i].holdings[j].locationCode;
+                            //Updated as part of MSSOTIQUBE-1902 and 2042.
+                            positionDetail.account_name = respBody.data[i].safekeepingAccountName;
+                            positionDetail.security_name = respBody.data[i].financialInstrumentIdentification.description;
+                            positionDetail.trade_id = trade_sys_id;
+                            positionDetail.trade_base = trade_sys_id; //Custody Redesign
+                            positionDetail.market_value_in_security_curr = respBody.data[i].holdings[j].marketValueInSecurityCurrency;
+                            positionDetail.market_value_in_report_value = respBody.data[i].holdings[j].marketValueInReportCurrency;
+                            positionDetail.type = 'Trade';
+                            positionDetail.insert();
+                        }
+                    }
+                }
+            } else {
+                var tradeDataErr = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade_passive');
+                if (tradeDataErr.get(trade_sys_id)) {
+                    tradeDataErr.position_attribute_sync = "Response Un-Successful - Error";
+                    tradeDataErr.last_positions_refresh_date_time = new GlideDateTime();
+                    tradeDataErr.update();
+                }
+
+                var grPosOnDemandDetail = new GlideRecord("x_hsb11_mss_pos_mss_custody_position_ondemand_staging");
+                grPosOnDemandDetail.addEncodedQuery('refresh_end_timeISEMPTY^trade_base=' + trade_sys_id);
+                grPosOnDemandDetail.query();
+                if (grPosOnDemandDetail.next()) {
+                    grPosOnDemandDetail.refresh_end_time = new GlideDateTime();
+                    grPosOnDemandDetail.response_body_for_detail = response;
+                    grPosOnDemandDetail.state_for_detail = "error"; // Have retry if error from detail
+                    grPosOnDemandDetail.error_body_for_detail = response;
+                    grPosOnDemandDetail.update();
+                }
+            }
+
+
+
+        }
+
+
+        // MSSOTIQUBE - 2406 - Ondemand refresh position data from task form
+        else if (Form == "TaskForm") {
+            if (httpCode == "200") {
+                var taskData = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_task");
+                taskData.get(sys_id);
+                var tradeData = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                if (tradeData.get(trade_sys_id)) {
+                    //Do the API Call for summary
+                    var sec_acc = tradeData.securities_account;
+                    var countryTerritoryLocationCodes = sec_acc.substring(0, 2);
+                    var groupMemberIdentification = sec_acc.substring(3, 7);
+                    var safekeepingAccountIdentifications = sec_acc.substring(8, 22);
+                    var requestBody = 'countryTerritoryLocationCode=' + countryTerritoryLocationCodes + '&groupMemberIdentification=' + groupMemberIdentification + '&safekeepingAccountIdentifications=' + safekeepingAccountIdentifications + '&hsbcIdentifiers=' + encodeURIComponent(tradeData.security_id) + '&reportType=SUMMARY';
+                    var mssPositiononDemandToken = gs.getProperty('x_hsb11_mss_pos.hsbcmss_el_custodyPositionSummaryonDemand_api_token');
+                    try {
+                        var positionOnDemandenv = gs.getProperty('x_hsb11_mss_pos.hsbcmss_el_custodyPositionSummaryonDemand_api_url');
+                        var r = new sn_ws.RESTMessageV2('x_hsb11_mss_pos.MSS Position Summary API Send', 'Fetch Position Summary');
+                        r.setStringParameterNoEscape('mssPositionSummary_token', mssPositiononDemandToken);
+                        r.setStringParameterNoEscape('eventoutbound_base_uri', positionOnDemandenv);
+                        r.setStringParameterNoEscape('requestbody', requestBody);
+                        var correlator = sys_id + "/TaskForm"; //API Call as per new flow - MSSOTIQUBE-1902 2042
+                        r.setEccCorrelator(correlator);
+                        r.executeAsync();
+                    } catch (ex) {
+                        var message = ex.message;
+                        gs.info("1902 - Error while doing the api call for Summary" + message);
+                        tradeData.position_attribute_sync = "Response Un-Successful - Error";
+                        tradeData.last_positions_refresh_date_time = new GlideDateTime();
+                        tradeData.update();
+
+                        taskData.position_attribute_sync = "Response Un-Successful - Error";
+                        taskData.last_positions_refresh_date_time = new GlideDateTime();
+                        taskData.update();
+                    }
+
+                    //Create the position details records as per the response
+                    var responsebody = response.toString();
+                    var respBody = JSON.parse(responsebody);
+                    for (var i = 0; i < respBody.data.length; i++) {
+                        for (var j = 0; j < respBody.data[i].holdings.length; j++) {
+                            var positionDetail = new GlideRecord("x_hsb11_mss_pos_custody_positions_details");
+                            positionDetail.initialize();
+                            positionDetail.holding_event_type = respBody.data[i].holdings[j].type;
+                            positionDetail.security_account = respBody.data[i].safekeepingAccountIdentification;
+                            positionDetail.isin = respBody.data[i].financialInstrumentIdentification.isin;
+                            positionDetail.security_id = respBody.data[i].financialInstrumentIdentification.hsbcIdentifier;
+                            positionDetail.currency = respBody.data[i].financialInstrumentIdentification.currency;
+                            positionDetail.quantity_available = respBody.data[i].holdings[j].quantity;
+                            positionDetail.registration_code = respBody.data[i].holdings[j].registrationCode;
+                            positionDetail.location_id = respBody.data[i].holdings[j].locationCode;
+                            //Updated as part of MSSOTIQUBE-1902 and 2042.
+                            positionDetail.account_name = respBody.data[i].safekeepingAccountName;
+                            positionDetail.security_name = respBody.data[i].financialInstrumentIdentification.description;
+                            positionDetail.trade_id = trade_sys_id;
+                            positionDetail.trade_base = trade_sys_id; //Custody Redesign
+                            positionDetail.market_value_in_security_curr = respBody.data[i].holdings[j].marketValueInSecurityCurrency;
+                            positionDetail.market_value_in_report_value = respBody.data[i].holdings[j].marketValueInReportCurrency;
+                            positionDetail.type = 'Trade';
+                            positionDetail.insert();
+                        }
+                    }
+                }
+            } else {
+                var tradeDataErr = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                if (tradeDataErr.get(trade_sys_id)) {
+                    tradeDataErr.position_attribute_sync = "Response Un-Successful - Error";
+                    tradeDataErr.last_positions_refresh_date_time = new GlideDateTime();
+                    tradeDataErr.update();
+                }
+                var taskDataErr = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_task");
+                if (taskDataErr.get(sys_id)) {
+                    taskDataErr.position_attribute_sync = "Response Un-Successful - Error";
+                    taskDataErr.last_positions_refresh_date_time = new GlideDateTime();
+                    taskDataErr.update();
+                }
+
+                var grPosOnDemandDetail = new GlideRecord("x_hsb11_mss_pos_mss_custody_position_ondemand_staging");
+                grPosOnDemandDetail.addQuery('task_reference', sys_id);
+                grPosOnDemandDetail.addEncodedQuery('refresh_end_timeISEMPTY^trade_reference=' + trade_sys_id);
+                grPosOnDemandDetail.query();
+                if (grPosOnDemandDetail.next()) {
+                    grPosOnDemandDetail.refresh_end_time = new GlideDateTime();
+                    grPosOnDemandDetail.response_body_for_detail = response;
+                    grPosOnDemandDetail.state_for_detail = "error"; // Have retry if error from detail
+                    grPosOnDemandDetail.error_body_for_detail = response;
+                    grPosOnDemandDetail.update();
+                }
+            }
+        } else {
+            //Updated as part of MSSOTIQUBE-1902 and 2042
+            var pos_demand_id = trade_sys_id;
+            var grMssCustodyPosOndemandDetail = new GlideRecord("x_hsb11_mss_pos_mss_custody_position_ondemand_staging");
+            grMssCustodyPosOndemandDetail.get(pos_demand_id);
+            grMssCustodyPosOndemandDetail.response_date_detail = current.sys_updated_on;
+            grMssCustodyPosOndemandDetail.response_body_for_detail = response;
+            grMssCustodyPosOndemandDetail.response_code_for_detail = httpCode;
+
+            if (httpCode == '200') {
+                grMssCustodyPosOndemandDetail.state_for_detail = "processed";
+
+            } else {
+                grMssCustodyPosOndemandDetail.state_for_detail = "error";
+                grMssCustodyPosOndemandDetail.error_body_for_detail = response;
+            }
+
+            grMssCustodyPosOndemandDetail.update();
+
+        }
+
+
+    } catch (e) {
+        gs.info(e.message);
+    }
+
+})(current, previous);]]></script>
+        <sys_class_name>sys_script</sys_class_name>
+        <sys_created_by>45307326@hsbc.com</sys_created_by>
+        <sys_created_on>2024-01-10 12:43:32</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>0c2a5cdf1b23f5106ed00e1ad34bcba0</sys_id>
+        <sys_mod_count>24</sys_mod_count>
+        <sys_name>MSS Custody SensorDetailOndemandResponse</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_0c2a5cdf1b23f5106ed00e1ad34bcba0</sys_update_name>
+        <sys_updated_by>45376863@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-10-22 07:11:12</sys_updated_on>
+        <template/>
+        <when>after</when>
+    </sys_script>
+    <sys_translated_text action="delete_multiple" query="documentkey=0c2a5cdf1b23f5106ed00e1ad34bcba0"/>
+</record_update>

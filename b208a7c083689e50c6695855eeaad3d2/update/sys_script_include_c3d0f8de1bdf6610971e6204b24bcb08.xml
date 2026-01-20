@@ -1,0 +1,280 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.HSBC_Trade_and_Task_Migration</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description>MSSOTIQUBE-2578
+
+Script include called by 'HSBC - Trade &amp; Task Migration'  will migrate any Trades/Cases/Tasks that meet certain criteria and move them to a Passive table outlined within  'x_hsb11_hsbc_mss_o_hsbc_trade_task_migration_registry' - Logs will be stored here 'x_hsb11_hsbc_mss_o_hsbc_migration_logs_trace'.</description>
+        <mobile_callable>false</mobile_callable>
+        <name>HSBC_Trade_and_Task_Migration</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var HSBC_Trade_and_Task_Migration = Class.create();
+HSBC_Trade_and_Task_Migration.prototype = {
+    initialize: function() {},
+
+    //Unpack Options
+    migrate: function(opts) {
+        opts = opts || {};
+        var application = opts.application;
+        var sourceTable = opts.sourceTable;
+        var targetTable = opts.targetTable;
+        var encodedQuery = opts.query || '';
+        var referenceField = opts.referenceField;
+        var journalChunkSize = parseInt(opts.journalChunkSize, 10) || 50;
+        var batchSize = parseInt(opts.batchSize, 10) || 100;
+        var maxRunTimeMinutes = parseInt(opts.maxRunTimeMinutes, 10) || 10;
+        var schedule = opts.schedule;
+
+        //Set VAR for Logging Script Inc
+        var summaryStartTime = new GlideDateTime();
+        var summaryEndTime = new GlideDateTime();
+        var endTime = new GlideDateTime();
+        var status = 'In Progress';
+        var errorMessage = 'NA';
+        var errorCount = 0;
+        var getNextBatch = true;
+        var batchID = 'NA';
+        var endMaxRunTime = false;
+
+        gs.info('HSBC_Trade_and_Task_Migration - Starting');
+
+        try {
+            //Query Registry to get corresponding Task & Case Tables
+            var registryGR = new GlideRecord('x_hsb11_hsbc_mss_o_hsbc_trade_task_migration_registry');
+            registryGR.addQuery('is_enabled', false);
+            registryGR.addQuery('application', application);
+            registryGR.query();
+
+            //gs.info('HSBC_Trade_and_Task_Migration - Queried config table ');
+            var taskSourceTable, taskTargetTable, taskReference;
+            var caseSourceTable, caseTargetTable, caseReference;
+            var anyResults = false;
+
+            while (registryGR.next()) {
+                anyResults = true;
+                var stb = String(registryGR.getValue('source_table'));
+                var tbl = String(registryGR.getValue('target_table'));
+                var trf = String(registryGR.getValue('reference_field'));
+                if (stb.indexOf('task') > -1) {
+                    taskSourceTable = stb;
+                    taskTargetTable = tbl;
+                    taskReference = trf;
+                } else if (stb.indexOf('case') > -1) {
+                    caseSourceTable = stb;
+                    caseTargetTable = tbl;
+                    caseReference = trf;
+                }
+            }
+            if (!anyResults) throw new Error('No enabled registry rows for application: ' + application);
+            //gs.info('HSBC_Trade_and_Task_Migration - Results - ' + taskSourceTable + '_' + taskTargetTable + '_' + caseSourceTable + '_' + caseTargetTable);
+
+            //Check tables are valid
+            var tables = [{
+                    label: 'taskSourceTable',
+                    val: taskSourceTable
+                },
+                {
+                    label: 'taskTargetTable',
+                    val: taskTargetTable
+                },
+                {
+                    label: 'caseSourceTable',
+                    val: caseSourceTable
+                },
+                {
+                    label: 'caseTargetTable',
+                    val: caseTargetTable
+                }
+            ];
+
+            var missing = [];
+
+            tables.forEach(function(t) {
+                try {
+                    if (!t.val) {
+                        missing.push(t.label + '=undefined/blank');
+                        return;
+                    }
+                    var gr = new GlideRecord(t.val);
+                    if (!gr.isValid()) missing.push(t.label + '=' + t.val);
+                } catch (err) {
+                    missing.push(t.label + '=' + (t.val || 'undefined') + ' (' + err.message + ')');
+                }
+            });
+
+            if (missing.length === 0) {
+                gs.info('HSBC_Trade_and_Task_Migration - All tables exist');
+            } else {
+                throw new Error('HSBC_Trade_and_Task_Migration Missing/invalid tables: ' + missing.join(', '));
+            }
+
+            //Get Next Batch
+            while (getNextBatch && !endMaxRunTime) {
+
+                //Query Source Table per registry to get Trade Records
+                batchID = gs.generateGUID();
+                var tradeGR = new GlideRecord(sourceTable);
+                tradeGR.addQuery(encodedQuery);
+                tradeGR.orderBy("sys_created_on");
+                tradeGR.setLimit(batchSize);
+                tradeGR.query();
+                var totalTrades = tradeGR.getRowCount();
+                summaryStartTime = new GlideDateTime();
+
+                //gs.info('HSBC_Trade_and_Task_Migration - Queried Source table' + sourceTable + ' - Number of Trades: ' + totalTrades);
+
+                if (totalTrades === 0) {
+                    getNextBatch = false;
+                    break;
+                }
+
+                //TRADE/TASK/CASE RECLASS FOR BATCH
+
+
+                //Reset Completed Count / Array for Journal Events
+                var completedCount = 0;
+                //var tradeSysIdArray = [];
+
+                while (tradeGR.next()) {
+
+                    try {
+
+                        var startTime = new GlideDateTime();
+                        var tradeSysId = tradeGR.getUniqueValue();
+                        //tradeSysIdArray.push(tradeSysId);
+
+                        //Task Reclass
+                        var taskGR = new GlideRecord(taskSourceTable);
+                        taskGR.addQuery(taskReference, tradeSysId);
+                        taskGR.setValue('sys_class_name', taskTargetTable);
+                        taskGR.setWorkflow(false);
+                        taskGR.autoSysFields(false);
+                        taskGR.updateMultiple();
+
+                        //Case Reclass
+                        var caseGR = new GlideRecord(caseSourceTable);
+                        caseGR.addQuery(caseReference, tradeSysId);
+                        caseGR.setValue('sys_class_name', caseTargetTable);
+                        caseGR.setWorkflow(false);
+                        caseGR.autoSysFields(false);
+                        caseGR.updateMultiple();
+
+                        //Trade Reclass
+                        tradeGR.sys_class_name = targetTable;
+                        tradeGR.setWorkflow(false);
+                        tradeGR.autoSysFields(false);
+						tradeGR.migrated_on = startTime;
+                        tradeGR.update();
+
+                        completedCount++;
+
+                        //Batch completed?
+                        if (completedCount === batchSize) {
+                            break;
+                        }
+
+                        //Max Run time elapsed check
+                        var now = new GlideDateTime();
+                        var elapsedMs = now.getNumericValue() - summaryStartTime.getNumericValue();
+                        var elapsedMinutes = elapsedMs / (1000 * 60);
+                        if (parseInt(elapsedMinutes, 10) > parseInt(maxRunTimeMinutes, 10)) {
+                            errorCount++;
+                            error = 'HSBC_Trade_and_Task_Migration - Runtime exceeded: ' + maxRunTimeMinutes + ' minutes.'; //required for xMatters
+                            errorMessage = 'HSBC_Trade_and_Task_Migration - Runtime exceeded: ' + maxRunTimeMinutes + 'minutes.'; //Required for Summary Log
+                            endMaxRunTime = true;
+                            break;
+                        }
+
+                        //While Catch - Send xMatters Alert & MNigration Log Trace Non Summary
+                    } catch (error) {
+                        gs.info('HSBC_Trade_and_Task_Migration - Error Migrating Trades: ' + error);
+                        errorCount++;
+
+                        status = 'Error';
+                        endTime = new GlideDateTime();
+                        migrationLogsTrace = new HSBC_Migration_Logs_Trace();
+                        migrationLogsTrace.log(
+                            batchID,
+                            false, {
+                                recordSysId: tradeSysId,
+                                status: status,
+                                startTime: startTime,
+                                endTime: endTime,
+                                errorMessage: error,
+                                sourceTable: sourceTable,
+                                targetTable: targetTable,
+                                schedule: schedule
+                            });
+                    }
+                } //End of Individual Batch while
+
+                // Create Event for Journal and Audit Updates
+                /*var totalTradesLength = tradeSysIdArray.length;
+                for (var i = 0; i < totalTradesLength; i += journalChunkSize) {
+                    var tradesArray = tradeSysIdArray.slice(i, i + journalChunkSize);
+                    var parm1 = ('BatchID: ' + batchID + ' - Scheduler: ' + schedule);
+                    gs.eventQueue("x_hsb11_hsbc_mss_o.custody_journal_updat", current, parm1, tradesArray.join(','));
+                }*/
+
+                summaryEndTime = new GlideDateTime();
+
+                if (errorCount > 0) {
+                    var alertDesc = "HSBC Trade and Task Migration: Error during Migration Process. " + error;
+                    var createEventForWidgetFailure = new x_hsb11_hsbc_mss_t.hsbcWidgetFailureHandler().createITIDEvent('WARNING', alertDesc, 'HSBC Trade and Task Migration');
+                }
+
+                var migrationLogsTrace = new HSBC_Migration_Logs_Trace();
+                migrationLogsTrace.log(
+                    batchID,
+                    true, {
+                        totalRecords: completedCount,
+                        errorCount: errorCount,
+                        startTime: summaryStartTime,
+                        endTime: summaryEndTime,
+                        initiatedBy: gs.getUserDisplayName(),
+                        errorMessage: errorMessage,
+                        schedule: schedule
+                    });
+
+                gs.info('HSBC Trade and Task Migration - BatchID: ' + batchID + 'completed');
+
+            } //End of Run Next Batch While
+
+            //Main Script Catch
+        } catch (mainError) {
+            gs.error('HSBC Trade and Task Migration Main Error: ' + mainError.message);
+
+            migrationLogsTrace = new HSBC_Migration_Logs_Trace();
+            migrationLogsTrace.log(
+                batchID,
+                true, {
+                    totalRecords: completedCount,
+                    errorCount: errorCount,
+                    startTime: summaryStartTime,
+                    endTime: summaryEndTime,
+                    initiatedBy: gs.getUserDisplayName(),
+                    errorMessage: mainError,
+                    schedule: schedule
+                });
+        }
+    },
+
+    type: 'HSBC_Trade_and_Task_Migration'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>44107021@hsbc.com</sys_created_by>
+        <sys_created_on>2025-08-13 13:58:08</sys_created_on>
+        <sys_id>c3d0f8de1bdf6610971e6204b24bcb08</sys_id>
+        <sys_mod_count>138</sys_mod_count>
+        <sys_name>HSBC_Trade_and_Task_Migration</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_c3d0f8de1bdf6610971e6204b24bcb08</sys_update_name>
+        <sys_updated_by>44107021@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-11-10 12:54:13</sys_updated_on>
+    </sys_script_include>
+</record_update>

@@ -1,0 +1,205 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.MSSFXRatesSource</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description>Script will handle the process of fetching API token and do the API call to get FX rates from SPS</description>
+        <mobile_callable>false</mobile_callable>
+        <name>MSSFXRatesSource</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[//MSSCUSTODY-3570 - Created this script include to handle the process of fetching API token and do the API call to get FX rates
+var MSSFXRatesSource = Class.create();
+MSSFXRatesSource.prototype = {
+    initialize: function() {},
+
+    fetchAllFXRates: function() {
+        // Function to run loop and call fetchFXRatesPage for all pages
+        try {
+            var nextPageId = null;
+            var token = gs.getProperty('x_hsb11_hsbc_mss_o.fx_rates_SPS_token'); // Fetch token from system properties
+            var nextPage = true;
+            while (nextPage) {
+                // Loop to fetch and insert rates
+                nextPageId = this.fetchFXRatesPage(nextPageId, token);
+                nextPage = nextPageId !== null && nextPageId !== '';
+                //gs.info('Next Page Id: ' + nextPage + ' ' + nextPageId);
+            }
+            this.insertRates([], true); // Insert base currency as 1 in fx_rate
+            return true;
+        } catch (ex) {
+
+            var currentDateTime = new Date();
+            var failureDescription = "Cutsody MSSFXRatesSource failure in function fetchAllFXRates, details of the error are as following. Timestamp : " + currentDateTime + ' Error message: ' + ex.message; //MSSCUSTODY-5421
+            gs.error("Script Includes Error - MSSFXRatesSource - in function fetchAllFXRates " + failureDescription);
+            // Calling the already created API and script include to create events
+            new x_hsb11_hsbc_mss_t.hsbcWidgetFailureHandler().createITIDEvent('MAJOR', failureDescription, 'MSSiQubeSNscript_MSSFXRatesSource');
+            return false;
+        }
+    },
+
+
+    fetchFXRatesPage: function(pageId, token) {
+        // Function will fetch rates for a specific page and insert them in fx_rate table
+        try {
+            // Get endpoint and query parameter from system properties/rest message
+
+            var ratesEndpoint = gs.getProperty('x_hsb11_hsbc_mss_o.fx_Rates_SPS_getPayload');
+            var snapTime = gs.getProperty('x_hsb11_hsbc_mss_o.fx_Rates_getSnapTime');
+            var baseCurrency = gs.getProperty('x_hsb11_hsbc_mss_o.fx_Rates_getBaseCurrency');
+            var pageSize = gs.getProperty('x_hsb11_hsbc_mss_o.fx_Rates_getPageSize');
+
+            var gdt = new GlideDateTime();
+            var currentDate = gdt.getLocalDate().toString();
+            //var currentDate = '2024-08-20';
+            var restMessage = new sn_ws.RESTMessageV2('MSS FX_Rates Fetch FX Rates', 'getFxRates');
+            restMessage.setStringParameterNoEscape('fx_rates_base_uri', ratesEndpoint);
+
+            // Set query parameters and request header
+            restMessage.setRequestHeader('Authorization', token);
+            restMessage.setQueryParameter('SnapTime', snapTime);
+            restMessage.setQueryParameter('EffectiveBusinessDateStart', currentDate);
+            restMessage.setQueryParameter('EffectiveBusinessDateEnd', currentDate);
+            //restMessage.setQueryParameter('SnapGroup', 'INTRAA');
+            restMessage.setQueryParameter('BaseCurrency', baseCurrency);
+            restMessage.setQueryParameter('pageSize', pageSize);
+
+            if (pageId) {
+                //restMessage.setQueryParameter('pageId', pageId);
+                restMessage.setStringParameterNoEscape('page_id', pageId); // Set the pageId as query parameter if it exists
+                //gs.info(' Setting Page id is ' + pageId);
+            }
+            var response = restMessage.execute(); // Execute the REST request
+            var responseBody = response.getBody();
+            var httpStatus = response.getStatusCode();
+            gs.info("In httpStatus: " + httpStatus);
+            gs.info("In fetchFXRatesPage: " + JSON.stringify(responseBody));
+
+            
+            if (httpStatus == 200) {
+                var responseJson = JSON.parse(responseBody);
+                // Check for the 'Zero dcuments found' message in response
+                if (responseJson.message && responseBody.message.indexOf('Zero documents found') > -1) {
+                    gs.info('MSSFXRatesSource - Zero documents found');
+                    return null;
+                }
+                var nextPageId = responseJson.links.nextPageId || null;
+                this.insertRates(responseJson.results); // Insert rates into the table
+                return nextPageId;
+            } else if (httpStatus == 404) {
+                //gs.info('404 error. Zero documents');
+                return null;
+            } else {
+
+                var currentDateTime = new Date();
+                var failureDescription = "Custody MSSFXRatesSource failure in function fetchFXRatesPage, details of the error are as following. Timestamp : " + currentDateTime + " Response Code: " + httpStatus + " Response Body: " + responseBody; //MSSCUSTODY-5421
+                gs.error("Script Includes Error - MSSFXRatesSource - in function fetchFXRatesPage " + failureDescription);
+                // Calling the already created API and script include to create events
+                new x_hsb11_hsbc_mss_t.hsbcWidgetFailureHandler().createITIDEvent('MAJOR', failureDescription, 'MSSiQubeSNscript_MSSFXRatesSource');
+                return null;
+            }
+
+        } catch (ex) {
+
+            currentDateTime = new Date();
+            failureDescription = "Custody MSSFXRatesSource failure in function fetchFXRatesPage, details of the error are as following. Timestamp : " + currentDateTime + ' Error message: ' + ex.message; //MSSCUSTODY-5421
+            gs.error("Script Includes Error - MSSFXRatesSource - in function fetchFXRatesPage " + failureDescription);
+            // Calling the already created API and script include to create events
+            new x_hsb11_hsbc_mss_t.hsbcWidgetFailureHandler().createITIDEvent('MAJOR', failureDescription, 'MSSiQubeSNscript_MSSFXRatesSource');
+            return null;
+        }
+    },
+
+    insertRates: function(results, insertBaseCurrency) {
+        // Function to insert rates into the table
+        try {
+            var currencyMap = {};
+            var baseCurrency = gs.getProperty('x_hsb11_hsbc_mss_o.fx_Rates_getBaseCurrency');
+            var currencyGR = new GlideRecord('fx_currency');
+            //currencyGR.addQuery('active', true); // Only include active currencies
+            currencyGR.query();
+            while (currencyGR.next()) {
+                currencyMap[currencyGR.code.toString()] = currencyGR.sys_id.toString();
+            }
+
+            // Insert base currency with rate as 1
+            if (insertBaseCurrency && currencyMap[baseCurrency]) {
+                var baseCurrencyRateGR = new GlideRecord('fx_rate');
+                baseCurrencyRateGR.initialize();
+                baseCurrencyRateGR.currency = currencyMap[baseCurrency];
+                baseCurrencyRateGR.rate = 1;
+                baseCurrencyRateGR.insert();
+                gs.info("results" + results);
+                gs.info("Base Currency " + baseCurrency + ' inserted with 2 as rate');
+            }
+
+            var currencyName = '';
+            var currencyValue = 0;
+
+            for (var i = 0; i < results.length; i++) {
+                try {
+                    currencyName = results[i].document.Price.Curve.CurveHeading.CRNCY;
+                    var curveTenors = results[i].document.Price.Curve.CurveTenors.CurveTenor;
+
+                    // Converting curveTenors to always be an array
+                    if (!Array.isArray(curveTenors)) {
+                        curveTenors = [curveTenors];
+                    }
+                    var tenorEntry = null;
+                    for (var j = 0; j < curveTenors.length; j++) {
+                        //Loops to iterate CurveTenor array to find the entry with SECURITY_TENOR_ONE === 'SP'
+                        if (curveTenors[j].SECURITY_TENOR_ONE === 'SP') {
+                            tenorEntry = curveTenors[j];
+                            break;
+                        }
+                    }
+                    /*if (tenorEntry) {
+                        gs.info('Tenor Entry value: ' + JSON.stringify(tenorEntry));
+                    } */
+                    if (tenorEntry && currencyMap[currencyName]) {
+                        currencyValue = tenorEntry.PX_MID;
+                        gs.info('Currency Name: ' + currencyName + ' Currency value or PX_MID: ' + currencyValue);
+                        var rateGR = new GlideRecord('fx_rate');
+                        rateGR.initialize();
+                        rateGR.currency = currencyMap[currencyName];
+                        rateGR.rate = currencyValue;
+                        rateGR.insert();
+
+                        gs.info('Currency ' + currencyName + ' found in CurrencyMap and inserted');
+                    }
+                } catch (ex) {
+                    var currentDateTime = new Date();
+                    var failureDescription = "Custody MSSFXRatesSource failure in function insertRates, details of the error are as following. Timestamp : " + currentDateTime + ' Error message: ' + ex.message; //MSSCUSTODY-5421
+                    gs.error("Script Includes Error - MSSFXRatesSource - in function fetchFXRatesPage " + failureDescription);
+                    // Calling the already created API and script include to create events
+                    new x_hsb11_hsbc_mss_t.hsbcWidgetFailureHandler().createITIDEvent('MAJOR', failureDescription, 'MSSiQubeSNscript_MSSFXRatesSource');
+
+                }
+            }
+        } catch (ex) {
+            currentDateTime = new Date();
+            failureDescription = "Custody MSSFXRatesSource failure in function insertRates, details of the error are as following. Timestamp : " + currentDateTime + ' Error message: ' + ex.message; //MSSCUSTODY-5421
+            gs.error("Script Includes Error - MSSFXRatesSource - in function fetchFXRatesPage " + failureDescription);
+            // Calling the already created API and script include to create events
+            new x_hsb11_hsbc_mss_t.hsbcWidgetFailureHandler().createITIDEvent('MAJOR', failureDescription, 'MSSiQubeSNscript_MSSFXRatesSource');
+            return null;
+        }
+
+    }
+
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>45180553@hsbc.com</sys_created_by>
+        <sys_created_on>2024-06-18 17:30:59</sys_created_on>
+        <sys_id>8e02e0361bb24210ff37eb14b24bcbcd</sys_id>
+        <sys_mod_count>292</sys_mod_count>
+        <sys_name>MSSFXRatesSource</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_8e02e0361bb24210ff37eb14b24bcbcd</sys_update_name>
+        <sys_updated_by>45423095@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-02-27 15:25:35</sys_updated_on>
+    </sys_script_include>
+</record_update>

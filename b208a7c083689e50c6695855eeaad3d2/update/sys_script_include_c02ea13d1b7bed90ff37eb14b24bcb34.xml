@@ -1,0 +1,1792 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.MSS_Custody_Event_Utils</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description>This Script include will take the input from "Business Process Stage" and  "MSS Custody Event Inbound Staging" Table and update/create the Trades and BPI based on multiple validations and calculations.</description>
+        <mobile_callable>false</mobile_callable>
+        <name>MSS_Custody_Event_Utils</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var MSS_Custody_Event_Utils = Class.create();
+MSS_Custody_Event_Utils.prototype = {
+
+    initialize: function() {
+
+        // Cache information based on Status of Custody in Business Process Stage Table...
+        var businessProcessStageStatus = {};
+        var bPSt = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_stage');
+        bPSt.addQuery('business_process.financial_object', 'x_hsb11_mss_c_proc_mss_custody_trade');
+        bPSt.query();
+
+        while (bPSt.next()) {
+            //var ctacmarket = bPSt.ctac_code.toString() + bPSt.market.toString(); commended as part of defect 1650 and added below code
+            var ctacmarket = bPSt.ctac_code.toString() + bPSt.market.toString() + bPSt.business_process.process_name.toString();
+            businessProcessStageStatus[ctacmarket] = {
+                isActive: bPSt.active.toString(),
+                isexception: bPSt.is_exception.toString(),
+                isbatch: bPSt.is_batch.toString(),
+                market: bPSt.market.toString(),
+                terminal_stage: bPSt.terminal_stage.toString(),
+                dur: bPSt.expected_duration.toString(),
+                dur_ts: new GlideDateTime(bPSt.expected_duration).getNumericValue(), //get Timestamp from expected duration field
+                busProcess: bPSt.business_process.toString(),
+                status: bPSt.status.toString(),
+                ctac: bPSt.ctac_code.toString(),
+                status_sys_id: bPSt.sys_id.toString()
+            };
+        }
+
+        this.businessProcessStageStatus = businessProcessStageStatus;
+
+
+        // Cache information based on Stage.Status of Custody in Market Batch Process Table.
+        var marketBatchProcessStatus = {};
+        var mBPS = new GlideRecord('x_hsb11_mss_custod_custody_market_batch_process');
+        mBPS.query();
+        while (mBPS.next()) {
+            // MSSCUSTODY-4281 -- update array index as status+market, and add schedule
+            var batchProcess = mBPS.stage.ctac_code + mBPS.market;
+            marketBatchProcessStatus[batchProcess] = {
+                sDateBatch: mBPS.target_settlement_date.toString(),
+                sDate1Batch: mBPS.target_settlement_date_1_batch.toString(),
+                sDate2Batch: mBPS.target_settlement_date_2_batch.toString(),
+                sDateafterBatch: mBPS.after_settlement_date_batch.toString(),
+                sSchedule: mBPS.schedule.getDisplayValue().toString(), //MSSCUSTODY-4727
+                offset: mBPS.offset_time.toString(),
+
+                mSettlementDateBatch: mBPS.settlement_date_batch.toString(), // MSSCUSTODY 5319 - Added mapping of settlementdate batch in market time
+                tSDateafterBatch: mBPS.target_settlement_date_after_batch.toString(), // MSSCUSTODY 5319 - Added mapping of target after settlement date batch
+            };
+        }
+
+        this.marketBatchProcessStatus = marketBatchProcessStatus;
+
+
+        // Cache information of Custody Location Code table based on the Location code in the table
+        var locationCodeRecord = {};
+        var lCR = new GlideRecord('x_hsb11_mss_c_proc_custody_location_code');
+        lCR.query();
+        while (lCR.next()) {
+            var locationMarket = lCR.location_code.toString() + lCR.owning_business.toString();
+            locationCodeRecord[locationMarket] = {
+                locationCodeID: lCR.sys_id.toString()
+            };
+        }
+
+        this.locationCodeRecord = locationCodeRecord;
+
+
+        // Cache information of Curreny Table based on the code in the table
+        var currencyCodeTableRecord = {};
+        var currRec = new GlideRecord('fx_currency');
+        currRec.query();
+        while (currRec.next()) {
+            currencyCodeTableRecord[currRec.code] = {
+                settlementAmountCurrency: currRec.sys_id.toString()
+            };
+        }
+
+        this.currencyCodeTableRecord = currencyCodeTableRecord;
+
+
+        // Cache information of Custody Reason Code table based on the Reason code in the table
+        var reasonCodeRecord = {};
+        var reasonCR = new GlideRecord('x_hsb11_mss_c_proc_custody_reason_code');
+        reasonCR.query();
+        while (reasonCR.next()) {
+            var ctacReason = reasonCR.reason_code.toString() + reasonCR.owning_business.toString();
+            reasonCodeRecord[ctacReason] = {
+                reasonCodeId: reasonCR.sys_id.toString()
+            };
+        }
+
+        this.reasonCodeRecord = reasonCodeRecord;
+
+    },
+
+    //Process events that are in Processing status from selected queue.
+    processEventQueue: function(queue) {
+
+        var tradeLogs = []; //MSSCUSTODY-8224
+        var tradeData = gs.getProperty('x_hsb11_mss_custod.tradeDataConfigs'); //MSSCUSTODY-8224
+        tradeData = JSON.parse(tradeData); //MSSCUSTODY-8224
+
+        var currentStatus;
+        var etc_service = '';
+        // var addAttrObj = {};
+        var mssevt = new GlideRecord('x_hsb11_mss_custod_mss_custody_event_inbound_staging');
+        mssevt.addEncodedQuery('queue_id=' + queue + '^processing_status=Processing'); ////MSSCUSTODY-8224 - converted to encoded query for better processing
+        mssevt.orderBy('sys_created_on');
+        mssevt.query();
+        while (mssevt.next()) {
+
+            var tradeDetails = JSON.parse(mssevt.trade_details);
+            var OwningBusinessName = tradeDetails['OwningBusinessName'].toString();
+            mssevt.owning_business = OwningBusinessName;
+            var region = this.getOwningBusinessRegion(OwningBusinessName, mssevt.object_id); //MSSCUSTODY-3037: Create region field to trade form  ////MSSCUSTODY-8224 - added additional Attributes
+            var tradeLifeCycle = gs.getProperty('x_hsb11_mss_custod.owning_business_core');
+            //var tradeCashStock = gs.getProperty('x_hsb11_mss_custod.owning_business_stock');
+            var eventOwningBusinessCore = mssevt.business_event_status + OwningBusinessName + tradeLifeCycle;
+            var tradeIdentification = tradeDetails['HSBCTransactionIdentification'] ? tradeDetails['HSBCTransactionIdentification'].toString() : ""; //MSSCUSTODY-7530 ////MSSCUSTODY-8224 - Position changed to global for easy acess no other change
+
+            if (mssevt.event_type == 'SWIFT_EVENT') {
+                var swift = new x_hsb11_mss_custod.MSS_Custody_Swift_Event_Utils();
+                var swftSourceSystemTimeStamp = tradeDetails['MessageSourceTimestamp'].toString();
+                var swftSourceSystemTimeStampUtc = tradeDetails['MessageSourceTimestampUtc'].toString(); // MSSCUSTODY-2524:Timezone changes to UTC to store market
+                var securities_account = tradeDetails['SenderIdentification'].toString();
+                var instruction_source = tradeDetails['MessageChannelType'].toString();
+                var messageProcessingStatus = tradeDetails['MessageProcessingStatus'] ? tradeDetails['MessageProcessingStatus'].toString() : ""; //MSSCUSTODY-7630
+
+                if (this.businessProcessStageStatus[eventOwningBusinessCore] == undefined || this.businessProcessStageStatus[eventOwningBusinessCore]["isActive"] == "false") {
+
+                    mssevt.processing_status = 'Error'; //As part of MSSCUSTODY-5260
+                    if (this.businessProcessStageStatus[eventOwningBusinessCore] == undefined) {
+                        mssevt.error_description = "Record for business event status '" + mssevt.business_event_status + "' for given owning business '" + OwningBusinessName + "' and for given trade life cycle '" + tradeLifeCycle + "' is not present in 'Business Process Stages' table"; //As part of MSSCUSTODY-5260
+                    } else {
+                        mssevt.error_description = "Record for business event status '" + mssevt.business_event_status + "' for given owning business '" + OwningBusinessName + "' and for given trade life cycle '" + tradeLifeCycle + "' is present in 'Business Process Stages' table with inActive state"; //As part of MSSCUSTODY-5260
+                    }
+                } else {
+                    var stgstatus = this.businessProcessStageStatus[eventOwningBusinessCore]["status_sys_id"];
+                    var isExceptionSwft = this.businessProcessStageStatus[eventOwningBusinessCore]["isexception"];
+                    //currentStatus will store the value of executeEvent function to update in Custody Inbound Staging Table             
+                    currentStatus = swift.executeSwiftEvent(mssevt.object_id, mssevt.technical_uuid, mssevt.source_system, mssevt.object_type, mssevt.business_event_status, stgstatus, mssevt.unity_updated_timestamp, swftSourceSystemTimeStamp, OwningBusinessName, securities_account, instruction_source, mssevt.instruction_receipt_date_time, isExceptionSwft, swftSourceSystemTimeStampUtc, region, tradeIdentification, messageProcessingStatus); //MSSCUSTODY-7530 - tradeIdentification added //MSSCUSTODY-7630 - messageProcessingStatus added
+                    mssevt.processing_status = currentStatus;
+
+                }
+                mssevt.update();
+
+            } else {
+                try {
+                    var transType = ["RECEIVE VERSUS PAYMENT", "RECEIVE FREE", "DELIVER FREE", "DELIVER VERSUS PAYMENT", "STOCK LOAN", "STOCK LOAN RETURN", "REDEMPTION", "SWITCH TO", "SWITCH FROM", "CORPORATE DELIVER", "CORPORATE RECEIVE", "NET RECEIVE", "NET DELIVER"]; //GR5
+                    var OtherBusinessName = tradeDetails['OtherBusinessName'].toString();
+                    var sourceSystemName = tradeDetails['SourceSystemName'].toLowerCase().toString(); //GR5
+                    var expectedSettlementDate = tradeDetails['ExpectedSettlementDate'];
+                    var clientTransactionIdentification = tradeDetails['ClientTransactionIdentification'].toString();
+                    var counterpartyIdentification = tradeDetails['CounterpartyIdentification'].toString();
+                    var sourceOfInstructionType = tradeDetails['SourceOfInstructionType'].toString();
+                    var linkedTransactionIdentification = tradeDetails['LinkedTransactionIdentification'].toString();
+                    var sameDaySettlementIndicator = tradeDetails['SameDaySettlementIndicator'].toString();
+                    var safekeepingAccountIdentification = tradeDetails['SafekeepingAccountIdentification'].toString();
+                    var financialInstrumentIdentificationPrimaryIdentifier = tradeDetails['FinancialInstrumentIdentificationPrimaryIdentifier'].toString();
+                    var settlementAmount = tradeDetails['SettlementAmount'].toString();
+                    var settlementAmountCurrency = tradeDetails['SettlementAmountCurrency'].toString();
+                    var settlementQuantity = tradeDetails['SettlementQuantity'].toString();
+                    var internalAccountTransferAccountIdentification = tradeDetails['InternalAccountTransferAccountIdentification'].toString();
+                    var internalAccountTransferTransactionIdentification = tradeDetails['InternalAccountTransferTransactionIdentification'].toString();
+                    //GR5 4240
+                    var tradeDate = tradeDetails['TradeDate'] ? tradeDetails['TradeDate'].toString() : "";
+                    var systemTransactionIdenfication = tradeDetails['SystemTransactionIdentification'].toString();
+                    var sourceSystemTransactionType = tradeDetails['SourceSystemTransactionType'].toString();
+
+                    //MSSCUSTODY - 8224 Modified as configurable
+                    var commonID = '';
+                    if (tradeData.commonIdentificationMarket.indexOf(OwningBusinessName) > -1) {
+                        gs.info('Within Market');
+                        commonID = tradeDetails['CommonIdentification'] ? tradeDetails['CommonIdentification'].toString() : "";
+                    } else {
+                        commonID = '';
+                    }
+
+                    if (tradeData.transactionType.indexOf(sourceSystemTransactionType) > -1) { //MSSCUSTODY-8224
+                        sourceSystemTransactionType = sourceSystemTransactionType.toString().replaceAll(" ", ""); //removing spaces to identify the exact value from property
+                        sourceSystemTransactionType = tradeData[sourceSystemTransactionType]; //final value as RVP or DVP from system property
+                    } else if (tradeData.transTypeTag.indexOf(sourceSystemTransactionType) > -1) {
+                        sourceSystemTransactionType = sourceSystemTransactionType; //default handling //MSSCUSTODY-8224
+                    } else {
+                        sourceSystemTransactionType = sourceSystemTransactionType; //default handling //MSSCUSTODY-8224
+                        var sourceTransLog = "-->Transaction type received as " + sourceSystemTransactionType + "\n";
+                        this.tradeInvalidDataLogs(sourceTransLog, mssevt.object_id);
+
+                    }
+                    //MSSCUSTODY - 8224 Modified as configurable
+
+                    //MSSCUSTODY-8224
+                    var tradeCoreStatus = tradeDetails['TradeBusinessStatus'].toString();
+                    var tradeStockStatus = tradeDetails['TradeEconomicAvailabilityStatus'].toString();
+                    var poolIdentification = tradeDetails['PoolIdentification'].toString();
+                    var associatedAccountIdentification = tradeDetails['AssociatedAccountIdentification'].toString();
+                    var associatedSubAccountIdentification = tradeDetails['AssociatedSubAccountIdentification'].toString();
+                    var settlementInstructionCancellationStatus = tradeDetails['SettlementInstructionCancellationStatus'].toString();
+                    var additionalUnexecutionReasonInformation = tradeDetails['AdditionalUnexecutionReasonInformation'].toString();
+                    var repurchaseTransactionIdentification = tradeDetails['RepurchaseTransactionIdentification'].toString();
+                    var repurchaseLegType = tradeDetails['RepurchaseLegType'].toString();
+                    var safekeepingAccountName = tradeDetails['SafekeepingAccountName'].toString();
+                    //GR5 4240
+                    var effectiveSettlementDate = tradeDetails['EffectiveSettlementDate'] ? tradeDetails['EffectiveSettlementDate'].toString() : "";
+                    var counterpartyName = tradeDetails['CounterpartyName'].toString();
+                    var customerIdentification = tradeDetails['CustomerIdentification'].toString();
+                    var settlementInstructionProcessingAdditionalDetails = tradeDetails['SettlementInstructionProcessingAdditionalDetails'].toString();
+                    //GR5 4240
+                    var settlement_Date = tradeDetails['SettlementDate'] ? tradeDetails['SettlementDate'].toString() : "";
+                    var sourceSystemLastUpdatedDateTime = tradeDetails['SourceSystemLastUpdatedDateTime'].toString();
+                    var financialInstrumentIdentificationDescription = tradeDetails['FinancialInstrumentIdentificationDescription'].toString();
+                    var crossBusinessTransactionIdentification = tradeDetails['CrossBusinessTransactionIdentification'].toString();
+                    var clientEntityIdentification = tradeDetails['ClientEntityIdentification'].toString();
+                    var clientGroupIdentification = tradeDetails['ClientGroupIdentification'].toString();
+                    var transactionReferenceAmount = tradeDetails['TransactionReferenceAmount'].toString();
+                    var transactionReferenceAmountCurrency = tradeDetails['TransactionReferenceAmountCurrency'].toString();
+                    var securitiesRtgsIndicator = tradeDetails['SecuritiesRtgsIndicator'].toString(); //MSSCUSTODY-3174 : Populate variable on Inbound
+                    var securitiesLendingIndicator = tradeDetails['SecuritiesLendingIndicator'].toString(); //MSSCUSTODY-3174 : Populate variable on Inbound
+                    var securitiesBorrowingIndicator = tradeDetails['SecuritiesBorrowingIndicator'].toString(); //MSSCUSTODY-3174 : Populate variable on Inbound
+
+                    // MSSCUSTODY-3591 : Coverting below fields from On-demand to Grid
+                    var stp_indicator = tradeDetails['StraightThroughProcessedIndicator'] ? tradeDetails['StraightThroughProcessedIndicator'].toString() : "";
+                    // var account_standing_instructions = tradeDetails['SecuritiesAccountStandingInstructionDetails'] ? tradeDetails['SecuritiesAccountStandingInstructionDetails'].toString() : "";
+                    var stlpos_no = tradeDetails['MarketInfrastructureTransactionIdentification'] ? tradeDetails['MarketInfrastructureTransactionIdentification'].toString() : "";
+                    var si_payment_indicator = tradeDetails['HKSettlementInstructionPaymentIndicator'] ? tradeDetails['HKSettlementInstructionPaymentIndicator'].toString() : "";
+                    var link_indicator = tradeDetails['LinkedIndicator'] ? tradeDetails['LinkedIndicator'].toString() : "";
+                    var local_security_code = tradeDetails['FinancialInstrumentIdentificationLocalSecurityCode'] ? tradeDetails['FinancialInstrumentIdentificationLocalSecurityCode'].toString() : "";
+                    var customer_instruction_received = tradeDetails['ClientInstructionReceivedIndicator'] ? tradeDetails['ClientInstructionReceivedIndicator'].toString() : "";
+                    var cash_payment_method = tradeDetails['CashPaymentMethod'] ? tradeDetails['CashPaymentMethod'].toString() : "";
+                    var counterparty_cash_account_id = tradeDetails['CounterpartyCashAccountIdentification'] ? tradeDetails['CounterpartyCashAccountIdentification'].toString() : "";
+                    var deal_price_currency = tradeDetails['DealPriceAmountCurrency'] ? tradeDetails['DealPriceAmountCurrency'].toString() : "";
+                    var deal_price = tradeDetails['DealPriceAmount'] ? tradeDetails['DealPriceAmount'].toString() : "";
+                    var external_reference = tradeDetails['InstructionIdentification'] ? tradeDetails['InstructionIdentification'].toString() : "";
+                    var exchange_reference2 = tradeDetails['ExchangeIdentification'] ? tradeDetails['ExchangeIdentification'].toString() : "";
+                    var buyerName = tradeDetails['BuyerName'] ? tradeDetails['BuyerName'].toString() : "";
+                    var sellerName = tradeDetails['SellerName'] ? tradeDetails['SellerName'].toString() : "";
+                    var buyer_seller = buyerName + ' / ' + sellerName;
+                    var receiverAccount = tradeDetails['ReceiversCustodianAccountIdentification'] ? tradeDetails['ReceiversCustodianAccountIdentification'].toString() : "";
+                    var delivererAccount = tradeDetails['DeliverersCustodianAccountIdentification'] ? tradeDetails['DeliverersCustodianAccountIdentification'].toString() : "";
+                    var u_client_s_deliverer_receiverer_account = receiverAccount + ' / ' + delivererAccount;
+                    var receiver_custodian_bic = tradeDetails['ReceiversCustodianBic'] ? tradeDetails['ReceiversCustodianBic'].toString() : "";
+                    var deliverer_custodian_bic = tradeDetails['DeliverersCustodianBic'] ? tradeDetails['DeliverersCustodianBic'].toString() : "";
+                    var receiver_deliverer_custodian_bic = receiver_custodian_bic + '/' + deliverer_custodian_bic;
+                    var counterparty_s_associate_account = tradeDetails['CounterpartyAssociatedAccountIdentification'] ? tradeDetails['CounterpartyAssociatedAccountIdentification'].toString() : "";
+                    var hold_matched_si_indicator = tradeDetails['HoldMatchedSettlementInstructionIndicator'] ? tradeDetails['HoldMatchedSettlementInstructionIndicator'].toString() : "";
+                    var remarks = tradeDetails['TradeDescription'] ? tradeDetails['TradeDescription'].toString() : "";
+                    var ent_opid = tradeDetails['CaptureUserIdentification'] ? tradeDetails['CaptureUserIdentification'].toString() : "";
+                    var quantity_type = tradeDetails['QuantityType'] ? tradeDetails['QuantityType'].toString() : "";
+
+                    //added as part of 7123 --> coverting on-demand to grid
+                    var si_purpose_code = tradeDetails['HKSettlementInstructionPurposeCode'] ? tradeDetails['HKSettlementInstructionPurposeCode'].toString() : "";
+                    var propriety_code = tradeDetails['CounterpartyDataSourceSchemeCode'] ? tradeDetails['CounterpartyDataSourceSchemeCode'].toString() : "";
+                    var data_source_scheme = tradeDetails['CounterpartyDataSourceSchemeType'] ? tradeDetails['CounterpartyDataSourceSchemeType'].toString() : "";
+
+                    // MSSCUSTODY-3591 : Created new fields 
+                    var customer_cancellation_reference = tradeDetails['ClientCancellationIdentification'] ? tradeDetails['ClientCancellationIdentification'].toString() : "";
+                    var security_account_type = tradeDetails['SafekeepingAccountType'] ? tradeDetails['SafekeepingAccountType'].toString() : "";
+                    var u_fx_indicator = tradeDetails['FxIndicator'] ? tradeDetails['FxIndicator'].toString() : "";
+                    var nssc = tradeDetails['SuppressStockSufficiencyCheckIndicator'] ? tradeDetails['SuppressStockSufficiencyCheckIndicator'].toString() : "";
+                    var sett_type = tradeDetails['DepositorySettlementType'] ? tradeDetails['DepositorySettlementType'].toString() : "";
+                    var iss_ind = tradeDetails['BursaSettlementType'] ? tradeDetails['BursaSettlementType'].toString() : "";
+                    var reg = tradeDetails['RegistrationCode'] ? tradeDetails['RegistrationCode'].toString() : "";
+                    var rgst_reg = tradeDetails['RegistrationIndicator'] ? tradeDetails['RegistrationIndicator'].toString() : "";
+
+                    //MSSCUSTODY-6479
+                    var trade_account_model = tradeDetails['TradeAccountModelType'] ? tradeDetails['TradeAccountModelType'].toString() : "";
+                    var single_sided_indicator = tradeDetails['SingleSidedIndicator'] ? tradeDetails['SingleSidedIndicator'].toString() : "";
+
+                    //MSSCUSTODY-5992 : Converting fields to Grid
+                    var counterparty_reference = tradeDetails['TradeIdentification'] ? tradeDetails['TradeIdentification'].toString() : "";
+                    var switch_indicator = tradeDetails['InternalAccountTransferIndicator'] ? tradeDetails['InternalAccountTransferIndicator'].toString() : "";
+                    var counterparty_cash_account_name = tradeDetails['CounterpartyCashAccountName'] ? tradeDetails['CounterpartyCashAccountName'].toString() : "";
+                    var account_standing_instructions = tradeDetails['SecuritiesAccountStandingInstructionDetails'] ? tradeDetails['SecuritiesAccountStandingInstructionDetails'].toString() : "";
+                    if (account_standing_instructions.length > 2100) { //MSSCUSTODY-7182
+                        account_standing_instructions = account_standing_instructions.substring(0, 2100);
+                    }
+                    var suspense_account_number = tradeDetails['InternalAccountTransferSuspenseCashAccountIdentification'] ? tradeDetails['InternalAccountTransferSuspenseCashAccountIdentification'].toString() : "";
+                    var exch_rate = tradeDetails['FxRate'] ? tradeDetails['FxRate'].toString() : "";
+
+                    //MSSCUSTODY-8060 New
+                    var si_proc_status = tradeDetails['SettlementInstructionProcessingStatus'] ? tradeDetails['SettlementInstructionProcessingStatus'].toString() : "";
+
+                    //MSSCUSTODY-7611
+                    if (OwningBusinessName.indexOf("GC HK") > -1) {
+                        var pending_cancellation_support_indicator = tradeDetails['PendingCancellationSupportedIndicator'] ? tradeDetails['PendingCancellationSupportedIndicator'].toString() : "";
+                        var contractual_indicator = tradeDetails['ContractualPostedIndicator'] ? tradeDetails['ContractualPostedIndicator'].toString() : "";
+                        var pending_cancellation_indicator = tradeDetails['PendingCancellationIndicator'] ? tradeDetails['PendingCancellationIndicator'].toString() : "";
+                    }
+
+                    //MSSCUSTODY-7353 : Converting fields to Grid
+                    var fxcx = tradeDetails['FxOrderCancellationIndicator'] ? tradeDetails['FxOrderCancellationIndicator'].toString() : "";
+                    var fx_inst_sts = tradeDetails['FxInstructionStatus'] ? tradeDetails['FxInstructionStatus'].toString() : "";
+                    var av_indicator = tradeDetails['AccountingAndValuationMessageStatus'] ? tradeDetails['AccountingAndValuationMessageStatus'].toString() : "";
+
+                    var cancellation_date = tradeDetails['CancellationDate'] ? tradeDetails['CancellationDate'].toString() : "";
+                    var swift_sett_trans_cond = tradeDetails['SettlementTransactionConditionCode'] ? tradeDetails['SettlementTransactionConditionCode'].toString() : "";
+                    var legacy_pre_state = tradeDetails['SourceSystemPreviousStatus'] ? tradeDetails['SourceSystemPreviousStatus'].toString() : "";
+                    var bk_to_bk = tradeDetails['SettlementConfirmationAdditionalDetails'] ? tradeDetails['SettlementConfirmationAdditionalDetails'].toString() : "";
+
+
+                    //MSSCUSTODY-6824 : Converting fields to Grid
+                    var place_of_trad_mic = tradeDetails['PlaceOfTradeMic'] ? tradeDetails['PlaceOfTradeMic'].toString() : ""; //for non uk
+                    var place_of_trad_typ_cod = tradeDetails['PlaceOfTradeTypeCode'] ? tradeDetails['PlaceOfTradeTypeCode'].toString() : ""; //for uk
+                    var secIDType = tradeDetails['FinancialInstrumentIdentificationProductType'] ? tradeDetails['FinancialInstrumentIdentificationProductType'].toString() : "";
+
+                    //GR5
+                    var defaultPlaceOfSettlementBic = tradeDetails['DefaultPlaceOfSettlementBic'] ? tradeDetails['DefaultPlaceOfSettlementBic'].toString() : "";
+                    var placeOfSettlementBic = tradeDetails['PlaceOfSettlementBic'] ? tradeDetails['PlaceOfSettlementBic'].toString() : defaultPlaceOfSettlementBic; //	MSSCUSTODY-5648Setting defaultvalu for PSET. 
+                    var financialInstrumentIdentificationIsin = tradeDetails['FinancialInstrumentIdentificationIsin'] ? tradeDetails['FinancialInstrumentIdentificationIsin'].toString() : "";
+                    var counterpartyDataSourceSchemeCode = tradeDetails['CounterpartyDataSourceSchemeCode'] ? tradeDetails['CounterpartyDataSourceSchemeCode'].toString() : "";
+                    var buyerBic = tradeDetails['BuyerBic'] ? tradeDetails['BuyerBic'].toString() : "";
+                    var sellerBic = tradeDetails['SellerBic'] ? tradeDetails['SellerBic'].toString() : "";
+                    var buyerOrSellerBic = buyerBic + ' / ' + sellerBic;
+                    var buyerDataSourceSchemeCode = tradeDetails['BuyerDataSourceSchemeCode'] ? tradeDetails['BuyerDataSourceSchemeCode'].toString() : "";
+                    var sellerDataSourceSchemeCode = tradeDetails['SellerDataSourceSchemeCode'] ? tradeDetails['SellerDataSourceSchemeCode'].toString() : "";
+                    var buyerSellerDataSourceScheme = buyerDataSourceSchemeCode + ' / ' + sellerDataSourceSchemeCode;
+                    var cashAccountIdentification = tradeDetails['CashAccountIdentification'] ? tradeDetails['CashAccountIdentification'].toString() : "";
+                    var valueDate = tradeDetails['ValueDate'] ? tradeDetails['ValueDate'].toString() : "";
+                    var registrationCode = tradeDetails['RegistrationCode'] ? tradeDetails['RegistrationCode'].toString() : "";
+                    var buyerAccountIdentification = tradeDetails['BuyerAccountIdentification'] ? tradeDetails['BuyerAccountIdentification'].toString() : "";
+                    var sellerAccountIdentification = tradeDetails['SellerAccountIdentification'] ? tradeDetails['SellerAccountIdentification'].toString() : "";
+                    var buyerOrSellerAccountIdentification = buyerAccountIdentification + ' / ' + sellerAccountIdentification;
+                    var pendingCancelIationIndicator = tradeDetails['PendingCancellationIndicator'] ? tradeDetails['PendingCancellationIndicator'].toString() : "";
+                    var accountBaseCurrency = tradeDetails['AccountBaseCurrency'] ? tradeDetails['AccountBaseCurrency'].toString() : "";
+                    var depositoryIdentification = tradeDetails['DepositoryIdentification'] ? tradeDetails['DepositoryIdentification'].toString() : "";
+                    var localCustodianIdentification = tradeDetails['LocalCustodianIdentification'] ? tradeDetails['LocalCustodianIdentification'].toString() : ""
+                    var depositoryOrLocalCustodianIdentification = depositoryIdentification + localCustodianIdentification;
+                    var securitiesTransactionTypeCode = tradeDetails['SecuritiesTransactionTypeCode'] ? tradeDetails['SecuritiesTransactionTypeCode'].toString() : "";
+                    var fxInstructionStatus = tradeDetails['FxInstructionStatus'] ? tradeDetails['FxInstructionStatus'].toString() : "";
+                    var additionalCancellationReasonInformation = tradeDetails['AdditionalCancellationReasonInformation'] ? tradeDetails['AdditionalCancellationReasonInformation'].toString() : "";
+                    var counterparty = tradeDetails['CounterpartyBic'] ? tradeDetails['CounterpartyBic'] : "";
+                    var counterpartyBic = counterparty + counterpartyIdentification;
+                    var swiftStatus1Reason1Code = tradeDetails['SwiftStatus1Reason1Code'] ? tradeDetails['SwiftStatus1Reason1Code'] : "";
+                    var gdiIdicatorValue = tradeDetails['GenerateDepositoryInstructionIndicator'] ? tradeDetails['GenerateDepositoryInstructionIndicator'] : "";
+
+                    //few of the commented codes below has been removed as the reference was not mentioned 
+                    var tradeType, instructionDateTime;
+
+                    var tradeTypeFound = mssevt.trade_details.indexOf("SecuritiesSettlementType");
+                    var instructionDateTimeFound = mssevt.instruction_receipt_date_time;
+
+                    if (tradeTypeFound !== -1) {
+                        tradeType = tradeDetails['SecuritiesSettlementType'].toString();
+                    }
+
+                    if (instructionDateTimeFound !== -1) {
+                        instructionDateTime = mssevt.instruction_receipt_date_time;
+                    }
+
+                    //Added as part of MSSCUSTODY-3854 for GR5 P1b UK market
+
+                    var priority = tradeDetails['CrestSettlementPriorityCode'] ? tradeDetails['CrestSettlementPriorityCode'] : "";
+                    var fxLocation = tradeDetails['FxLocationCode'] ? tradeDetails['FxLocationCode'] : "";
+                    var fxrTD = tradeDetails['FxCancellationIndicator'] ? tradeDetails['FxCancellationIndicator'] : "";
+                    var contractType = tradeDetails['ContractualSettlementIndicator'] ? tradeDetails['ContractualSettlementIndicator'] : ""; // Made GRID field with 4148 and moved with 4701 to PROD
+
+                    var locationCode, locationDescription;
+                    if (OwningBusinessName.indexOf("DCC") > -1) {
+                        locationCode = tradeDetails['LocationCode'].toString();
+                        locationDescription = tradeDetails['LocationDescription'].toString();
+                    } else if (OwningBusinessName.indexOf("GC") > -1) {
+                        locationCode = tradeDetails['LocalCustodianCode'].toString();
+                        locationDescription = tradeDetails['LocalCustodianDescription'].toString();
+                    }
+
+                    var eventDateTimes = GlideDateTime(mssevt.source_system_timestamp); //mssevt.source_system_timestamp;
+                    var sourceDateTimeNumeric = GlideDateTime(mssevt.source_system_timestamp).getNumericValue();
+                    var eventDate = mssevt.getValue('source_system_date');
+                    var eventdatetimeNumeric = mssevt.unity_updated_timestamp;
+                    var tradeCashStock = gs.getProperty('x_hsb11_mss_custod.owning_business_stock');
+                    var eventOwningBusinessStock = tradeStockStatus + OwningBusinessName + tradeCashStock;
+
+                    //As part of MSSCUSTODY-5260
+                    var transactionReference = tradeDetails['SystemTransactionIdentification'] ? tradeDetails['SystemTransactionIdentification'] : "";
+                    var transactionType = tradeDetails['SourceSystemTransactionType'] ? tradeDetails['SourceSystemTransactionType'] : "";
+                    var tradeDate = tradeDetails['TradeDate'] ? tradeDetails['TradeDate'] : "";
+                    var securityId = tradeDetails['FinancialInstrumentIdentificationPrimaryIdentifier'] ? tradeDetails['FinancialInstrumentIdentificationPrimaryIdentifier'] : "";
+
+                    //code to create an anomaly case in case of unknown Status received
+                    if (this.businessProcessStageStatus[eventOwningBusinessCore] == undefined) {
+                        // gs.info('vb=='+tradeStockStatus);
+                        mssevt.hsbc_transaction_reference = transactionReference; //As part of MSSCUSTODY-5260
+                        mssevt.transaction_type = transactionType; //As part of MSSCUSTODY-5260
+                        mssevt.trade_date = tradeDate; //As part of MSSCUSTODY-5260
+                        mssevt.security_id = securityId; //As part of MSSCUSTODY-5260
+                        mssevt.processing_status = 'Error';
+                        // mssevt.status = 'Pending'; //As part of MSSCUSTODY-5260
+                        mssevt.error_description = "Record for business event status '" + mssevt.business_event_status + "' for given owning business '" + OwningBusinessName + "' and for given trade life cycle '" + tradeLifeCycle + "' is not present in 'Business Process Stages' table"; //As part of MSSCUSTODY-5260
+
+                        //   gs.eventQueue('x_hsb11_hsbc_mss_o.ctacNotFound', mssevt, '', '');
+                    } else if ((tradeStockStatus != '') && (this.businessProcessStageStatus[eventOwningBusinessStock] == undefined)) {
+                        // gs.info('vb==='+tradeStockStatus+" and "+eventOwningBusinessStock+" and " +this.businessProcessStageStatus[eventOwningBusinessStock]);
+                        mssevt.hsbc_transaction_reference = transactionReference; //As part of MSSCUSTODY-5260
+                        mssevt.transaction_type = transactionType; //As part of MSSCUSTODY-5260
+                        mssevt.trade_date = tradeDate; //As part of MSSCUSTODY-5260
+                        mssevt.security_id = securityId; //As part of MSSCUSTODY-5260
+                        mssevt.processing_status = 'Error';
+                        //  mssevt.status = 'Pending'; //As part of MSSCUSTODY-5260
+                        mssevt.error_description = "Record for Trade Economic Availability Status '" + tradeStockStatus + "' for given owning business '" + OwningBusinessName + "' and for given '" + tradeCashStock + "' is not present in 'Business Process Stages' table"; //As part of MSSCUSTODY-5260
+                        // gs.eventQueue('x_hsb11_hsbc_mss_o.ctacNotFound', mssevt, '', '');										
+                    } else {
+
+                        ///start MSSCUSTODY-7887///
+                        var legacySubStatus = mssevt.legacy_sub_status;
+                        var legacySubStatusUpdated = '';
+                        var legacySubStatusLog; ////MSSCUSTODY-8224 // new variable for message
+                        //MSSCUSTODY-8224 // made as configurable
+                        if (legacySubStatus) {
+                            legacySubStatus = legacySubStatus.toString().replaceAll(" ", "")
+                            legacySubStatusUpdated = tradeData[legacySubStatus] ? tradeData[legacySubStatus] : mssevt.legacy_sub_status
+
+                            if (tradeData[legacySubStatus] == "" || tradeData[legacySubStatus] == undefined || tradeData[legacySubStatus] == null) {
+                                legacySubStatusLog = "-->Legacy Sub Status received as " + legacySubStatus + "\n";
+                                this.tradeInvalidDataLogs(legacySubStatusLog, mssevt.object_id);
+                            }
+                        } else { //error handing for invalid data
+
+                            legacySubStatusLog = "-->Legacy Sub Status received as empty " + "\n";
+                            this.tradeInvalidDataLogs(legacySubStatusLog, mssevt.object_id);
+                        }
+                        //MSSCUSTODY-8224 // made as configurable
+
+                        ///end MSSCUSTODY-7887/// legacySubStatusUpdated updated in executeEvent function (mssevt.legacy_sub_status replcaed with legacySubStatusUpdated)
+                        //currentStatus will store the value of executeEvent function to update in Custody Inbound Staging Table
+                        currentStatus = this.executeEvent(mssevt.object_id, mssevt.object_type, mssevt.object_id_type, mssevt.object_version, mssevt.business_event_status, mssevt.event_type, mssevt.source_system, eventDateTimes, eventdatetimeNumeric, mssevt.technical_uuid, mssevt.legacy_status, legacySubStatusUpdated, mssevt.legacy_reason_code.toString(), mssevt.gdi_indicator, mssevt.cash_hold_indicator, mssevt.script_hold_indicator, OtherBusinessName, OwningBusinessName, expectedSettlementDate, clientTransactionIdentification, counterpartyIdentification, linkedTransactionIdentification, locationCode, safekeepingAccountIdentification, financialInstrumentIdentificationPrimaryIdentifier, settlementAmount, settlementQuantity, internalAccountTransferAccountIdentification, internalAccountTransferTransactionIdentification, tradeDate, systemTransactionIdenfication, sourceSystemTransactionType, sourceOfInstructionType, sameDaySettlementIndicator, tradeCoreStatus, tradeStockStatus, poolIdentification, associatedAccountIdentification, associatedSubAccountIdentification, settlementInstructionCancellationStatus, locationDescription, settlementAmountCurrency, eventDate, tradeType, sourceDateTimeNumeric, eventOwningBusinessCore, eventOwningBusinessStock, instructionDateTime, additionalUnexecutionReasonInformation, repurchaseTransactionIdentification, repurchaseLegType, safekeepingAccountName, effectiveSettlementDate, counterpartyName, customerIdentification, settlementInstructionProcessingAdditionalDetails, settlement_Date, sourceSystemLastUpdatedDateTime, financialInstrumentIdentificationDescription, crossBusinessTransactionIdentification, clientEntityIdentification, clientGroupIdentification, transactionReferenceAmount, transactionReferenceAmountCurrency, region, securitiesRtgsIndicator, securitiesLendingIndicator, securitiesBorrowingIndicator, placeOfSettlementBic, financialInstrumentIdentificationIsin, counterpartyDataSourceSchemeCode, buyerOrSellerBic, buyerSellerDataSourceScheme, cashAccountIdentification, valueDate, registrationCode, buyerOrSellerAccountIdentification, pendingCancelIationIndicator, accountBaseCurrency, depositoryOrLocalCustodianIdentification, securitiesTransactionTypeCode, fxInstructionStatus, additionalCancellationReasonInformation, counterpartyBic, swiftStatus1Reason1Code, gdiIdicatorValue, stp_indicator /*, account_standing_instructions*/ , stlpos_no, si_payment_indicator, link_indicator, local_security_code, customer_instruction_received, cash_payment_method, counterparty_cash_account_id, deal_price_currency, deal_price, external_reference, exchange_reference2, buyer_seller, u_client_s_deliverer_receiverer_account, receiver_deliverer_custodian_bic, counterparty_s_associate_account, priority, fxLocation, fxrTD, contractType, hold_matched_si_indicator, ent_opid, remarks, quantity_type, customer_cancellation_reference, security_account_type, u_fx_indicator, nssc, sett_type, iss_ind, reg, rgst_reg, counterparty_reference, switch_indicator, counterparty_cash_account_name, account_standing_instructions, suspense_account_number, exch_rate, trade_account_model, single_sided_indicator, si_purpose_code, propriety_code, data_source_scheme, commonID, fxcx, fx_inst_sts, av_indicator, cancellation_date, swift_sett_trans_cond, legacy_pre_state, bk_to_bk, receiverAccount, delivererAccount, buyerAccountIdentification, sellerAccountIdentification, pending_cancellation_support_indicator, contractual_indicator, pending_cancellation_indicator, si_proc_status, place_of_trad_mic, place_of_trad_typ_cod, secIDType /*, cap_id, exch_rate */ ); //add variables as part of MSSCUSTODY-3591 //MSSCUSTODY-3174 //MSSCUSTODY-3854 : Populate variable on Inbound//GR5	//MSSCUSTODY-5992 //MSSCUSTODY-6479 //MSSCUSTODY-7123 //Added for MSSCUSTODY-7257  //MSSCUSTODY-7611 //MSSCUSTODY-7353  //MSSCUSTODY-8060 //MSSCUSTODY-6824
+
+                        mssevt.processing_status = currentStatus;
+                    }
+
+                } catch (e) {
+                    mssevt.hsbc_transaction_reference = transactionReference; //As part of MSSCUSTODY-5260
+                    mssevt.transaction_type = transactionType; //As part of MSSCUSTODY-5260
+                    mssevt.trade_date = tradeDate; //As part of MSSCUSTODY-5260
+                    mssevt.security_id = securityId; //As part of MSSCUSTODY-5260
+                    var message = e.message;
+
+                    gs.error("Error from Script Include MSS_Custody_Event_Utils - processEventQueue: " + message);
+                    //mssevt.status = 'Pending'; //As part of MSSCUSTODY-5260
+                    mssevt.error_description = "Error from Script Include MSS_Custody_Event_Utils - processEventQueue: " + message; //As part of MSSCUSTODY-5260
+                    mssevt.processing_status = 'Error';
+                }
+                mssevt.update();
+            }
+
+        }
+
+    },
+
+    //function to execute all actions for the event Update/Created BPI and Trade Record
+    executeEvent: function(objectid, objecttype, objectidtype, objectversion, eventstatus, eventtype, source, eventdatetime, eventdatetimeNumeric, TechId, legacystatus, legacysubstatus, legacyreasoncode, gdiindicator, cashholdindicator, scriptholdindicator, OtherBusinessName, OwningBusinessName, ExpectedSettlementDate, ClientTransactionIdentification, CounterpartyCode, linkedTransactionIdentification, locationCode, safekeepingAccountIdentification, financialInstrumentIdentificationPrimaryIdentifier, settlementAmount, settlementQuantity, internalAccountTransferAccountIdentification, internalAccountTransferTransactionIdentification, tradeDate, systemTransactionIdenfication, sourceSystemTransactionType, sourceOfInstructionType, sameDaySettlementIndicator, tradeCoreStatus, tradeStockStatus, poolIdentification, associatedAccountIdentification, associatedSubAccountIdentification, settlementInstructionCancellationStatus, locationDescription, settlementAmountCurrency, eventDate, tradeType, sourceDateTimeNumeric, eventOwningBusinessCore, eventOwningBusinessStock, instructionDateTime, additionalUnexecutionReasonInformation, repurchaseTransactionIdentification, repurchaseLegType, safekeepingAccountName, effectiveSettlementDate, counterpartyName, customerIdentification, settlementInstructionProcessingAdditionalDetails, settlement_Date, sourceSystemLastUpdatedDateTime, financialInstrumentIdentificationDescription, crossBusinessTransactionIdentification, clientEntityIdentification, clientGroupIdentification, transactionReferenceAmount, transactionReferenceAmountCurrency, region, securitiesRtgsIndicator, securitiesLendingIndicator, securitiesBorrowingIndicator, placeOfSettlementBic, financialInstrumentIdentificationIsin, counterpartyDataSourceSchemeCode, buyerOrSellerBic, buyerSellerDataSourceScheme, cashAccountIdentification, valueDate, registrationCode, buyerOrSellerAccountIdentification, pendingCancelIationIndicator, accountBaseCurrency, depositoryOrLocalCustodianIdentification, securitiesTransactionTypeCode, fxInstructionStatus, additionalCancellationReasonInformation, counterpartyBic, swiftStatus1Reason1Code, gdiIdicatorValue, stp_indicator /*, account_standing_instructions*/ , stlpos_no, si_payment_indicator, link_indicator, local_security_code, customer_instruction_received, cash_payment_method, counterparty_cash_account_id, deal_price_currency, deal_price, external_reference, exchange_reference2, buyer_seller, u_client_s_deliverer_receiverer_account, receiver_deliverer_custodian_bic, counterparty_s_associate_account, priority, fxLocation, fxrTD, contractType, hold_matched_si_indicator, ent_opid, remarks, quantity_type, customer_cancellation_reference, security_account_type, u_fx_indicator, nssc, sett_type, iss_ind, reg, rgst_reg, counterparty_reference, switch_indicator, counterparty_cash_account_name, account_standing_instructions, suspense_account_number, exch_rate, trade_account_model, single_sided_indicator, si_purpose_code, propriety_code, data_source_scheme, commonID, fxcx, fx_inst_sts, av_indicator, cancellation_date, swift_sett_trans_cond, legacy_pre_state, bk_to_bk, receiverAccount, delivererAccount, buyerAccountIdentification, sellerAccountIdentification, pending_cancellation_support_indicator, contractual_indicator, pending_cancellation_indicator, si_proc_status, place_of_trad_mic, place_of_trad_typ_cod, secIDType /*, cap_id, exch_rate */ ) //adding variables as part of MSSCUSTODY-3591 //MSSCUSTODY-3174 //MSSCUSTODY-3854  //MSSCUSTODY-3174 : Populate variable on Inbound//GR5	//MSSCUSTODY-5992 //MSSCUSTODY-6479	//MSSCUSTODY-7123//Added for MSSCUSTODY-7257  //MSSCUSTODY-7611 //MSSCUSTODY-7353  //MSSCUSTODY-8060//MSSCUSTODY-6824
+    {
+        try {
+            //find an existing BPI for this object_id
+            var existBPI = new GlideRecord('x_hsb11_mss_custod_mss_custody_business_process_instance');
+            existBPI.addQuery('object_id', objectid);
+            existBPI.query();
+            if (existBPI.next()) {
+                var eventDateN = parseInt(eventdatetimeNumeric);
+                var lastUpdateUnityTimestamp = parseInt(existBPI.unity_updated_timestamp);
+                var cDate = new GlideDate();
+                var sysTime = new GlideDateTime();
+                var isException, businessProcess, terminalStage, isBatch, stgTime, stgstatus, gdt;
+                //gs.info('line 273' + eventDateN + '++' + lastUpdateUnityTimestamp);
+                //To check if the event is the lates one and to take the decision if to update the tables or not
+                if (eventDateN > lastUpdateUnityTimestamp) {
+                    if (existBPI.core_case_creation_in_progress == true) {
+                        return 'Processing';
+                    }
+
+                    if (eventstatus != existBPI.core_business_event_status) {
+                        if (this.businessProcessStageStatus[eventOwningBusinessCore] != undefined) {
+                            isException = this.businessProcessStageStatus[eventOwningBusinessCore]["isexception"];
+                            businessProcess = this.businessProcessStageStatus[eventOwningBusinessCore]["busProcess"];
+                            terminalStage = this.businessProcessStageStatus[eventOwningBusinessCore]["terminal_stage"];
+                            isBatch = this.businessProcessStageStatus[eventOwningBusinessCore]["isbatch"];
+                            stgTime = this.businessProcessStageStatus[eventOwningBusinessCore]['dur_ts'];
+                            stgstatus = this.businessProcessStageStatus[eventOwningBusinessCore]["status_sys_id"];
+                            gdt = parseInt(sourceDateTimeNumeric) + parseInt(stgTime); // add eventdatetime to expectedtransition to calculate SLA
+
+                            //update the existing BPI Record
+                            this.updateBPICore(gdt, objectid, objecttype, eventstatus, source, TechId, isException, eventdatetimeNumeric, OtherBusinessName, OwningBusinessName, businessProcess, terminalStage, eventdatetime, ExpectedSettlementDate, locationDescription, isBatch, cDate, eventDate, stgTime, stgstatus);
+                        }
+                    } else if (eventstatus == existBPI.core_business_event_status) {
+                        this.updateBPIEssentialCore(objectid, eventdatetime, eventdatetimeNumeric);
+
+                    }
+
+
+
+                    if ((tradeStockStatus != '') && (tradeStockStatus != existBPI.stock_business_event_status)) {
+                        if (this.businessProcessStageStatus[eventOwningBusinessStock] != undefined) {
+                            isException = this.businessProcessStageStatus[eventOwningBusinessStock]["isexception"];
+                            businessProcess = this.businessProcessStageStatus[eventOwningBusinessStock]["busProcess"];
+                            terminalStage = this.businessProcessStageStatus[eventOwningBusinessStock]["terminal_stage"];
+                            isBatch = this.businessProcessStageStatus[eventOwningBusinessStock]["isbatch"];
+                            stgTime = this.businessProcessStageStatus[eventOwningBusinessStock]['dur_ts'];
+                            stgstatus = this.businessProcessStageStatus[eventOwningBusinessStock]["status_sys_id"];
+                            gdt = parseInt(sourceDateTimeNumeric) + parseInt(stgTime); // add eventdatetime to expectedtransition to calculate SLA
+
+                            //update the existing BPI Record
+                            this.updateBPIStock(gdt, objectid, objecttype, tradeStockStatus, source, TechId, isException, eventdatetimeNumeric, OtherBusinessName, OwningBusinessName, businessProcess, terminalStage, eventdatetime, ExpectedSettlementDate, locationDescription, isBatch, cDate, eventDate, stgTime, stgstatus);
+
+                        }
+                    } else if ((tradeStockStatus != '') && (tradeStockStatus == existBPI.stock_business_event_status)) {
+                        this.updateBPIEssentialStock(objectid, eventdatetime);
+
+                    }
+
+
+                    //update the existing Trade Record
+                    this.updateTradeRecord(objectid, TechId, legacystatus, legacysubstatus, legacyreasoncode, gdiindicator, cashholdindicator, scriptholdindicator, OtherBusinessName, OwningBusinessName, ExpectedSettlementDate, ClientTransactionIdentification, CounterpartyCode, linkedTransactionIdentification, locationCode, safekeepingAccountIdentification, financialInstrumentIdentificationPrimaryIdentifier, settlementAmount, settlementQuantity, internalAccountTransferAccountIdentification, internalAccountTransferTransactionIdentification, tradeDate, systemTransactionIdenfication, sourceSystemTransactionType, sourceOfInstructionType, sameDaySettlementIndicator, tradeCoreStatus, tradeStockStatus, eventdatetime, source, poolIdentification, associatedAccountIdentification, associatedSubAccountIdentification, settlementInstructionCancellationStatus, settlementAmountCurrency, eventstatus, locationDescription, tradeType, instructionDateTime, additionalUnexecutionReasonInformation, repurchaseTransactionIdentification, repurchaseLegType, safekeepingAccountName, effectiveSettlementDate, counterpartyName, customerIdentification, settlementInstructionProcessingAdditionalDetails, settlement_Date, sourceSystemLastUpdatedDateTime, financialInstrumentIdentificationDescription, crossBusinessTransactionIdentification, clientEntityIdentification, clientGroupIdentification, transactionReferenceAmount, transactionReferenceAmountCurrency, region, securitiesRtgsIndicator, securitiesLendingIndicator, securitiesBorrowingIndicator, placeOfSettlementBic, financialInstrumentIdentificationIsin, counterpartyDataSourceSchemeCode, buyerOrSellerBic, buyerSellerDataSourceScheme, cashAccountIdentification, valueDate, registrationCode, buyerOrSellerAccountIdentification, pendingCancelIationIndicator, accountBaseCurrency, depositoryOrLocalCustodianIdentification, securitiesTransactionTypeCode, fxInstructionStatus, additionalCancellationReasonInformation, counterpartyBic, swiftStatus1Reason1Code, gdiIdicatorValue, stp_indicator /*, account_standing_instructions*/ , stlpos_no, si_payment_indicator, link_indicator, local_security_code, customer_instruction_received, cash_payment_method, counterparty_cash_account_id, deal_price_currency, deal_price, external_reference, exchange_reference2, buyer_seller, u_client_s_deliverer_receiverer_account, receiver_deliverer_custodian_bic, counterparty_s_associate_account, priority, fxLocation, fxrTD, contractType, hold_matched_si_indicator, ent_opid, remarks, quantity_type, customer_cancellation_reference, security_account_type, u_fx_indicator, nssc, sett_type, iss_ind, reg, rgst_reg, counterparty_reference, switch_indicator, counterparty_cash_account_name, account_standing_instructions, suspense_account_number, exch_rate, trade_account_model, single_sided_indicator, si_purpose_code, propriety_code, data_source_scheme, commonID, fxcx, fx_inst_sts, av_indicator, cancellation_date, swift_sett_trans_cond, legacy_pre_state, bk_to_bk, receiverAccount, delivererAccount, buyerAccountIdentification, sellerAccountIdentification, pending_cancellation_support_indicator, contractual_indicator, pending_cancellation_indicator, si_proc_status, place_of_trad_mic, place_of_trad_typ_cod, secIDType /*, cap_id, exch_rate */ ); //adding variables as part of MSSCUSTODY-3591 //MSSCUSTODY-3174 : Populate variable on Inbound//GR5	//MSSCUSTODY-5992 //MSSCUSTODY-6479 //MSSCUSTODY-7123 //Added for MSSCUSTODY-7257  // MSSCUSTODY-7611 //MSSCUSTODY-7353  //MSSCUSTODY-8060 //MSSCUSTODY-6824
+                    return 'processed_updated';
+                } else {
+                    return 'Ignored'; //Ignored as there was a newer update already
+                }
+            } else {
+
+                //create a new trade record
+                var obj_sys_id = this.insertTradeRecord(objectid, TechId, legacystatus, legacysubstatus, legacyreasoncode, gdiindicator, cashholdindicator, scriptholdindicator, OtherBusinessName, OwningBusinessName, ExpectedSettlementDate, ClientTransactionIdentification, CounterpartyCode, linkedTransactionIdentification, locationCode, safekeepingAccountIdentification, financialInstrumentIdentificationPrimaryIdentifier, settlementAmount, settlementQuantity, internalAccountTransferAccountIdentification, internalAccountTransferTransactionIdentification, tradeDate, systemTransactionIdenfication, sourceSystemTransactionType, sourceOfInstructionType, sameDaySettlementIndicator, tradeCoreStatus, tradeStockStatus, eventdatetime, source, poolIdentification, associatedAccountIdentification, associatedSubAccountIdentification, settlementInstructionCancellationStatus, settlementAmountCurrency, eventstatus, locationDescription, tradeType, instructionDateTime, additionalUnexecutionReasonInformation, repurchaseTransactionIdentification, repurchaseLegType, safekeepingAccountName, effectiveSettlementDate, counterpartyName, customerIdentification, settlementInstructionProcessingAdditionalDetails, settlement_Date, sourceSystemLastUpdatedDateTime, financialInstrumentIdentificationDescription, crossBusinessTransactionIdentification, clientEntityIdentification, clientGroupIdentification, transactionReferenceAmount, transactionReferenceAmountCurrency, region, securitiesRtgsIndicator, securitiesLendingIndicator, securitiesBorrowingIndicator, placeOfSettlementBic, financialInstrumentIdentificationIsin, counterpartyDataSourceSchemeCode, buyerOrSellerBic, buyerSellerDataSourceScheme, cashAccountIdentification, valueDate, registrationCode, buyerOrSellerAccountIdentification, pendingCancelIationIndicator, accountBaseCurrency, depositoryOrLocalCustodianIdentification, securitiesTransactionTypeCode, fxInstructionStatus, additionalCancellationReasonInformation, counterpartyBic, swiftStatus1Reason1Code, gdiIdicatorValue, stp_indicator /*, account_standing_instructions*/ , stlpos_no, si_payment_indicator, link_indicator, local_security_code, customer_instruction_received, cash_payment_method, counterparty_cash_account_id, deal_price_currency, deal_price, external_reference, exchange_reference2, buyer_seller, u_client_s_deliverer_receiverer_account, receiver_deliverer_custodian_bic, counterparty_s_associate_account, priority, fxLocation, fxrTD, contractType, hold_matched_si_indicator, ent_opid, remarks, quantity_type, customer_cancellation_reference, security_account_type, u_fx_indicator, nssc, sett_type, iss_ind, reg, rgst_reg, counterparty_reference, switch_indicator, counterparty_cash_account_name, account_standing_instructions, suspense_account_number, exch_rate, trade_account_model, single_sided_indicator, si_purpose_code, propriety_code, data_source_scheme, commonID, fxcx, fx_inst_sts, av_indicator, cancellation_date, swift_sett_trans_cond, legacy_pre_state, bk_to_bk, receiverAccount, delivererAccount, buyerAccountIdentification, sellerAccountIdentification, pending_cancellation_support_indicator, contractual_indicator, pending_cancellation_indicator, si_proc_status, place_of_trad_mic, place_of_trad_typ_cod, secIDType /*, cap_id, exch_rate */ ); //adding variables as part of MSSCUSTODY-3591 //MSSCUSTODY-3174 : Populate variable on Inbound//GR5	//MSSCUSTODY-5992 //MSSCUSTODY-6479 //MSSCUSTODY-7123 //Added for MSSCUSTODY-7257  // MSSCUSTODY-7611  //MSSCUSTODY-8060 //MSSCUSTODY-6824
+
+
+                if (tradeStockStatus == '') {
+
+                    if (this.businessProcessStageStatus[eventOwningBusinessCore] != undefined) {
+                        isException = this.businessProcessStageStatus[eventOwningBusinessCore]["isexception"];
+                        businessProcess = this.businessProcessStageStatus[eventOwningBusinessCore]["busProcess"];
+                        terminalStage = this.businessProcessStageStatus[eventOwningBusinessCore]["terminal_stage"];
+                        isBatch = this.businessProcessStageStatus[eventOwningBusinessCore]["isbatch"];
+                        stgTime = this.businessProcessStageStatus[eventOwningBusinessCore]['dur_ts'];
+                        stgstatus = this.businessProcessStageStatus[eventOwningBusinessCore]["status_sys_id"];
+                        gdt = parseInt(sourceDateTimeNumeric) + parseInt(stgTime); // add eventdatetime to expectedtransition to calculate SLA
+
+                        //create a new BPI record
+                        this.createBPICore(gdt, objectid, objecttype, eventstatus, source, TechId, isException, eventdatetimeNumeric, OtherBusinessName, OwningBusinessName, obj_sys_id, businessProcess, terminalStage, eventdatetime, ExpectedSettlementDate, locationDescription, isBatch, cDate, eventDate, stgTime, stgstatus);
+                    }
+                } else if (tradeStockStatus != '') {
+
+                    if (this.businessProcessStageStatus[eventOwningBusinessCore] != undefined) {
+                        isException = this.businessProcessStageStatus[eventOwningBusinessCore]["isexception"];
+                        businessProcess = this.businessProcessStageStatus[eventOwningBusinessCore]["busProcess"];
+                        terminalStage = this.businessProcessStageStatus[eventOwningBusinessCore]["terminal_stage"];
+                        isBatch = this.businessProcessStageStatus[eventOwningBusinessCore]["isbatch"];
+                        stgTime = this.businessProcessStageStatus[eventOwningBusinessCore]['dur_ts'];
+                        stgstatus = this.businessProcessStageStatus[eventOwningBusinessCore]["status_sys_id"];
+                        gdt = parseInt(sourceDateTimeNumeric) + parseInt(stgTime); // add eventdatetime to expectedtransition to calculate SLA
+
+                        //create a new BPI record
+                        this.createBPICore(gdt, objectid, objecttype, eventstatus, source, TechId, isException, eventdatetimeNumeric, OtherBusinessName, OwningBusinessName, obj_sys_id, businessProcess, terminalStage, eventdatetime, ExpectedSettlementDate, locationDescription, isBatch, cDate, eventDate, stgTime, stgstatus);
+                    }
+
+                    if (this.businessProcessStageStatus[eventOwningBusinessStock] != undefined) {
+                        isException = this.businessProcessStageStatus[eventOwningBusinessStock]["isexception"];
+                        businessProcess = this.businessProcessStageStatus[eventOwningBusinessStock]["busProcess"];
+                        terminalStage = this.businessProcessStageStatus[eventOwningBusinessStock]["terminal_stage"];
+                        isBatch = this.businessProcessStageStatus[eventOwningBusinessStock]["isbatch"];
+                        stgTime = this.businessProcessStageStatus[eventOwningBusinessStock]['dur_ts'];
+                        stgstatus = this.businessProcessStageStatus[eventOwningBusinessStock]["status_sys_id"];
+                        gdt = parseInt(sourceDateTimeNumeric) + parseInt(stgTime); // add eventdatetime to expectedtransition to calculate SLA
+
+
+                        this.updateBPIStock(gdt, objectid, objecttype, tradeStockStatus, source, TechId, isException, eventdatetimeNumeric, OtherBusinessName, OwningBusinessName, businessProcess, terminalStage, eventdatetime, ExpectedSettlementDate, locationDescription, isBatch, cDate, eventDate, stgTime, stgstatus);
+                    }
+                }
+
+
+                return 'processed_created';
+                //returning status to the event table
+            }
+        } catch (e) {
+            gs.error("Error from Script Include MSS_Custody_Event_Utils - executeEvent (for trade " + objectid + "): " + e.message);
+        }
+    },
+
+
+
+    updateTradeRecord: function(objectid, TechId, legacystatus, legacysubstatus, legacyreasoncode, gdiindicator, cashholdindicator, scriptholdindicator, OtherBusinessName, OwningBusinessName, ExpectedSettlementDate, ClientTransactionIdentification, CounterpartyCode, linkedTransactionIdentification, locationCode, safekeepingAccountIdentification, financialInstrumentIdentificationPrimaryIdentifier, settlementAmount, settlementQuantity, internalAccountTransferAccountIdentification, internalAccountTransferTransactionIdentification, tradeDate, systemTransactionIdenfication, sourceSystemTransactionType, sourceOfInstructionType, sameDaySettlementIndicator, tradeCoreStatus, tradeStockStatus, eventdatetime, source, poolIdentification, associatedAccountIdentification, associatedSubAccountIdentification, settlementInstructionCancellationStatus, settlementAmountCurrency, eventstatus, locationDescription, tradeType, instructionDateTime, additionalUnexecutionReasonInformation, repurchaseTransactionIdentification, repurchaseLegType, safekeepingAccountName, effectiveSettlementDate, counterpartyName, customerIdentification, settlementInstructionProcessingAdditionalDetails, settlement_Date, sourceSystemLastUpdatedDateTime, financialInstrumentIdentificationDescription, crossBusinessTransactionIdentification, clientEntityIdentification, clientGroupIdentification, transactionReferenceAmount, transactionReferenceAmountCurrency, region, securitiesRtgsIndicator, securitiesLendingIndicator, securitiesBorrowingIndicator, placeOfSettlementBic, financialInstrumentIdentificationIsin, counterpartyDataSourceSchemeCode, buyerOrSellerBic, buyerSellerDataSourceScheme, cashAccountIdentification, valueDate, registrationCode, buyerOrSellerAccountIdentification, pendingCancelIationIndicator, accountBaseCurrency, depositoryOrLocalCustodianIdentification, securitiesTransactionTypeCode, fxInstructionStatus, additionalCancellationReasonInformation, counterpartyBic, swiftStatus1Reason1Code, gdiIdicatorValue, stp_indicator /*, account_standing_instructions*/ , stlpos_no, si_payment_indicator, link_indicator, local_security_code, customer_instruction_received, cash_payment_method, counterparty_cash_account_id, deal_price_currency, deal_price, external_reference, exchange_reference2, buyer_seller, u_client_s_deliverer_receiverer_account, receiver_deliverer_custodian_bic, counterparty_s_associate_account, priority, fxLocation, fxrTD, contractType, hold_matched_si_indicator, ent_opid, remarks, quantity_type, customer_cancellation_reference, security_account_type, u_fx_indicator, nssc, sett_type, iss_ind, reg, rgst_reg, counterparty_reference, switch_indicator, counterparty_cash_account_name, account_standing_instructions, suspense_account_number, exch_rate, trade_account_model, single_sided_indicator, si_purpose_code, propriety_code, data_source_scheme, commonID, fxcx, fx_inst_sts, av_indicator, cancellation_date, swift_sett_trans_cond, legacy_pre_state, bk_to_bk, receiverAccount, delivererAccount, buyerAccountIdentification, sellerAccountIdentification, pending_cancellation_support_indicator, contractual_indicator, pending_cancellation_indicator, si_proc_status, place_of_trad_mic, place_of_trad_typ_cod, secIDType /*, cap_id, exch_rate */ ) { //adding variables as part of MSSCUSTODY-3591 //MSSCUSTODY-3854 //GR5	//MSSCUSTODY-5992 //MSSCUSTODY-6479 //MSSCUSTODY-7123 //Added for MSSCUSTODY-7257 //MSSCUSTODY-7611 //MSSCUSTODY-7353  //MSSCUSTODY-8060 //MSSCUSTODY-6824
+        try {
+            var locationCodeTableRec, currencyCodeTableRec, currencyCodeTableRecNominal;
+            var reasonCodeTableRec = '';
+            var trDdt = new GlideDate();
+            trDdt.setValue(tradeDate);
+
+
+            //For retrieving the location code value from custody location code table
+            var locationCodes = locationCode + OwningBusinessName;
+            if ((this.locationCodeRecord[locationCodes] != undefined) && (locationCode != "")) {
+                locationCodeTableRec = this.locationCodeRecord[locationCodes]['locationCodeID'];
+            }
+
+            //For retrieving the settlement amount currency value from currency table
+            if ((this.currencyCodeTableRecord[settlementAmountCurrency] != undefined) && (settlementAmountCurrency != "")) {
+                currencyCodeTableRec = this.currencyCodeTableRecord[settlementAmountCurrency]['settlementAmountCurrency'];
+            }
+
+            //For retrieving the Nominal amount currency value from currency table
+            if ((this.currencyCodeTableRecord[transactionReferenceAmountCurrency] != undefined) && (transactionReferenceAmountCurrency != "")) {
+                currencyCodeTableRecNominal = this.currencyCodeTableRecord[transactionReferenceAmountCurrency]['settlementAmountCurrency'];
+            }
+
+            //7302 - For retrieving the reason code value from reason code table
+            var reasonCode = legacyreasoncode + OwningBusinessName;
+            if ((this.reasonCodeRecord[reasonCode] != undefined) && (legacyreasoncode != "")) {
+                reasonCodeTableRec = this.reasonCodeRecord[reasonCode]['reasonCodeId'];
+            }
+
+            var updtrade = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_trade");
+            updtrade.addQuery('trade_id', objectid);
+            updtrade.query();
+            if (updtrade.next()) {
+
+                updtrade.trade_id = objectid;
+                updtrade.u_id = objectid; //MSSOTIQUBE-2572 Custody Redesign, populate Trade ID in sn_bom_trade
+                updtrade.legacy_status = legacystatus;
+                updtrade.legacy_sub_status = legacysubstatus;
+
+                updtrade.gdi_indicator = gdiindicator;
+                updtrade.cash_hold_indicator = cashholdindicator;
+                updtrade.script_hold_indicator = scriptholdindicator;
+                updtrade.other_business = OtherBusinessName;
+                updtrade.owning_business = OwningBusinessName;
+                updtrade.region = region;
+                updtrade.settlement_date = ExpectedSettlementDate;
+                updtrade.customer_reference = ClientTransactionIdentification;
+                updtrade.counterparty_code = CounterpartyCode;
+                updtrade.link_reference = linkedTransactionIdentification;
+                updtrade.securities_account = safekeepingAccountIdentification;
+                updtrade.security_id = financialInstrumentIdentificationPrimaryIdentifier;
+                updtrade.settlement_amount = settlementAmount;
+                updtrade.settlement_amount_currency = settlementAmountCurrency;
+                updtrade.settlement_quantity = settlementQuantity;
+                updtrade.switch_account = internalAccountTransferAccountIdentification;
+                updtrade.switch_reference = internalAccountTransferTransactionIdentification;
+                updtrade.trade_date = trDdt;
+                updtrade.transaction_reference = systemTransactionIdenfication;
+                updtrade.transaction_type = sourceSystemTransactionType;
+                updtrade.instruction_source = sourceOfInstructionType;
+                updtrade.same_day_settlement_indicator = sameDaySettlementIndicator;
+                updtrade.trade_lifecycle_status = tradeCoreStatus;
+                updtrade.trade_cash_stock_status = tradeStockStatus;
+                updtrade.source_system_timestamp = eventdatetime;
+                updtrade.source_system = source;
+                updtrade.pool_reference = poolIdentification;
+                updtrade.associated_account = associatedAccountIdentification;
+                updtrade.associated_sub_account = associatedSubAccountIdentification;
+                updtrade.stp_cancelled_indicator = settlementInstructionCancellationStatus;
+                updtrade.market_code = locationDescription;
+                updtrade.location_code = locationCodeTableRec;
+                updtrade.settlement_amount_currency = currencyCodeTableRec;
+                updtrade.reason_code = reasonCodeTableRec;
+                updtrade.reason_code_description = this.getReasonCodeDescription(updtrade.reason_code, objectid, legacyreasoncode); //MSSCUSTODY-6201 //MSSCUSTODY-8224- added additional parameter for logging
+                updtrade.instruction_receipt_date_time = instructionDateTime;
+                updtrade.mss_trade_type = tradeType;
+                updtrade.reason_description_remarks_unex = additionalUnexecutionReasonInformation;
+                updtrade.u_repo_reference = repurchaseTransactionIdentification;
+                updtrade.u_repo_leg = repurchaseLegType;
+                updtrade.account_name = safekeepingAccountName;
+                updtrade.actual_settlement_date = effectiveSettlementDate;
+                updtrade.counterparty_name = counterpartyName;
+                updtrade.customer_id = customerIdentification;
+                updtrade.comm_ref = commonID //Added for MSSCUSTODY-7257
+                // MSSCUSTODY-3591 
+                if (!(OwningBusinessName.contains('UK'))) {
+                    updtrade.remarks = settlementInstructionProcessingAdditionalDetails;
+                }
+                updtrade.contractual_settlement_date = settlement_Date;
+                //updtrade.source_system_timestamp_market = sourceSystemLastUpdatedDateTime;
+                updtrade.security_name = financialInstrumentIdentificationDescription;
+                updtrade.source_system_time_stamp_market_time = sourceSystemLastUpdatedDateTime;
+                updtrade.cross_business_reference = crossBusinessTransactionIdentification;
+                updtrade.enitity_code = clientEntityIdentification;
+                updtrade.mis_group = clientGroupIdentification;
+                updtrade.nominal_settlement_amount = transactionReferenceAmount;
+                updtrade.nominal_settlement_currency = currencyCodeTableRecNominal;
+                updtrade.u_rtgs = securitiesRtgsIndicator; //MSSCUSTODY-3174 : Populate variable on Inbound
+                updtrade.stock_lending_indicator = securitiesLendingIndicator; //MSSCUSTODY-3174 : Populate variable on Inbound
+                updtrade.stock_borrowing_indicator = securitiesBorrowingIndicator; //MSSCUSTODY-3174 : Populate variable on Inbound
+                updtrade.cash_account_id = cashAccountIdentification; //MSSCUSTODY-4489: Added to populate Cash Account Identification
+
+                // MSSCUSTODY-3591
+                updtrade.stp_indicator = stp_indicator;
+                //updtrade.account_standing_instructions = account_standing_instructions;
+                updtrade.stlpos_no = stlpos_no;
+                updtrade.si_payment_indicator = si_payment_indicator;
+                updtrade.link_indicator = link_indicator;
+                updtrade.local_security_code = local_security_code;
+                updtrade.customer_instruction_received = customer_instruction_received;
+                updtrade.cash_payment_method = cash_payment_method;
+                updtrade.counterparty_cash_account_id = counterparty_cash_account_id;
+                updtrade.counterparty_settlement_account_number = counterparty_cash_account_id; //added as a part of MSSCUSTODY-6523 Amend
+                updtrade.deal_price_currency = deal_price_currency;
+                updtrade.deal_price = deal_price;
+                updtrade.external_reference = external_reference;
+                updtrade.exchange_reference2 = exchange_reference2;
+                updtrade.buyer_seller = buyer_seller;
+                if (!(OwningBusinessName.contains('DCC UK'))) {
+                    updtrade.u_client_s_deliverer_receiverer_account = u_client_s_deliverer_receiverer_account;
+                }
+                updtrade.receiver_deliverer_custodian_bic = receiver_deliverer_custodian_bic;
+                updtrade.counterparty_s_associate_account = counterparty_s_associate_account;
+                updtrade.isin = financialInstrumentIdentificationIsin;
+                updtrade.depository_reference = depositoryOrLocalCustodianIdentification;
+                updtrade.cash_account_id = cashAccountIdentification;
+                updtrade.buyer_seller_bic = buyerOrSellerBic;
+                updtrade.u_client_s_seller_buyer_account = buyerOrSellerAccountIdentification;
+                updtrade.a_c_of_client = buyerOrSellerAccountIdentification; //added as a part of MSSCUSTODY-6523 Amend
+                updtrade.place_of_settlement_95a_qualifier_pset = placeOfSettlementBic;
+                updtrade.hold_matched_si_indicator = hold_matched_si_indicator;
+                updtrade.quantity_type = quantity_type;
+                updtrade.data_source_scheme = data_source_scheme;
+                updtrade.propriety_code = propriety_code;
+                updtrade.si_purpose_code = si_purpose_code;
+                updtrade.customer_cancellation_reference = customer_cancellation_reference;
+                updtrade.security_account_type = security_account_type;
+                if (!(OwningBusinessName.contains('DCC HK'))) {
+                    updtrade.u_fx_indicator = u_fx_indicator;
+                }
+                if ((OwningBusinessName.contains('HK'))) {
+                    updtrade.nssc = nssc;
+                }
+                if ((OwningBusinessName.contains('TH'))) {
+                    updtrade.sett_type = sett_type;
+                }
+                updtrade.iss_ind = iss_ind;
+                updtrade.reg = reg;
+                updtrade.rgst_reg = rgst_reg;
+                //MSSCUSTODY-6479
+                if ((OwningBusinessName.contains('DCC HK'))) {
+                    updtrade.trade_account_model = trade_account_model;
+                    updtrade.single_sided_indicator = single_sided_indicator;
+                }
+
+                //MSSCUSTODY-5992
+                updtrade.counterparty_reference = counterparty_reference;
+                updtrade.switch_indicator = switch_indicator;
+                updtrade.counterparty_cash_account_name = counterparty_cash_account_name;
+                updtrade.account_standing_instructions = account_standing_instructions;
+                updtrade.suspense_account_number = suspense_account_number;
+                updtrade.exch_rate = exch_rate;
+                //MSSCUSTODE-7611
+                updtrade.pending_cancellation_status = pending_cancellation_indicator;
+                updtrade.pend_canc_support_indicator = pending_cancellation_support_indicator;
+                updtrade.contractual_indicator = contractual_indicator;
+
+                //MSSCUSTODY-8060
+                if ((OwningBusinessName.contains('DCC KR'))) {
+                    updtrade.si_proc_status = si_proc_status;
+                }
+
+                //MSSCUSTODY-7353
+                if ((OwningBusinessName.contains('GC HK'))) {
+                    updtrade.u_fxcx_indicator = fxcx;
+                    updtrade.u_fx_inst_sts = fx_inst_sts;
+                    updtrade.a_v_indicator = av_indicator;
+                }
+
+                updtrade.cancellation_date = cancellation_date;
+                updtrade.swift_settlement_transaction_condition = swift_sett_trans_cond;
+                updtrade.legacy_previous_status = legacy_pre_state;
+                updtrade.bk_to_bk_info = bk_to_bk;
+                updtrade.swift_settlement_type_data_source_indicator = securitiesTransactionTypeCode;
+                updtrade.account_with_receiver_deliverer_custodian = receiverAccount + ' | ' + buyerAccountIdentification + ' / ' + delivererAccount + ' | ' + sellerAccountIdentification; // for non uk as per MSSCUSTODY-7353
+
+                //MSSCUSTODY-6824
+                updtrade.u_trade_94b_indicator = place_of_trad_typ_cod;
+                updtrade.market_exchange_code = place_of_trad_mic;
+                updtrade.security_id_type = secIDType;
+
+                //GR5
+                if (OwningBusinessName.contains('UK')) {
+                    updtrade.propriety_code = counterpartyDataSourceSchemeCode;
+                    updtrade.buyer_seller_data_source_scheme = buyerSellerDataSourceScheme;
+                    updtrade.u_value_date = valueDate;
+                    var vDdt = new GlideDate();
+                    vDdt.setValue(valueDate);
+                    updtrade.value_date = vDdt; // 5273, 7214 value date
+                    updtrade.pos_reg = registrationCode;
+                    updtrade.pnd_canc = pendingCancelIationIndicator;
+                    updtrade.remittance_currency = accountBaseCurrency;
+                    updtrade.fx_status = fxInstructionStatus; //MSSCUSTODY-3854P1Bchange,mappedtonewfield Fx status																																			
+                    updtrade.amortised_value = settlementQuantity;
+                    updtrade.reason_description_remarks_canc = additionalCancellationReasonInformation;
+                    updtrade.counterparty_code = counterpartyBic;
+                    updtrade.u_primary_swift_reason_code_1 = swiftStatus1Reason1Code;
+                    updtrade.snis_crest = gdiIdicatorValue;
+                    updtrade.swift = gdiIdicatorValue;
+                    updtrade.settlement_date = settlement_Date; //added as a part of 4067 UDM - Settlement Date // similar mapping as contractual settlement date
+
+                    // MSSCUSTODY-3854 P1B changes
+                    updtrade.priority = priority;
+                    updtrade.fxr_td = fxrTD;
+                    updtrade.fx_location = fxLocation;
+                    updtrade.contract_type = contractType;
+
+                    // 3591
+                    updtrade.ent_opid = ent_opid;
+                    updtrade.remarks = remarks;
+
+                    // MSSCUSTODY-4732
+                    updtrade.trade_ccy = settlementAmountCurrency;
+                    updtrade.acct_ccy = accountBaseCurrency;
+
+                }
+                //GR5
+
+                updtrade.update();
+
+            }
+        } catch (e) {
+            gs.error("Error from Script Include MSS_Custody_Event_Utils - updateTradeRecord (for trade " + objectid + "): " + e.message);
+        }
+    },
+
+
+
+    insertTradeRecord: function(objectid, TechId, legacystatus, legacysubstatus, legacyreasoncode, gdiindicator, cashholdindicator, scriptholdindicator, OtherBusinessName, OwningBusinessName, ExpectedSettlementDate, ClientTransactionIdentification, CounterpartyCode, linkedTransactionIdentification, locationCode, safekeepingAccountIdentification, financialInstrumentIdentificationPrimaryIdentifier, settlementAmount, settlementQuantity, internalAccountTransferAccountIdentification, internalAccountTransferTransactionIdentification, tradeDate, systemTransactionIdenfication, sourceSystemTransactionType, sourceOfInstructionType, sameDaySettlementIndicator, tradeCoreStatus, tradeStockStatus, eventdatetime, source, poolIdentification, associatedAccountIdentification, associatedSubAccountIdentification, settlementInstructionCancellationStatus, settlementAmountCurrency, eventstatus, locationDescription, tradeType, instructionDateTime, additionalUnexecutionReasonInformation, repurchaseTransactionIdentification, repurchaseLegType, safekeepingAccountName, effectiveSettlementDate, counterpartyName, customerIdentification, settlementInstructionProcessingAdditionalDetails, settlement_Date, sourceSystemLastUpdatedDateTime, financialInstrumentIdentificationDescription, crossBusinessTransactionIdentification, clientEntityIdentification, clientGroupIdentification, transactionReferenceAmount, transactionReferenceAmountCurrency, region, securitiesRtgsIndicator, securitiesLendingIndicator, securitiesBorrowingIndicator, placeOfSettlementBic, financialInstrumentIdentificationIsin, counterpartyDataSourceSchemeCode, buyerOrSellerBic, buyerSellerDataSourceScheme, cashAccountIdentification, valueDate, registrationCode, buyerOrSellerAccountIdentification, pendingCancelIationIndicator, accountBaseCurrency, depositoryOrLocalCustodianIdentification, securitiesTransactionTypeCode, fxInstructionStatus, additionalCancellationReasonInformation, counterpartyBic, swiftStatus1Reason1Code, gdiIdicatorValue, stp_indicator /*, account_standing_instructions*/ , stlpos_no, si_payment_indicator, link_indicator, local_security_code, customer_instruction_received, cash_payment_method, counterparty_cash_account_id, deal_price_currency, deal_price, external_reference, exchange_reference2, buyer_seller, u_client_s_deliverer_receiverer_account, receiver_deliverer_custodian_bic, counterparty_s_associate_account, priority, fxLocation, fxrTD, contractType, hold_matched_si_indicator, ent_opid, remarks, quantity_type, customer_cancellation_reference, security_account_type, u_fx_indicator, nssc, sett_type, iss_ind, reg, rgst_reg, counterparty_reference, switch_indicator, counterparty_cash_account_name, account_standing_instructions, suspense_account_number, exch_rate, trade_account_model, single_sided_indicator, si_purpose_code, propriety_code, data_source_scheme, commonID, fxcx, fx_inst_sts, av_indicator, cancellation_date, swift_sett_trans_cond, legacy_pre_state, bk_to_bk, receiverAccount, delivererAccount, buyerAccountIdentification, sellerAccountIdentification, pending_cancellation_support_indicator, contractual_indicator, pending_cancellation_indicator, si_proc_status, place_of_trad_mic, place_of_trad_typ_cod, secIDType /*, cap_id, exch_rate */ ) { //adding variables as part of MSSCUSTODY-3591  //MSSCUSTODY=3854 //GR5	//MSSCUSTODY-5992 //MSSCUSTODY-6479 //MSSCUSTODY-7123 //Added for MSSCUSTODY-7257 //MSSCUSTODY-7611 //MSSCUSTODY-7353  //MSSCUSTODY-8060 //MSSCUSTODY-6824
+        try {
+            var locationCodeTableRec, currencyCodeTableRec, currencyCodeTableRecNominal;
+            var reasonCodeTableRec = '';
+            var trDdt = new GlideDate();
+            trDdt.setValue(tradeDate);
+
+            //7302 -For retrieving the location code value from custody location code table
+            var locationCodes = locationCode + OwningBusinessName;
+            if ((this.locationCodeRecord[locationCodes] != undefined) && (locationCode != "")) {
+                locationCodeTableRec = this.locationCodeRecord[locationCodes]['locationCodeID'];
+            }
+
+
+            //For retrieving the settlement amount currency value from currency table
+            if ((this.currencyCodeTableRecord[settlementAmountCurrency] != undefined) && (settlementAmountCurrency != "")) {
+                currencyCodeTableRec = this.currencyCodeTableRecord[settlementAmountCurrency]['settlementAmountCurrency'];
+            }
+
+            //For retrieving the Nominal amount currency value from currency table
+            if ((this.currencyCodeTableRecord[transactionReferenceAmountCurrency] != undefined) && (transactionReferenceAmountCurrency != "")) {
+                currencyCodeTableRecNominal = this.currencyCodeTableRecord[transactionReferenceAmountCurrency]['settlementAmountCurrency'];
+            }
+
+            //7302-For retrieving the reason code value from reason code table
+            var reasonCode = legacyreasoncode + OwningBusinessName;
+            if ((this.reasonCodeRecord[reasonCode] != undefined) && (legacyreasoncode != "")) {
+                reasonCodeTableRec = this.reasonCodeRecord[reasonCode]['reasonCodeId'];
+            }
+
+            var crttrade = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_trade");
+            crttrade.initialize();
+            crttrade.trade_id = objectid;
+            crttrade.u_id = objectid; //MSSOTIQUBE-2572 Custody Redesign, populate Trade ID in sn_bom_trade
+            crttrade.legacy_status = legacystatus;
+            crttrade.legacy_sub_status = legacysubstatus;
+            crttrade.gdi_indicator = gdiindicator;
+            crttrade.cash_hold_indicator = cashholdindicator;
+            crttrade.script_hold_indicator = scriptholdindicator;
+            crttrade.other_business = OtherBusinessName;
+            crttrade.owning_business = OwningBusinessName;
+            crttrade.region = region;
+            crttrade.settlement_date = ExpectedSettlementDate; //No
+            crttrade.customer_reference = ClientTransactionIdentification;
+            crttrade.counterparty_code = CounterpartyCode;
+            crttrade.link_reference = linkedTransactionIdentification;
+            crttrade.securities_account = safekeepingAccountIdentification;
+            crttrade.security_id = financialInstrumentIdentificationPrimaryIdentifier;
+            crttrade.settlement_amount = settlementAmount;
+            crttrade.settlement_quantity = settlementQuantity;
+            crttrade.switch_account = internalAccountTransferAccountIdentification;
+            crttrade.switch_reference = internalAccountTransferTransactionIdentification;
+            crttrade.trade_date = trDdt;
+            crttrade.transaction_reference = systemTransactionIdenfication;
+            crttrade.transaction_type = sourceSystemTransactionType;
+            crttrade.instruction_source = sourceOfInstructionType;
+            crttrade.same_day_settlement_indicator = sameDaySettlementIndicator;
+            crttrade.trade_lifecycle_status = tradeCoreStatus;
+            crttrade.trade_cash_stock_status = tradeStockStatus;
+            crttrade.source_system_timestamp = eventdatetime;
+            crttrade.source_system = source;
+            crttrade.pool_reference = poolIdentification;
+            crttrade.associated_account = associatedAccountIdentification;
+            crttrade.associated_sub_account = associatedSubAccountIdentification;
+            crttrade.stp_cancelled_indicator = settlementInstructionCancellationStatus;
+            crttrade.market_code = locationDescription;
+            crttrade.reason_description_remarks_unex = additionalUnexecutionReasonInformation;
+            crttrade.location_code = locationCodeTableRec;
+            crttrade.settlement_amount_currency = currencyCodeTableRec;
+            crttrade.reason_code = reasonCodeTableRec;
+            crttrade.reason_code_description = this.getReasonCodeDescription(crttrade.reason_code, objectid, legacyreasoncode); //MSSCUSTODY-6201 //MSSCUSTODY-8224- added additional parameter for logging
+            crttrade.instruction_receipt_date_time = instructionDateTime;
+            crttrade.mss_trade_type = tradeType;
+            crttrade.u_repo_reference = repurchaseTransactionIdentification;
+            crttrade.u_repo_leg = repurchaseLegType;
+            crttrade.account_name = safekeepingAccountName;
+            crttrade.actual_settlement_date = effectiveSettlementDate;
+            crttrade.counterparty_name = counterpartyName;
+            crttrade.customer_id = customerIdentification;
+            crttrade.comm_ref = commonID //Added for MSSCUSTODY-7257
+            // MSSCUSTODY-3591
+            if (!(OwningBusinessName.contains('UK'))) {
+                crttrade.remarks = settlementInstructionProcessingAdditionalDetails;
+            }
+            crttrade.contractual_settlement_date = settlement_Date;
+            crttrade.security_name = financialInstrumentIdentificationDescription;
+            crttrade.source_system_time_stamp_market_time = sourceSystemLastUpdatedDateTime;
+            crttrade.cross_business_reference = crossBusinessTransactionIdentification;
+            crttrade.enitity_code = clientEntityIdentification;
+            crttrade.mis_group = clientGroupIdentification;
+            crttrade.nominal_settlement_amount = transactionReferenceAmount;
+            crttrade.nominal_settlement_currency = currencyCodeTableRecNominal;
+            crttrade.u_rtgs = securitiesRtgsIndicator; //MSSCUSTODY-3174 : Populate variable on Inbound
+            crttrade.stock_lending_indicator = securitiesLendingIndicator; //MSSCUSTODY-3174 : Populate variable on Inbound
+            crttrade.stock_borrowing_indicator = securitiesBorrowingIndicator; //MSSCUSTODY-3174 : Populate variable on Inbound
+            crttrade.cash_account_id = cashAccountIdentification; //MSSCUSTODY-4489: Added to populate Cash Account Identification
+
+            // MSSCUSTODY-3591
+            crttrade.stp_indicator = stp_indicator;
+            crttrade.stlpos_no = stlpos_no;
+            crttrade.si_payment_indicator = si_payment_indicator;
+            crttrade.link_indicator = link_indicator;
+            crttrade.local_security_code = local_security_code;
+            crttrade.customer_instruction_received = customer_instruction_received;
+            crttrade.cash_payment_method = cash_payment_method;
+            crttrade.counterparty_cash_account_id = counterparty_cash_account_id;
+            crttrade.counterparty_settlement_account_number = counterparty_cash_account_id; //added as a part of MSSCUSTODY-6523 Amend
+            crttrade.deal_price_currency = deal_price_currency;
+            crttrade.deal_price = deal_price;
+            crttrade.external_reference = external_reference;
+            crttrade.exchange_reference2 = exchange_reference2;
+            crttrade.buyer_seller = buyer_seller;
+            if (!(OwningBusinessName.contains('DCC UK'))) {
+                crttrade.u_client_s_deliverer_receiverer_account = u_client_s_deliverer_receiverer_account;
+            }
+            crttrade.receiver_deliverer_custodian_bic = receiver_deliverer_custodian_bic;
+            crttrade.counterparty_s_associate_account = counterparty_s_associate_account;
+            crttrade.isin = financialInstrumentIdentificationIsin;
+            crttrade.depository_reference = depositoryOrLocalCustodianIdentification;
+            crttrade.cash_account_id = cashAccountIdentification;
+            crttrade.buyer_seller_bic = buyerOrSellerBic;
+            crttrade.u_client_s_seller_buyer_account = buyerOrSellerAccountIdentification;
+            crttrade.a_c_of_client = buyerOrSellerAccountIdentification; //added as a part of MSSCUSTODY-6523 Amend
+            crttrade.place_of_settlement_95a_qualifier_pset = placeOfSettlementBic;
+            crttrade.hold_matched_si_indicator = hold_matched_si_indicator;
+            crttrade.quantity_type = quantity_type;
+            crttrade.data_source_scheme = data_source_scheme;
+            crttrade.propriety_code = propriety_code;
+            crttrade.si_purpose_code = si_purpose_code;
+            crttrade.customer_cancellation_reference = customer_cancellation_reference;
+            crttrade.security_account_type = security_account_type;
+            if (!(OwningBusinessName.contains('DCC HK'))) {
+                crttrade.u_fx_indicator = u_fx_indicator;
+            }
+            if ((OwningBusinessName.contains('HK'))) {
+                crttrade.nssc = nssc;
+            }
+            if ((OwningBusinessName.contains('TH'))) {
+                crttrade.sett_type = sett_type;
+            }
+            crttrade.iss_ind = iss_ind;
+            crttrade.reg = reg;
+            crttrade.rgst_reg = rgst_reg;
+            //MSSCUSTODY-6479
+            if ((OwningBusinessName.contains("DCC HK"))) {
+                crttrade.trade_account_model = trade_account_model;
+                crttrade.single_sided_indicator = single_sided_indicator;
+            }
+
+            //MSSCUSTODY-5992
+            crttrade.counterparty_reference = counterparty_reference;
+            crttrade.switch_indicator = switch_indicator;
+            crttrade.counterparty_cash_account_name = counterparty_cash_account_name;
+            crttrade.account_standing_instructions = account_standing_instructions;
+            crttrade.suspense_account_number = suspense_account_number;
+            crttrade.exch_rate = exch_rate;
+            //MSSCUSTODY-7611
+            crttrade.pending_cancellation_status = pending_cancellation_indicator;
+            crttrade.pend_canc_support_indicator = pending_cancellation_support_indicator;
+            crttrade.contractual_indicator = contractual_indicator;
+
+            //MSSCUSTODY-8060
+            if ((OwningBusinessName.contains('DCC KR'))) {
+                crttrade.si_proc_status = si_proc_status;
+            }
+
+            //MSSCUSTODY-7353
+            if ((OwningBusinessName.contains('GC HK'))) {
+                crttrade.u_fxcx_indicator = fxcx;
+                crttrade.u_fx_inst_sts = fx_inst_sts;
+                crttrade.a_v_indicator = av_indicator;
+            }
+
+            crttrade.cancellation_date = cancellation_date;
+            crttrade.swift_settlement_transaction_condition = swift_sett_trans_cond;
+            crttrade.legacy_previous_status = legacy_pre_state;
+            crttrade.bk_to_bk_info = bk_to_bk;
+            crttrade.swift_settlement_type_data_source_indicator = securitiesTransactionTypeCode;
+            crttrade.account_with_receiver_deliverer_custodian = receiverAccount + ' | ' + buyerAccountIdentification + ' / ' + delivererAccount + ' | ' + sellerAccountIdentification; // for non uk as per MSSCUSTODY-7353
+
+            //MSSCUSTODY-7353 ends here
+
+            //MSSCUSTODY-6824
+
+            crttrade.u_trade_94b_indicator = place_of_trad_typ_cod;
+            crttrade.market_exchange_code = place_of_trad_mic;
+            crttrade.security_id_type = secIDType;
+
+            //GR5
+            if (OwningBusinessName.contains('UK')) {
+                crttrade.propriety_code = counterpartyDataSourceSchemeCode;
+                crttrade.buyer_seller_data_source_scheme = buyerSellerDataSourceScheme;
+                crttrade.u_value_date = valueDate;
+                var vDdt = new GlideDate();
+                vDdt.setValue(valueDate);
+                crttrade.value_date = vDdt; // 5273, 7214 value date
+                crttrade.pos_reg = registrationCode;
+                crttrade.account_with_receiver_deliverer_custodian = buyerOrSellerAccountIdentification;
+                crttrade.pnd_canc = pendingCancelIationIndicator;
+                crttrade.remittance_currency = accountBaseCurrency;
+                crttrade.fx_status = fxInstructionStatus; //MSSCUSTODY-3854 P1B change, mapped to new field Fx status																									 
+                crttrade.amortised_value = settlementQuantity;
+                crttrade.reason_description_remarks_canc = additionalCancellationReasonInformation;
+                crttrade.counterparty_code = counterpartyBic;
+                crttrade.u_primary_swift_reason_code_1 = swiftStatus1Reason1Code;
+                crttrade.snis_crest = gdiIdicatorValue;
+                crttrade.swift = gdiIdicatorValue;
+                crttrade.settlement_date = settlement_Date; //added as a part of 4067 UDM - Settlement Date // similar mapping as contractual settlement date
+
+                // MSSCUSTODY-3854 P1B changes
+                crttrade.fx_location = fxLocation;
+                crttrade.fxr_td = fxrTD;
+                crttrade.priority = priority;
+                crttrade.contract_type = contractType;
+
+                // 3591
+                crttrade.ent_opid = ent_opid;
+                crttrade.remarks = remarks;
+
+                // MSSCUSTODY-4732
+                crttrade.trade_ccy = settlementAmountCurrency;
+                crttrade.acct_ccy = accountBaseCurrency;
+            }
+
+            return crttrade.insert();
+            //        }
+        } catch (e) {
+            gs.error("Error from Script Include MSS_Custody_Event_Utils - insertTradeRecord (for trade " + objectid + "): " + e.message);
+        }
+    },
+
+    //MSSCUSTODY-6201
+    getReasonCodeDescription: function(rcode, objectid, legacyreasoncode) { //MSSCUSTODY-8224 - object ID added extra
+        var description = '';
+        var grCode = new GlideRecord('x_hsb11_mss_c_proc_custody_reason_code');
+        grCode.addQuery('sys_id', rcode);
+        grCode.query();
+        if (grCode.next()) {
+            description = grCode.getValue('reason_code') + " - " + grCode.getValue('reason_description');
+        } else { //MSSCUSTODY-8224
+            var reasonCodeLog;
+            if (legacyreasoncode != '') {
+                reasonCodeLog = "-->Reason Code " + legacyreasoncode + " does not exsist in iQube so reason code description population failed" + "\n";
+                this.tradeInvalidDataLogs(reasonCodeLog, objectid);
+            } else {
+                reasonCodeLog = "-->Reason Code received as empty" + "\n";
+                this.tradeInvalidDataLogs(reasonCodeLog, objectid);
+            }
+        } //MSSCUSTODY-8224
+
+        return description.toString();
+
+    },
+
+    updateBPICore: function(gdt, objectid, objecttype, eventstatus, source, TechId, isException, eventdatetimeNumeric, OtherBusinessName, OwningBusinessName, businessProcess, terminal_stage, eventdatetime, ExpectedSettlementDate, locationDescription, isBatch, cDate, eventDate, stg_time, stg_status) {
+        try {
+            var initGdt = new GlideDateTime();
+            initGdt.setValue(gdt);
+
+            var initGdtINT = initGdt.getNumericValue();
+
+            var updBPI = new GlideRecord('x_hsb11_mss_custod_mss_custody_business_process_instance');
+            updBPI.addQuery('object_id', objectid);
+            updBPI.query();
+            if (updBPI.next()) {
+
+                updBPI.object_type = objecttype;
+                updBPI.source_system = source;
+                updBPI.other_business = OtherBusinessName;
+                updBPI.owning_business = OwningBusinessName;
+                updBPI.business_process_definition = businessProcess;
+                updBPI.recent_technical_uuid = TechId;
+                updBPI.settlement_date = ExpectedSettlementDate;
+                updBPI.market_code = locationDescription;
+                updBPI.unity_updated_timestamp = eventdatetimeNumeric;
+                updBPI.core_business_event_status = eventstatus;
+                updBPI.core_stage_reference = stg_status;
+                updBPI.core_source_system_last_update = eventdatetime;
+
+                if (isException == "true") {
+                    updBPI.is_core_status_exception = true;
+                    updBPI.is_batch = false;
+                    updBPI.core_expected_transition_time = '';
+                } else if (isBatch == "true") {
+                    updBPI.is_batch = true;
+
+                    if ((ExpectedSettlementDate < cDate) || (ExpectedSettlementDate < eventDate)) {
+                        updBPI.is_core_status_exception = true;
+                        updBPI.core_expected_transition_time = '';
+                    } else {
+                        //MSSCUSTODY-4281 include market value in the index when looking up the market batch record from the array
+                        var batchMarket = OwningBusinessName.split(' ');
+                        var market = batchMarket[1] + ' ' + batchMarket[0];
+
+                        if (this.marketBatchProcessStatus[eventstatus + market] != undefined) {
+
+
+                            var CoreExpectedTransitionTime = this.getCoreExpectedTransitionTime(eventstatus, market, eventdatetime, ExpectedSettlementDate, eventDate);
+
+                            if (CoreExpectedTransitionTime == 'Exception') {
+                                updBPI.is_core_status_exception = true;
+                                updBPI.core_expected_transition_time = '';
+                            } else {
+                                updBPI.is_core_status_exception = false;
+                                updBPI.core_expected_transition_time.setDisplayValue(CoreExpectedTransitionTime);
+                            }
+                        }
+                    }
+                } else if (stg_time != 0) {
+                    updBPI.is_core_status_exception = false;
+                    updBPI.is_batch = false;
+                    updBPI.core_expected_transition_time = initGdt;
+                } else {
+                    updBPI.is_core_status_exception = false;
+                    updBPI.is_batch = false;
+                    updBPI.core_expected_transition_time = '';
+                }
+
+                if (terminal_stage == "true") {
+                    updBPI.is_core_terminal_status = true;
+                } else {
+                    updBPI.is_core_terminal_status = false;
+                }
+
+                updBPI.update();
+            }
+        } catch (e) {
+            gs.error("Error from Script Include MSS_Custody_Event_Utils - updateBPICore (for trade " + objectid + "): " + e.message);
+        }
+    },
+
+    updateBPIStock: function(gdt, objectid, objecttype, eventstatus, source, TechId, isException, eventdatetimeNumeric, OtherBusinessName, OwningBusinessName, businessProcess, terminal_stage, eventdatetime, ExpectedSettlementDate, locationDescription, isBatch, cDate, eventDate, stg_time, stg_status) {
+        try {
+            var initGdt = new GlideDateTime();
+            initGdt.setValue(gdt);
+
+            var initGdtINT = initGdt.getNumericValue();
+
+            var updBPI = new GlideRecord('x_hsb11_mss_custod_mss_custody_business_process_instance');
+            updBPI.addQuery('object_id', objectid);
+            updBPI.query();
+            if (updBPI.next()) {
+
+                updBPI.object_type = objecttype;
+                updBPI.source_system = source;
+                updBPI.other_business = OtherBusinessName;
+                updBPI.owning_business = OwningBusinessName;
+                updBPI.business_process_definition = businessProcess;
+                updBPI.recent_technical_uuid = TechId;
+                updBPI.settlement_date = ExpectedSettlementDate;
+                updBPI.market_code = locationDescription;
+                updBPI.unity_updated_timestamp = eventdatetimeNumeric;
+                updBPI.stock_business_event_status = eventstatus;
+                updBPI.stock_stage_reference = stg_status;
+                updBPI.stock_source_system_last_update = eventdatetime;
+
+                if (isException == "true") {
+                    updBPI.is_stock_status_exception = true;
+                    updBPI.is_batch = false;
+                    updBPI.stock_expected_transition_time = '';
+                } else if (isBatch == "true") {
+                    updBPI.is_batch = true;
+
+                    if ((ExpectedSettlementDate < cDate) || (ExpectedSettlementDate < eventDate)) {
+                        updBPI.is_stock_status_exception = true;
+                        updBPI.stock_expected_transition_time = '';
+                    } else {
+                        //MSSCUSTODY-4281 include market value in the index when looking up the market batch record from the array
+                        var batchMarket = OwningBusinessName.split(' ');
+                        var market = batchMarket[1] + ' ' + batchMarket[0];
+
+                        if (this.marketBatchProcessStatus[eventstatus + market] != undefined) {
+
+                            var StockExpectedTransitionTime = this.getCoreExpectedTransitionTime(eventstatus, market, eventdatetime, ExpectedSettlementDate, eventDate);
+
+                            if (StockExpectedTransitionTime == 'Exception') {
+                                updBPI.is_stock_status_exception = true;
+                                updBPI.stock_expected_transition_time = '';
+                            } else {
+                                updBPI.is_stock_status_exception = false;
+                                updBPI.stock_expected_transition_time.setDisplayValue(StockExpectedTransitionTime);
+                            }
+
+                        }
+
+                    }
+                } else if (stg_time != 0) {
+                    updBPI.is_stock_status_exception = false;
+                    updBPI.is_batch = false;
+                    updBPI.stock_expected_transition_time = initGdt;
+
+                } else {
+                    updBPI.is_stock_status_exception = false;
+                    updBPI.is_batch = false;
+                    updBPI.stock_expected_transition_time = '';
+                }
+
+                if (terminal_stage == "true") {
+                    updBPI.is_stock_terminal_status = true;
+                } else {
+                    updBPI.is_stock_terminal_status = false;
+                }
+                updBPI.update();
+            }
+        } catch (e) {
+            gs.error("Error from Script Include MSS_Custody_Event_Utils - updateBPIStock (for trade " + objectid + "): " + e.message);
+        }
+    },
+
+    createBPICore: function(gdt, objectid, objecttype, eventstatus, source, TechId, isException, eventdatetimeNumeric, OtherBusinessName, OwningBusinessName, obj_sys_id, businessProcess, terminal_stage, eventdatetime, ExpectedSettlementDate, locationDescription, isBatch, cDate, eventDate, stg_time, stg_status) {
+
+        try {
+            var initGdt = new GlideDateTime();
+            initGdt.setValue(gdt);
+            var initGdtINT = initGdt.getNumericValue();
+            var crtBPI = new GlideRecord('x_hsb11_mss_custod_mss_custody_business_process_instance');
+            crtBPI.initialize();
+            crtBPI.object_id = objectid;
+            crtBPI.object_type = objecttype;
+            crtBPI.source_system = source;
+            crtBPI.other_business = OtherBusinessName;
+            crtBPI.owning_business = OwningBusinessName;
+            crtBPI.recent_technical_uuid = TechId;
+            crtBPI.trade_id = obj_sys_id;
+            crtBPI.trade_base = obj_sys_id; //MSSOTIQUBE-2572 Custody Redesign, populate Trade ID in sn_bom_trade
+            crtBPI.business_process_definition = businessProcess;
+            crtBPI.settlement_date = ExpectedSettlementDate;
+            crtBPI.market_code = locationDescription;
+            crtBPI.unity_updated_timestamp = eventdatetimeNumeric;
+            crtBPI.core_business_event_status = eventstatus;
+            crtBPI.core_stage_reference = stg_status;
+            crtBPI.core_source_system_last_update = eventdatetime;
+
+
+            if (isException == "true") {
+                crtBPI.is_core_status_exception = true;
+            } else if (isBatch == "true") {
+                crtBPI.is_batch = true;
+
+                if ((ExpectedSettlementDate < cDate) || (ExpectedSettlementDate < eventDate)) {
+                    crtBPI.is_core_status_exception = true;
+                } else {
+                    //MSSCUSTODY-4281 include market value in the index when looking up the market batch record from the array
+                    var batchMarket = OwningBusinessName.split(' ');
+                    var market = batchMarket[1] + ' ' + batchMarket[0];
+
+                    if (this.marketBatchProcessStatus[eventstatus + market] != undefined) {
+
+                        var CoreExpectedTransitionTime = this.getCoreExpectedTransitionTime(eventstatus, market, eventdatetime, ExpectedSettlementDate, eventDate);
+
+                        if (CoreExpectedTransitionTime == 'Exception') {
+                            crtBPI.is_core_status_exception = true;
+                        } else {
+                            //crtBPI.core_expected_transition_time = CoreExpectedTransitionTime;
+                            crtBPI.core_expected_transition_time.setDisplayValue(CoreExpectedTransitionTime);
+                        }
+                    }
+                }
+            } else if (stg_time != 0) {
+                crtBPI.core_expected_transition_time = initGdt;
+            }
+
+            if (terminal_stage == "true") {
+                crtBPI.is_core_terminal_status = true;
+            } else {
+                crtBPI.is_core_terminal_status = false;
+            }
+
+
+            crtBPI.insert();
+        } catch (e) {
+            gs.error("Error from Script Include MSS_Custody_Event_Utils - createBPICore (for trade " + objectid + "): " + e.message);
+        }
+    },
+
+    updateBPIEssentialCore: function(objectid, eventdatetime, eventdatetimeNumeric) {
+        try {
+            var updBPICore = new GlideRecord('x_hsb11_mss_custod_mss_custody_business_process_instance');
+            updBPICore.addQuery('object_id', objectid);
+            updBPICore.query();
+            if (updBPICore.next()) {
+                updBPICore.core_source_system_last_update = eventdatetime;
+                updBPICore.unity_updated_timestamp = eventdatetimeNumeric;
+                updBPICore.update();
+            } else { //MSSCUSTODY- 8224
+                var updBPICoreLog = "-->Unable to find BPI Core record and has failed updation " + "\n";
+                this.tradeInvalidDataLogs(updBPICoreLog, objectid);
+            } ////MSSCUSTODY- 8224
+
+        } catch (e) {
+            gs.error("Error from Script Include MSS_Custody_Event_Utils - updateBPIEssentialCore (for trade " + objectid + "): " + e.message);
+        }
+    },
+
+    updateBPIEssentialStock: function(objectid, eventdatetime) {
+        try {
+            var updBPIStock = new GlideRecord('x_hsb11_mss_custod_mss_custody_business_process_instance');
+            updBPIStock.addQuery('object_id', objectid);
+            updBPIStock.query();
+            if (updBPIStock.next()) {
+                updBPIStock.stock_source_system_last_update = eventdatetime;
+                updBPIStock.update();
+            } else { //MSSCUSTODY- 8224
+                var updBPIStockLog = "-->Unable to find BPI Stock record and has failed updation " + "\n";
+                this.tradeInvalidDataLogs(updBPIStockLog, objectid);
+            } ////MSSCUSTODY- 8224
+
+        } catch (e) {
+            gs.error("Error from Script Include MSS_Custody_Event_Utils - updateBPIEssentialStock (for trade " + objectid + "): " + e.message);
+        }
+    },
+
+    //MSSCUSTODY-4281 -- add market as input parameter in this function for looking up  market batch record, and taking the next day Batch timings for the screnario that all today's batch are already processed
+    getCoreExpectedTransitionTime: function(eventstatus, market, eventdatetime, ExpectedSettlementDate, eventDate) {
+        try {
+            //Fetch all the required variables from Market Bath Process table
+            var eventstatusmarket = eventstatus + market; //MSSCUSTODY-4281 -- include market in the index to look up the record in array
+            var settlementDateBatch = this.marketBatchProcessStatus[eventstatusmarket]['sDateBatch'];
+            var settlementDate1Batch = this.marketBatchProcessStatus[eventstatusmarket]['sDate1Batch'];
+            var settlementDate2Batch = this.marketBatchProcessStatus[eventstatusmarket]['sDate2Batch'];
+            var settlementDateafterBatch = this.marketBatchProcessStatus[eventstatusmarket]['sDateafterBatch'];
+
+            // MSSCUSTODY 5319 - Fetch values of Settlement date batch in market time and target after settlement date batch
+            var marketSettlementDateBatch = this.marketBatchProcessStatus[eventstatusmarket]['mSettlementDateBatch'];
+            var targetAfterSettlementDateBatch = this.marketBatchProcessStatus[eventstatusmarket]['tSDateafterBatch'];
+
+            //MSSCUSTODY-4727 
+            var schedule = this.marketBatchProcessStatus[eventstatusmarket]['sSchedule'];
+
+            var sluDate = new GlideDateTime(eventdatetime);
+            var sDate = sluDate.getLocalDate();
+            var settlmntDate = new GlideDateTime(ExpectedSettlementDate); //This will always come as same date but time to 00:00:00
+            var differenceIndate = GlideDateTime.subtract(sDate, settlmntDate).getDayPart();
+
+            //MSSCUSTODY-4727
+            var coreExpectedTransitionTime = 'Exception';
+
+            // MSSCUSTODY 5319 - Convert current time and settlement time to the same schedule
+            var currentTime = new GlideScheduleDateTime(eventdatetime);
+            currentTime.setTimeZone("UTC");
+            var settlementDateTime = new GlideDateTime(ExpectedSettlementDate);
+
+            // MSSCUSTODY 5319 - Convert current time to the market's time zone
+            var gdtCurrentTime = new GlideScheduleDateTime(currentTime);
+            gdtCurrentTime.setTimeZone(schedule);
+
+            // MSSCUSTODY 5319 - Convert settlement time to the market's time zone
+            var gdtSettlementDate = new GlideScheduleDateTime(settlementDateTime);
+            gdtSettlementDate.setTimeZone(schedule);
+
+
+            if ((differenceIndate >= 2 && gs.nil(settlementDate2Batch)) || (differenceIndate == 1 && gs.nil(settlementDate1Batch))) {
+                if (gs.nil(settlementDateBatch)) {
+                    //settlementDateBatch no value, check settlementDateafterBatch
+                    coreExpectedTransitionTime = this.caculateCoreExpectedTransDateTime(targetAfterSettlementDateBatch, ExpectedSettlementDate, schedule, -1, eventstatusmarket); // MSSCSUTODY 5319 - Updated function call with targetAfterSettlementDateBatch instead of settlementDateafterBatch ////MSSCUSTODY-6274
+                    return coreExpectedTransitionTime;
+                }
+                // MSSCUSTODY 5319 - Settlement Date-2 batch is empty then consider Settlement Date-1 batch as core expected transitition time if present
+                else if (!gs.nil(settlementDate1Batch)) {
+                    coreExpectedTransitionTime = this.caculateCoreExpectedTransDateTime(settlementDate1Batch, ExpectedSettlementDate, schedule, 0, eventstatusmarket); // MSSCSUTODY 5319 - Updated function call with targetAfterSettlementDateBatch instead of settlementDateafterBatch   ////MSSCUSTODY-6274
+                    return coreExpectedTransitionTime;
+                } else {
+                    // settlementDateBatch has value, could be exception ( SD 00:00), or first time of the batch.
+                    coreExpectedTransitionTime = this.caculateCoreExpectedTransDateTime(settlementDateBatch, ExpectedSettlementDate, schedule, 0, eventstatusmarket); ////MSSCUSTODY-6274
+                    return coreExpectedTransitionTime;
+                }
+            } else if ((differenceIndate > 2 && !gs.nil(settlementDate2Batch))) { // Added as part of MSSCUSTODY-7080
+                var parts = ExpectedSettlementDate.split("-");
+                var day = parseInt(parts[2], 10) - 2;
+                parts[2] = day.toString().padStart(2, '0');
+                var reducedSettlementDateStr = parts.join("-");
+                coreExpectedTransitionTime = this.caculateCoreExpectedTransDateTime(settlementDate2Batch, reducedSettlementDateStr, schedule, 2, eventstatusmarket); // MSSCSUTODY 5319 - Updated function call with targetAfterSettlementDateBatch instead of settlementDateafterBatch ////MSSCUSTODY-6274
+                return coreExpectedTransitionTime;
+            } else if (differenceIndate == 0) {
+                if (gs.nil(settlementDateBatch)) {
+                    //settlementDateBatch is blank, check settlementDateafterBatch
+                    coreExpectedTransitionTime = this.caculateCoreExpectedTransDateTime(targetAfterSettlementDateBatch, ExpectedSettlementDate, schedule, -1, eventstatusmarket); // MSSCSUTODY 5319 - Updated function call with targetAfterSettlementDateBatch instead of settlementDateafterBatch //MSSCUSTODY-6274
+                    return coreExpectedTransitionTime;
+                } else if (settlementDateBatch == 'Exception' || settlementDateBatch == 'aNaN') {
+                    // settlementDateBatch is Exception, create case immediately.
+                    return coreExpectedTransitionTime;
+                }
+                // has value return to original logic
+            } else if (gs.nil(targetAfterSettlementDateBatch)) {
+                //not expect.
+                gs.error("MSSCUSTODY-4727: differenceIndate:" + differenceIndate + ".settlementDate2Batch:" + settlementDate2Batch + ".settlementDate1Batch:" + settlementDate1Batch + ".settlementDateBatch:" + settlementDateBatch + ".settlementDateafterBatch:" + settlementDateafterBatch);
+                return coreExpectedTransitionTime;
+            }
+
+            var appropriateBatch;
+            var nextDayBatch;
+
+            if (differenceIndate == 0) {
+                appropriateBatch = settlementDateBatch;
+                nextDayBatch = targetAfterSettlementDateBatch;
+            } else if (differenceIndate == 1) {
+                appropriateBatch = settlementDate1Batch;
+                nextDayBatch = settlementDateBatch;
+            } else if (differenceIndate == 2) {
+                appropriateBatch = settlementDate2Batch;
+                nextDayBatch = settlementDate1Batch;
+            } else if (differenceIndate > 2) {
+                appropriateBatch = settlementDate2Batch;
+                nextDayBatch = settlementDate2Batch;
+            } else if (differenceIndate < 0) {
+                //appropriateBatch = 'Exception';  //MSSCUSTODY-4281 updated to take value from config instead of hardcode
+                appropriateBatch = targetAfterSettlementDateBatch;
+            }
+
+            //MSSCUSTODY 5319 - If the event time is after the settlement date batch time, create the case immediately
+            if (differenceIndate === 0 && marketSettlementDateBatch === '0000') {
+                if (gdtCurrentTime.getGlideDateTime().getNumericValue() > gdtSettlementDate.getGlideDateTime().getNumericValue()) {
+                    return 'Exception'; // Create the case immediately
+                }
+            }
+            if (appropriateBatch == 'Exception' || appropriateBatch == 'aNaN') { //MSSCUSTODY-4281 In market process config table, 'aNaN' may appear in the Target... filed, if its batch setup is 'Exception'
+
+                return 'Exception';
+            }
+
+            return this.getCoreExpectedTransDateTime(eventdatetime, ExpectedSettlementDate, appropriateBatch, nextDayBatch, eventstatusmarket, eventDate, schedule); // MSSCUSTODY 5319 - Added schedule in function declaration
+
+        } catch (e) {
+            gs.error("Error from Script Include MSS_Custody_Event_Utils - getCoreExpectedTransitionTime " + e.message);
+        }
+    },
+
+    //MSSCUSTODY-4727
+    //batchtype, 2, 1, 0 batch, -1 = after batch
+    caculateCoreExpectedTransDateTime: function(appropriateBatch, settlmntDate, schedule, batchType, eventstatusmarket) { ////MSSCUSTODY-6274
+        try {
+            //default if no rules matched. settlmntDate consider as local time.
+            var coreExpectedTransitionTime = 'Exception';
+            var marketSettlementBatch = this.marketBatchProcessStatus[eventstatusmarket]['mSettlementDateBatch'];
+            var settlementDateBatch = this.marketBatchProcessStatus[eventstatusmarket]['sDateBatch'];
+            //Sample: 0900,1100,1300,1500,1700
+            if (appropriateBatch.indexOf(',') > -1) {
+                var ttime = appropriateBatch.split(',');
+                var tt = ttime[0];
+                var hour = tt.slice(0, -2).padStart(2, '0');
+                var min = tt.slice(-2).padStart(2, '0');
+                var timef = hour + ":" + min + ":00"; // + sec;
+
+                var nxtTime = settlmntDate + " " + timef;
+                coreExpectedTransitionTime = new GlideDateTime(nxtTime);
+
+            } else if (appropriateBatch == 'Exception' || appropriateBatch == 'aNaN') {
+                //Set local time
+                var localSettlmntDate = new GlideDateTime(settlmntDate);
+                if (batchType == -1) {
+                    localSettlmntDate.addDaysLocalTime(1);
+                }
+                var gdtSettlmntDate = new GlideScheduleDateTime(localSettlmntDate);
+                gdtSettlmntDate.setTimeZone(schedule);
+                //gs.info("MSSCUSTODY-4727:1" + gdtSettlmntDate + ".schedule:" + schedule);
+
+                //convert to UKT
+                gdtSettlmntDate.setTimeZone("UTC");
+                //gs.info("MSSCUSTODY-4727:2" + gdtSettlmntDate + ".schedule:" + schedule);
+
+                coreExpectedTransitionTime = gdtSettlmntDate.getGlideDateTime(); //.getDisplayValue();
+            } else if ((appropriateBatch === settlementDateBatch) && marketSettlementBatch === '0000') { //MSSCUSTODY-6274
+                var hour = appropriateBatch.slice(0, -2).padStart(2, '0');
+                var min = appropriateBatch.slice(-2).padStart(2, '0');
+                var timef = hour + ":" + min + ":00";
+
+                var nxtTime = settlmntDate + " " + timef;
+
+                coreExpectedTransitionTime = new GlideDateTime(nxtTime);
+                coreExpectedTransitionTime.addDaysLocalTime(-1);
+            } else {
+                // MSSCUSTODY 5319 - Handle single batch value
+                var hour = appropriateBatch.slice(0, -2).padStart(2, '0');
+                var min = appropriateBatch.slice(-2).padStart(2, '0');
+                var timef = hour + ":" + min + ":00";
+
+                var nxtTime = settlmntDate + " " + timef;
+
+                coreExpectedTransitionTime = new GlideDateTime(nxtTime);
+                //   coreExpectedTransitionTime.addDaysLocalTime(-1);      ////MSSCUSTODY-6274
+            }
+            return coreExpectedTransitionTime;
+        } catch (e) {
+            gs.error("Error from Script Include MSS_Custody_Event_Utils - caculateCoreExpectedTransDateTime: " + e.message);
+        }
+    },
+
+    //MSSCUSTODY-4281 -- add market as input parameter of this function and used to look up the market batch record
+    getCoreExpectedTransDateTime: function(eventDateTime, settlementDate, appropriateBatch, nextDayBatch, eventstatusmarket, eventDate, schedule) { // MSSCUSTODY 5319 - Added schedule in function definition
+        try {
+            var offse;
+            try {
+                offse = this.marketBatchProcessStatus[eventstatusmarket]['offset'];
+            } catch (e) {
+                gs.error("Error from Script Include MSS_Custody_Event_Utils - offset retrieval: " + e.message);
+            }
+
+            var marketSettlementBatch, settlementDateafterBatch, targetAfterSettlementDateBatch, settlementDateBatch;
+            try {
+                // MSSCUSTODY 5319 - Fetch require values for Core Expected transition time calculation
+                marketSettlementBatch = this.marketBatchProcessStatus[eventstatusmarket]['mSettlementDateBatch'];
+                settlementDateafterBatch = this.marketBatchProcessStatus[eventstatusmarket]['sDateafterBatch'];
+                targetAfterSettlementDateBatch = this.marketBatchProcessStatus[eventstatusmarket]['tSDateafterBatch'];
+                settlementDateBatch = this.marketBatchProcessStatus[eventstatusmarket]['sDateBatch'];
+            } catch (e) {
+                gs.error("Error from Script Include MSS_Custody_Event_Utils - market batch process status retrieval: " + e.message);
+            }
+
+            var currentTime;
+
+            var dayLightFlag = gs.getProperty('x_hsb11_mss_custod.isDayLightsSavingOnMarketBatch');
+            var daylighthr;
+            var additionalhr = (dayLightFlag.toString() == 'true') ? 3600 : 0; // MSSCUSTODY-7080
+
+            if (offse) {
+                daylighthr = (parseInt(offse, 10) + additionalhr).toString();
+            } else {
+                daylighthr = additionalhr.toString();
+            }
+
+            try {
+                // MSSCUSTODY 5319 - Converted event time to UTC timezone
+                currentTime = new GlideScheduleDateTime(eventDateTime);
+                currentTime.setTimeZone("UTC");
+                currentTime.addSeconds(daylighthr);
+            } catch (e) {
+                gs.error("Error from Script Include MSS_Custody_Event_Utils - currentTime initialization: " + e.message);
+            }
+
+            var time, timeSplit, coreSSLUTimeInt;
+            try {
+                time = currentTime.getGlideDateTime().toString().split(" ")[1];
+                timeSplit = time.split(":");
+                coreSSLUTimeInt = timeSplit[0] + timeSplit[1];
+            } catch (e) {
+                gs.error("Error from Script Include MSS_Custody_Event_Utils - time parsing: " + e.message);
+            }
+
+            var isNextDate = false;
+            var nextAvailableTime = -1;
+
+            try {
+                //set value to nextAvailableTime if there're still batch(es) later today
+                if (appropriateBatch.indexOf(',') != -1) { // If Multiple Values are present differentiated via ,
+                    var ttime = appropriateBatch.split(',');
+
+                    for (var i = 0; i < ttime.length; i++) {
+                        if (coreSSLUTimeInt < ttime[i] && (nextAvailableTime === -1 || ttime[i] < nextAvailableTime)) {
+                            nextAvailableTime = ttime[i];
+                        }
+                    }
+                } else { // If a single value
+                    if (coreSSLUTimeInt < appropriateBatch) {
+                        nextAvailableTime = appropriateBatch;
+                    }
+                }
+
+            } catch (e) {
+                gs.error("Error from Script Include MSS_Custody_Event_Utils - nextAvailableTime calculation: " + e.message);
+            }
+
+            try {
+
+                // If a trade is received after the last batch, the trigger has to be based on the next rule
+                if (nextAvailableTime === -1) { // today's batch(es) are already processed
+                    isNextDate = true;
+
+                    if (!nextDayBatch || nextDayBatch == 'Exception' || nextDayBatch == 'aNaN') { //MSSCUSTODY-7186: Introduced additional checks for nextDayBatch
+                        return 'Exception';
+                    } else { // will be the earliest batch on the next day
+
+                        if (nextDayBatch.indexOf(',') != -1) { // If multiple values are present, differentiated via ','
+                            try {
+
+                                var ntime = nextDayBatch.split(',');
+                                for (var i = 0; i < ntime.length; i++) {
+                                    if (nextAvailableTime === -1 || ntime[i] < nextAvailableTime) {
+                                        nextAvailableTime = ntime[i];
+
+                                    }
+                                }
+                            } catch (e) {
+                                gs.error("Error from Script Include MSS_Custody_Event_Utils - getCoreExpectedTransDateTime - multiple values are present: " + e.message);
+                            }
+
+
+                        } else { // If a single value in the next day batch
+
+                            nextAvailableTime = nextDayBatch;
+                            try {
+                                // MSSCUSTODY 5319 - Added below logic to handle case creation when event comes on SD-1 after all batches are complete
+                                if ((nextAvailableTime === settlementDateBatch || nextAvailableTime === targetAfterSettlementDateBatch) &&
+                                    (marketSettlementBatch === '0000' || settlementDateafterBatch === '0000')) {
+
+
+                                    if (nextAvailableTime === settlementDateBatch) {
+                                        try {
+                                            var batchHour = settlementDateBatch.slice(0, 2);
+                                            var batchMinute = settlementDateBatch.slice(2, 4);
+                                            var batchTime = batchHour + ":" + batchMinute + ":00";
+
+                                            var adjustedDate = new GlideDateTime(settlementDate);
+                                            if (schedule === 'Europe/London') {
+                                                adjustedDate = adjustedDate.getLocalDate() + " " + batchTime;
+
+                                            } else {
+                                                adjustedDate.addDaysLocalTime(-1);
+                                                adjustedDate = adjustedDate.getLocalDate() + " " + batchTime;
+                                            }
+
+                                            var gdtSettlementDate = new GlideScheduleDateTime(adjustedDate);
+                                            gdtSettlementDate.setTimeZone(schedule);
+
+                                            return gdtSettlementDate;
+                                        } catch (e) {
+                                            gs.error("Error from Script Include MSS_Custody_Event_Utils - getCoreExpectedTransDateTime - nextAvailableTime === settlementDateBatch: " + e.message);
+                                        }
+
+                                    } else if (nextAvailableTime === targetAfterSettlementDateBatch) {
+                                        try {
+
+
+                                            var batchHour = targetAfterSettlementDateBatch.slice(0, 2);
+                                            var batchMinute = targetAfterSettlementDateBatch.slice(2, 4);
+                                            var batchTime = batchHour + ":" + batchMinute + ":00";
+
+                                            var adjustedDate = new GlideDateTime(settlementDate);
+                                            if (schedule === 'Europe/London') {
+                                                adjustedDate.addDaysLocalTime(1);
+                                            }
+                                            var settlementDateWithBatchTime = adjustedDate.getLocalDate() + " " + batchTime;
+
+
+                                            var gdtSettlementDate = new GlideScheduleDateTime(settlementDateWithBatchTime);
+                                            gdtSettlementDate.setTimeZone(schedule);
+
+
+                                            return gdtSettlementDate;
+                                        } catch (e) {
+                                            gs.error("Error from Script Include MSS_Custody_Event_Utils - getCoreExpectedTransDateTime - nextAvailableTime === targetAfterSettlementDateBatch: " + e.message);
+                                        }
+                                    }
+                                }
+                            } catch (e) {
+                                gs.error("Error from Script Include MSS_Custody_Event_Utils - getCoreExpectedTransDateTime - case creation when event comes on SD-1: " + e.message);
+                            }
+                        }
+                    }
+                }
+            } catch (e) {
+                gs.error("Error from Script Include MSS_Custody_Event_Utils - getCoreExpectedTransDateTime - next day batch processing: " + e.message);
+            }
+
+            var date;
+            try {
+                date = new GlideDateTime(eventDateTime);
+                if (isNextDate) {
+                    date.addDaysLocalTime(1);
+
+                }
+            } catch (e) {
+                gs.error("Error from Script Include MSS_Custody_Event_Utils - date adjustment: " + e.message);
+            }
+
+            var tt, hour, min, timef, nxtTime, coreExpectedTransitionTime;
+            try {
+
+                tt = nextAvailableTime.toString();
+                hour = tt.slice(0, -2).padStart(2, '0');
+                min = tt.slice(-2).padStart(2, '0');
+                timef = hour + ":" + min + ":00";
+
+                nxtTime = date.getDate().toString() + " " + timef;
+                coreExpectedTransitionTime = new GlideScheduleDateTime(nxtTime);
+                coreExpectedTransitionTime.setTimeZone("UTC");
+
+            } catch (e) {
+                gs.error("Error from Script Include MSS_Custody_Event_Utils - final transition time calculation: " + e.message);
+            }
+
+            return coreExpectedTransitionTime;
+
+        } catch (e) {
+            gs.error("Error from Script Include MSS_Custody_Event_Utils - getCoreExpectedTransDateTime: " + e.message);
+        }
+    },
+
+    //Below function is created as per MSSCUSTODY-3037: Create region field to trade form
+    getOwningBusinessRegion: function(OwningBusinessName, objectid) {
+        try {
+            var region = '';
+            var grRegion = new GlideRecord('x_hsb11_mss_c_proc_custody_location_code');
+            grRegion.addQuery('owning_business', OwningBusinessName);
+            grRegion.query();
+            if (grRegion.next()) { //MSSCUSTODY-8224 - added adtional bracket if was without bracket
+                region = grRegion.region;
+            } else { //MSSCUSTODY-8224 
+                var invalidMarketLog = "-->Region population failed due to missing record in Custody Location Codes for market " + OwningBusinessName + "\n";
+                this.tradeInvalidDataLogs(invalidMarketLog, objectid);
+            } //MSSCUSTODY-8224 
+            return region;
+        } catch (e) {
+            gs.error("Error from Script Include MSS_Custody_Event_Utils - getOwningBusinessRegion: " + e.message);
+        }
+    },
+
+    evalAmendCase: function(tradeId) {
+        try {
+            var getTrade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+            if (getTrade.get(tradeId)) {
+                var getCase = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_case');
+                getCase.addEncodedQuery('trade_id.sys_id=' + getTrade.sys_id + '^stateNOT IN3,4,7^amend_case=True^ORamend_case=confSettle'); //7964
+                getCase.query();
+                if (getCase.next()) {
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+            return false;
+        } catch (e) {
+            gs.error("Error from Script Include MSS_Custody_Event_Utils - evalAmendCase (for trade " + tradeId + "): " + e.message);
+        }
+    },
+
+    tradeInvalidDataLogs: function(newLog, tradeID) { //MSSCUSTODY-8224 - New function for logging details
+
+        try {
+            var finalLogs = [];
+            var logData = new GlideRecord('x_hsb11_mss_custod_mss_custody_event_inbound_staging');
+            logData.addEncodedQuery('object_id=' + tradeID);
+            logData.orderByDesc('sys_created_on');
+            logData.query();
+            if (logData.next()) {
+                if (logData.invalid_data == "") { //heading only for the very first time
+                    finalLogs.push("The below received data are not expected as per iQube Configuration/tradeDataConfigs property - x_hsb11_mss_custod.tradeDataConfigs  " + "\n");
+                }
+                finalLogs.push(logData.invalid_data)
+                finalLogs.push(newLog)
+                logData.invalid_data = finalLogs.toString().replaceAll(",", "")
+                logData.update();
+            }
+        } catch (ex) {
+            gs.info('Error Received from tradeInvalidDataLogs' + ex)
+        }
+
+    }, //MSSCUSTODY-8224 - New function for logging details
+
+
+    type: 'MSS_Custody_Event_Utils'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>45336668@hsbc.com</sys_created_by>
+        <sys_created_on>2023-07-03 16:46:38</sys_created_on>
+        <sys_id>c02ea13d1b7bed90ff37eb14b24bcb34</sys_id>
+        <sys_mod_count>1091</sys_mod_count>
+        <sys_name>MSS_Custody_Event_Utils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_c02ea13d1b7bed90ff37eb14b24bcb34</sys_update_name>
+        <sys_updated_by>45381533@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-12-08 06:50:23</sys_updated_on>
+    </sys_script_include>
+</record_update>

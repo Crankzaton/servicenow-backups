@@ -1,0 +1,483 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="sys_script">
+    <sys_script action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection>ecc_queue</collection>
+        <condition>current.agent == "RESTClient" &amp;&amp; current.queue == "input" &amp;&amp; (current.state=="ready" || current.state=="error" || current.state=="processed" ) &amp;&amp; current.source.indexOf(gs.getProperty("x_hsb11_mss_c_swft.hsbcmss_el_custodySwiftonDemand_api_url"))&gt;-1</condition>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>MSS Custody Swift SensorOnDemandResponse</name>
+        <order>100</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function executeRule(current, previous /*null when async*/ ) {
+
+    try {
+        //var mssCustodySwiftOutboundRec = current.response_to.agent_correlator.toString();
+        var agentCorrelator = current.response_to.agent_correlator.toString();
+        var splitArr = agentCorrelator.split("/");
+        var trade_sys_id;
+        var taskid = splitArr[0];
+        var Form = splitArr[1];
+        if (Form == "TaskForm") {
+            var Task = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_task");
+            Task.get(taskid);
+            trade_sys_id = Task.trade_id;
+        } else {
+            trade_sys_id = taskid;
+        }
+        var response = "";
+
+        var xmlDoc = new XMLDocument2();
+        xmlDoc.parseXML(current.payload.toString());
+
+
+        response = xmlDoc.getNodeText("//result/output");
+
+        var httpCodeNode = xmlDoc.getNode("//parameters/parameter");
+        var httpCode = httpCodeNode.getAttribute('value');
+        var responseBody = response.toString().replaceAll("\n", "\\n");
+
+        //To know whether we are calling this from Trade Form or from Auto Populate Flow
+        // MSSOTIQUBE- 2406 - optimising Swift onDemand on Task form
+        if (Form == "TradeForm" || Form == "TaskForm") {
+            if (httpCode != "200") {
+                var tradeData = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                if (tradeData.get(trade_sys_id)) {
+                    var swiftOnDemand = new GlideRecord('x_hsb11_mss_c_swft_mss_custody_swift_ondemand_staging');
+                    swiftOnDemand.addQuery("trade_reference", tradeData.sys_id);
+                    if (Form == "TaskForm") {
+                        swiftOnDemand.addQuery("task_reference", sys_id);
+                    }
+                    swiftOnDemand.addEncodedQuery("sys_created_onONLast 30 minutes@javascript:gs.beginningOfLast30Minutes()@javascript:gs.endOfLast30Minutes()");
+                    swiftOnDemand.query();
+                    if (swiftOnDemand.next()) { //Record already exists
+                        swiftOnDemand.request_body = 'hsbcTransactionIdentification=' + encodeURIComponent(tradeData.trade_id) + '&messageProcessingStatus=completed';
+                        swiftOnDemand.trade_reference = tradeData.sys_id;
+                        swiftOnDemand.state = "Error";
+                        swiftOnDemand.error_body = response;
+                        swiftOnDemand.response_code = httpCode;
+                        swiftOnDemand.response_body = response;
+                        swiftOnDemand.update();
+                    } else { //Create new error record in onDemand
+
+                        // MSSOTIQBUE - 2406
+                        if (Form == "TaskForm") {
+                            swiftOnDemand.initialize();
+                            swiftOnDemand.request_body = 'hsbcTransactionIdentification=' + encodeURIComponent(tradeData.trade_id) + '&messageProcessingStatus=completed';
+                            swiftOnDemand.trade_reference = tradeData.sys_id;
+                            swiftOnDemand.task_reference = taskid;
+                            swiftOnDemand.state = "Error";
+                            swiftOnDemand.response_body = response;
+                            swiftOnDemand.error_body = response;
+                            swiftOnDemand.response_code = httpCode;
+                            swiftOnDemand.insert();
+                        } else {
+                            swiftOnDemand.initialize();
+                            swiftOnDemand.request_body = 'hsbcTransactionIdentification=' + encodeURIComponent(tradeData.trade_id) + '&messageProcessingStatus=completed';
+                            swiftOnDemand.trade_reference = tradeData.sys_id;
+                            swiftOnDemand.state = "Error";
+                            swiftOnDemand.response_body = response;
+                            swiftOnDemand.error_body = response;
+                            swiftOnDemand.response_code = httpCode;
+                            swiftOnDemand.insert();
+                        }
+
+                    }
+
+                    // MSSOTIQUBE - 2406 - updating swfit attribute if triggered from task form
+                    if (Form == "TaskForm") {
+                        var taskRecord = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_task");
+                        taskRecord.get(taskid);
+                        taskRecord.swift_attribute_sync = "Response Un-Successful - Error";
+                        taskRecord.last_swift_refresh_date_time = new GlideDateTime();
+                        taskRecord.update();
+                    }
+                    if (httpCode.toString().startsWith('4')) {
+                        tradeData.swift_attribute_sync = "Response Un-Successful-400 Client Error";
+                        tradeData.last_swift_refresh_date_time = new GlideDateTime();
+                    } else if (httpCode.toString().startsWith('5')) {
+                        tradeData.swift_attribute_sync = "Response Un-Successful-500 Server Error";
+                        tradeData.last_swift_refresh_date_time = new GlideDateTime();
+                    } else {
+                        tradeData.swift_attribute_sync = "Response Un-Successful - Error";
+                        tradeData.last_swift_refresh_date_time = new GlideDateTime();
+                    }
+                    trade
+                    // tradeData.swift_attribute_sync = "Response Un-Successful - Error";
+                    // tradeData.last_swift_refresh_date_time = new GlideDateTime();
+                    tradeData.update();
+                }
+
+            } else if (responseBody == gs.getProperty("x_hsb11_mss_c_swft.swift_empty_response_body")) {
+                if (Form == "TradeForm") {
+                    var tradeDataResp = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                    if (tradeDataResp.get(trade_sys_id)) {
+                        tradeDataResp.swift_attribute_sync = "Response Success-All fields updated(200)";
+                        tradeDataResp.last_swift_refresh_date_time = new GlideDateTime();
+                        tradeDataResp.update();
+                        var swiftOnDemandResp = new GlideRecord('x_hsb11_mss_c_swft_mss_custody_swift_ondemand_staging');
+                        swiftOnDemandResp.addQuery("trade_reference", tradeDataResp.sys_id);
+                        swiftOnDemandResp.addEncodedQuery("sys_created_onONLast 30 minutes@javascript:gs.beginningOfLast30Minutes()@javascript:gs.endOfLast30Minutes()");
+                        swiftOnDemandResp.query();
+                        if (swiftOnDemandResp.next()) { //Record already exists
+                            swiftOnDemandResp.request_body = 'hsbcTransactionIdentification=' + encodeURIComponent(tradeDataResp.trade_id) + '&messageProcessingStatus=completed';
+                            swiftOnDemandResp.trade_reference = tradeDataResp.sys_id;
+                            swiftOnDemandResp.response_body = response;
+                            swiftOnDemandResp.state = "Processed";
+                            swiftOnDemandResp.response_code = '200';
+                            //  swiftOnDemandResp.error_body = response;
+                            swiftOnDemandResp.update();
+                        } else { //Create new error record in onDemand
+                            swiftOnDemandResp.initialize();
+                            swiftOnDemandResp.request_body = 'hsbcTransactionIdentification=' + encodeURIComponent(tradeDataResp.trade_id) + '&messageProcessingStatus=completed';
+                            swiftOnDemandResp.trade_reference = tradeDataResp.sys_id;
+                            swiftOnDemandResp.state = "Processed";
+                            swiftOnDemandResp.response_code = '200';
+                            swiftOnDemandResp.response_body = response;
+                            //   swiftOnDemandResp.error_body = response;
+                            swiftOnDemandResp.insert();
+                        }
+                    }
+                }
+
+                // MSSOTIQUBE - 2406 updating swfit attribute if triggered from task form
+                if (Form == "TaskForm") {
+
+                    var tradeDataResp = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                    var taskdataResp = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_task");
+                    if (tradeDataResp.get(trade_sys_id)) {
+                        tradeDataResp.swift_attribute_sync = "Response Success-All fields updated(200)";
+                        tradeDataResp.last_swift_refresh_date_time = new GlideDateTime();
+                        tradeDataResp.update();
+
+
+                        taskdataResp.get(taskid);
+                        taskdataResp.swift_attribute_sync = "Response Success-All fields updated(200)";
+                        //    taskdataResp.last_swift_refresh_date_time = new GlideDateTime();
+                        taskdataResp.update();
+
+                        var swiftOnDemandResp = new GlideRecord('x_hsb11_mss_c_swft_mss_custody_swift_ondemand_staging');
+                        swiftOnDemandResp.addQuery("trade_reference", tradeDataResp.sys_id);
+                        swiftOnDemandResp.addQuery("task_reference", taskdataResp.sys_id);
+                        swiftOnDemandResp.addEncodedQuery("sys_created_onONLast 30 minutes@javascript:gs.beginningOfLast30Minutes()@javascript:gs.endOfLast30Minutes()");
+                        swiftOnDemandResp.query();
+                        if (swiftOnDemandResp.next()) { //Record already exists
+                            swiftOnDemandResp.request_body = 'hsbcTransactionIdentification=' + encodeURIComponent(tradeDataResp.trade_id) + '&messageProcessingStatus=completed';
+                            swiftOnDemandResp.trade_reference = tradeDataResp.sys_id;
+                            swiftOnDemandResp.state = "Processed";
+                            swiftOnDemandResp.response_code = '200';
+                            swiftOnDemandResp.response_body = response;
+                            //   swiftOnDemandResp.error_body = response;
+                            swiftOnDemandResp.update();
+                        } else { //Create new error record in onDemand
+                            swiftOnDemandResp.initialize();
+                            swiftOnDemandResp.request_body = 'hsbcTransactionIdentification=' + encodeURIComponent(tradeDataResp.trade_id) + '&messageProcessingStatus=completed';
+                            swiftOnDemandResp.trade_reference = tradeDataResp.sys_id;
+                            swiftOnDemandResp.task_reference = taskdataResp.sys_id;
+                            swiftOnDemandResp.state = "Processed";
+                            swiftOnDemandResp.response_code = '200';
+                            swiftOnDemandResp.response_body = response;
+                            //    swiftOnDemandResp.error_body = response;
+                            swiftOnDemandResp.insert();
+                        }
+                    }
+
+                }
+
+
+            } else { //Case for 200 and Non Empty RESPONSE BODY
+                //new x_hsb11_mss_custod.MSSCustodyOnDemandCallUtils().updateSwiftMessageAPICall(trade_sys_id, task_sys_id, httpCode, responseBody);
+
+                var tradeDataSuccess = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                if (tradeDataSuccess.get(trade_sys_id)) {
+
+                    var respBodySuccess = JSON.parse(responseBody);
+                    tradeDataSuccess.swift_attribute_sync = "Response Success-All fields updated(200)";
+                    tradeDataSuccess.last_swift_refresh_date_time = new GlideDateTime(); // needs to be checked
+                    tradeDataSuccess.update();
+
+                    if (Form == "TaskForm") {
+                        var taskDataSuccess = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_task');
+                        taskDataSuccess.get(taskid);
+                        taskDataSuccess.swift_attribute_sync = "Response Success-All fields updated(200)";
+                        taskDataSuccess.last_swift_refresh_date_time = new GlideDateTime();
+                        taskDataSuccess.update();
+                    }
+                    for (var i = 0; i < respBodySuccess.data.length; i++) {
+                        var swiftMessageSuccess = new GlideRecord("x_hsb11_mss_c_swft_mss_custody_swift_messages");
+                        swiftMessageSuccess.addQuery("message_source_id", respBodySuccess.data[i].messageSourceIdentification);
+                        swiftMessageSuccess.addQuery("trade_base", trade_sys_id);
+                        swiftMessageSuccess.query();
+                        if (swiftMessageSuccess.next()) { //already exists
+                            swiftMessageSuccess.message_source_system = respBodySuccess.data[i].messageSourceSystemName;
+                            swiftMessageSuccess.message_source_id = respBodySuccess.data[i].messageSourceIdentification;
+                            swiftMessageSuccess.message_source_timestamp = respBodySuccess.data[i].messageSourceTimestamp;
+                            swiftMessageSuccess.message_channel = respBodySuccess.data[i].messageChannelType;
+                            swiftMessageSuccess.message_format = respBodySuccess.data[i].messageFormatType;
+                            swiftMessageSuccess.message_function_type = respBodySuccess.data[i].messageFunctionType;
+                            swiftMessageSuccess.message_status = respBodySuccess.data[i].messageProcessingStatus;
+                            swiftMessageSuccess.sender_id = respBodySuccess.data[i].senderIdentification;
+                            swiftMessageSuccess.owning_business = respBodySuccess.data[i].owningBusinessName;
+                            swiftMessageSuccess.exception_message_text = respBodySuccess.data[i].exceptionMessageText;
+                            swiftMessageSuccess.message_content = respBodySuccess.data[i].messageContentText;
+                            swiftMessageSuccess.trade_id = trade_sys_id;
+                            swiftMessageSuccess.trade_base = trade_sys_id; //Custody Redesign
+                            swiftMessageSuccess.update();
+                        } else { //create new swift message
+                            swiftMessageSuccess.initialize();
+                            swiftMessageSuccess.message_source_system = respBodySuccess.data[i].messageSourceSystemName;
+                            swiftMessageSuccess.message_source_id = respBodySuccess.data[i].messageSourceIdentification;
+                            swiftMessageSuccess.message_source_timestamp = respBodySuccess.data[i].messageSourceTimestamp;
+                            swiftMessageSuccess.message_channel = respBodySuccess.data[i].messageChannelType;
+                            swiftMessageSuccess.message_format = respBodySuccess.data[i].messageFormatType;
+                            swiftMessageSuccess.message_function_type = respBodySuccess.data[i].messageFunctionType;
+                            swiftMessageSuccess.message_status = respBodySuccess.data[i].messageProcessingStatus;
+                            swiftMessageSuccess.sender_id = respBodySuccess.data[i].senderIdentification;
+                            swiftMessageSuccess.owning_business = respBodySuccess.data[i].owningBusinessName;
+                            swiftMessageSuccess.exception_message_text = respBodySuccess.data[i].exceptionMessageText;
+                            swiftMessageSuccess.message_content = respBodySuccess.data[i].messageContentText;
+                            swiftMessageSuccess.trade_id = trade_sys_id;
+                            swiftMessageSuccess.trade_base = trade_sys_id; //Custody Redesign
+                            swiftMessageSuccess.insert();
+                        }
+                    }
+
+
+                }
+
+                var grSwftOnDemandSummary = new GlideRecord("x_hsb11_mss_c_swft_mss_custody_swift_ondemand_staging");
+                if (Form == "TaskForm") {
+                    grSwftOnDemandSummary.addQuery('task_reference', taskid);
+                }
+                grSwftOnDemandSummary.addEncodedQuery('refresh_end_timeISEMPTY^trade_reference=' + trade_sys_id);
+                grSwftOnDemandSummary.query();
+                if (grSwftOnDemandSummary.next()) {
+                    grSwftOnDemandSummary.refresh_end_time = new GlideDateTime();
+                    grSwftOnDemandSummary.response_body = response;
+                    grSwftOnDemandSummary.update();
+                }
+
+
+            }
+
+        }
+
+
+        // Call from Passive Trade 
+        else if (Form == 'TradeFormPassive') {
+
+            if (httpCode != "200") {
+                var tradeData = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade_passive');
+                if (tradeData.get(trade_sys_id)) {
+                    var swiftOnDemand = new GlideRecord('x_hsb11_mss_c_swft_mss_custody_swift_ondemand_staging');
+                    swiftOnDemand.addQuery("trade_base", tradeData.sys_id);
+                    swiftOnDemand.addEncodedQuery("sys_created_onONLast 30 minutes@javascript:gs.beginningOfLast30Minutes()@javascript:gs.endOfLast30Minutes()");
+                    swiftOnDemand.query();
+                    if (swiftOnDemand.next()) { //Record already exists
+                        swiftOnDemand.request_body = 'hsbcTransactionIdentification=' + encodeURIComponent(tradeData.trade_id) + '&messageProcessingStatus=completed';
+                        swiftOnDemand.trade_reference = tradeData.sys_id;
+                        swiftOnDemand.trade_base = tradeData.sys_id;
+                        swiftOnDemand.state = "Error";
+                        swiftOnDemand.error_body = response;
+                        swiftOnDemand.update();
+                    } else { //Create new error record in onDemand
+
+                        // MSSOTIQBUE - 2406
+
+                        swiftOnDemand.initialize();
+                        swiftOnDemand.request_body = 'hsbcTransactionIdentification=' + encodeURIComponent(tradeData.trade_id) + '&messageProcessingStatus=completed';
+                        swiftOnDemand.trade_reference = tradeData.sys_id;
+                        swiftOnDemand.trade_base = tradeData.sys_id;
+                        swiftOnDemand.state = "Error";
+                        swiftOnDemand.response_body = response;
+                        swiftOnDemand.error_body = response;
+                        swiftOnDemand.insert();
+
+
+                    }
+
+                    tradeData.swift_attribute_sync = "Response Un-Successful - Error";
+                    tradeData.last_swift_refresh_date_time = new GlideDateTime();
+                    tradeData.update();
+                }
+
+            } else if (responseBody == gs.getProperty("x_hsb11_mss_c_swft.swift_empty_response_body")) {
+
+                var tradeDataResp = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade_passive');
+                if (tradeDataResp.get(trade_sys_id)) {
+                    tradeDataResp.swift_attribute_sync = "Response Success-All fields updated(200)";
+                    tradeDataResp.last_swift_refresh_date_time = new GlideDateTime();
+                    tradeDataResp.update();
+                    var swiftOnDemandResp = new GlideRecord('x_hsb11_mss_c_swft_mss_custody_swift_ondemand_staging');
+                    swiftOnDemandResp.addQuery("trade_base", tradeDataResp.sys_id);
+                    swiftOnDemandResp.addEncodedQuery("sys_created_onONLast 30 minutes@javascript:gs.beginningOfLast30Minutes()@javascript:gs.endOfLast30Minutes()");
+                    swiftOnDemandResp.query();
+                    if (swiftOnDemandResp.next()) { //Record already exists
+                        swiftOnDemandResp.request_body = 'hsbcTransactionIdentification=' + encodeURIComponent(tradeDataResp.trade_id) + '&messageProcessingStatus=completed';
+                        swiftOnDemandResp.trade_reference = tradeDataResp.sys_id;
+                        swiftOnDemandResp.response_body = response;
+                        swiftOnDemandResp.state = "Processed";
+                        swiftOnDemandResp.response_code = '200';
+                        //  swiftOnDemandResp.error_body = response;
+                        swiftOnDemandResp.update();
+                    } else { //Create new error record in onDemand
+                        swiftOnDemandResp.initialize();
+                        swiftOnDemandResp.request_body = 'hsbcTransactionIdentification=' + encodeURIComponent(tradeDataResp.trade_id) + '&messageProcessingStatus=completed';
+                        swiftOnDemandResp.trade_reference = tradeDataResp.sys_id;
+                        swiftOnDemandResp.state = "Processed";
+                        swiftOnDemandResp.response_code = '200';
+                        swiftOnDemandResp.response_body = response;
+                        //   swiftOnDemandResp.error_body = response;
+                        swiftOnDemandResp.insert();
+                    }
+                }
+
+
+                // MSSOTIQUBE - 2406 updating swfit attribute if triggered from task form
+
+
+
+            } else { //Case for 200 and Non Empty RESPONSE BODY
+                //new x_hsb11_mss_custod.MSSCustodyOnDemandCallUtils().updateSwiftMessageAPICall(trade_sys_id, task_sys_id, httpCode, responseBody);
+
+                var tradeDataSuccess = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade_passive');
+                if (tradeDataSuccess.get(trade_sys_id)) {
+
+                    var respBodySuccess = JSON.parse(responseBody);
+                    tradeDataSuccess.swift_attribute_sync = "Response Success-All fields updated(200)";
+                    tradeDataSuccess.last_swift_refresh_date_time = new GlideDateTime(); // needs to be checked
+                    tradeDataSuccess.update();
+
+
+                    for (var i = 0; i < respBodySuccess.data.length; i++) {
+                        var swiftMessageSuccess = new GlideRecord("x_hsb11_mss_c_swft_mss_custody_swift_messages");
+                        swiftMessageSuccess.addQuery("message_source_id", respBodySuccess.data[i].messageSourceIdentification);
+                        swiftMessageSuccess.addQuery("trade_base", trade_sys_id);
+                        swiftMessageSuccess.query();
+                        if (swiftMessageSuccess.next()) { //already exists
+                            swiftMessageSuccess.message_source_system = respBodySuccess.data[i].messageSourceSystemName;
+                            swiftMessageSuccess.message_source_id = respBodySuccess.data[i].messageSourceIdentification;
+                            swiftMessageSuccess.message_source_timestamp = respBodySuccess.data[i].messageSourceTimestamp;
+                            swiftMessageSuccess.message_channel = respBodySuccess.data[i].messageChannelType;
+                            swiftMessageSuccess.message_format = respBodySuccess.data[i].messageFormatType;
+                            swiftMessageSuccess.message_function_type = respBodySuccess.data[i].messageFunctionType;
+                            swiftMessageSuccess.message_status = respBodySuccess.data[i].messageProcessingStatus;
+                            swiftMessageSuccess.sender_id = respBodySuccess.data[i].senderIdentification;
+                            swiftMessageSuccess.owning_business = respBodySuccess.data[i].owningBusinessName;
+                            swiftMessageSuccess.exception_message_text = respBodySuccess.data[i].exceptionMessageText;
+                            swiftMessageSuccess.message_content = respBodySuccess.data[i].messageContentText;
+                            swiftMessageSuccess.trade_id = trade_sys_id;
+                            swiftMessageSuccess.trade_base = trade_sys_id; // Custody Redesign
+                            swiftMessageSuccess.update();
+                        } else { //create new swift message
+                            swiftMessageSuccess.initialize();
+                            swiftMessageSuccess.message_source_system = respBodySuccess.data[i].messageSourceSystemName;
+                            swiftMessageSuccess.message_source_id = respBodySuccess.data[i].messageSourceIdentification;
+                            swiftMessageSuccess.message_source_timestamp = respBodySuccess.data[i].messageSourceTimestamp;
+                            swiftMessageSuccess.message_channel = respBodySuccess.data[i].messageChannelType;
+                            swiftMessageSuccess.message_format = respBodySuccess.data[i].messageFormatType;
+                            swiftMessageSuccess.message_function_type = respBodySuccess.data[i].messageFunctionType;
+                            swiftMessageSuccess.message_status = respBodySuccess.data[i].messageProcessingStatus;
+                            swiftMessageSuccess.sender_id = respBodySuccess.data[i].senderIdentification;
+                            swiftMessageSuccess.owning_business = respBodySuccess.data[i].owningBusinessName;
+                            swiftMessageSuccess.exception_message_text = respBodySuccess.data[i].exceptionMessageText;
+                            swiftMessageSuccess.message_content = respBodySuccess.data[i].messageContentText;
+                            swiftMessageSuccess.trade_id = trade_sys_id;
+                            swiftMessageSuccess.trade_base = trade_sys_id; // Custody Redesign
+                            swiftMessageSuccess.insert();
+                        }
+                    }
+
+
+                }
+
+                var grSwftOnDemandSummary = new GlideRecord("x_hsb11_mss_c_swft_mss_custody_swift_ondemand_staging");
+                grSwftOnDemandSummary.addEncodedQuery('refresh_end_timeISEMPTY^trade_base=' + trade_sys_id);
+                grSwftOnDemandSummary.query();
+                if (grSwftOnDemandSummary.next()) {
+                    grSwftOnDemandSummary.refresh_end_time = new GlideDateTime();
+                    grSwftOnDemandSummary.response_body = response;
+                    grSwftOnDemandSummary.update();
+                }
+
+
+            }
+
+        } else {
+            //Updated as part of 1813
+            var mssCustodySwiftOutboundRec = current.response_to.agent_correlator.toString();
+            var grMssCustodySwiftOutbound = new GlideRecord("x_hsb11_mss_c_swft_mss_custody_swift_ondemand_staging");
+            grMssCustodySwiftOutbound.get(mssCustodySwiftOutboundRec);
+            grMssCustodySwiftOutbound.response_date = current.sys_updated_on;
+            grMssCustodySwiftOutbound.response_body = response;
+            grMssCustodySwiftOutbound.response_code = httpCode;
+
+            //MSSCUSTODY-8428 to handle 504 or other errors
+            try {
+                var responseStringify = JSON.parse(response);
+                if (response && (response != '') && (response != null) && (response != undefined) && (response.indexOf('status') > -1) && (responseStringify.status)) {
+                    httpCode = responseStringify.status ? responseStringify.status : httpCode;
+                    grMssCustodySwiftOutbound.response_code = httpCode; //reassigning the actual error code received to reflect in ondemand
+                }
+            } catch (ex) {
+                gs.info('Received Response for swift_ondemand_staging' + response + ' Status code obtained ' + httpCode);
+            }
+            //MSSCUSTODY-8428 to handle 504 or other errors
+
+
+            if (httpCode == '200') {
+                grMssCustodySwiftOutbound.state = "Processed";
+
+            } else {
+                grMssCustodySwiftOutbound.state = "Error";
+                grMssCustodySwiftOutbound.error_body = response;
+            }
+
+            grMssCustodySwiftOutbound.update();
+
+        }
+
+
+    } catch (e) {
+        gs.info("1813 error while BR in ecc queue" + e.message);
+    }
+
+})(current, previous);]]></script>
+        <sys_class_name>sys_script</sys_class_name>
+        <sys_created_by>45307326@hsbc.com</sys_created_by>
+        <sys_created_on>2023-11-22 09:30:25</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>1a4dd7171bae7550ff37eb14b24bcb50</sys_id>
+        <sys_mod_count>36</sys_mod_count>
+        <sys_name>MSS Custody Swift SensorOnDemandResponse</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_1a4dd7171bae7550ff37eb14b24bcb50</sys_update_name>
+        <sys_updated_by>45423148@hsbc.com</sys_updated_by>
+        <sys_updated_on>2026-01-16 05:52:59</sys_updated_on>
+        <template/>
+        <when>after</when>
+    </sys_script>
+    <sys_translated_text action="delete_multiple" query="documentkey=1a4dd7171bae7550ff37eb14b24bcb50"/>
+</record_update>

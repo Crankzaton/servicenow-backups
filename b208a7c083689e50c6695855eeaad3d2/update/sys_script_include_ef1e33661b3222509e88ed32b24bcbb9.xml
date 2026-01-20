@@ -1,0 +1,741 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.MSSCustodyBulkProcessUtils</api_name>
+        <caller_access/>
+        <client_callable>true</client_callable>
+        <description>Created from MSSOTIQUBE-2464 for performance optimization on bulk activities</description>
+        <mobile_callable>false</mobile_callable>
+        <name>MSSCustodyBulkProcessUtils</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var MSSCustodyBulkProcessUtils = Class.create();
+MSSCustodyBulkProcessUtils.prototype = Object.extendsObject(global.AbstractAjaxProcessor, {
+
+    createBulkCaseTask: function() { //MSSOTIQUBE-2464
+        try {
+
+            var query = this.getParameter('sysparm_query'),
+                bulkId = this.getParameter('bulk_id'),
+                tskoutcome = this.getParameter("sysparm_outcome"),
+                parm1 = bulkId + '|' + tskoutcome,
+                tradeCount = this.getParameter("sysparm_tradeCount"),
+                threshold = gs.getProperty('x_hsb11_mss_c_proc.bulk_threshold_event_queue');
+
+            var grCustodyTrade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+            grCustodyTrade.addEncodedQuery(query);
+            grCustodyTrade.query();
+
+            if (parseInt(tradeCount, 10) > parseInt(threshold, 10) && gs.getProperty('x_hsb11_mss_c_proc.BulkEventQueue') == 'true') {
+                //If number of trades in the bulk is larger than threshold, use asyn event queue approach
+                var tradesArray = [],
+                    i = 0,
+                    tradesInSingleEvt = gs.getProperty('x_hsb11_mss_c_proc.number_of_items_in_bulk_event'); //number of trades to be processed via a single event for case creation
+
+                while (grCustodyTrade.next()) {
+                    tradesArray.push(grCustodyTrade.sys_id.toString());
+                    i++;
+                    if (i == tradesInSingleEvt) {
+                        gs.eventQueue("x_hsb11_mss_c_proc.cust_mmbulk_casecreat", current, parm1, tradesArray.join(','));
+                        //reset to initial
+                        i = 0;
+                        tradesArray = [];
+                    }
+                }
+
+                //create event for the remainings after loop completes
+                if (i > 0) {
+                    gs.eventQueue("x_hsb11_mss_c_proc.cust_mmbulk_casecreat", current, parm1, tradesArray.join(','));
+                }
+
+            } else {
+
+                //for small bulk, process in sequential right away
+                while (grCustodyTrade.next()) {
+                    var grcustodycase = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_case");
+                    grcustodycase.initialize();
+                    grcustodycase.short_description = 'Manually triggered by Bulk processing';
+                    grcustodycase.description = 'Manually triggered by Bulk processing';
+                    grcustodycase.trade_id = grCustodyTrade.sys_id;
+                    grcustodycase.bulk_id = bulkId;
+                    grcustodycase.triggered_by = '19c79fbb1ba30a10c6ada6c7b04bcbd5';
+                    grcustodycase.case_status = 'ec34a3731b270a10c6ada6c7b04bcb7a';
+                    if (tskoutcome == 'Amend Trade') { // fix for 7211- duplicate makers getting created (one from flow and oher from script)
+                        grcustodycase.amend_case = 'True';
+                    }
+                    grcustodycase.insert();
+
+                    //Create Maker Task as part of Amend
+                    if (tskoutcome == 'Amend Trade') {
+                        //var flowAPI = new sn_fd.FlowAPI();
+                        //var subflowSysId = '2b992c1e1bdcaa506ed00e1ad34bcbed';
+                        // var subflowName = 'x_hsb11_mss_c_proc.hsbccustodytrade_amend_maker'; // changes to fix 7211
+                        // var inputs = {};
+                        // inputs.re_initiate_process = false;
+                        // inputs.case_id = grcustodycase;
+                        // // sn_fd.FlowAPI.getRunner().subflow(subflowName).inBackground().withInputs(inputs).run();
+                        // new global.amendTaskCreation().createAmendMakerTask(subflowName,inputs);
+
+                        // if (!result) {
+                        //     gs.error('Failed to start subflow');
+                        // }
+                        try {
+                            // changes to fix 7211
+                            var amendTemplate = new global.JSON.parse(this.selectTaskTemplate('CUSTODYTTMP00126')); //Template selection
+                            var grcustodytask = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_task');
+                            grcustodytask.initialize();
+                            grcustodytask.trade_task_type = 'Maker';
+                            grcustodytask.short_description = amendTemplate.shortDescription; //deparsed from method selectTaskTemplate
+                            grcustodytask.description = amendTemplate.description; //deparsed from method selectTaskTemplate
+                            grcustodytask.trade_task_type = amendTemplate.trdTaskType;
+                            grcustodytask.trade_task_template_id = amendTemplate.templateID;
+                            grcustodytask.trade_id = grCustodyTrade.sys_id;
+                            grcustodytask.trade_case_id = grcustodycase.sys_id;
+                            grcustodytask.bulk_id = bulkId;
+                            grcustodytask.outcome = 'Amend Trade';
+                            grcustodytask.checker_decision = 'Amend';
+                            grcustodytask.follow_up = new GlideDateTime();
+                            grcustodytask.insert();
+
+                        } catch (ex) {
+                            gs.error('SI MSSCustodyBulkProcessUtils - Error while MM bulk case creation, bulkID amend trade:' + bulkId + ',error:' + ex.message);
+                        }
+                    }
+                    grCustodyTrade.case_type = 'manual';
+                    grCustodyTrade.update();
+                }
+            }
+
+        } catch (ex) {
+            gs.error('SI MSSCustodyBulkProcessUtils - Error while MM bulk case creation, bulkID:' + bulkId + ',error:' + ex.message);
+        }
+    },
+
+    selectTaskTemplate: function(tempNum) {
+        var taskTemplate = new GlideRecord('x_hsb11_mss_c_proc_custody_trade_task_template');
+        taskTemplate.addQuery('template_id', tempNum);
+        taskTemplate.query();
+        if (taskTemplate.next()) {
+            var tempContents = {
+                "description": taskTemplate.getValue("template_description"),
+                "shortDescription": taskTemplate.getValue("template_short_description"),
+                "trdTaskType": taskTemplate.getValue('trade_task_type'),
+                "templateID": taskTemplate.getValue('sys_id')
+            };
+            return JSON.stringify(tempContents);
+        }
+
+    },
+
+    updateMakerTask: function() { //MSSCUSTODY-3396 //MSSOTIQUBE-2465
+
+        try {
+            var bulkid = this.getParameter('sysparm_bulkid');
+            var assignmentgroup = this.getParameter('sysparm_assignmentgroup');
+            var assignedto = this.getParameter('sysparm_assignedto');
+            var outcome = this.getParameter('sysparm_outcome');
+            var advice = this.getParameter('sysparm_advice');
+            var reasoncode = this.getParameter('sysparm_reasoncode');
+            var reasondesc = this.getParameter('sysparm_reasondescription');
+            var suspend = this.getParameter('sysparm_suspend');
+            var cancelby = this.getParameter('sysparm_cancelby');
+            var setttype = this.getParameter('sysparm_settlementtype');
+            var bktobkinfo = this.getParameter('sysparm_bktobk');
+            var cancreference = this.getParameter('sysparm_cancellationreference');
+            var cancelcharge = this.getParameter('sysparm_collectcancelcharge');
+            //adding as part of 4901
+            var settDate = this.getParameter('sysparm_settDate');
+            var fxrTD = this.getParameter('sysparm_fxrTD');
+            var valDate = this.getParameter('sysparm_valDate');
+            var comments = this.getParameter('sysparm_comments'); // MSSCUSTODY-6379
+            var uploadType = this.getParameter('sysparm_uploadType'); // MSSCUSTODY-6821 // 7191
+            var tasksCount = this.getParameter('sysparm_tasksCount');
+
+            //MSSCUSTODY-6087
+            var fxcx = this.getParameter('sysparm_fxcx'); //MSSCUSTODY-6087
+            var gdi = this.getParameter('sysparm_gdi');
+
+            //MSSCUSTODY-7266
+            var subOutcome = this.getParameter('sysparm_subOutcome');
+            var transRef = this.getParameter('sysparm_transRef');
+            var transType = this.getParameter('sysparm_transType');
+            var legStatus = this.getParameter('sysparm_legStatus');
+            var switchRef = this.getParameter('sysparm_switchRef');
+            var counterpartyCode = this.getParameter('sysparm_counterpartyCode');
+            var trdSettDate = this.getParameter('sysparm_trdSettDate');
+            var trdLegStat = this.getParameter('sysparm_trdLegStat');
+            var trdLocCode = this.getParameter('sysparm_trdLocCode');
+            var trdQuantity = this.getParameter('sysparm_trdQuantity');
+            var trdScripHold = this.getParameter('sysparm_trdScripHold');
+            var trdSecAccnt = this.getParameter('sysparm_trdSecAccnt');
+            var trdSettAmt = this.getParameter('sysparm_trdSettAmt');
+            var trdSwitchAccnt = this.getParameter('sysparm_trdSwitchAccnt');
+            var trdTransRef = this.getParameter('sysparm_trdTransRef');
+            var trdTransType = this.getParameter('sysparm_trdTransType');
+
+            //MSSCUSTODY-7057
+            var transRefLink = this.getParameter('sysparm_transRefLink');
+            var gdiInd = this.getParameter('sysparm_gdiInd');
+            var holdInd = this.getParameter('sysparm_holdInd');
+            var settleInd = this.getParameter('sysparm_settleInd');
+
+            //
+            var linkRef = this.getParameter('sysparm_linRef');
+            var tranRef = this.getParameter('sysparm_dTranRef');
+            var dHold = this.getParameter('sysparm_dHold');
+            var dSettQntty = this.getParameter('sysparm_dSetllment');
+            var dLegacy = this.getParameter('sysparm_dLegacyStatus');
+            var dTxnType = this.getParameter('sysparm_dTxnType');
+
+            var threshold = gs.getProperty('x_hsb11_mss_c_proc.bulk_threshold_event_queue');
+
+            var makerTasks = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_task');
+            makerTasks.addEncodedQuery('active=true^trade_task_type=Maker^bulk_id=' + bulkid);
+            makerTasks.query();
+
+
+            if (parseInt(tasksCount, 10) > parseInt(threshold, 10) && gs.getProperty('x_hsb11_mss_c_proc.BulkEventQueue') == 'true') {
+
+                var obj = {
+                    bulkid: bulkid,
+                    assignmentgroup: assignmentgroup,
+                    assignedto: assignedto,
+                    outcome: outcome,
+                    advice: advice,
+                    reasoncode: reasoncode,
+                    reasondesc: reasondesc,
+                    suspend: suspend,
+                    cancelby: cancelby,
+                    setttype: setttype,
+                    bktobkinfo: bktobkinfo,
+                    cancreference: cancreference,
+                    cancelcharge: cancelcharge,
+                    settDate: settDate,
+                    fxrTD: fxrTD,
+                    valDate: valDate,
+                    comments: comments,
+                    uploadType: uploadType,
+
+                    //MSSCUSTODY-6087
+                    fxcx: fxcx,
+                    gdi: gdi,
+
+                    //MSSCUSTODY-7266
+                    subOutcome: subOutcome,
+                    transRef: transRef,
+                    transType: transType,
+                    legStatus: legStatus,
+                    switchRef: switchRef,
+                    counterpartyCode: counterpartyCode
+                };
+
+                var bulkInfo = JSON.stringify(obj);
+
+                //If number of Maker Task in the bulk is larger than threshold, use asyn event queue approach
+                var makerArray = [];
+                var j = 0;
+                var makerTaskinSingleEvent = gs.getProperty('x_hsb11_mss_c_proc.number_of_items_in_bulk_event'); //number of trades to be processed via a single event for case creation
+                while (makerTasks.next()) {
+                    makerArray.push(makerTasks.sys_id.toString());
+                    j++;
+
+                    if (j == makerTaskinSingleEvent) {
+                        gs.eventQueue("x_hsb11_mss_c_proc.cust_makertask_update", current, bulkInfo, makerArray.join(','));
+                        //reset to initial
+                        j = 0;
+                        makerArray = [];
+                    }
+                }
+
+                //create event for the remainings after loop completes
+                if (j > 0) {
+                    gs.eventQueue("x_hsb11_mss_c_proc.cust_makertask_update", current, bulkInfo, makerArray.join(','));
+                }
+
+                var evtName = "x_hsb11_mss_c_proc.cust_makertask_update";
+                var evtComplete = false;
+                var globalSleep = new global.MSSQuerySysEventQueue();
+
+                //loop to check all events are completed, after which will update the bulk record and release the session, due to an issue on form loading if maker opens the bulk form after submit but task update are still not complted
+                for (var i = 0; i < 50; i++) {
+                    globalSleep.sleepUtility(5000);
+                    evtComplete = new global.MSSQuerySysEventQueue().checkCustBulkEventState(evtName, bulkid);
+                    if (evtComplete == true) {
+                        break;
+                    }
+                }
+
+            } else {
+
+                while (makerTasks.next()) {
+                    if (outcome == 'Review and closed the task') { // MSSCUSTODY-3964 - Cancelling associated flow if outcome is review and close the task for manual.
+                        makerTasks.state = '3'; //closing related maker task
+                        makerTasks.assignment_group = assignmentgroup; //Populating assignment group
+                        makerTasks.assigned_to = assignedto; //Populating assigned to
+                        makerTasks.outcome = outcome;
+                        makerTasks.lock = false; //MSSCUSTODY-3993
+                        makerTasks.update();
+                        var grCusCase = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_case");
+                        grCusCase.addEncodedQuery('sys_id=' + makerTasks.trade_case_id + '^bulk_id=' + bulkid);
+                        grCusCase.query();
+                        if (grCusCase.next()) {
+                            grCusCase.state = '3';
+                            grCusCase.update();
+                        }
+
+                        new x_hsb11_mss_c_proc.MSSCustodyBulkUtils().cancelFlow(makerTasks.trade_case_id, 'Cancelling flow as state is Review and Close');
+                        makerTasks.work_notes = 'Cancelling flow as state is Review and Close'; // Updating work notes of Task
+                    } else {
+
+                        makerTasks.assignment_group = assignmentgroup; //Populating assignment group
+                        makerTasks.assigned_to = assignedto; //Populating assigned to
+                        makerTasks.outcome = outcome;
+                        makerTasks.advice = advice;
+                        if ((uploadType == '') || (uploadType == 'bulk_level')) {
+                            makerTasks.reason_code = reasoncode;
+                            makerTasks.reason_description = reasondesc;
+                            makerTasks.cancellation_reference = cancreference;
+                        }
+                        makerTasks.suspend = suspend;
+                        makerTasks.cancel_by = cancelby; // for outcome 'Process Trade Cancellation'
+                        makerTasks.settlement_type = setttype; // for outcome 'Settle Trade'
+                        makerTasks.bk_to_bk_info = bktobkinfo;
+                        makerTasks.collect_cancel_charge = cancelcharge;
+                        makerTasks.state = '3'; //closing related maker task
+                        makerTasks.lock = false; //MSSCUSTODY-3993
+
+                        // MSSCUSTODY-6379
+                        makerTasks.work_notes = comments;
+
+                        //MSSCUSTODY-6087
+                        makerTasks.fx_cx = fxcx;
+                        makerTasks.gdi_indicator = gdi;
+
+                        //MSSCUSTODY-7266
+                        makerTasks.bulk_id.sub_outcome = subOutcome;
+                        makerTasks.bulk_id.transaction_reference = transRef;
+                        makerTasks.bulk_id.transaction_type_display = transType;
+                        makerTasks.bulk_id.legacy_status_display = legStatus;
+                        makerTasks.bulk_id.pair_switch_reference = switchRef;
+                        makerTasks.bulk_id.switch_counterparty_code = counterpartyCode;
+
+                        //MSSCUSTODY-7057
+                        makerTasks.bulk_id.transaction_reference_link = transRefLink;
+                        makerTasks.bulk_id.amend_gdi_indicator = gdiInd;
+                        makerTasks.bulk_id.amend_cash_hold_indicator = holdInd;
+                        makerTasks.bulk_id.settle_link = settleInd;
+
+                        //added as part of 4901
+                        if ((makerTasks.trade_id.contract_type == 'C') && (outcome == 'Confirm Trade')) {
+                            makerTasks.value_date = valDate;
+                        } else if ((makerTasks.trade_id.contract_type != 'C') && (outcome == 'Confirm Trade')) {
+                            makerTasks.value_date = "";
+                        } else if ((makerTasks.trade_id.owning_business == 'GC HK') && (outcome == 'Settle Trade')) { //MSSCUSTODY-7754
+                            makerTasks.value_date = valDate;
+                        } else if ((makerTasks.trade_id.contract_type == 'A') && (outcome == 'Settle Trade')) {
+                            makerTasks.value_date = valDate;
+                        } else if ((makerTasks.trade_id.contract_type != 'A') && (outcome == 'Settle Trade')) {
+                            makerTasks.value_date = "";
+                        } else if (((makerTasks.trade_id.fx_location == 'L') || (makerTasks.trade_id.fx_location == 'O')) && (outcome == 'Process Trade Cancellation')) {
+                            makerTasks.fxr_td = fxrTD;
+                        } else if ((makerTasks.trade_id.fx_location != 'L') && (makerTasks.trade_id.fx_location != 'O') && (outcome == 'Process Trade Cancellation')) {
+                            makerTasks.fxr_td = "";
+                        }
+                        makerTasks.settlement_date = settDate;
+                        makerTasks.update();
+                    }
+                }
+            }
+
+            //update bulk record after all tasks are processed 
+            var grbulk = new GlideRecord("x_hsb11_hsbc_mss_o_hsbc_bulk_transaction");
+            grbulk.addQuery("sys_id", bulkid);
+            grbulk.query();
+            if (grbulk.next()) {
+                if (grbulk.outcome == 'Review and closed the task') {
+                    grbulk.bulk_task_type = 'GHSS Handler';
+                } else {
+                    grbulk.bulk_task_type = 'Checker';
+                }
+                grbulk.current_maker_assignee = assignedto;
+                grbulk.maker_assignment_group = assignmentgroup;
+                grbulk.new_maker_task_assignee = assignedto;
+                grbulk.outcome = outcome;
+                grbulk.advice = advice;
+                grbulk.reason_code = reasoncode;
+                grbulk.reason_description = reasondesc;
+                grbulk.suspend = suspend;
+                grbulk.cancel_by = cancelby;
+                grbulk.settlement_type = setttype;
+                grbulk.bk_to_bk_info = bktobkinfo;
+                grbulk.cancellation_reference = cancreference;
+                grbulk.collect_cancel_charge = cancelcharge;
+                grbulk.assigned_to = '';
+                grbulk.lock = false; //MSSCUSTODY-3993
+                //adding as part of 4901
+                grbulk.settlement_date = settDate;
+                grbulk.fxr_td = fxrTD;
+                grbulk.value_date = valDate;
+                grbulk.comments = comments; // MSSCUSTODY-6379
+
+                //MSSCUSTODY-6087
+                grbulk.fx_cx = fxcx;
+                grbulk.gdi = gdi;
+
+                //MSSCUSTODY-7266
+                grbulk.sub_outcome = subOutcome;
+                grbulk.transaction_reference = transRef;
+                grbulk.transaction_type_display = transType;
+                grbulk.legacy_status_display = legStatus;
+                grbulk.pair_switch_reference = switchRef;
+                grbulk.switch_counterparty_code = counterpartyCode;
+                grbulk.trade_settlement_date = trdSettDate;
+                grbulk.trade_legacy_status = trdLegStat;
+                grbulk.trade_location_code = trdLocCode;
+                grbulk.trade_quantity = trdQuantity;
+                grbulk.trade_scrip_hold_indicator = trdScripHold;
+                grbulk.trade_securities_account = trdSecAccnt;
+                grbulk.trade_settlement_amount = trdSettAmt;
+                grbulk.trade_switch_account = trdSwitchAccnt;
+                grbulk.trade_transaction_reference = trdTransRef;
+                grbulk.trade_transaction_type = trdTransType;
+
+                //MSSCUSTODY-7057
+                grbulk.transaction_reference_link = transRefLink;
+                grbulk.amend_gdi_indicator = gdiInd;
+                grbulk.amend_cash_hold_indicator = holdInd;
+                grbulk.settle_link = settleInd;
+
+                //MSSCUSTODY-8162
+                grbulk.trade_link_reference = linkRef;
+                grbulk.d_transaction_reference = tranRef;
+                grbulk.d_transaction_type = dTxnType;
+                grbulk.d_settlement_quantity = dSettQntty;
+                grbulk.d_legacy_status = dLegacy;
+                grbulk.d_hold_indicator = dHold;
+
+
+                grbulk.update();
+            }
+
+            return true;
+
+        } catch (ex) {
+            gs.error('SI MSSCustodyBulkProcessUtils - Error while processing maker tasks, bulkID:' + bulkid + ',error:' + ex.message);
+        }
+    },
+
+    //MSSCUSTODY-7111
+    getCheckerTasks: function(bulkId) {
+        try {
+            var bulkGR = new GlideRecord('x_hsb11_hsbc_mss_o_hsbc_bulk_transaction');
+            if (!bulkGR.get(bulkId)) return 'Bulk record not found';
+
+            var activeTradeCount = parseInt(bulkGR.active_trade_count, 10) || 0;
+            var status = bulkGR.processing_status + '';
+            var checkerCount = 0;
+            var newStatus = '';
+
+            // Count active Checker tasks in state 1 or 2 for this bulk
+            var ga = new GlideAggregate('x_hsb11_mss_c_proc_mss_custody_task');
+            ga.addEncodedQuery('bulk_id=' + bulkId + '^trade_task_type=Checker^active=true^stateIN1,2');
+            ga.addAggregate('COUNT');
+            ga.query();
+            if (ga.next()) {
+                checkerCount = ga.getAggregate('COUNT');
+            }
+
+            // Set new status based on count
+            if (checkerCount == activeTradeCount) {
+                newStatus = "Checker Tasks linking completed: " + checkerCount + " / " + activeTradeCount + " Tasks linked.";
+            } else {
+                newStatus = "Checker Tasks are in progress: " + checkerCount + " / " + activeTradeCount + " Tasks linked. Please refresh the page.";
+            }
+
+            // Only update if status has changed
+            if (bulkGR.processing_status !== newStatus) {
+                bulkGR.processing_status = newStatus;
+                bulkGR.update();
+            }
+            return newStatus;
+        } catch (e) {
+            gs.info('Error in getCheckerTasks for processing status of bulk: ' + e.message);
+            return '';
+        }
+    },
+    //MSSCUSTODY-7111
+    getGHSSHandlerTasks: function(bulkId) {
+        try {
+            var bulkGR = new GlideRecord('x_hsb11_hsbc_mss_o_hsbc_bulk_transaction');
+            if (!bulkGR.get(bulkId)) return 'Bulk record not found';
+
+            var activeTradeCount = parseInt(bulkGR.active_trade_count, 10) || 0;
+            var status = bulkGR.processing_status + '';
+            var newStatus = '';
+            var handlerCount = 0;
+
+            // Count active GHSS Handler tasks for this bulk
+            var ga = new GlideAggregate('x_hsb11_mss_c_proc_mss_custody_task');
+            ga.addEncodedQuery('bulk_id=' + bulkId + '^trade_task_type=GHSS Handler^active=true');
+            ga.addAggregate('COUNT');
+            ga.query();
+            if (ga.next()) {
+                handlerCount = ga.getAggregate('COUNT');
+            }
+
+            // Set new status based on count
+            if (handlerCount == activeTradeCount) {
+                newStatus = "Handler Tasks linking completed.";
+            } else {
+                newStatus = "Handler Tasks are in progress. Please refresh the page.";
+            }
+
+            // Only update if status has changed
+            if (bulkGR.processing_status !== newStatus) {
+                bulkGR.processing_status = newStatus;
+                bulkGR.update();
+            }
+            return newStatus;
+        } catch (e) {
+            gs.info("Error in getGHSSHandlerTasks for processing status of bulk: " + e.message);
+            return '';
+        }
+    },
+
+    //MSSCUSTODY-7111
+    getMakerTasks: function(bulkId) {
+        try {
+            var bulkGR = new GlideRecord('x_hsb11_hsbc_mss_o_hsbc_bulk_transaction');
+            if (!bulkGR.get(bulkId)) return '';
+
+            var makerCount = 0;
+            var totalTrades = parseInt(bulkGR.active_trade_count, 10) || 0;
+            var status = bulkGR.processing_status + '';
+            var decisionReason = bulkGR.decision_reason.toString();
+            var newStatus = '';
+
+            // If decision reason exists, count rejected/automation failed tasks
+            if (decisionReason !== '') {
+                if (decisionReason.indexOf('Handler Rejected') !== -1) {
+                    // Handler Rejected logic
+                    var gar = new GlideAggregate('x_hsb11_mss_c_proc_mss_custody_task');
+                    gar.addEncodedQuery('bulk_id=' + bulkId + '^trade_task_type=Maker^active=true^stateIN1,2');
+                    gar.addAggregate('COUNT');
+                    gar.query();
+                    if (gar.next()) {
+                        makerCount = gar.getAggregate('COUNT');
+                    }
+                    newStatus = 'Maker Tasks linked for : ' + makerCount + ' Rejected Handlers';
+                } else {
+                    // Checker Rejected logic
+                    var gr = new GlideAggregate('x_hsb11_mss_c_proc_mss_custody_task');
+                    gr.addEncodedQuery('active=true^trade_task_type=Maker^sub_trade_task_type=Checker-Rejected^bulk_id=' + bulkId);
+                    gr.addAggregate('COUNT');
+                    gr.query();
+                    if (gr.next()) {
+                        makerCount = gr.getAggregate('COUNT');
+                    }
+                    newStatus = 'Maker Task linked for : ' + makerCount + ' rejected tasks.';
+                }
+            } else {
+                var ga = new GlideAggregate('x_hsb11_mss_c_proc_mss_custody_task');
+                ga.addEncodedQuery('bulk_id=' + bulkId + '^trade_task_type=Maker^active=true^stateIN1,2');
+                ga.addAggregate('COUNT');
+                ga.query();
+                if (ga.next()) {
+                    makerCount = ga.getAggregate('COUNT');
+                }
+                if (makerCount == totalTrades) {
+                    newStatus = 'Maker Tasks linking completed: ' + makerCount + ' / ' + totalTrades + ' Tasks linked.';
+                } else {
+                    newStatus = 'Maker Tasks are in progress: ' + makerCount + ' / ' + totalTrades + ' Tasks linked. Please refresh the page.';
+                }
+            }
+
+            // Only update if status has changed
+            if (bulkGR.processing_status !== newStatus) {
+                bulkGR.processing_status = newStatus;
+                bulkGR.update();
+            }
+            return newStatus;
+        } catch (e) {
+            gs.info('Error in getMakerTasks for processing status of bulk: ' + e.message);
+            return '';
+        }
+    },
+
+
+
+
+    getBulkTaskType: function() {
+        var bulkId = this.getParameter('sysparm_sys_id');
+        var bulkGR = new GlideRecord('x_hsb11_hsbc_mss_o_hsbc_bulk_transaction');
+        if (bulkGR.get(bulkId)) {
+            return bulkGR.bulk_task_type + "";
+        }
+
+    },
+    //MSSCUSTODY-7111
+    bulkProcess: function() {
+        try {
+            var bulkId = this.getParameter('sysparm_sys_id');
+            var bulkGR = new GlideRecord('x_hsb11_hsbc_mss_o_hsbc_bulk_transaction');
+            if (bulkGR.get(bulkId)) {
+                var bulkTaskType = (bulkGR.bulk_task_type + '').trim();
+                switch (bulkTaskType) {
+                    case 'Maker':
+                        return this.getMakerTasks(bulkId);
+                    case 'Checker':
+                        return this.getCheckerTasks(bulkId);
+                    case 'GHSS Handler':
+                        return this.getGHSSHandlerTasks(bulkId);
+                }
+                return '';
+            }
+        } catch (e) {
+            gs.info('Error in bulkProcess for processing status of bulk: ' + e.message);
+            return '';
+        }
+    },
+
+    getActiveTradeCount: function() {
+        try {
+            var bulkId = this.getParameter('sysparm_sys_id');
+            var bulkGR = new GlideRecord('x_hsb11_hsbc_mss_o_hsbc_bulk_transaction');
+            if (bulkGR.get(bulkId))
+                return bulkGR.active_trade_count + '';
+        } catch (e) {
+            gs.info('Error in processing status of bulk: ' + e.message);
+            return '';
+        }
+    },
+
+    //MSSCUSTODY-7111
+    getProcessingStatus: function() {
+        try {
+            var bulkId = this.getParameter('sysparm_sys_id');
+            var bulkGR = new GlideRecord('x_hsb11_hsbc_mss_o_hsbc_bulk_transaction');
+            if (bulkGR.get(bulkId))
+                return bulkGR.processing_status + '';
+        } catch (e) {
+            gs.info('Error in processing status of bulk: ' + e.message);
+            return '';
+        }
+    },
+
+    //MSSOTIQUBE-2539 --> Optimized function to update cases and tasks in bulk as part of Performance optimization
+    RemoveMakerTask: function() { //MSSCUSTODY-3546
+
+        try {
+            var bulkID = this.getParameter('sysparm_bulkID'); //get the passed bulk_id
+            var taskID = this.getParameter('sysparm_taskID'); //get the passed array of sys_ids
+
+            if (!taskID) {
+                return;
+            }
+
+            var caseIds = []; // To store case IDs for tasks
+            var tradeCaseId = "";
+
+            var gCustodyTask = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_task'); // Common GlideRecord object
+            gCustodyTask.addEncodedQuery('sys_idIN' + taskID); // Query tasks with the provided sys_ids
+            gCustodyTask.setLimit(1); // Only fetch one record
+            gCustodyTask.query();
+
+            //MSSOTIQUBE-2539 --> Fetching case type (Automated/Manual) only once
+            var caseType = "";
+            if (gCustodyTask.next()) {
+                caseType = gCustodyTask.trade_id.case_type; // Fetch the case type directly
+            }
+
+            gCustodyTask.initialize();
+            gCustodyTask.addEncodedQuery('sys_idIN' + taskID); // Query tasks again with the provided sys_ids
+            gCustodyTask.query();
+
+            while (gCustodyTask.next()) {
+                tradeCaseId = gCustodyTask.getValue('trade_case_id'); // Fetch trade_case_id
+                if (tradeCaseId)
+                    caseIds.push(tradeCaseId); // Collect all case IDs
+            }
+            if (caseType == 'manual') {
+                // ------Process Manual cases in bulk------
+                var gCustodyManualCase = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_case');
+                gCustodyManualCase.addQuery('sys_id', 'IN', caseIds.join(',')); // Query for manual cases
+                // Set the values for the fields to be updated
+                gCustodyManualCase.setValue('state', '3'); // Set state to 'closed'
+                gCustodyManualCase.setValue('active', 'false'); // Mark case as inactive
+                gCustodyManualCase.updateMultiple(); // Perform bulk update
+
+                // ------Process Manual tasks in bulk------
+                gCustodyTask.initialize(); // Reuse the common GlideRecord object
+                gCustodyTask.addQuery('sys_idIN' + taskID); // Query for specific tasks
+                // Set the values for the fields to be updated
+                gCustodyTask.setValue('state', '7'); // Set state to 'closed'
+                gCustodyTask.setValue('active', 'false'); // Mark task as inactive
+                gCustodyTask.setValue('lock', false); // Unlock the task
+                gCustodyTask.assigned_to = 'NULL'; // Clear assigned user
+                gCustodyTask.assignment_group = 'NULL'; // Clear assignment group
+                // Perform the bulk update
+                gCustodyTask.updateMultiple();
+
+            } else if (caseType == 'automated') {
+                // ------Process Automated cases in bulk------
+                var gCustodyAutomatedCase = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_case');
+                gCustodyAutomatedCase.addQuery('sys_id', 'IN', caseIds.join(',')); // Query for automated cases
+                gCustodyAutomatedCase.setValue('bulk_id', ''); // Clear the bulk ID
+                gCustodyAutomatedCase.updateMultiple(); // Perform bulk update
+
+                // ------Process Automated Tasks in bulk------
+                gCustodyTask.initialize(); // Reuse the common GlideRecord object
+                gCustodyTask.addQuery('sys_idIN' + taskID); // Query for specific tasks
+                // Set the values for the fields to be updated
+                gCustodyTask.setValue('bulk_id', ''); // Clear the bulk ID
+                gCustodyTask.setValue('state', '1');
+                gCustodyTask.setValue('lock', false); // Unlock the task
+                gCustodyTask.assigned_to = 'NULL'; // Clear assigned user
+                gCustodyTask.assignment_group = 'NULL'; // Clear assignment group
+                // Perform the bulk update
+                gCustodyTask.updateMultiple();
+
+            }
+
+            // Update active trade count for the bulk ID and Close bulk transaction
+            if (bulkID) {
+                var activeTaskCount = new GlideAggregate('x_hsb11_mss_c_proc_mss_custody_task');
+                activeTaskCount.addQuery('bulk_id', bulkID); // Filter tasks by bulk ID
+                activeTaskCount.addQuery('active', true); // Filter only active tasks
+                activeTaskCount.addAggregate('COUNT'); // Count the number of active tasks
+                activeTaskCount.query();
+                if (activeTaskCount.next()) {
+                    var count = parseInt(activeTaskCount.getAggregate('COUNT'), 10); // Get the count of active tasks
+                    // Update the trade count in the bulk transaction
+                    var gBulk = new GlideRecord("x_hsb11_hsbc_mss_o_hsbc_bulk_transaction");
+                    if (gBulk.get(bulkID)) {
+                        gBulk.setValue('active_trade_count', count); // Update the active trade count
+                        if (count === 0) {
+                            gBulk.setValue('state', '7'); // Set state to 'Cancelled' if no active tasks remain
+                        }
+                        gBulk.update(); // Save the change
+                    }
+                }
+            }
+        } catch (error) {
+            gs.error("SI MSSCustodyBulkProcessUtils - Error in RemoveMakerTask: " + error.message);
+        }
+    },
+    type: 'MSSCustodyBulkProcessUtils'
+});]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>43722084@hsbc.com</sys_created_by>
+        <sys_created_on>2025-07-21 02:45:06</sys_created_on>
+        <sys_id>ef1e33661b3222509e88ed32b24bcbb9</sys_id>
+        <sys_mod_count>76</sys_mod_count>
+        <sys_name>MSSCustodyBulkProcessUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_ef1e33661b3222509e88ed32b24bcbb9</sys_update_name>
+        <sys_updated_by>45423148@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-12-05 13:12:47</sys_updated_on>
+    </sys_script_include>
+</record_update>

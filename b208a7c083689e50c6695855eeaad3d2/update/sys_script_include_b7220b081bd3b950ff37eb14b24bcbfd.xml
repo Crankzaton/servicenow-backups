@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.MSS_Custody_Swift_Event_Utils</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description>This Script include will take the input from "Business Process Stage" and  "MSS Custody Event Inbound Staging" Table and update/create dummy trades and BPI for swift events.</description>
+        <mobile_callable>false</mobile_callable>
+        <name>MSS_Custody_Swift_Event_Utils</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var MSS_Custody_Swift_Event_Utils = Class.create();
+MSS_Custody_Swift_Event_Utils.prototype = {
+    //Test
+    /* executeSwiftEvent: it is the main method that process Swift Events
+    Creates a GlideRecord instance to check if a Business Process Instance is already Exist for given Objectid.
+    If record exists, it logs that the event is skipped and returns "Ignored (to avoid duplicate Record)".
+    var swft_obj_sys_id = this.insertDummyTradeRecord -- Calls insertDummyTradeRecord to create a dummy trade record and stores its SystemID in swftObjSysId. */
+    executeSwiftEvent: function(objectid, TechId, source, objecttype, trdeventstatus, eventstatus, eventdatetimeNumeric, swftSourceSystemTimeStamp, OwningBusinessName, securities_account, instruction_source, instruction_receipt_date_time, isException, swftSourceSystemTimeStampUtc, region, transactionReference, messageProcessingStatus) { // transactionReference added as part of MSSCUSTODY-7530 //MSSCUSTODY-7630 - messageProcessingStatus added
+        //Added Error handling as a part of MSSCUSTODY-5372
+        try {
+            var existBPI = new GlideRecord('x_hsb11_mss_custod_mss_custody_business_process_instance');
+            existBPI.addQuery('object_id', objectid);
+            existBPI.query();
+            if (existBPI.next()) {
+                return 'Ignored';
+            } else {
+                var swft_obj_sys_id = this.insertDummyTradeRecord(objectid, source, trdeventstatus, swftSourceSystemTimeStamp, OwningBusinessName, securities_account, instruction_source, instruction_receipt_date_time, swftSourceSystemTimeStampUtc, region, transactionReference); // transactionReference added as part of MSSCUSTODY-7530
+                this.createBPISwift(objectid, TechId, source, objecttype, eventstatus, eventdatetimeNumeric, swftSourceSystemTimeStamp, OwningBusinessName, isException, swft_obj_sys_id, swftSourceSystemTimeStampUtc, messageProcessingStatus); //MSSCUSTODY-7630 - messageProcessingStatus added
+                return 'processed_created';
+            }
+        } catch (error) {
+            gs.error(" [MSS_Custody_Swift_Event_Utils] Error : " + error.message); //MSSCUSTODY-5372
+        }
+    },
+    // Upon Successful Execution of above insertDummyTradeRecord, a new dummy trade is inserted in the table 'x_hsb11_mss_c_proc_mss_custody_trade'.
+    insertDummyTradeRecord: function(objectid, source, tradeCoreStatus, swftSourceSystemTimeStamp, OwningBusinessName, securities_account, instruction_source, instruction_receipt_date_time, swftSourceSystemTimeStampUtc, region, transactionReference) { // transactionReference added as part of MSSCUSTODY-7530
+        try {
+            var dummytrade = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_trade");
+            dummytrade.initialize();
+            dummytrade.trade_id = objectid;
+            dummytrade.u_id = objectid; //MSSOTIQUBE-2572 Custody Redesign, populate Trade ID in sn_bom_trade table
+            dummytrade.source_system = source;
+            dummytrade.trade_lifecycle_status = tradeCoreStatus;
+            dummytrade.source_system_timestamp = swftSourceSystemTimeStampUtc; //MSSCUSTODY-2524: Timezone Changes to UTC
+            dummytrade.source_system_time_stamp_market_time = swftSourceSystemTimeStamp; //MSSCUSTODY-2524: Timezone Changes to UTC
+            dummytrade.owning_business = OwningBusinessName;
+            // MSSCUSTODY-4815 - Populate source system time stamp for UK Swifts.
+            var sourcesystemTimeStampUTC = dummytrade.source_system_timestamp.toString();
+            var owningBusiness = dummytrade.owning_business.toString();
+            var sourceSystemTimeStamp = dummytrade.source_system_time_stamp_market_time.replace('T', " ").toString();
+            if ((sourcesystemTimeStampUTC == "") && (owningBusiness.indexOf('UK') > -1)) {
+                var gmtDiff = -3600; //1 hour difference from UTC
+                var utcValue = this.getUTCTime(sourceSystemTimeStamp, gmtDiff);
+                dummytrade.source_system_timestamp = utcValue;
+            }
+            dummytrade.region = region;
+            dummytrade.sender_id = securities_account; //MSSCUSTODY-7474
+            dummytrade.securities_account = securities_account; //MSSCUSTODY-7474
+            dummytrade.instruction_source = instruction_source;
+            dummytrade.instruction_receipt_date_time = instruction_receipt_date_time;
+
+            //-- transactionReference and legacyStatus added as part of MSSCUSTODY-7530
+            dummytrade.transaction_reference = transactionReference;
+            if (transactionReference) {
+                dummytrade.legacy_status = this.getLegacyStatusFromTransactionReference(transactionReference);
+            }
+            //--
+
+            //MSSCUSTODY-5372
+            var insertResult = dummytrade.insert();
+            if (!insertResult) {
+                gs.error("[MSS_Custody_Swift_Event_Utils] Error"); //MSSCUSTODY-5372
+            } else {
+                return insertResult;
+            }
+        } catch (error) {
+            gs.error("[MSS_Custody_Swift_Event_Utils] Error: " + error.message); //MSSCUSTODY-5372
+        }
+    },
+    // createBPISwift: Creates a new BPI record in x_hsb11_mss_custod_mss_custody_business_process_instance 
+    createBPISwift: function(objectid, TechId, source, objecttype, eventstatus, eventdatetimeNumeric, swftSourceSystemTimeStamp, OwningBusinessName, isException, swft_obj_sys_id, swftSourceSystemTimeStampUtc, messageProcessingStatus) {
+        try {
+            var swftBPI = new GlideRecord('x_hsb11_mss_custod_mss_custody_business_process_instance');
+            swftBPI.initialize();
+            swftBPI.object_id = objectid;
+            swftBPI.recent_technical_uuid = TechId;
+            swftBPI.source_system = source;
+            swftBPI.object_type = objecttype;
+            swftBPI.core_stage_reference = eventstatus;
+            swftBPI.unity_updated_timestamp = eventdatetimeNumeric;
+            swftBPI.core_source_system_last_update = swftSourceSystemTimeStampUtc; ////MSSCUSTODY-2524: Timezone Changes to UTC
+            swftBPI.owning_business = OwningBusinessName;
+            swftBPI.trade_id = swft_obj_sys_id;
+            swftBPI.trade_base = swft_obj_sys_id; //MSSOTIQUBE-2572 Custody Redesign, populate Trade ID in BPI table new reference field 
+            if (isException == "true") {
+                if ((messageProcessingStatus == "rejected_with_client_advise") && (gs.getProperty("x_hsb11_mss_custod.activateSwiftRejectedWithClientAdvise", "false") === 'true')) { //MSSCUSTODY-7630 - messageProcessingStatus condition added
+                    swftBPI.is_core_status_exception = false;
+                } else {
+                    swftBPI.is_core_status_exception = true;
+                }
+            }
+            swftBPI.insert();
+        } catch (error) {
+            gs.error("[MSS_Custody_Swift_Event_Utils] Error" + error.message); //MSSCUSTODY-5372
+        }
+    },
+    // getUTCTime: converts time to UTC, Takes a timeStamp and converts it to UTC using a time offset(gmtDiff).
+    getUTCTime: function(tt, gmtDiff) {
+        //converting canada time to UTC + GMT 1
+        try {
+            var recTime = new GlideDateTime(); //record time
+            recTime.setValue(tt); // pass the updated time
+            recTime.addSeconds(gmtDiff); //UTC conversion
+            return recTime.getDisplayValue();
+        } catch (error) {
+            gs.error("[MSS_Custody_Swift_Event_Utils] Error " + error.message); //MSSCUSTODY-5372
+        }
+    },
+
+    //Get the legacy status using Transaction Refrecne 
+    getLegacyStatusFromTransactionReference: function(transactionReference) {
+        var glideTrade = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_trade");
+        if (glideTrade.get('trade_id', transactionReference)) {
+            return glideTrade.legacy_status;
+        }
+    },
+
+    type: 'MSS_Custody_Swift_Event_Utils' //script type declaration
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>45307326@hsbc.com</sys_created_by>
+        <sys_created_on>2023-12-19 11:50:46</sys_created_on>
+        <sys_id>b7220b081bd3b950ff37eb14b24bcbfd</sys_id>
+        <sys_mod_count>64</sys_mod_count>
+        <sys_name>MSS_Custody_Swift_Event_Utils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_b7220b081bd3b950ff37eb14b24bcbfd</sys_update_name>
+        <sys_updated_by>44111348@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-10-30 11:10:27</sys_updated_on>
+    </sys_script_include>
+</record_update>

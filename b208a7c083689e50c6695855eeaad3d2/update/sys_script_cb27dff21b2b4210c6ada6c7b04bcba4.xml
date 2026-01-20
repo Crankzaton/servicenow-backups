@@ -1,0 +1,192 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="sys_script">
+    <sys_script action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection>x_hsb11_hsbc_mss_o_hsbc_bulk_transaction</collection>
+        <condition/>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message><![CDATA[<div>
+<div>        var initialTasksCount &#61; g_scratchpad.checkTaskCount; //Fetch scratchpad data</div>
+</div>]]></message>
+        <name>MSS Custody Bulk Record data set</name>
+        <order>100</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[//MSSCUSTODY-3414 - Created this business rule to set bulk task type and retrieve the related list in Client Script - MSSCustodyShowBulkTaskRelatedList	
+(function executeRule(current, previous /*null when async*/ ) {
+
+    //MSSCUSOTDY-3282 : This code will extract data and load in scratchpad for further use
+    new x_hsb11_mss_c_proc.MSSCustodyBulkUtils().gettaskdetails(current.sys_id, current.owning_business);
+
+    g_scratchpad.blkTskRelated = current.bulk_task_type;
+    g_scratchpad.bulktype = current.bulk_type;
+    g_scratchpad.loggeduserID = gs.getUserID(); //MSSCUSTODY-3978
+    g_scratchpad.host = gs.getProperty("glide.servlet.uri"); //MSSCUSTODY - 3992
+    g_scratchpad.name = current.assigned_to.first_name; //MSSCUSTODY - 3992
+    g_scratchpad.time = GlideDateTime().getDisplayValue(); //MSSCUSTODY - 3992
+    g_scratchpad.usr_access = gs.getUser().isMemberOf(current.assignment_group.parent.toString());
+    g_scratchpad.active_trades = current.active_trade_count; //MSSCUSTODY-5407 & MSSCUSTODY-5580
+    //MSSCUSTODY-4966
+    g_scratchpad.ownB = current.owning_business; //MSSCUSTODY-4901
+    g_scratchpad.rCodeDCCUK = gs.getProperty('x_hsb11_mss_c_proc.ReasonCodeForGCSDccUK'); //MSSCUSTODY-4901
+    g_scratchpad.rCodeGCCUK = gs.getProperty('x_hsb11_mss_c_proc.ReasonCodeForGCSGcUK'); //MSSCUSTODY-4901
+    g_scratchpad.hasWorkedAsMaker = false; //MSSCUSTODY - 5250
+    var manager = gs.hasRole('x_hsb11_mss_custod.custody_manager');
+    var maker_access = new x_hsb11_mss_c_proc.MSSCustodyBulkUtils().evalMakerAccess();
+
+    // Count the number of tasks in the same case with trade_task_type as Maker
+    var makerTaskCount = 0; // Initialize the count variable
+    var makerTaskQuery = new GlideAggregate("x_hsb11_mss_c_proc_mss_custody_task");
+    makerTaskQuery.addEncodedQuery('bulk_id.sys_id=' + current.sys_id + '^trade_task_type=Maker^active=false');
+    makerTaskQuery.groupBy('trade_task_type');
+    makerTaskQuery.addAggregate('COUNT', 'number'); // Count the number of tasks
+    makerTaskQuery.query();
+    while (makerTaskQuery.next()) {
+        makerTaskCount = parseInt(makerTaskQuery.getAggregate('COUNT', 'number')); // Get the count
+    }
+    g_scratchpad.bulkMakerTaskCount = makerTaskCount;
+    //MSSCUSTODY-4192
+    var grbulk = current;
+
+    // if (current.lock == false && (current.state == '1' || current.state == '2')) {
+    //     if (gs.getUser().isMemberOf(current.assignment_group.parent.toString()) && ((grbulk.bulk_task_type == 'Checker') || (grbulk.bulk_task_type == 'Maker'))) {
+    //         grbulk.assigned_to = gs.getUserID();
+    //         grbulk.lock = true; // MSSCUSTODY - 3992
+    //         grbulk.locktime = GlideDateTime().getDisplayValue(); // MSSCUSTODY - 3992           
+    //         grbulk.update();
+    //     }
+    // }
+
+    //MSSCUSTODY-5250
+    if (current.lock == false && (current.state == '1' || current.state == '2') && gs.getUser().isMemberOf(current.assignment_group.parent.toString()) && ((grbulk.bulk_task_type == 'Checker') || (grbulk.bulk_task_type == 'Maker'))) {
+
+        if (grbulk.bulk_task_type == 'Checker') {
+            if (grbulk.current_maker_assignee == gs.getUserID()) { //If current user has been a Maker before
+                g_scratchpad.hasWorkedAsMaker = true;
+                return;
+            }
+
+            grbulk.assigned_to = gs.getUserID();
+            grbulk.lock = true; // MSSCUSTODY - 3992
+            grbulk.locktime = GlideDateTime().getDisplayValue(); // MSSCUSTODY - 3992           
+            grbulk.update();
+
+        } else {
+            grbulk.assigned_to = gs.getUserID();
+            grbulk.lock = true; // MSSCUSTODY - 3992
+            grbulk.locktime = GlideDateTime().getDisplayValue(); // MSSCUSTODY - 3992           
+            grbulk.update();
+        }
+
+    } else if (current.lock == true && current.state == '2' && gs.getUser().isMemberOf(current.assignment_group.parent.toString()) && grbulk.trade_task_type == 'Checker' && grbulk.current_maker_assignee == gs.getUserID()) {
+        g_scratchpad.hasWorkedAsMaker = true;
+        return;
+    }
+
+    var created = new GlideDateTime(current.sys_created_on); // for defect 3717, checking if the bulk is created within 1 minute of loading it.    
+    var currentTime = new GlideDateTime();
+    currentTime.addSeconds(-60);
+    if (created > currentTime)
+        g_scratchpad.created_time = true;
+    else
+        g_scratchpad.created_time = false;
+
+    // MSSCUSTODY-5855
+    var glideTask = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_task');
+    glideTask.addQuery('bulk_id', current.sys_id);
+    glideTask.query();
+    if (glideTask.next()) {
+        gs.getSession().putClientData('siteCode', glideTask.trade_id.trade_id.slice(0, 7));
+    }
+
+    //Updating Bulk Task Type for Amend
+    var updateBulkRec = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_task");
+    updateBulkRec.addEncodedQuery('bulk_id.sys_idSTARTSWITH' + current.sys_id + '^active=true');
+    updateBulkRec.setLimit(1);
+    updateBulkRec.query();
+    if (updateBulkRec.next()) {
+
+        if (updateBulkRec.trade_task_type == 'Maker') {
+            current.bulk_task_type = 'Maker';
+        } else if (current.trade_task_type == 'Checker') {
+            current.bulk_task_type = 'Checker';
+        } else if (current.trade_task_type == 'GHSS Handler - Amend') {
+            current.bulk_task_type = 'GHSS Handler';
+        }
+        current.update();
+    }
+    //Updating Bulk Task Type for Amend
+
+	g_scratchpad.hasAfterConfTradeStatus = new x_hsb11_hsbc_mss_o.MSSAmendUtilsCore().bulkAmendHasAfterConfStatusTrade(current.sys_id); // MSSCUSTODY-8065
+	
+    //-----------------------------GC HK-Validations - MSSCUSTODY-7894------------------------------
+
+    g_scratchpad.fx_bulk = false;
+    g_scratchpad.bCi_bulk = false;
+
+
+    var tradeGr = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_task");
+    tradeGr.addQuery('bulk_id', current.sys_id);
+    tradeGr.query();
+    while (tradeGr.next()) {
+        if (!g_scratchpad.fx_bulk && (tradeGr.trade_id.u_fx_inst_sts != 'NA' && tradeGr.trade_id.u_fx_inst_sts != '')) {
+            g_scratchpad.fx_bulk = true;
+        }
+        if (!g_scratchpad.bCi_bulk && (tradeGr.trade_id.pend_canc_support_indicator == 'B' || tradeGr.trade_id.pend_canc_support_indicator == 'Y')) {
+            g_scratchpad.bCi_bulk = true;
+        }
+
+        if (
+            g_scratchpad.fx_bulk &&
+            g_scratchpad.bCi_bulk
+        ) {
+            break;
+        }
+    }
+    gs.info('GC-HK Scratchpad - FX ' + g_scratchpad.fx_bulk + ' bCi- ' + g_scratchpad.bCi_bulk);
+
+    //-----------------------------GC HK - Validations - MSSCUSTODY-7894------------------------------
+
+    if (current.upload_type != '') { // MSSCUSTODY-6106
+        g_scratchpad.uploadType = current.upload_type;
+    }
+
+
+})(current, previous);]]></script>
+        <sys_class_name>sys_script</sys_class_name>
+        <sys_created_by>45180553@hsbc.com</sys_created_by>
+        <sys_created_on>2024-07-26 08:56:00</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>cb27dff21b2b4210c6ada6c7b04bcba4</sys_id>
+        <sys_mod_count>256</sys_mod_count>
+        <sys_name>MSS Custody Bulk Record data set</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_cb27dff21b2b4210c6ada6c7b04bcba4</sys_update_name>
+        <sys_updated_by>45180553@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-12-11 08:00:53</sys_updated_on>
+        <template/>
+        <when>before_display</when>
+    </sys_script>
+    <sys_translated_text action="delete_multiple" query="documentkey=cb27dff21b2b4210c6ada6c7b04bcba4"/>
+</record_update>

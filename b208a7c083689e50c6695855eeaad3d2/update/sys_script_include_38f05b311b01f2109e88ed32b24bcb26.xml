@@ -1,0 +1,446 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>package_private</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.HSBC_External_Archive_API_Call</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description>MSSOTIQUBE-3053</description>
+        <mobile_callable>false</mobile_callable>
+        <name>HSBC_External_Archive_API_Call</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var HSBC_External_Archive_API_Call = Class.create();
+HSBC_External_Archive_API_Call.prototype = {
+
+    // Config from Registry Table
+    migrate: function(opts) {
+        opts = opts || {};
+
+        var sourceTable = String(opts.sourceTable || '');
+        var targetTable = String(opts.targetTable || '');
+        var encodedQuery = String(opts.query || '');
+        var batchSize = parseInt(opts.batchSize, 10) || 100;
+        var xmlInitialLines = String(opts.xmlInitialLines || '');
+        var xmlFinalLines = String(opts.xmlFinalLines || '');
+        var xmlFunctionName = String(opts.xmlFunctionName || '');
+        var additionalAttributeInput = String(opts.additionalAttribute || '');
+        var owningBusinessReg = String(opts.owningBusiness || '');
+
+
+        if (!sourceTable || !targetTable || !encodedQuery || !batchSize || !xmlInitialLines || !xmlFinalLines || !xmlFunctionName || !additionalAttributeInput) {
+            gs.error('HSBC_External_Archive_API_Call: Missing data in Registry.');
+            return;
+        }
+
+        var auditRec = [];
+        var journalRec = [];
+
+        if (targetTable == 'CUSTODY_AUDIT') {
+
+            var auditRecords = [];
+            var outboundRec = new GlideRecord('x_hsb11_hsbc_mss_o_archive_outbound_table');
+            outboundRec.addEncodedQuery('audit_records_archived=false^infoarchive_response_status=Success^table_nameINar_x_hsb11_mss_c_proc_mss_custody_trade,ar_x_hsb11_mss_c_proc_mss_custody_case,ar_x_hsb11_mss_c_proc_mss_custody_task');
+            outboundRec.query();
+
+            while (outboundRec.next()) {
+                auditRecords.push(outboundRec.record_sys_ids.toString());
+                auditRec.push(outboundRec.sys_id.toString());
+            }
+
+            encodedQuery = encodedQuery + '^documentkeyIN' + auditRecords;
+
+        }
+
+        if (targetTable == 'CUSTODY_JOURNAL') {
+
+            var journalRecords = [];
+            var outboundRec = new GlideRecord('x_hsb11_hsbc_mss_o_archive_outbound_table');
+            outboundRec.addEncodedQuery('journal_records_archived=false^infoarchive_response_status=Success^table_nameINar_x_hsb11_mss_c_proc_mss_custody_trade,ar_x_hsb11_mss_c_proc_mss_custody_case,ar_x_hsb11_mss_c_proc_mss_custody_task');
+            outboundRec.query();
+
+            while (outboundRec.next()) {
+                journalRecords.push(outboundRec.record_sys_ids.toString());
+                journalRec.push(outboundRec.sys_id.toString());
+            }
+
+            encodedQuery = encodedQuery + '^element_idIN' + journalRecords;
+        }
+
+        var endpoint = gs.getProperty('x_hsb11_hsbc_mss_o.eventlayer_endpoint_toInfoArchive');
+        var gcpOutboundToken = gs.getProperty('x_hsb11_hsbc_mss_o.eventOutbound_GCP_token');
+
+        var r = new sn_ws.RESTMessageV2('x_hsb11_hsbc_mss_o.InfoArchive Outbound API', 'Send Data');
+        r.setEndpoint(endpoint);
+        r.setRequestHeader('Authorization', 'Bearer ' + gcpOutboundToken);
+        r.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+        //r.setRequestHeader('Content-Type', 'application/xml');
+
+        var externalArchiveFunction = new x_hsb11_hsbc_mss_o.InfoArchiveRecords();
+
+        try {
+
+            var sysidCount = 0;
+
+            //Query records from source table 
+            var srcGR = new GlideRecord(sourceTable);
+            srcGR.addEncodedQuery(encodedQuery);
+            //    srcGR.orderBy('archived'); //older first
+            srcGR.query();
+
+
+
+            // if (!srcGR.hasNext()) {
+            //     gs.info('HSBC_External_Archive_API_Call - No records');
+            // }
+
+            var sysIds = [];
+            while (srcGR.next()) {
+                //	var owningBusiness = srcGR.owning_business.getDisplayValue();
+                sysidCount++;
+                sysIds.push(String(srcGR.getUniqueValue()));
+            }
+
+            for (var i = 0; i < sysIds.length; i += batchSize) {
+
+                var currentBatchSysIds = sysIds.slice(i, i + batchSize);
+                sysidCount = currentBatchSysIds.length;
+
+                var payloadXml = '';
+
+
+                for (var j = 0; j < currentBatchSysIds.length; j++) {
+                    var thisSysId = currentBatchSysIds[j];
+                    var thisXml = externalArchiveFunction[xmlFunctionName](thisSysId);
+                    payloadXml += thisXml;
+                }
+
+                var wrappedXml = xmlInitialLines + payloadXml + xmlFinalLines;
+                var encodedPayload = gs.base64Encode(wrappedXml);
+                // gs.info('HSBC_External_Archive_API_Call: wrapped xml' + wrappedXml);
+                // gs.info('HSBC_External_Archive_API_Call: encodedPayload: ' + encodedPayload);
+
+
+                var outGR = new GlideRecord('x_hsb11_hsbc_mss_o_archive_outbound_table');
+                outGR.initialize();
+                outGR.table_name = sourceTable;
+                outGR.record_sys_ids = currentBatchSysIds.join(',');
+                outGR.el_response_status = 'Pending to be sent';
+                outGR.infoarchive_response_status = 'Pending to be sent';
+                outGR.owning_business = owningBusinessReg;
+                var outboundSysId = outGR.insert();
+
+                var reqBody = {};
+                var bodyHeader = {};
+                var additionalAttributes = {};
+                var bodyPayload = {};
+
+                var gd = new GlideDate();
+                var gtime1 = new GlideTime();
+                var gtime2 = gtime1.getByFormat("hh:mm:ss");
+                var evttime = gd + 'T' + gtime2 + 'Z';
+
+                bodyHeader.MessageID = outboundSysId;
+                bodyHeader.EventType = targetTable.toLowerCase();
+                bodyHeader.Source = 'IAAppBuilder';
+                bodyHeader.ObjectType = targetTable.toUpperCase();
+                bodyHeader.ObjectIDType = 'na';
+                bodyHeader.ObjectID = 'na';
+                bodyHeader.ObjectVersion = '1';
+                bodyHeader.EventStatus = 'na';
+                bodyHeader.EventDateTime = evttime;
+                additionalAttributes.aiu_count = sysidCount;
+                additionalAttributes.xmlns = additionalAttributeInput;
+                bodyHeader.AdditionalAttributes = additionalAttributes;
+
+                bodyPayload.xml = encodedPayload;
+
+                reqBody.HEADER = bodyHeader;
+                reqBody.PAYLOAD = bodyPayload;
+
+                //  gs.info('HSBC_External_Archive_API_Call: JSON: ' + JSON.stringify(reqBody));
+
+                var requestBody = 'data=' + gs.base64Encode(JSON.stringify(reqBody));
+                // gs.info('HSBC_External_Archive_API_Call: url encoded: ' +
+                //    gs.base64Encode(JSON.stringify(reqBody)));
+
+                r.setRequestBody(requestBody);
+                r.setEccCorrelator(outboundSysId);
+
+                var response = r.executeAsync();
+
+                // var responseBody = response.getBody();
+                // gs.info('HSBC_External_Archive_API_Call: Response Body: ' + responseBody);
+                // var statuscode = response.getStatusCode();
+                // gs.info('HSBC_External_Archive_API_Call: Status Code: ' + statuscode);
+
+                // var upGR = new GlideRecord('x_hsb11_hsbc_mss_o_archive_outbound_table');
+                // if (upGR.get(outboundSysId)) {
+                //     upGR.setValue('el_response_status', statuscode + ' - ' + responseBody);
+                //     upGR.setValue('message_id', outboundSysId);
+                //     upGR.setValue('owning_business', owningBusiness);
+                //     upGR.setValue('http_log_id', httpLogId);
+                //     upGR.update();
+                // }
+            }
+
+        } catch (e) {
+            gs.info('HSBC_External_Archive_API_Call: Error: ' + e.message);
+            var alertDesc = "HSBC_External_Archive_API_Call Error: " + e.message;
+            var createEventForWidgetFailure = new x_hsb11_hsbc_mss_t.hsbcWidgetFailureHandler().createITIDEvent('WARNING', alertDesc, 'HSBC_External_Archive_API_Call');
+        }
+    },
+
+    migrateAuditRecords: function(opts) {
+        opts = opts || {};
+
+        var sourceTable = String(opts.sourceTable || '');
+        var targetTable = String(opts.targetTable || '');
+        var encodedQuery = String(opts.query || '');
+        var batchSize = parseInt(opts.batchSize, 10) || 100;
+        var xmlInitialLines = String(opts.xmlInitialLines || '');
+        var xmlFinalLines = String(opts.xmlFinalLines || '');
+        var xmlFunctionName = (opts.xmlFunctionName || '');
+        var additionalAttributeInput = String(opts.additionalAttribute || '');
+        var owningBusinessReg = String(opts.owningBusiness || '');
+
+
+        if (!sourceTable || !targetTable || !encodedQuery || !batchSize || !xmlInitialLines || !xmlFinalLines || !xmlFunctionName || !additionalAttributeInput) {
+            gs.error('HSBC_External_Archive_API_Call: Missing data in Registry.');
+            return;
+        }
+
+        var endpoint = gs.getProperty('x_hsb11_hsbc_mss_o.eventlayer_endpoint_toInfoArchive');
+        var gcpOutboundToken = gs.getProperty('x_hsb11_hsbc_mss_o.eventOutbound_GCP_token');
+
+        var r = new sn_ws.RESTMessageV2('x_hsb11_hsbc_mss_o.InfoArchive Outbound API', 'Send Data');
+        r.setEndpoint(endpoint);
+        r.setRequestHeader('Authorization', 'Bearer ' + gcpOutboundToken);
+        r.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+        //r.setRequestHeader('Content-Type', 'application/xml');
+
+
+        var externalArchiveFunction = new x_hsb11_hsbc_mss_o.InfoArchiveRecords(); //xmlFunctionName REPLACE
+
+        try {
+
+            var prevarr = [];
+            var prevflag = false;
+            var prevOutbounRec = '';
+            var counter = 0;
+
+
+            var outboundRec = new GlideRecord('x_hsb11_hsbc_mss_o_archive_outbound_table');
+            if (targetTable == 'CUSTODY_JOURNAL') {
+                outboundRec.addEncodedQuery('journal_records_archived=false^infoarchive_response_status=Success^table_nameINar_x_hsb11_mss_c_proc_mss_custody_case,ar_x_hsb11_mss_c_proc_mss_custody_task');
+            }
+            if (targetTable == 'CUSTODY_AUDIT') {
+                outboundRec.addEncodedQuery('audit_records_archived=false^infoarchive_response_status=Success^table_nameINar_x_hsb11_mss_c_proc_mss_custody_case,ar_x_hsb11_mss_c_proc_mss_custody_task');
+            }
+            outboundRec.query();
+
+            while (outboundRec.next()) {
+
+                var auditsysid = outboundRec.record_sys_ids.split(',');
+                // gs.info('audit archive records list sysid of records' + auditsysid);
+                var sysIds = [];
+
+                for (var k = 0; k < auditsysid.length; k++) {
+
+                    auditEncodedQuery = '';
+                    auditEncodedQuery = encodedQuery + auditsysid[k];
+
+
+
+                    //Query records from source table 
+                    var srcGR = new GlideRecord(sourceTable);
+                    srcGR.addEncodedQuery(auditEncodedQuery);
+                    //   srcGR.orderBy('sys_created_on'); //older first
+                    srcGR.query();
+
+
+
+                    // if (!srcGR.hasNext()) {
+                    //     gs.info('HSBC_External_Archive_API_Call - No records');
+                    // }
+
+
+                    while (srcGR.next()) {
+
+                        sysIds.push(String(srcGR.getUniqueValue()));
+
+
+                    }
+                }
+
+
+                //   add previous outbound records remaing sysids into new one
+
+                if (prevarr.length != 0) {
+
+                    sysIds.unshift(...prevarr);
+                    // gs.info('audit archive records including previous record' + sysIds); // adding previous remaining ids in front of new one
+                    prevarr = [];
+
+                }
+
+
+
+                for (var i = 0; i < sysIds.length; i += batchSize) {
+
+
+                    // Check if last batch and records are less then batchsize
+
+                    if ((sysIds.length - i) < batchSize && outboundRec.hasNext() == true) {
+
+
+                        if (i == 0 && prevOutbounRec != '') {
+
+                            var prevoutbouRec = new GlideRecord('x_hsb11_hsbc_mss_o_archive_outbound_table');
+                            prevoutbouRec.get(prevOutbounRec);
+                            if (targetTable == 'CUSTODY_JOURNAL') {
+                                prevoutbouRec.journal_records_archived = true;
+                            }
+                            if (targetTable == 'CUSTODY_AUDIT') {
+                                prevoutbouRec.audit_records_archived = true;
+                            }
+
+                            prevoutbouRec.update();
+
+                            prevflag = false;
+                            prevOutbounRec = '';
+
+                        }
+
+                        prevarr = sysIds.slice(i, i + batchSize);
+                        // gs.info('audit archive records storing previous records' + outboundRec.sys_id + 'value of i' + i); // storing remaining sysids in an array
+                        prevOutbounRec = outboundRec.sys_id.toString();
+                        prevflag = true;
+                        break;
+
+                    }
+
+                    var currentBatchSysIds = sysIds.slice(i, i + batchSize);
+                    sysidCount = currentBatchSysIds.length;
+
+                    var payloadXml = '';
+
+
+                    for (var j = 0; j < currentBatchSysIds.length; j++) {
+                        var thisSysId = currentBatchSysIds[j];
+                        var thisXml = externalArchiveFunction[xmlFunctionName](thisSysId);
+                        payloadXml += thisXml;
+                    }
+
+                    var wrappedXml = xmlInitialLines + payloadXml + xmlFinalLines;
+                    var encodedPayload = gs.base64Encode(wrappedXml);
+                    // gs.info('HSBC_External_Archive_API_Call: wrapped xml' + wrappedXml);
+                    // gs.info('HSBC_External_Archive_API_Call: encodedPayload: ' + encodedPayload);
+
+
+                    var outGR = new GlideRecord('x_hsb11_hsbc_mss_o_archive_outbound_table');
+                    outGR.initialize();
+                    outGR.table_name = sourceTable;
+                    outGR.record_sys_ids = currentBatchSysIds.join(',');
+                    outGR.el_response_status = 'Pending to be sent';
+                    outGR.infoarchive_response_status = 'Pending to be sent';
+                    outGR.owning_business = owningBusinessReg;
+                    var outboundSysId = outGR.insert();
+
+                    var reqBody = {};
+                    var bodyHeader = {};
+                    var additionalAttributes = {};
+                    var bodyPayload = {};
+
+                    var gd = new GlideDate();
+                    var gtime1 = new GlideTime();
+                    var gtime2 = gtime1.getByFormat("hh:mm:ss");
+                    var evttime = gd + 'T' + gtime2 + 'Z';
+
+                    bodyHeader.MessageID = outboundSysId;
+                    bodyHeader.EventType = targetTable.toLowerCase();
+                    bodyHeader.Source = 'IAAppBuilder';
+                    bodyHeader.ObjectType = targetTable.toUpperCase();
+                    bodyHeader.ObjectIDType = 'na';
+                    bodyHeader.ObjectID = 'na';
+                    bodyHeader.ObjectVersion = '1';
+                    bodyHeader.EventStatus = 'na';
+                    bodyHeader.EventDateTime = evttime;
+                    additionalAttributes.aiu_count = sysidCount;
+                    additionalAttributes.xmlns = additionalAttributeInput;
+                    //bodyHeader['AdditionalAttributes'] = additionalAttribute;
+                    bodyHeader.AdditionalAttributes = additionalAttributes;
+
+                    bodyPayload.xml = encodedPayload;
+
+                    reqBody.HEADER = bodyHeader;
+                    reqBody.PAYLOAD = bodyPayload;
+
+                    // gs.info('HSBC_External_Archive_API_Call: JSON: ' + JSON.stringify(reqBody));
+
+                    var requestBody = 'data=' + gs.base64Encode(JSON.stringify(reqBody));
+                    // gs.info('HSBC_External_Archive_API_Call: url encoded: ' +
+                    //    gs.base64Encode(JSON.stringify(reqBody)));
+
+                    r.setRequestBody(requestBody);
+                    r.setEccCorrelator(outboundSysId);
+
+                    var response = r.executeAsync();
+
+                    // updating the previous outbound record
+
+                    if (prevflag == true) {
+
+                        var prevoutbouRec = new GlideRecord('x_hsb11_hsbc_mss_o_archive_outbound_table');
+                        prevoutbouRec.get(prevOutbounRec);
+                        if (targetTable == 'CUSTODY_JOURNAL') {
+                            prevoutbouRec.journal_records_archived = true;
+                        }
+                        if (targetTable == 'CUSTODY_AUDIT') {
+                            prevoutbouRec.audit_records_archived = true;
+                        }
+                        prevoutbouRec.update();
+
+                        prevflag = false;
+                        prevOutbounRec = '';
+
+
+                    }
+
+                }
+
+                if (prevflag == false) {
+
+                    //  gs.info('audit archive records inside prevflag is false ' + outboundRec.sys_id);
+                    if (targetTable == 'CUSTODY_JOURNAL') {
+                        outboundRec.journal_records_archived = true;
+                    }
+                    if (targetTable == 'CUSTODY_AUDIT') {
+                        outboundRec.audit_records_archived = true;
+                    }
+                    outboundRec.update();
+
+                }
+
+            }
+
+        } catch (e) {
+            gs.info('HSBC_External_Archive_API_Call: Error: ' + e.message);
+            var alertDesc = "HSBC_External_Archive_API_Call Error: " + error;
+            var createEventForWidgetFailure = new x_hsb11_hsbc_mss_t.hsbcWidgetFailureHandler().createITIDEvent('WARNING', alertDesc, 'HSBC_External_Archive_API_Call');
+        }
+    },
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>44107021@hsbc.com</sys_created_by>
+        <sys_created_on>2025-11-07 12:04:58</sys_created_on>
+        <sys_id>38f05b311b01f2109e88ed32b24bcb26</sys_id>
+        <sys_mod_count>98</sys_mod_count>
+        <sys_name>HSBC_External_Archive_API_Call</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_38f05b311b01f2109e88ed32b24bcb26</sys_update_name>
+        <sys_updated_by>45376863@hsbc.com</sys_updated_by>
+        <sys_updated_on>2026-01-09 06:37:15</sys_updated_on>
+    </sys_script_include>
+</record_update>

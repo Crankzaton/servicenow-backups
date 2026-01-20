@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.HSBCTradeCaseCreation</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description>This function is for HSBCTradeCase  creation and updation for Non-exception cases.
+TradeCase is created via scheduled job.</description>
+        <mobile_callable>false</mobile_callable>
+        <name>HSBCTradeCaseCreation</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var HSBCTradeCaseCreation = Class.create();
+HSBCTradeCaseCreation.prototype = {
+    initialize: function() {},
+    job_trigger: function() {
+        var objectID = '';
+        var newobjectid = '';
+        var tmatFlag = false;
+
+		//MSSOTIQUBE-1331, setting this flag as true because if counterpartycode is not provided, case should be created.
+        var isClientandProcessLive = true;
+        var getCaseSuppressionLogicLiveCheck = gs.getProperty('x_hsb11_hsbc_mss_t.case_suppressionlogic_isactive'); // Checking if case suppression logic value
+
+        //Querying the business process instance table(MSSOTIQUBE-1096)
+        var bpInstance = new GlideRecord("x_hsb11_hsbc_mss_o_business_process_instance");
+        var sysTime = new GlideDateTime();
+        bpInstance.addQuery("is_case_created", false);
+        bpInstance.addQuery("is_exception", false);
+        bpInstance.addQuery("expected_transition_time", "<", sysTime);
+        bpInstance.addQuery("expected_transition_time", ">", getSuppressionUpdatedValue());
+        //Logic for terminal stage
+        bpInstance.addQuery("status.terminal_stage", 'false');
+
+        //Additional code added for case suppression logic check for status isLive check
+        if (getCaseSuppressionLogicLiveCheck == 'true')
+            bpInstance.addQuery("status.is_live", 'true');
+
+        bpInstance.query(); //Query the table
+
+        // Process each record
+        while (bpInstance.next()) {
+            //logic for TMAT suppression
+            if (bpInstance.status.ctac_code == "TMAT") {
+                tmatFlag = validateTMAT(bpInstance.financial_object_id);
+            } else {
+                tmatFlag = false;
+
+            }
+
+            //MSSOTIQUBE-1331 - Stop Case Creation for Not Live Client
+            var additionalAttribute = JSON.parse(bpInstance.additional_attributes);
+            if (additionalAttribute.COUNTERPARTY_CODE != null) {
+                isClientandProcessLive = checkClientandProcessLive(additionalAttribute.COUNTERPARTY_CODE, bpInstance.business_process_definition);
+            }else{
+				gs.error("CounterParty Code not provided for : "+ bpInstance.financial_object_record.getDisplayValue());
+			}
+
+            if (isClientandProcessLive == false) {
+                try {
+                    bpInstance.expected_transition_time = "";
+                    bpInstance.update();
+                } catch (e) {
+                    gs.error("Unexpected error occurred during processing: " + "Name: " + e.name + "  " + "Message: " + e.message); //MSSOTIQUBE-1331
+                }
+            }
+            //Adding additional check so we check condition for real time values when this while loop is running
+            else if (bpInstance.expected_transition_time < sysTime && bpInstance.is_exception == false && tmatFlag == false) {
+                //MSSOTIQUBE-1096
+                try {
+                    // Prepare the trade case record(MSSOTIQUBE-1096)
+                    var tradeCase = new GlideRecord("x_hsb11_hsbc_mss_t_trade_case");
+                    tradeCase.initialize();
+
+                    //Retrieve the automation group id(MSSOTIQUBE-1096)
+                    var mssSNAutomationGrpID = gs.getProperty("HSBC_MOCS_Group");
+                    tradeCase.setValue("assignment_group", mssSNAutomationGrpID);
+
+                    // Populate the trade case field
+                    tradeCase.short_description = "Time Limit Exceeded at " + bpInstance.expected_transition_time.getDisplayValue();
+                    objectID = bpInstance.financial_object_record.getDisplayValue();
+                    tradeCase.financial_object.setDisplayValue(objectID);
+                    tradeCase.trade_status = bpInstance.status;
+                    tradeCase.u_fo_process_status = bpInstance.status;
+                    tradeCase.u_additional_attributes = bpInstance.additional_attributes;
+                    tradeCase.u_objectversion = bpInstance.object_version;
+                    tradeCase.u_event_type = bpInstance.event_type;
+                    tradeCase.u_objectidtype = bpInstance.objectid_type;
+                    tradeCase.u_object_type = bpInstance.object_type;
+                    var bpiValue = bpInstance.number.getDisplayValue();
+                    tradeCase.u_business_process_instance.setDisplayValue(bpiValue);
+                    tradeCase.u_message_id = bpInstance.messageid;
+                    tradeCase.u_source = bpInstance.source;
+
+                    // Insert the trade case record and update business process instance(MSSOTIQUBE-1096)
+                    newobjectid = tradeCase.insert();
+                    bpInstance.is_case_created = true;
+                    bpInstance.payload = tradeCase.u_payload;
+                    bpInstance.update();
+                } catch (e) {
+                    gs.error("Unexpected error occurred during processing: " + "Name: " + e.name + "  " + "Message: " + e.message); //MSSOTIQUBE-1096
+                }
+
+            }
+        }
+        // Function to get the updated suppression value
+        function getSuppressionUpdatedValue() {
+            var getSuppUpdatedValue = new GlideRecord('sys_properties');
+            getSuppUpdatedValue.get('name', 'x_hsb11_hsbc_mss_t.case_suppressionlogic_isactive');
+            return getSuppUpdatedValue.sys_updated_on;
+        }
+
+        // Function to validate TMAT logic
+        function validateTMAT(trade_id) {
+            var allocs = new GlideRecord('sn_bom_trade');
+            allocs.addQuery("u_ctac_trade_did", trade_id);
+            allocs.addQuery("u_trade_status.ctac_code", "AMSM");
+            allocs.query();
+            while (allocs.next()) {
+                var amsmCases = new GlideRecord("x_hsb11_hsbc_mss_t_trade_case");
+                amsmCases.addQuery("financial_object", allocs.sys_id);
+                amsmCases.addQuery("state", "!=", 7);
+                amsmCases.addQuery("state", "!=", 3);
+                amsmCases.addQuery("state", "!=", 4);
+                amsmCases.query();
+                if (amsmCases.next()) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        function checkClientandProcessLive(counterPartyCode, businessProcessDefinition) {
+            var checkClientLive = new GlideRecord('x_hsb11_hsbc_mss_o_client_and_processes_checklist');
+            checkClientLive.addEncodedQuery('client.u_counterparty_code=' + counterPartyCode + '^business_process_definition=' + businessProcessDefinition);
+            checkClientLive.query();
+            if (checkClientLive.next()) {
+                return checkClientLive.active;
+            } else {
+                return false;
+            }
+        }
+
+    },
+    type: 'HSBCTradeCaseCreation'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>45202174@hsbc.com</sys_created_by>
+        <sys_created_on>2022-11-04 09:59:48</sys_created_on>
+        <sys_id>bf7a83c01b43dd106ed00e1ad34bcb86</sys_id>
+        <sys_mod_count>154</sys_mod_count>
+        <sys_name>HSBCTradeCaseCreation</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_bf7a83c01b43dd106ed00e1ad34bcb86</sys_update_name>
+        <sys_updated_by>45298029@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-03-26 08:45:49</sys_updated_on>
+    </sys_script_include>
+</record_update>

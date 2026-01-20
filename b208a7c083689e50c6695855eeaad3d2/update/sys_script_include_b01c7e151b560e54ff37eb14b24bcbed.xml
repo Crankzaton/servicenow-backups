@@ -1,0 +1,180 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.open_new_task</api_name>
+        <caller_access/>
+        <client_callable>true</client_callable>
+        <description/>
+        <mobile_callable>false</mobile_callable>
+        <name>open_new_task</name>
+        <sandbox_callable>true</sandbox_callable>
+        <script><![CDATA[var open_new_task = Class.create();
+open_new_task.prototype = Object.extendsObject(global.AbstractAjaxProcessor, {
+    opentask: function() {
+
+        var gr = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_task');
+        var q = this.getParameter('quer');
+        var user = this.getParameter('user');
+
+        //	gs.info('query'+q);
+        var j = 'active=true^assigned_toISEMPTY^ORassigned_to=' + user + '^stateNOT IN3,7^' + q;
+    //    gs.info('query ' + j);
+        gr.addEncodedQuery('bulk_idISEMPTY^active=true^assigned_toISEMPTY^ORassigned_to=' + user + '^stateNOT IN3,7^' + q);
+        //    gr.orderByDesc('sys_updated_on');
+        gr.query();
+
+        if (gr.next()) {
+
+            var sys = gr.getValue('sys_id');
+
+        }
+
+    //    gs.info('sys id of next task ' + sys);
+        return sys;
+
+    },
+
+    opentask1: function(quer, user) {
+
+
+
+        var substring = 'trade_id=';
+        var sys;
+        var band = true;
+        var skip_ids = [];
+
+        if (quer.indexOf(substring) !== -1) {
+            //    gs.info('Substring found');
+
+            var gettradeid = quer.split('^');
+            var tradeid = gettradeid[0].toString().split('=');
+            //    gs.info(tradeid[1]);
+
+            sys = tradeid[1].toString();
+            return 'trade&' + sys;
+
+
+        } else {
+
+
+
+            var skip = gs.getSession().getClientData('skip_ids');
+        //    gs.info('skipped sys-ids' + skip);
+
+            var task = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_task');
+            task.addEncodedQuery('bulk_idISEMPTY^active=true^assigned_toISEMPTY^ORassigned_to=' + user + '^stateNOT IN3,7^sys_idNOT IN' + skip + '^' + quer);
+            var que = 'active=true^assigned_toISEMPTY^ORassigned_to=' + user + '^stateNOT IN3,7^sys_idNOT IN' + skip + '^' + quer;
+            //   gr.orderByDesc('sys_updated_on');
+        //    gs.info('query' + que);
+            task.query();
+
+            while (task.next()) {
+                band = true;
+                var mak = true;
+                sys = task.getValue('sys_id'); // getting task sys_id
+                var task_type = task.trade_task_type;
+                var out = task.outcome;
+                //    gs.info(task_type);
+                var current_maker = task.trade_case_id.current_maker_assignee;
+
+                //  MSSCUSTODY-3592 (Band limit check)
+
+                if ((task_type == 'Checker') && (task.trade_case_id.current_maker_assignee == user)) {
+                    mak = false;
+                }
+
+                if ((task_type == 'Checker') && ((out == 'Confirm Trade') || (out == 'Settle Trade'))) {
+                    //       gs.info('inside maker assignee' + task.trade_task_type + ' ' + task.outcome);
+                    var tradeID = task.trade_id;
+                    var grTrade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                    grTrade.get(tradeID);
+                    var nomAmt = grTrade.nominal_settlement_amount_in_usd; // nominal_settlement_amount_in_usd
+                    var setAmt = grTrade.settlement_amount_in_usd; //settlement_amount_in_usd
+                    var transType = grTrade.getValue('transaction_type'); //DVP or RVP
+
+
+                    if (setAmt != 0 || setAmt != '') { //if nominal or settlement amount is valid
+                        //Added as part of MSSCUSTODY-2530 to fetch the right group based on the owning business of the trade
+
+                        //          gs.info('amount not 0');
+                        var owningBusiness = grTrade.owning_business; //trade owning business
+                        var trdType = new GlideRecord('sys_user_group_type');
+                        trdType.get(owningBusiness);
+                        //Added as part of MSSCUSTODY-2530 to fetch the right group based on the owning business of the trade
+                        var typeID = trdType.sys_id;
+                        var grUser = new GlideRecord('sys_user');
+                        grUser.get(user);
+                        var userMarket = grUser.u_associated_business_markets; //associated markets of user
+                        var usrBand = grUser.u_user_band; //user band
+                        if (userMarket.indexOf(owningBusiness) > -1) {
+                            //              gs.info('index');
+                            var grGroup = new GlideRecord("sys_user_group");
+                            grGroup.addEncodedQuery('u_associated_group_band=' + usrBand + '^typeLIKE' + typeID); //Considering only access groups
+                            grGroup.orderByDesc('u_usd_limit');
+                            grGroup.query();
+                            if (grGroup.next()) {
+                                //gs.addInfoMessage('settlement amount in USD =' + grTrade.settlement_amount_in_usd);
+                                //gs.addInfoMessage('Nominal settlement amount in USD =' + grTrade.nominal_settlement_amount_in_usd);
+                                //gs.addInfoMessage('Group selected' + grGroup.getDisplayValue());
+                                //gs.addInfoMessage('Group Limit in USD = ' + grGroup.u_usd_limit);
+                                if (transType == 'DVP' || transType == 'RVP') {
+                                    //                      gs.info('rvp');
+                                    if ((grTrade.settlement_amount_in_usd > grGroup.u_usd_limit)) {
+                                        //                           gs.info('false rvp');
+                                        band = false; //Higher limit than USD limit for DVP and RVP
+                                    }
+                                } else if (transType == 'RFP' || transType == 'DFP') {
+                                    //                       gs.info('rfp')
+                                    if ((grTrade.nominal_settlement_amount_in_usd > grGroup.u_usd_limit)) {
+                                        //                           gs.info('fasle rfp');
+                                        band = false; //Higher limit than USD limit for FOP
+                                    }
+                                }
+
+                            } else
+                                band = false; //User Does not belong to any groups allowed for trade approval
+                        } else {
+                            band = false; //User Does not belong to Trade market
+                        }
+
+
+                    } else {
+                        band = false;
+                    }
+                }
+
+                if (band == true && mak == true) {
+                    return 'task&' + sys;
+                }
+
+
+                // } else if (band == true) {
+                //         //       gs.info('inside band true' + task_type + ' ' + task.outcome);
+                //         return 'task&' + sys;
+                //     }
+
+
+
+            }
+
+        }
+    },
+
+
+    type: 'open_new_task'
+});]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>45382254@hsbc.com</sys_created_by>
+        <sys_created_on>2024-05-20 11:47:57</sys_created_on>
+        <sys_id>b01c7e151b560e54ff37eb14b24bcbed</sys_id>
+        <sys_mod_count>71</sys_mod_count>
+        <sys_name>open_new_task</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_b01c7e151b560e54ff37eb14b24bcbed</sys_update_name>
+        <sys_updated_by>45376863@hsbc.com</sys_updated_by>
+        <sys_updated_on>2024-12-12 06:25:38</sys_updated_on>
+    </sys_script_include>
+</record_update>

@@ -1,0 +1,234 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.HSBCCustodySPUtils</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description>This is used in 'Holdings Query screen' page widgets to create ondemand statging records for Position Summary and Deatils</description>
+        <mobile_callable>false</mobile_callable>
+        <name>HSBCCustodySPUtils</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var HSBCCustodySPUtils = Class.create();
+HSBCCustodySPUtils.prototype = {
+    initialize: function() {},
+
+    //Checks if record exists in staging table and filters it based on conditions
+    checkRecordExists: function() {
+        //MSSOTIQUBE-1292 --> Error handling 
+        try {
+            var query = 'state_for_summary=processing^ORstate_for_summary=ready_to_be_sent^triggered_by=' + gs.getUserID();
+            var onDemand = new GlideRecord('x_hsb11_mss_pos_mss_custody_position_ondemand_staging');
+            onDemand.addEncodedQuery(query);
+            onDemand.query();
+            //If record is found
+            if (onDemand.next()) {
+                return true;
+            }
+            return false;
+        } catch (error) {
+            gs.error('Script Include: HSBCCustodySPUtils: Unexpected error in checkRecordExists function. ' + error.message); //MSSOTIQUBE-1292
+        }
+    },
+
+    /*Creates and insert an outbound record based on the parameters
+	@param country- Country code
+	@param grpId- Group Id
+	@param secAcc- security account identifier
+	@param secCode- security code
+	@param secCodeChk- security code check value
+	*/
+    createOutboundRecord: function(country, grpId, secAcc, secCode, secCodeChk) {
+        //MSSOTIQUBE-1292 --> Error handling 
+        try {
+            if (secCode)
+                secCode = secCode.replace(/ /g, "%20");
+            var owningBusiness = country.slice(-2).toUpperCase();
+            var requestBody = '';
+            //MSSCUSTODY-4528
+            var maxLength = 13;
+            if (owningBusiness == 'UK') {
+                requestBody = 'countryTerritoryLocationCode=' + 'GB' + '&groupMemberIdentification=' + grpId.toUpperCase();
+                if (secAcc != '' && secAcc != undefined && (secAcc.indexOf('-') == -1)) {
+                    //MSSCUSTODY-4527
+                    while (secAcc.length < maxLength) {
+                        secAcc = '0' + secAcc;
+                    }
+                    requestBody += '&safekeepingAccountIdentifications=' + secAcc;
+                } else if (secAcc != '' && secAcc != undefined) {
+                    //MSSCUSTODY-4589
+                    requestBody += '&safekeepingAccountIdentifications=' + secAcc;
+                }
+            } else {
+                requestBody = 'countryTerritoryLocationCode=' + owningBusiness + '&groupMemberIdentification=' + grpId.toUpperCase();
+                if (secAcc != '' && secAcc != undefined && (secAcc.indexOf('-') != -1))
+                    requestBody += '&safekeepingAccountIdentifications=' + secAcc;
+                else if (secAcc != '' && secAcc != undefined)
+                    requestBody += '&safekeepingAccountIdentifications=' + secAcc.slice(0, 3) + '-' + secAcc.slice(3, 9) + '-' + secAcc.slice(9, 12);
+            }
+
+            if (secCode != '' && secCode != undefined)
+                requestBody += '&' + secCodeChk + '=' + secCode;
+            requestBody += '&reportType=SUMMARY';
+
+            var onDemand = new GlideRecord('x_hsb11_mss_pos_mss_custody_position_ondemand_staging');
+            onDemand.initialize();
+            onDemand.request_body_for_summary = requestBody;
+            onDemand.state_for_summary = 'ready_to_be_sent';
+            onDemand.request_date = new GlideDateTime();
+            onDemand.type = 'query';
+            onDemand.triggered_by = gs.getUserID();
+            var id = onDemand.insert();
+            return id;
+        } catch (error) {
+            gs.error('Script Include: HSBCCustodySPUtils: Unexpected error in createOutboundRecord function. ' + error.message); //MSSOTIQUBE-1292
+        }
+    },
+
+    /*Checks the summary state of a record based on the given sys_id and returns the response code
+	@param id- sys_id of record to check
+	Returns 200 if processing is successfull; false if no record matching is found
+	*/
+    checkResponseSummary: function(id) {
+        //MSSOTIQUBE-1292 --> Error handling 
+        try {
+            //Fetch records matching the given sys_id based on state
+            var query = 'sys_id=' + id + '^state_for_summary=processed^ORstate_for_summary=error';
+            var onDemand = new GlideRecord('x_hsb11_mss_pos_mss_custody_position_ondemand_staging');
+            onDemand.addEncodedQuery(query);
+            onDemand.query();
+
+            if (onDemand.next()) {
+                if (onDemand.state_for_summary == 'processed') {
+                    try {
+                        var res = onDemand.response_body_for_summary.toString();
+                        var total = JSON.parse(res).total;
+                        if (total > 500) {
+                            var count = total / 500;
+                            var req = onDemand.request_body_for_summary.toString();
+                            this.createOutboundOffsetRecords(id, req, count);
+                        }
+                    } catch (error) {
+                        gs.error('Script Include: HSBCCustodySPUtils: Error in parsing response in checkResponseSummary function ' + error.message); //MSSOTIQUBE-1292
+                    }
+					//If processing is successfull
+                    return '200';
+                } else {
+                    if (onDemand.response_code_for_summary.slice(0, 2) == '40' || onDemand.response_code_for_summary == '429' || onDemand.response_code_for_summary == '500' || onDemand.response_code_for_summary == '503' || onDemand.response_code_for_summary == '502') {
+                        return '40xerror';
+                    }
+                    return 'error';
+                }
+            }
+            return false;
+        } catch (error) {
+            gs.error('Script Include: HSBCCustodySPUtils: Unexpected error in checkResponseSummary function. ' + error.message); //MSSOTIQUBE-1292
+        }
+    },
+
+    /*Creates and insert a detail outbound record
+	Returns the sys_id of inserted record
+	*/
+    createDetailOutboundRecord: function(country, grpId, secAcc, secCode) {
+        //MSSOTIQUBE-1292 --> Error handling 
+        try {
+            if (secCode)
+                secCode = secCode.replace(/ /g, "%20");
+            var owningBusiness = country.slice(-2).toUpperCase();
+            var requestBodyDetail = '';
+            var requestBodySum = '';
+            //MSSCUSTODY-4528
+            if (owningBusiness == 'UK') {
+                requestBodyDetail = 'countryTerritoryLocationCode=' + 'GB' + '&groupMemberIdentification=' + grpId.toUpperCase() + '&safekeepingAccountIdentifications=' + secAcc + '&hsbcIdentifiers=' + secCode;
+                requestBodyDetail += '&reportType=DETAIL';
+
+                requestBodySum = 'countryTerritoryLocationCode=' + 'GB' + '&groupMemberIdentification=' + grpId.toUpperCase() + '&safekeepingAccountIdentifications=' + secAcc + '&hsbcIdentifiers=' + secCode;
+                requestBodySum += '&reportType=SUMMARY';
+            } else {
+                requestBodyDetail = 'countryTerritoryLocationCode=' + owningBusiness + '&groupMemberIdentification=' + grpId.toUpperCase() + '&safekeepingAccountIdentifications=' + secAcc + '&hsbcIdentifiers=' + secCode;
+                requestBodyDetail += '&reportType=DETAIL';
+
+                requestBodySum = 'countryTerritoryLocationCode=' + owningBusiness + '&groupMemberIdentification=' + grpId.toUpperCase() + '&safekeepingAccountIdentifications=' + secAcc + '&hsbcIdentifiers=' + secCode;
+                requestBodySum += '&reportType=SUMMARY';
+            }
+
+            var onDemand = new GlideRecord('x_hsb11_mss_pos_mss_custody_position_ondemand_staging');
+            onDemand.initialize();
+            onDemand.request_body_for_detail = requestBodyDetail;
+            onDemand.state_for_detail = 'ready_to_be_sent';
+            onDemand.request_body_for_summary = requestBodySum;
+            onDemand.state_for_summary = 'ready_to_be_sent';
+            onDemand.request_date = new GlideDateTime();
+            onDemand.type = 'query';
+            onDemand.triggered_by = gs.getUserID();
+            var id = onDemand.insert();
+            return id;
+        } catch (error) {
+            gs.error('Script Include: HSBCCustodySPUtils: Unexpected error in createDetailOutboundRecord function. ' + error.message); //MSSOTIQUBE-1292
+        }
+    },
+
+    //Checks the detail state of a record and returns the response code
+    checkResponseDetail: function(id) {
+        //MSSOTIQUBE-1292 --> Error handling 
+        try {
+            var query = 'sys_id=' + id + '^state_for_detail=processed^ORstate_for_detail=error';
+            var onDemand = new GlideRecord('x_hsb11_mss_pos_mss_custody_position_ondemand_staging');
+            onDemand.addEncodedQuery(query);
+            onDemand.query();
+
+            if (onDemand.next()) {
+                if (onDemand.state_for_detail == 'processed') {
+					//If processed
+                    return '200';
+                } else {
+                    return 'error';
+                }
+            }
+            return false;
+        } catch (error) {
+            gs.error('Script Include: HSBCCustodySPUtils: Unexpected error in checkResponseDetail function. ' + error.message); //MSSOTIQUBE-1292
+        }
+    },
+
+    /*Creates and insert records based on offset value to process large data
+	@param id- parent record id
+	@param reqBody- Request body that needs to be processed
+	@param count- Total number of records to be created based on offset
+	*/
+    createOutboundOffsetRecords: function(id, reqBody, count) {
+        //MSSOTIQUBE-1292 --> Error handling 
+        try {
+            for (var i = 1; i <= count; i++) {
+                var requestBody = reqBody + '&offset=' + (500 * i);
+                var onDemand = new GlideRecord('x_hsb11_mss_pos_mss_custody_position_ondemand_staging');
+                onDemand.initialize();
+                onDemand.request_body_for_summary = requestBody;
+                onDemand.state_for_summary = 'ready_to_be_sent';
+                onDemand.request_date = new GlideDateTime();
+                onDemand.type = 'query';
+                onDemand.triggered_by = gs.getUserID();
+                onDemand.parent_position_ondemand = id;
+                onDemand.insert();
+            }
+        } catch (error) {
+            gs.error('Script Include: HSBCCustodySPUtils: Unexpected error in createOutboundOffsetRecords function. ' + error.message); //MSSOTIQUBE-1292
+        }
+    },
+
+    type: 'HSBCCustodySPUtils'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>45346905@hsbc.com</sys_created_by>
+        <sys_created_on>2024-01-11 14:57:52</sys_created_on>
+        <sys_id>d8e90eef1b23b910ff37eb14b24bcbf6</sys_id>
+        <sys_mod_count>133</sys_mod_count>
+        <sys_name>HSBCCustodySPUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_d8e90eef1b23b910ff37eb14b24bcbf6</sys_update_name>
+        <sys_updated_by>45423094@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-02-14 09:05:57</sys_updated_on>
+    </sys_script_include>
+</record_update>

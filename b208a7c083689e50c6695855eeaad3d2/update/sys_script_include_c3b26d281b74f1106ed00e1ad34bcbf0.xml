@@ -1,0 +1,526 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.HSBCTradeTaskUtils</api_name>
+        <caller_access/>
+        <client_callable>true</client_callable>
+        <description/>
+        <mobile_callable>false</mobile_callable>
+        <name>HSBCTradeTaskUtils</name>
+        <sandbox_callable>true</sandbox_callable>
+        <script><![CDATA[var HSBCTradeTaskUtils = Class.create();
+HSBCTradeTaskUtils.prototype = Object.extendsObject(global.AbstractAjaxProcessor, {
+    getOutcomesOptions: function() {
+        var outcomesArray = [];
+        var templateId = this.getParameter('sysparm_template_id');
+        var tradeID = this.getParameter('sysparm_trade_id');
+        var taskNumber = this.getParameter('sysparm_task_number');
+
+        var custodyTrade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+        custodyTrade.get(tradeID);
+        var market = custodyTrade.getValue('owning_business');
+        var outcomeMapping = new GlideRecord('x_hsb11_mss_c_proc_custody_trade_task_outcome_mapping');
+        outcomeMapping.addQuery('trade_template_id', templateId);
+        outcomeMapping.addEncodedQuery('marketLIKE' + market);
+        outcomeMapping.query();
+        while (outcomeMapping.next()) {
+            var outcomeChoice = {};
+            outcomeChoice.displayValue = outcomeMapping.getDisplayValue('outcome');
+            outcomeChoice.value = outcomeMapping.getValue('outcome');
+            outcomesArray.push(outcomeChoice);
+        }
+
+
+        var grCustodyTask = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_task"); //MSSCUSTODY-3456-->MSSCUSTODY-3746
+        grCustodyTask.addEncodedQuery("sub_trade_task_typeINChecker-Rejected,Automation Failed^state=2^trade_task_type=Maker^number=" + taskNumber);
+        grCustodyTask.query();
+        if (grCustodyTask.next()) {
+            var reviewClosedTaskChoice = {};
+            reviewClosedTaskChoice.displayValue = 'Review and closed the task'; //store outcome display value
+            reviewClosedTaskChoice.value = 'Review and closed the task'; // store outcome value
+            outcomesArray.push(reviewClosedTaskChoice);
+        }
+
+        var result = JSON.stringify(outcomesArray);
+        return result;
+    },
+
+    // MSSCUSTODY-3964//4112 - Function to cancel associated flow and close the case.
+    cancelFlow: function(source_record_sys_id, cancelReason) {
+        var flowContext = new GlideRecord('sys_flow_context');
+        flowContext.addQuery('source_record', source_record_sys_id);
+        flowContext.query();
+        while (flowContext.next()) {
+            sn_fd.FlowAPI.cancel(flowContext.getUniqueValue(), cancelReason);
+        }
+
+        var grcase = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_case');
+        grcase.get(source_record_sys_id);
+        grcase.state = 3;
+        grcase.update();
+        //MSSCustody 4282
+        new x_hsb11_mss_c_proc.MSSCustodyBulkUtils().decrementTradeCount(grcase.bulk_id);
+    },
+
+    //Workspace migration
+    cancelFlowWS: function() {
+
+        try {
+            var source_record_sys_id = this.getParameter('source_record_sys_id');
+            var cancelReason = this.getParameter('cancelReason');
+
+            gs.info("XXXXXXXX1:" + source_record_sys_id);
+            var flowContext = new GlideRecord('sys_flow_context');
+            flowContext.addQuery('source_record', source_record_sys_id);
+            flowContext.query();
+            while (flowContext.next()) {
+                sn_fd.FlowAPI.cancel(flowContext.getUniqueValue(), cancelReason);
+            }
+
+            var grcase = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_case');
+            grcase.get(source_record_sys_id);
+            grcase.state = 3;
+            grcase.update();
+            //MSSCustody 4282
+
+            new x_hsb11_mss_c_proc.MSSCustodyBulkUtils().decrementTradeCount(grcase.bulk_id);
+            return true;
+        } catch (e) {
+            gs.info("cancelFlowWS unexpected error occured:" + e);
+            return false;
+        }
+
+
+    },
+
+    getUser: function(task) {
+
+
+        if (task.trade_task_type == 'Checker') {
+            return 'sys_id!=' + task.trade_case_id.current_maker_assignee;
+        }
+
+
+    },
+    //Returns reason description by querying from name custody_reason_code
+    // Define a function to get the reason description based on the selected reason code
+    getReasonDescription: function() {
+        var reasonCode = this.getParameter('sysparm_reason_code');
+        var description = '';
+        // Check if a reason code is provided
+        if (reasonCode) {
+            var custodyReasonCode = new GlideRecord('x_hsb11_mss_c_proc_custody_reason_code');
+            // Query the reasonCodetable for the selected reason code
+            custodyReasonCode.addQuery('sys_id', reasonCode);
+            custodyReasonCode.query();
+            // Check if a record is found			
+            if (custodyReasonCode.next()) {
+                // Set the description based on the record found				
+                description = custodyReasonCode.reason_description;
+            }
+        }
+        return description;
+    },
+
+
+    //Validate whether logged in user is part of the same assignment group and user ID to client script
+    LoggedUserAssigned: function() {
+        var assignGroupId = this.getParameter('sysparm_grpID');
+        var currentUser = gs.getUser();
+        var groupCheck = currentUser.isMemberOf(assignGroupId);
+        if (groupCheck) {
+            var ouputId = currentUser.getID();
+            return ouputId;
+        }
+    },
+    getOwningBusiness: function(tradeOB, tradeoutcome) {
+        //Filter the reason code based on the outcome
+        var rID = [];
+        var rCode = new GlideRecord('x_hsb11_mss_c_proc_custody_reason_code');
+        rCode.addQuery('owning_business', tradeOB);
+        var outcome = tradeoutcome;
+
+        if (outcome == "Put 'Trade on Hold'" || outcome == 'Put Trade On-Hold') {
+            rCode.addQuery('reason_code_type', 'Put On Hold');
+        }
+        if (outcome == "Process Trade Cancellation") {
+            rCode.addQuery('reason_code_type', 'Cancel');
+        }
+        rCode.addActiveQuery();
+        rCode.query();
+        while (rCode.next()) {
+            rID.push(rCode.sys_id.toString());
+        }
+        return 'sys_idIN' + rID;
+    },
+
+    getMarketValue: function() {
+        var tradeId = this.getParameter('sysparm_trade_id');
+        var Trade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+        Trade.get(tradeId);
+        var market = Trade.getValue('owning_business');
+        return market;
+
+    },
+
+    validateSwiftID: function() {
+        var tradeID = this.getParameter('sysparm_trade_id');
+        var trade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+        trade.addQuery('trade_id', tradeID);
+        trade.query();
+        if (trade.next()) {
+            return true;
+        }
+        return false;
+    },
+
+    getTradeDetails: function() {
+        var market = this.getParameter('sysparm_dummy_trade_market');
+        var refId = this.getParameter('sysparm_trade_ref_id');
+        // var Trade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+        // Trade.get(tradeId);
+        // var market = Trade.getValue('owning_business');
+        var query = 'trade_idLIKE' + refId + '^owning_business=' + market;
+        var tradeExists = new GlideAggregate('x_hsb11_mss_c_proc_mss_custody_trade');
+        tradeExists.addEncodedQuery(query);
+        tradeExists.setLimit(3);
+        tradeExists.query();
+        if (tradeExists.getRowCount() == 1) {
+            tradeExists.next();
+            return tradeExists.trade_id;
+        } else if (tradeExists.getRowCount() > 1) {
+            return 'multiple';
+        } else {
+            return 'no record';
+        }
+
+    },
+
+    getRefTime: function() {
+        //Convert the time in seconds to minutes 
+        var SyncTime = gs.getProperty('x_hsb11_mss_c_proc.mss.custody.position.idle.timer');
+        return (SyncTime / 60);
+    },
+
+    getSwiftAvailableMarkets: function() {
+        var swift_unavailable_markets = gs.getProperty('x_hsb11_mss_c_proc.custody_swift_unavailable_markets');
+        var tradeId = this.getParameter('sysparm_trade_id');
+
+        var trade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+        trade.addQuery('sys_id', tradeId);
+        trade.addQuery('owning_business', 'NOT IN', swift_unavailable_markets);
+        trade.query();
+        if (trade.next())
+            return true;
+        else
+            return false;
+
+
+    },
+
+    getPositionAvailableMarkets: function() {
+        var position_unavailable_markets = gs.getProperty('x_hsb11_mss_c_proc.custody_position_unavailable_markets');
+        var tradeId = this.getParameter('sysparm_trade_id');
+
+        var trade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+        trade.addQuery('sys_id', tradeId);
+        trade.addQuery('owning_business', 'NOT IN', position_unavailable_markets);
+        trade.query();
+        if (trade.next())
+            return true;
+        else
+            return false;
+
+    },
+    //Added below function as part of story MSSCustody-3002
+    retrieveCBR: function() {
+
+        var currentTradeRecId = this.getParameter('traderec');
+        var grPB = new GlideRecord('x_hsb11_mss_c_proc_custody_trades');
+        if (grPB.get(currentTradeRecId)) {
+            var gr = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+            gr.addQuery('cross_business_reference', grPB.custodytrade_cross_business_reference);
+            gr.query();
+
+            var results = {
+                'count': gr.getRowCount(),
+                'cbrValue': grPB.getValue('custodytrade_cross_business_reference')
+
+            };
+
+            return JSON.stringify(results);
+        } else {
+            return null;
+        }
+
+
+
+    },
+    //Added below function as part of story MSSCUSTODY-3122
+    getTradeID: function() {
+
+
+
+
+        var market = this.getParameter('sysparm_dummy_trade_market');
+        var refId = this.getParameter('sysparm_trade_ref_id');
+        var clsname;
+
+        var checkClassName = new GlideRecord('sn_bom_trade');
+        checkClassName.addEncodedQuery('ref_x_hsb11_mss_c_proc_mss_custody_trade.trade_idLIKE' + refId + '^ref_x_hsb11_mss_c_proc_mss_custody_trade.owning_business=' + market + '^NQref_x_hsb11_mss_c_proc_mss_custody_trade_passive.trade_idLIKE' + refId + '^ref_x_hsb11_mss_c_proc_mss_custody_trade_passive.owning_business=' + market);
+        checkClassName.query();
+
+        var count = checkClassName.getRowCount();
+
+        if (count > 1) {
+            return 'multiple';
+        }
+
+        if (checkClassName.next()) {
+            clsname = checkClassName.sys_class_name;
+            //    gs.info('clsname' + clsname);
+        }
+
+        if (clsname == 'x_hsb11_mss_c_proc_mss_custody_trade_passive') {
+            var sleeper = new global.MSSQuerySysEventQueue();
+            sleeper.sleepUtility(10000);
+        } else {
+            // do nothing
+        }
+
+
+        //  gs.info('chinmay - get trade id' + refId);
+        var sourceSystem = '';
+
+        if (market.indexOf('UK') > -1) {
+            sourceSystem = 'GCS';
+        } else {
+            sourceSystem = 'GHSS'; // source system non UK
+        }
+
+        var query = 'trade_idLIKE' + refId + '^owning_business=' + market + '^source_systemLIKE' + sourceSystem;
+        var tradeExists = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+        tradeExists.addEncodedQuery(query);
+        //tradeExists.setLimit(3);
+        tradeExists.query();
+        if (tradeExists.next()) {
+            //gs.log("Inside if " + ctrade.sys_id);
+            //   gs.info('chinmay inside if trade exist' + tradeExists.sys_id);
+            return tradeExists.sys_id;
+        } else
+            return 'no record';
+
+
+    },
+
+    //This function is added as part of MSSCUSTODY-4883
+    validateTransactionType: function() {
+        // Define a map of valid transaction types for different MT codes
+        var mtCodes = {
+            'MT541': ['RVP', 'SLR', 'SBW', 'RVN'],
+            'MT545': ['RVP', 'SLR', 'SBW', 'RVN'],
+            'MT543': ['DVP', 'SLN', 'SBR', 'DVN'],
+            'MT547': ['DVP', 'SLN', 'SBR', 'DVN'],
+            'MT540': ['RFP', 'SLR', 'SBW', 'EDC'],
+            'MT544': ['RFP', 'SLR', 'SBW', 'ETD'],
+            'MT542': ['DFP', 'SLN', 'SBR', 'ETD'],
+            'MT546': ['DFP', 'SLN', 'SBR', 'ETD'],
+            'MT548': ['RVP', 'DVP', 'DVN', 'RVN', 'RFP', 'SLN', 'SBR', 'DFP', 'SLR', 'SBW', 'ETD', 'EDC']
+        };
+
+        // Retrieve parameters from the request
+        var market = this.getParameter('sysparm_dummy_trade_market');
+        var refId = this.getParameter('sysparm_trade_ref_id');
+        var triggeredBy = this.getParameter('sysparm_triggered_by'); // MSSCUSTODY-4883
+
+        // Query the trade record
+        var tradeExists = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+        tradeExists.addNotNullQuery('transaction_reference');
+        tradeExists.addNotNullQuery('owning_business');
+        tradeExists.addEncodedQuery('trade_idLIKE' + refId + '^owning_business=' + market + '^source_systemLIKEGCS');
+        tradeExists.query();
+
+        // Check if a matching trade record is found
+        if (tradeExists.next()) {
+            var tradeReference = tradeExists.getValue('sys_id');
+            var transactionType = tradeExists.transaction_type.getDisplayValue().slice(0, 3); // MSSCUSTODY-4883
+
+            // Validate the transaction type based on the triggeredBy MT code
+            if (mtCodes[triggeredBy] && mtCodes[triggeredBy].indexOf(transactionType) > -1) {
+                return tradeReference;
+            } else {
+                return triggeredBy;
+            }
+        } else {
+            return '';
+        }
+    },
+
+    validateTransactionTypeSwift: function() {
+        // Define a map of valid transaction types for different MT codes
+        var mtCodes = {
+            'MT541': ['RVP', 'SLR', 'SBW', 'RVN'],
+            'MT545': ['RVP', 'SLR', 'SBW', 'RVN'],
+            'MT543': ['DVP', 'SLN', 'SBR', 'DVN'],
+            'MT547': ['DVP', 'SLN', 'SBR', 'DVN'],
+            'MT540': ['RFP', 'SLR', 'SBW', 'EDC'],
+            'MT544': ['RFP', 'SLR', 'SBW', 'ETD'],
+            'MT542': ['DFP', 'SLN', 'SBR', 'ETD'],
+            'MT546': ['DFP', 'SLN', 'SBR', 'ETD'],
+            'MT548': ['RVP', 'DVP', 'DVN', 'RVN', 'RFP', 'SLN', 'SBR', 'DFP', 'SLR', 'SBW', 'ETD', 'EDC']
+        };
+
+        // Retrieve parameters from the request
+        var market = this.getParameter('sysparm_dummy_trade_market');
+        var refId = this.getParameter('sysparm_trade_ref_id');
+        var triggeredBy = this.getParameter('sysparm_triggered_by'); // MSSCUSTODY-4883
+
+        var tradeExists = new GlideRecord('sn_bom_trade');
+        tradeExists.addEncodedQuery('trade_idLIKE' + refId + '^owning_business=' + market + '^source_systemLIKEGCS');
+        tradeExists.addEncodedQuery('ref_x_hsb11_mss_c_proc_mss_custody_trade.trade_idLIKE' + refId + '^ref_x_hsb11_mss_c_proc_mss_custody_trade.owning_business=' + market + 'ref_x_hsb11_mss_c_proc_mss_custody_trade.source_systemLIKEGCS^NQref_x_hsb11_mss_c_proc_mss_custody_trade_passive.trade_idLIKE' + refId + '^ref_x_hsb11_mss_c_proc_mss_custody_trade_passive.owning_business=' + market + 'ref_x_hsb11_mss_c_proc_mss_custody_trade_passive.source_systemLIKEGCS');
+        tradeExists.query();
+
+        var count = tradeExists.getRowCount();
+
+
+        // // Query the trade record
+        // var tradeExists = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+        // tradeExists.addNotNullQuery('transaction_reference');
+        // tradeExists.addNotNullQuery('owning_business');
+        // tradeExists.addEncodedQuery('trade_idLIKE' + refId + '^owning_business=' + market + '^source_systemLIKEGCS');
+        // tradeExists.query();
+
+        // Check if a matching trade record is found
+        if (count == 1) {
+            if (tradeExists.next()) {
+                if (tradeExists.sys_class_name == 'x_hsb11_mss_c_proc_mss_custody_trade_passive') {
+                    var sleeper = new global.MSSQuerySysEventQueue();
+                    sleeper.sleepUtility(10000);
+                }
+                var tradeReference = tradeExists.getValue('sys_id');
+                var transactionType = tradeExists.transaction_type.getDisplayValue().slice(0, 3); // MSSCUSTODY-4883
+
+                // Validate the transaction type based on the triggeredBy MT code
+                if (mtCodes[triggeredBy] && mtCodes[triggeredBy].indexOf(transactionType) > -1) {
+                    return tradeReference;
+                } else {
+                    return triggeredBy;
+                }
+            } else {
+                return '';
+            }
+        } else if (count > 1) {
+            return 'multiple';
+        } else {
+            return 'no record';
+        }
+    },
+
+
+    //This function is added as part of MSSCUSTODY-4883
+    settlementDateValidation: function() {
+        var trdSettlementDate = this.getParameter('sysparm_tradeSetlDte');
+        var tskAmendDate = this.getParameter('sysparm_inputSetlDte');
+        var todayDate = new GlideDate();
+
+        if ((tskAmendDate >= trdSettlementDate) && (tskAmendDate <= todayDate)) {
+            return true;
+        } else {
+            return "Actual Settlement Date should be between Sett DT (C) and Today";
+        }
+    },
+
+    // MSSCUSTODY-5380 : Creating a new function to return trade_id
+    getTrade: function() {
+        var tradeSysId = this.getParameter('sysparm_tradeSysId');
+        var trade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+        if (trade.get(tradeSysId)) {
+            return trade.trade_id.toString();
+        }
+        return '';
+    },
+
+    getTradeSwift: function() {
+        var tradeSysId = this.getParameter('sysparm_tradeSysId');
+        var taskSysId = this.getParameter('sysparm_taskSysID');
+        var trade = new GlideRecord('sn_bom_trade');
+        if (trade.get(tradeSysId)) {
+            //  gs.info('Chinmay on submit');
+            if (trade.sys_class_name == 'x_hsb11_mss_c_proc_mss_custody_trade') {
+
+                new x_hsb11_mss_c_proc.MSSCustodyDataMigration().setSwiftLinkingFlag(trade.sys_id, true);
+
+                var task = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_task');
+                task.get(taskSysId);
+                task.swift_linking_reference = trade.sys_id;
+                task.swift_linking_reference_id = trade.ref_x_hsb11_mss_c_proc_mss_custody_trade.trade_id.toString();
+                task.update();
+
+                return trade.ref_x_hsb11_mss_c_proc_mss_custody_trade.trade_id.toString();
+            } else if (trade.sys_class_name == 'x_hsb11_mss_c_proc_mss_custody_trade_passive') {
+                //    gs.info('chinmay before calling migration scrit on submit' + trade.sys_id + ' & ' + tradeSysId);
+                //   var id = new x_hsb11_hsbc_mss_o.HSBC_Trade_and_Task_Migration().custRevertMigration(trade.ref_x_hsb11_mss_c_proc_mss_custody_trade_passive.trade_id);
+                var id = new x_hsb11_mss_c_proc.MSSCustodyDataMigration().revertMigration(trade.sys_id);
+                new x_hsb11_mss_c_proc.MSSCustodyDataMigration().setSwiftLinkingFlag(trade.sys_id, true);
+                var sleeper = new global.MSSQuerySysEventQueue();
+                sleeper.sleepUtility(5000);
+                //  gs.info('chinmay after migration ' + trade.ref_x_hsb11_mss_c_proc_mss_custody_trade.trade_id.toString());
+                //  gs.info('chinmay after migration uid' + trade.u_id.toString());
+                var task = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_task');
+                task.get(taskSysId);
+                task.swift_linking_reference = trade.sys_id;
+                task.swift_linking_reference_id = trade.ref_x_hsb11_mss_c_proc_mss_custody_trade.trade_id.toString();
+                task.update();
+
+
+                return trade.ref_x_hsb11_mss_c_proc_mss_custody_trade.trade_id.toString();
+            }
+        }
+        return '';
+    },
+
+    //MSSCUSTODY-6479
+    //Created as an requirement under the above mentioned jira.
+    //Giving access to WIMT for GM Ops user.
+    //This function is called in UI Policy - Hide All Related Lists For GM Ops Users
+    checkGMOpsGroupMember: function() {
+        var user = this.getParameter('sysparm_user');
+        var groupSysId = gs.getProperty('x_hsb11_mss_c_proc.GM_Ops');
+        var grMember = new GlideRecord('sys_user_grmember');
+        grMember.addEncodedQuery('group=' + groupSysId + '^user=' + user);
+        grMember.query();
+        if (grMember.next()) {
+            return true;
+        } else
+            return false;
+    },
+
+    checkClassName: function() {
+        var user = this.getParameter('sysparm_user');
+        var groupSysId = gs.getProperty('x_hsb11_mss_c_proc.GM_Ops');
+        var grMember = new GlideRecord('sys_user_grmember');
+        grMember.addEncodedQuery('group=' + groupSysId + '^user=' + user);
+        grMember.query();
+        if (grMember.next()) {
+            return true;
+        } else
+            return false;
+    },
+
+    type: 'HSBCTradeTaskUtils'
+});]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>45346905@hsbc.com</sys_created_by>
+        <sys_created_on>2023-08-18 11:39:01</sys_created_on>
+        <sys_id>c3b26d281b74f1106ed00e1ad34bcbf0</sys_id>
+        <sys_mod_count>220</sys_mod_count>
+        <sys_name>HSBCTradeTaskUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_c3b26d281b74f1106ed00e1ad34bcbf0</sys_update_name>
+        <sys_updated_by>45376863@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-10-30 05:13:09</sys_updated_on>
+    </sys_script_include>
+</record_update>

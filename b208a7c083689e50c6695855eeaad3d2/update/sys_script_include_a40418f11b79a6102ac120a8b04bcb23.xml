@@ -1,0 +1,182 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.AgingDaysCalculation</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description>For aging days calculation through scheduled job.</description>
+        <mobile_callable>false</mobile_callable>
+        <name>AgingDaysCalculation</name>
+        <sandbox_callable>true</sandbox_callable>
+        <script><![CDATA[//MSSCUSTODY-6366
+var AgingDaysCalculation = Class.create();
+AgingDaysCalculation.prototype = {
+    //whole script logic is modifed as part of MSSCUSTODY-8236
+    //Removed conditions for swift as part of MSSCUSTODY-6999
+    //current date/time for each market is now first converted into local timezone and then calculated further for aging days.
+    calculateAgingDays: function(markets) {
+        try {
+            var businessTimezones = {
+                'DCC AE': 4,
+                'DCC AU': 10,
+                'DCC BD': 6,
+                'DCC BH': 3,
+                'DCC BM': -4,
+                'DCC EU': 1,
+                'DCC HK': 8,
+                'DCC ID': 7,
+                'DCC JP': 9,
+                'DCC KR': 9,
+                'DCC KW': 3,
+                'DCC LK': 5.5,
+                'DCC MU': 4,
+                'DCC MY': 8,
+                'DCC NZ': 12,
+                'DCC OM': 4,
+                'DCC PH': 8,
+                'DCC QA': 3,
+                'DCC SG': 8,
+                'DCC TH': 7,
+                'DCC TW': 8,
+                'DCC UK': 0,
+                'DCC VN': 7,
+                'GC EU': 1,
+                'GC UK': 0,
+                'GC HK': 8
+            };
+
+            var gr = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+            if (markets.length === 1) {
+                gr.addQuery('owning_business', markets[0]);
+            } else if (markets.length > 1) {
+                gr.addQuery('owning_business', 'IN', markets.join(','));
+            }
+            gr.addQuery('trade_lifecycle_status', 'NOT IN', 'TradCanc,TradSttld');
+            gr.query();
+            while (gr.next()) {
+                var tzOffset = businessTimezones[gr.owning_business + ''] || 0;
+
+                // Get current UTC time and add the timezone offset (in milliseconds)
+                var currentDate = new GlideDateTime();
+                var currentMillis = currentDate.getNumericValue() + (tzOffset * 60 * 60 * 1000);
+
+                // Skip certain records
+                if (
+                    gr.trade_lifecycle_status == 'PrtlySttld' &&
+                    (gr.owning_business == 'DCC UK' || gr.owning_business == 'GC UK')
+                ) {
+                    continue;
+                }
+
+                var aging_days = null;
+                if ((gr.source_system == 'GHSS' || gr.source_system == 'GCS') && !gs.nil(gr.settlement_date)) {
+                    var settlementDate = new GlideDateTime(gr.settlement_date);
+                    var settlementMillis = settlementDate.getNumericValue();
+
+                    // Calculate the difference in days (round down)
+                    aging_days = Math.floor((currentMillis - settlementMillis) / (1000 * 60 * 60 * 24));
+                }
+
+                if (aging_days !== null && !isNaN(aging_days)) {
+                    gr.aging_days = aging_days;
+                    gr.update();
+                }
+            }
+        } catch (e) {
+            gs.info('error in aging days calculation via job: ' + e.message);
+        }
+    },
+    //Removed conditions for swift as part of MSSCUSTODY-6999
+    calculateAgingDaysForRecord: function(gr) {
+        var businessTimezones = {
+            'DCC AE': 4,
+            'DCC AU': 10,
+            'DCC BD': 6,
+            'DCC BH': 3,
+            'DCC BM': -4,
+            'DCC EU': 1,
+            'DCC HK': 8,
+            'DCC ID': 7,
+            'DCC JP': 9,
+            'DCC KR': 9,
+            'DCC KW': 3,
+            'DCC LK': 5.5,
+            'DCC MU': 4,
+            'DCC MY': 8,
+            'DCC NZ': 12,
+            'DCC OM': 4,
+            'DCC PH': 8,
+            'DCC QA': 3,
+            'DCC SG': 8,
+            'DCC TH': 7,
+            'DCC TW': 8,
+            'DCC UK': 0,
+            'DCC VN': 7,
+            'GC EU': 1,
+            'GC UK': 0,
+            'GC HK': 8
+        };
+
+        var aging_days = null;
+        var tzOffset = businessTimezones[gr.owning_business + ''] || 0;
+
+        // Get current UTC time and add the timezone offset (in milliseconds)
+        var currentDate = new GlideDateTime();
+        var currentMillis = currentDate.getNumericValue() + (tzOffset * 60 * 60 * 1000);
+
+        gs.info('Aging days at trade level: ' + gr.trade_id + ' ' + currentDate.getNumericValue() + ' ' + currentMillis + ' ' + gr.owning_business + ' ' + tzOffset + ' ' + (currentMillis - currentDate.getNumericValue()));
+
+        // Trade Settled
+        if (gr.trade_lifecycle_status == 'TradSttld' && !gs.nil(gr.settlement_date) && !gs.nil(gr.actual_settlement_date)) {
+            var settlementDate = new GlideDateTime(gr.settlement_date);
+            var actualSettleDate = new GlideDateTime(gr.actual_settlement_date);
+            aging_days = (actualSettleDate.getNumericValue() - settlementDate.getNumericValue()) / (1000 * 60 * 60 * 24);
+        }
+        // Trade Canceled
+        else if (gr.trade_lifecycle_status == 'TradCanc' && !gs.nil(gr.settlement_date)) {
+            var settlementDate = new GlideDateTime(gr.settlement_date);
+            var endDate = null;
+            if (!gs.nil(gr.cancellation_date)) {
+                endDate = new GlideDateTime(gr.cancellation_date);
+            } else if (!gs.nil(gr.source_system_time_stamp_market_time)) {
+                endDate = new GlideDateTime(gr.source_system_time_stamp_market_time);
+            }
+            if (endDate) {
+                aging_days = (endDate.getNumericValue() - settlementDate.getNumericValue()) / (1000 * 60 * 60 * 24);
+            }
+        }
+        // GHSS/GCS: settlement_date
+        else if (
+            (gr.source_system == 'GHSS' || gr.source_system == 'GCS') &&
+            gr.trade_lifecycle_status != 'TradSttld' &&
+            gr.trade_lifecycle_status != 'TradCanc' &&
+            !gs.nil(gr.settlement_date)
+        ) {
+            var settlementDate = new GlideDateTime(gr.settlement_date);
+            var settlementMillis = settlementDate.getNumericValue();
+            aging_days = Math.floor((currentMillis - settlementMillis) / (1000 * 60 * 60 * 24));
+        }
+
+        if (aging_days !== null && !isNaN(aging_days)) {
+            gr.aging_days = Math.floor(aging_days);
+            gr.update();
+        }
+    },
+
+    type: 'AgingDaysCalculation'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>45423148@hsbc.com</sys_created_by>
+        <sys_created_on>2025-05-29 10:28:31</sys_created_on>
+        <sys_id>a40418f11b79a6102ac120a8b04bcb23</sys_id>
+        <sys_mod_count>25</sys_mod_count>
+        <sys_name>AgingDaysCalculation</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_a40418f11b79a6102ac120a8b04bcb23</sys_update_name>
+        <sys_updated_by>45423148@hsbc.com</sys_updated_by>
+        <sys_updated_on>2026-01-14 07:42:43</sys_updated_on>
+    </sys_script_include>
+</record_update>

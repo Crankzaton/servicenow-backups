@@ -1,0 +1,303 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.MSS_Unstructured_Instruction_Client_Utils</api_name>
+        <caller_access/>
+        <client_callable>true</client_callable>
+        <description/>
+        <mobile_callable>false</mobile_callable>
+        <name>MSS_Unstructured_Instruction_Client_Utils</name>
+        <sandbox_callable>true</sandbox_callable>
+        <script><![CDATA[var MSS_Unstructured_Instruction_Client_Utils = Class.create();
+MSS_Unstructured_Instruction_Client_Utils.prototype = Object.extendsObject(global.AbstractAjaxProcessor, {
+    updateOwningRegion: function() {
+        var line_no = this.getParameter('sysparm_id');
+        var responseObj = {};
+
+        var gr = new GlideRecordSecure('x_hsb11_mss_unst_0_mss_business_market_mapping');
+        gr.addQuery('u_external_line_number', line_no);
+        gr.query();
+        if (gr.next()) {
+            responseObj.business_market = gr.u_business_market.toString();
+            responseObj.instruction_type = gr.u_instruction_type.toString();
+        }
+        return JSON.stringify(responseObj);
+
+    },
+
+    validateChecker: function() {
+        var makerType;
+        var caseId = this.getParameter('sysparm_caseId');
+        var user = this.getParameter('sysparm_assignee');
+        var taskId = this.getParameter('sysparm_taskId');
+        var checkerType = this.getParameter('sysparm_type');
+        if (checkerType == 'Checker Index')
+            makerType = 'Maker Index';
+        else if (checkerType == 'Checker Extraction')
+            makerType = 'Maker Extraction';
+        else if (checkerType == 'Checker ITM')
+            makerType = 'Maker ITM';
+        else if (checkerType == 'trade_cancellation_checker')
+            makerType = 'trade_cancellation_maker';
+
+
+        var grTask = new GlideRecordSecure('x_hsb11_mss_unst_0_instructions_case_task');
+        grTask.addQuery('instruction_case', caseId);
+
+        if (taskId != '') {
+            grTask.addEncodedQuery('task_typeINindexing,callback^NQtask_type=' + makerType + '^instruction_task=' + taskId);
+        } else {
+            grTask.addQuery('task_type', makerType);
+        }
+        grTask.addQuery('assigned_to', user);
+        grTask.query();
+        if (grTask.next())
+            return false;
+        else
+            return true;
+    },
+
+    //MSSCUSTODY-7876
+    getPriorState: function() {
+        var caseId = this.getParameter('sysparm_caseId');
+
+        var audit = new GlideRecord('sys_audit');
+        audit.addQuery('documentkey', caseId);
+        audit.addQuery('fieldname', 'task_status');
+        audit.addQuery('newvalue', 'IN', 'EXTRACTION_COMPLETED.SUCCESS,REVIEW_COMPLETED.INPROGRESS,REVIEW_COMPLETED.REJECT');
+        audit.orderByDesc('sys_created_on');
+        audit.query();
+        if (audit.next()) {
+            var recentValue = audit.getValue('newvalue');
+            gs.info('Most recent value of event_status: ' + recentValue);
+            var grCase = new GlideRecord('x_hsb11_mss_unst_0_instructions_case');
+            grCase.addQuery('sys_id', caseId);
+            grCase.query();
+
+            if (grCase.next()) {
+                grCase.setWorkflow(false);
+                grCase.task_status = recentValue;
+                grCase.update();
+            }
+            return recentValue;
+        }
+        return '';
+    },
+
+    validateCallback: function() {
+        var caseId = this.getParameter('sysparm_caseId');
+        var user = this.getParameter('sysparm_assignee');
+        var grTask = new GlideRecordSecure('x_hsb11_mss_unst_0_instructions_case_task');
+        grTask.addQuery('instruction_case', caseId);
+        grTask.addEncodedQuery('task_type!=callback');
+        grTask.addQuery('assigned_to', user);
+        grTask.query();
+        if (grTask.next())
+            return false;
+        else
+            return true;
+    },
+
+    validateMaker: function() {
+        var caseId = this.getParameter('sysparm_caseId');
+        var user = this.getParameter('sysparm_assignee');
+        var grTask = new GlideRecordSecure('x_hsb11_mss_unst_0_instructions_case_task');
+        grTask.addQuery('instruction_case', caseId);
+        grTask.addEncodedQuery('task_typeINindexing,callback');
+        grTask.addQuery('assigned_to', user);
+        grTask.query();
+        if (grTask.next())
+            return false;
+        else
+            return true;
+    },
+
+    checkAssignTime: function() { // MSSCUSTODY-6109
+        var answer = '';
+        var task_id = this.getParameter('sysparm_taskId');
+        var grTask = new GlideRecordSecure('x_hsb11_mss_unst_0_instructions_case_task');
+        if (grTask.get(task_id)) {
+            var gdt = new GlideDateTime();
+            var dur = gdt.getNumericValue() - new GlideDateTime(grTask.work_start).getNumericValue();
+            if (dur > 720000) {
+                return true;
+            } else {
+                return false;
+            }
+        }
+    },
+
+    // MSSCUSTODY-5803
+    fetchSourceFileData: function() {
+        try {
+
+            var fileData = {};
+            var sysID = this.getParameter('sysparm_sysID');
+            var sourceFileId = '';
+            var token = gs.getProperty("x_hsb11_hsbcmss_sw.hsbcmss_swb_api_token");
+
+            // Fetching parent case sys_id
+            var grTask = new GlideRecord('x_hsb11_mss_unst_0_instructions_case_task');
+            grTask.addQuery('sys_id', sysID);
+            grTask.query();
+
+            if (grTask.next()) {
+                var case_Sys_ID = '';
+
+                // Checking if parent case has a parent
+                if (grTask.instruction_case.parent) {
+                    case_Sys_ID = grTask.instruction_case.parent;
+                } else {
+                    case_Sys_ID = grTask.instruction_case;
+                }
+
+                // Fetching Source file id from the preprocessing task of the parent case
+                var task_Processing = new GlideRecord('x_hsb11_mss_unst_0_instructions_case_task');
+                task_Processing.addQuery('instruction_case', case_Sys_ID);
+                task_Processing.addQuery('task_type', 'preprocessing');
+                task_Processing.query();
+
+                if (task_Processing.next()) {
+                    sourceFileId = task_Processing.source_file_id;
+                }
+
+            }
+
+            // Fetching Source file data from SWB
+            var r = new sn_ws.RESTMessageV2('x_hsb11_hsbcmss_sw.HSBC SWB API', 'SWB Source File base 64');
+            // r.setStringParameterNoEscape('source_id', '45236d8109d14ebcb42c1ba97f859674');
+            r.setStringParameterNoEscape('source_id', sourceFileId);
+            r.setStringParameterNoEscape('token', token);
+
+            var response = r.execute();
+
+            var responseBody = response.getBody();
+            var data = JSON.parse(responseBody);
+
+            var contentType = response.getHeader('Content-Type');
+            var httpStatus = response.getStatusCode();
+
+            fileData.type = this.fetchSourceFileType(sourceFileId);
+            fileData.data = data.data;
+
+            // return data.data;
+            return JSON.stringify(fileData);
+
+
+
+
+
+        } catch (ex) {
+            var message = ex.message;
+            return message;
+        }
+    },
+
+    // MSSCUSTODY-5803
+    fetchSourceFileType: function(sourceFileId) {
+        try {
+            var token = gs.getProperty("x_hsb11_hsbcmss_sw.hsbcmss_swb_api_token");
+            // Fetching file type of the source file from SWB
+            var r = new sn_ws.RESTMessageV2('x_hsb11_hsbcmss_sw.HSBC SWB API', 'SWB Source File Info');
+            // r.setStringParameterNoEscape('source_id', '45236d8109d14ebcb42c1ba97f859674');
+            r.setStringParameterNoEscape('source_id', sourceFileId);
+            r.setStringParameterNoEscape('token', token);
+
+            var response = r.execute();
+            var responseBody = response.getBody();
+            var fileInfo = JSON.parse(responseBody);
+
+            var httpStatus = response.getStatusCode();
+
+            return fileInfo.data.type;
+
+        } catch (ex) {
+            var message = ex.message;
+            return message;
+        }
+    },
+
+    // MSSCUSTODY-7090
+    fetchSourceFileDataCase: function() {
+        try {
+
+            var fileData = {};
+            var sysID = this.getParameter('sysparm_sysID');
+            var sourceFileId = '';
+            var token = gs.getProperty("x_hsb11_hsbcmss_sw.hsbcmss_swb_api_token");
+
+            // Fetching Current Case sys_id
+            var grCase = new GlideRecord('x_hsb11_mss_unst_0_instructions_case');
+            grCase.addQuery('sys_id', sysID);
+            grCase.query();
+
+            // Checking if current case has a parent case
+            if (grCase.next()) {
+                var case_Sys_ID = '';
+
+                // Checking if current case has a parent case
+                if (grCase.parent) {
+                    case_Sys_ID = grCase.parent;
+                } else {
+                    case_Sys_ID = grCase.sys_id;
+                }
+
+                // Fetching source file id from the preprocesing task of the current case
+                var task_Processing = new GlideRecord('x_hsb11_mss_unst_0_instructions_case_task');
+                task_Processing.addQuery('instruction_case', case_Sys_ID);
+                task_Processing.addQuery('task_type', 'preprocessing');
+                task_Processing.query();
+
+                if (task_Processing.next()) {
+                    sourceFileId = task_Processing.source_file_id;
+                }
+
+            }
+
+            // Fetching data of the source file from SWB
+            var r = new sn_ws.RESTMessageV2('x_hsb11_hsbcmss_sw.HSBC SWB API', 'SWB Source File base 64');
+            // r.setStringParameterNoEscape('source_id', '45236d8109d14ebcb42c1ba97f859674');
+            r.setStringParameterNoEscape('source_id', sourceFileId);
+            r.setStringParameterNoEscape('token', token);
+
+            var response = r.execute();
+
+            var responseBody = response.getBody();
+            var data = JSON.parse(responseBody);
+
+            var contentType = response.getHeader('Content-Type');
+            var httpStatus = response.getStatusCode();
+
+            fileData.type = this.fetchSourceFileType(sourceFileId);
+            fileData.data = data.data;
+
+            // return data.data;
+            return JSON.stringify(fileData);
+
+
+
+
+
+        } catch (ex) {
+            var message = ex.message;
+            return message;
+        }
+    },
+
+    type: 'MSS_Unstructured_Instruction_Client_Utils'
+});]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>45417052@hsbc.com</sys_created_by>
+        <sys_created_on>2024-11-26 08:44:05</sys_created_on>
+        <sys_id>ea6f2ca61b0e9e102ac120a8b04bcbaf</sys_id>
+        <sys_mod_count>148</sys_mod_count>
+        <sys_name>MSS_Unstructured_Instruction_Client_Utils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_ea6f2ca61b0e9e102ac120a8b04bcbaf</sys_update_name>
+        <sys_updated_by>45417052@hsbc.com</sys_updated_by>
+        <sys_updated_on>2026-01-09 07:18:23</sys_updated_on>
+    </sys_script_include>
+</record_update>

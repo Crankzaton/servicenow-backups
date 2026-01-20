@@ -1,0 +1,239 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="sys_script">
+    <sys_script action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>false</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection>x_hsb11_mss_c_proc_mss_custody_trade</collection>
+        <condition/>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition table="x_hsb11_mss_c_proc_mss_custody_trade">legacy_status=CONF^statusCHANGESTOconfsett^EQ<item endquery="true" field="" goto="false" newquery="false" operator="=" or="false" value=""/>
+        </filter_condition>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>mss.ghss.autosettle.confandsettle</name>
+        <order>100</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function executeRule(current, previous /*null when async*/ ) {
+
+    try {
+		gs.info("CONFSETT: IN BR ID:"+current.trade_id);
+        if (current.legacy_status == 'CONF') {
+            var ghss = new x_hsb11_mss_c_ghss.GHSS_Helper();
+            var req;
+
+            var ghssSourceSystem = gs.getProperty('x_hsb11_mss_c_ghss.hsbcGHSSWidgetTriggerSourceSystem');
+            var gcsSourceSystem = gs.getProperty('x_hsb11_mss_c_ghss.hsbcGCSWidgetTriggerSourceSystem');
+            var swiftSource = gs.getProperty('x_hsb11_mss_c_proc.hsbcmss_el_custody_source_system_swift_populate_swift_exception');
+            var sourceSystem = current.source_system.toString();
+            var trdOwningBusiness = current.owning_business.toString();
+            var valDateValue = null;
+            var settleDateValue = null;
+
+            // Fetching BulkId --- 
+            var bulkId;
+            var tradeTaskGr = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_task");
+            tradeTaskGr.addEncodedQuery('trade_id=' + current.sys_id + '^state=3^trade_task_type=Maker');
+            tradeTaskGr.orderByDesc('sys_created_on');
+            tradeTaskGr.setLimit(1);
+            tradeTaskGr.query();
+            if (tradeTaskGr.next()) {
+                bulkId = tradeTaskGr.bulk_id;
+                gs.info('CONFSETT: Fetched bulkId: ' + bulkId);
+            } else {
+                gs.info('CONFSETT: No bulkId found for trade_id: ' + current.sys_id);
+            }
+
+            // Fetching active case
+            var caseId;
+            var caseGr = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_case");
+            caseGr.addQuery("trade_id", current.sys_id);
+            caseGr.addQuery("active", true);
+            caseGr.orderByDesc('sys_created_on');
+            caseGr.setLimit(1);
+            caseGr.query();
+            if (caseGr.next()) {
+                caseId = caseGr.sys_id;
+                gs.info('CONFSETT: Fetched active caseId: ' + caseId);
+            } else {
+                gs.info('CONFSETT: No active case found for trade_id: ' + current.sys_id);
+            }
+
+            //finding handler
+            var confHandler = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_task");
+            confHandler.addEncodedQuery("trade_id.sys_idSTARTSWITH" + taskTrade + "^trade_task_type=GHSS Handler - Confirm");
+            confHandler.orderByDesc('sys_created_on');
+            confHandler.query();
+            if (confHandler.next()) {
+
+                var confHandlerCase = confHandler.trade_case_id.sys_id;
+                var confHandlerAdvice = confHandler.advice.toString();
+                var confHandlerSettType = confHandler.settlement_type.toString();
+                var confHandlerBKtoBKInfo = confHandler.bk_to_bk_info;
+
+            }
+            //finding handler
+
+            // Initializing Settle Handler
+            var settleTask = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_task');
+            settleTask.initialize();
+            settleTask.trade_task_template_id = 'CUSTODYTTMP00100';
+            settleTask.trade_task_type = 'GHSS Handler - Settle';
+            settleTask.short_description = 'Widget Update Handler - Settle Automation';
+            settleTask.description = 'This Task has been triggered to automatically perform an action on the trade in Widget.';
+            settleTask.trade_id = current.sys_id;
+            settleTask.bulk_id = bulkId;
+            settleTask.trade_case_id = caseId;
+            settleTask.advice = confHandlerAdvice;
+            settleTask.settlement_type = confHandlerSettType;
+            settleTask.bk_to_bk_info = confHandlerBKtoBKInfo;
+
+            //settleTask.amend_checker_decision = 'AMEND_CONF';
+            //settleTask.assignment_group = 'f1a78cb61b9cb950ff37eb14b24bcb85';
+            var settleTaskSysId = settleTask.insert();
+            gs.info('CONFSETT: Settle handler task created ' + settleTask.number + 'confirm task case id - ' + settleTask.trade_case_id.number + 'settle task bulk id - ' + settleTask.bulk_id.number);
+
+            var taskTrade = current.trade_id.sys_id; //trade ID of Confirm Widget same trade
+            var tradeID = current.trade_id.trade_id;
+            var confirmWidgetSysID = current.sys_id;
+
+
+
+            //MakerCheckerID for Confirm and Settle Trade
+            var getMakerChecker = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_task");
+            getMakerChecker.addEncodedQuery("sys_idSTARTSWITH" + tradeTaskGr.sys_id + "^trade_task_type=Maker");
+            getMakerChecker.orderByDesc('sys_created_on');
+            getMakerChecker.query();
+            if (getMakerChecker.next()) {
+                gs.info("conf 265 ");
+                var confcheckerName = getMakerChecker.trade_case_id.current_checker_assignee.user_name.toString();
+                var confcheckerId = confcheckerName.slice(0, 8);
+                var confmakerName = getMakerChecker.trade_case_id.current_maker_assignee.user_name.toString();
+                var confmakerId = confmakerName.slice(0, 8);
+            }
+            //MakerCheckerID for Confirm and Settle Trade
+
+            // Finding the latest eventTIme
+            var unityTimeStamp;
+            var getExisitingCONF = new GlideRecord("x_hsb11_mss_custod_mss_custody_event_inbound_staging");
+            getExisitingCONF.addEncodedQuery("object_idSTARTSWITH" + tradeID.toString() + "^legacy_status=CONF^ORlegacy_status=CLRG^processing_status=processed_updated");
+            getExisitingCONF.orderByDesc('sys_created_on');
+            getExisitingCONF.setLimit(1);
+            getExisitingCONF.query();
+            if (getExisitingCONF.next()) {
+                var payloadStr = getExisitingCONF.trade_details;
+                //   gs.info('AMENDCONF: Raw payloadStr: ' + payloadStr);
+                if (payloadStr) {
+                    try {
+                        var payloadObj = JSON.parse(payloadStr);
+                        unityTimeStamp = payloadObj.SourceSystemLastUpdatedDateTime;
+                        gs.info('CONFSETT: Found latest event timestamp: ' + unityTimeStamp);
+                    } catch (e) {
+                        gs.error('CONFSETT: JSON parse error: ' + e.message);
+                    }
+                } else {
+                    gs.error('CONFSETT: trade_details is empty for event: ' + getExisitingCONF.sys_id);
+                }
+            } else {
+                gs.error('CONFSETT: No PCON event found for trade_id: ' + amendTradeID);
+            }
+
+            makerId = confmakerId;
+            checkerId = confcheckerId;
+            tradeReference = tradeID;
+            sourceSystemTimeStamp = unityTimeStamp;
+            //adviceType = amendhandlerAdvice;
+
+
+
+            s = confHandlerBKtoBKInfo;
+
+            var reasonDescription = s.toString().replaceAll('"', '\\"'); // Replace single & double quotes with backslash.
+            var reason_description = reasonDescription.replace(/(?:\r\n|\r|\n)/g, " "); //Replace the new line characters with space.
+            var remarksCase = reason_description.toUpperCase();
+
+            //MSSCUSTODY-3232 -- Updated the value as required for "Settle Trade" 
+            if (confHandler.auto_resume_indicator == "Y") {
+                autoResumeIndicator = true;
+            } else if (confHandler.auto_resume_indicator == "N") {
+                autoResumeIndicator = false;
+            }
+
+            if (confHandler.advice == "Y") {
+                adviceType = true;
+            } else if (confHandler.advice == "N") {
+                adviceType = false;
+            }
+
+            if (confHandler.advice == "")
+                adviceType = "";
+
+            // MSSCUSTODY - Advice field to be defaulted as Y if empty for GCS.
+            if (confHandler.advice == "Y") {
+                adviceTypeGCS = true;
+            } else if (confHandler.advice == "N") {
+                adviceTypeGCS = false;
+            } else if (confHandler.advice == "") {
+                adviceTypeGCS = true;
+            }
+            if (confHandler.value_date) {
+                valDateValue = current.value_date;
+            }
+            if (confHandler.settlement_date) {
+                settleDateValue = current.settlement_date;
+            }
+
+			// Added check to set request body if source system is GHSS.
+            if ((ghssSourceSystem.indexOf(sourceSystem) > -1) && (trdOwningBusiness.indexOf('UK') == -1) && (trdOwningBusiness != 'GC HK')) {
+                req = '{ "request_type" : "settle_ghss", "servicenowid" : "' + settleTaskSysId + '", "maker" : "' + makerId + '", "checker" : "' + checkerId + '", "reference" : "' + tradeReference + '" , "last_update_date_time": "' + sourceSystemTimeStamp + '", "generate_advice":"' + adviceType + '", "remark": "' + remarksCase + '", "settle_indicator":"' + confHandler.settlement_type.toString().substring(0, 1) + '", "auto_resume_indicator":"' + autoResumeIndicator + '"  }';
+            }
+			//Added check to set request body if source system is GCS.
+            else if ((gcsSourceSystem.indexOf(sourceSystem) > -1) && (trdOwningBusiness.indexOf('UK') > -1)) {
+                req = '{ "request_type" : "settle_ghss", "servicenowid" : "' + settleTaskSysId + '", "maker" : "' + makerId + '", "checker" : "' + checkerId + '", "reference" : "' + tradeReference + '" , "last_update_date_time": "' + sourceSystemTimeStamp + '", "generate_advice":"' + adviceTypeGCS + '", "remark": "' + remarksCase + '", "settle_indicator":"' + confHandler.settlement_type.toString().substring(0, 1) + '", "auto_resume_indicator":"' + autoResumeIndicator + '","value_date":"' + valDateValue + '","settlement_date":"' + settleDateValue + '"  }';
+            }
+			//GC HK Widgets
+			else if ((ghssSourceSystem.indexOf(sourceSystem) > -1) && (trdOwningBusiness.indexOf('GC HK') > -1)) {
+				req = '{ "request_type" : "settle_ghss", "servicenowid" : "' + settleTaskSysId + '", "maker" : "' + makerId + '", "checker" : "' + checkerId + '", "reference" : "' + tradeReference + '" , "last_update_date_time": "' + sourceSystemTimeStamp + '", "generate_advice":"' + adviceType + '", "remark": "' + remarksCase + '", "settle_indicator":"' + confHandler.settlement_type.toString().substring(0, 1) + '","value_date":"' + valDateValue + '","settlement_date":"' + settleDateValue + '"  }';
+			}
+			ghss.ghssScriptedUpdateOutbound(req);
+        }
+    } catch (e) {
+		gs.info("CONFSETT - Unexpected error occurred from BR :" + err);
+    }
+    // Add your code here
+
+})(current, previous);]]></script>
+        <sys_class_name>sys_script</sys_class_name>
+        <sys_created_by>45375609@hsbc.com</sys_created_by>
+        <sys_created_on>2025-12-03 13:32:43</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>0cb125521ba5fe50da6eeac8b04bcb87</sys_id>
+        <sys_mod_count>20</sys_mod_count>
+        <sys_name>mss.ghss.autosettle.confandsettle</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_0cb125521ba5fe50da6eeac8b04bcb87</sys_update_name>
+        <sys_updated_by>44111348@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-12-15 09:45:04</sys_updated_on>
+        <template/>
+        <when>after</when>
+    </sys_script>
+    <sys_translated_text action="delete_multiple" query="documentkey=0cb125521ba5fe50da6eeac8b04bcb87"/>
+</record_update>

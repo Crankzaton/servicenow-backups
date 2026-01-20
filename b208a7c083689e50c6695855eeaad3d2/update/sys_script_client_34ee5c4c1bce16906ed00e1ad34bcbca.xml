@@ -1,0 +1,364 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="sys_script_client">
+    <sys_script_client action="INSERT_OR_UPDATE">
+        <active>true</active>
+        <applies_extended>false</applies_extended>
+        <condition/>
+        <description>Show/Hide  fields in task form based onchange of outcome for GCS trades.
+</description>
+        <field>outcome</field>
+        <global>true</global>
+        <isolate_script>true</isolate_script>
+        <messages/>
+        <name>GCS - On Change of Outcome</name>
+        <order>100</order>
+        <script><![CDATA[// MSSCUSTODY - 4148 - Hide/Show fields based on Outcome for GCS
+function onChange(control, oldValue, newValue, isLoading, isTemplate) {
+
+    //MSSCUSTODY-7421 - Return if the owning business is GC HK
+    if (g_scratchpad.owningBus.indexOf('GC HK') > -1 )
+        return;
+
+
+    if (isLoading || newValue === '') {
+        var tradeTaskType = g_form.getValue('trade_task_type');
+        var taskState = g_form.getValue('state').toString();
+        //the fields used at bottom should be included here
+        if ((tradeTaskType == 'Maker') && ((taskState == '1') || (taskState == '2'))) {
+            setOnLoadTaskForm(false);
+        }
+        if ((tradeTaskType == 'Checker') || (tradeTaskType == 'Maker') || (tradeTaskType.indexOf('GHSS') > -1)) {
+            showFieldsForChecker();
+        }
+        //MSSCUSTODY-4883 - Check added for disabling this script for GHSS and GC Market trades
+        if (g_scratchpad.owningBus.indexOf('UK') > -1 != true) {
+            //Start : MSSCUSTODY-6289 fixes
+            if ((newValue == "Settle Trade") || (newValue == "Confirm and Settle Trade")) { //MSSCUSTODY-7298
+                g_form.setDisplay('bk_to_bk_info', true);
+            }
+            //End : MSSCUSTODY-6289 fixes
+            g_form.setDisplay('value_date', false);
+            g_form.setDisplay('settlement_date', false);
+            g_form.setDisplay('fxr_td', false);
+        }
+        return;
+    }
+    if (g_scratchpad.owningBus.indexOf('UK') > -1 != true)
+        return;
+
+    var gcsData = new GlideAjax('x_hsb11_mss_c_proc.GCSTradeDetailsUtils');
+    gcsData.addParam('sysparm_name', 'getTradeData');
+    gcsData.addParam('sysparm_trdID', g_form.getValue('trade_id'));
+    gcsData.getXMLAnswer(handleResponse);
+    var source = g_scratchpad.validSourceSystemUK;
+
+
+
+    function handleResponse(response) {
+        var trdDetails = JSON.parse(response);
+
+        //actual values from trade
+        var transactionType = trdDetails.transactType; //Transaction Type
+        var tradeSource = trdDetails.sourceSystem; //Source Ssytem GCS or GHSS
+        var contrType = trdDetails.contractType; // Contract Type
+        var reasonCodeDCC = trdDetails.rCodeDCC; // Reason code for DCC UK trades
+        var reasonCodeGC = trdDetails.rCodeGC; // Reason code for GC UK trades
+        var market = trdDetails.owningBusiness; // Owning business
+        var fxLoc = trdDetails.fxLocation;
+        //Actual values from trade.
+
+        if (tradeSource == source) {
+            if (newValue == "Put 'Trade on Hold'") {
+                putTradeOnHold();
+            } else if ((newValue == "Settle Trade") || (newValue == "Confirm and Settle Trade")) { //MSSCUSTODY-7298
+
+                g_form.setValue('settlement_type', 'B'); // Set settlement type default as B for Settle Trade Outcome
+                g_form.setReadOnly('settlement_type', true);
+                g_form.setMandatory('cancellation_reference', false);
+                g_form.setDisplay('cancellation_reference', false);
+                g_form.setMandatory('settlement_date', false);
+                g_form.setMandatory('value_date', false);
+                g_form.setDisplay('value_date', true);
+                g_form.setDisplay('settlement_date', true);
+                g_form.setMandatory('bk_to_bk_info', false);
+                g_form.setDisplay('bk_to_bk_info', false);
+                g_form.setDisplay('advice', true); //MSSCUSTODY-4883
+                g_form.setReadOnly('advice', true); //MSSCUSTODY-4883
+                g_form.setDisplay('fx_cx', false); //MSSCUSTODY-6087
+                g_form.setDisplay('gdi_indicator', false); //MSSCUSTODY-6087
+
+                if ((transactionType == 'DVP' || transactionType == 'RVP') && (contrType == 'A')) {
+                    settleTrade();
+                } else if ((transactionType != 'DVP' || transactionType != 'RVP') && (contrType == 'A')) {
+                    g_form.setMandatory('value_date', false);
+                    g_form.setDisplay('value_date', true);
+                } else {
+                    g_form.setReadOnly('value_date', true); // Make Value Date Read Only //MSSCUSTODY-4883
+                }
+
+            } else if (newValue == "Confirm Trade") {
+                g_form.setMandatory('value_date', false);
+                g_form.setDisplay('value_date', true);
+                if ((transactionType == 'DVP' || transactionType == 'RVP') && (contrType == 'C')) {
+                    confirmTrade();
+                } else if ((transactionType != 'DVP' || transactionType != 'RVP') && (contrType == 'C')) {
+                    g_form.setMandatory('value_date', false);
+                    g_form.setDisplay('value_date', true);
+                } else {
+                    g_form.setReadOnly('value_date', true); //MSSCUSTODY-4883
+                }
+
+            } else if (newValue == "Process Trade Cancellation") {
+                processTradeCancellation(market, reasonCodeDCC, reasonCodeGC, fxLoc);
+            } else {
+                setOnLoadTaskForm(false);
+            }
+
+        }
+    }
+    // On change of Outcome fields will not be read only.
+    if (newValue != oldValue) {
+        g_form.setReadOnly('collect_cancel_charge', false);
+        g_form.setReadOnly('fxr_td', false);
+        g_form.setReadOnly('value_date', false);
+        g_form.setReadOnly('settlement_date', false);
+        g_form.setReadOnly('settlement_type', false);
+        g_form.setReadOnly('reason_code', false);
+        g_form.setReadOnly('reason_description', false);
+        g_form.setReadOnly('cancellation_reference', false);
+        g_form.setReadOnly('bk_to_bk_info', false);
+        g_form.setReadOnly('advice', false);
+    }
+
+
+    function setOnLoadTaskForm(out_1) {
+
+        g_form.setMandatory('cancel_by', out_1); //..
+        g_form.setMandatory('collect_cancel_charge', out_1); //..
+        g_form.setMandatory('settlement_date', out_1);
+        g_form.setMandatory('value_date', out_1);
+        g_form.setMandatory('fxr_td', out_1);
+        g_form.setMandatory('reason_code', out_1);
+        g_form.setMandatory('settlement_type', out_1);
+        g_form.setMandatory('cancellation_reference', out_1);
+        g_form.setMandatory('bk_to_bk_info', out_1);
+
+        g_form.setDisplay('fx_cx', out_1); //MSSCUSTODY-6087
+        g_form.setDisplay('advice', out_1); 
+        g_form.setDisplay('cancel_by', out_1); //..
+        g_form.setDisplay('collect_cancel_charge', out_1); //..
+        g_form.setDisplay('gdi_indicator', out_1); //MSSCUSTODY-6087
+        g_form.setDisplay('settlement_date', out_1);
+        g_form.setDisplay('value_date', out_1);
+        g_form.setDisplay('fxr_td', out_1);
+        g_form.setDisplay('reason_code', out_1);
+        g_form.setDisplay('settlement_type', out_1);
+        g_form.setDisplay('cancellation_reference', out_1);
+        g_form.setDisplay('bk_to_bk_info', out_1);
+
+
+        g_form.clearValue('fx_cx', out_1); //MSSCUSTODY-6087
+        g_form.clearValue('advice', out_1); //..
+        g_form.clearValue('cancel_by', out_1); //..
+        g_form.clearValue('collect_cancel_charge', out_1); //..
+        g_form.clearValue('gdi_indicator', out_1); //MSSCUSTODY-6087
+        g_form.clearValue('value_date');
+        g_form.clearValue('settlement_date');
+        g_form.clearValue('fxr_td');
+        g_form.clearValue('reason_code');
+        g_form.clearValue('reason_description');
+        g_form.clearValue('settlement_type');
+        g_form.clearValue('cancellation_reference');
+        g_form.clearValue('bk_to_bk_info');
+
+    }
+
+    function putTradeOnHold() {
+
+        // Enable fields for Put trade On Hold Outcome
+        g_form.setValue('suspend', 'Y');
+        g_form.setReadOnly('suspend', true);
+        g_form.setMandatory('reason_code', true);
+        g_form.setLabelOf('reason_code', 'Further Identification Code');
+        g_form.setDisplay('reason_code', true);
+        g_form.setDisplay('advice', true); //MSSCUSTODY-4883
+        g_form.setReadOnly('advice', true); //MSSCUSTODY-4883
+
+        // Disabling fields for Put Trade on Hold
+        g_form.setValue('settlement_type', '');
+        g_form.setMandatory('value_date', false);
+        g_form.setDisplay('value_date', false);
+        g_form.setMandatory('settlement_date', false);
+        g_form.setDisplay('settlement_date', false);
+        g_form.setValue('reason_code', '');
+        g_form.setValue('reason_description', '');
+        g_form.setMandatory('fxr_td', false);
+        g_form.setDisplay('fxr_td', false);
+        g_form.setMandatory('cancellation_reference', false);
+        g_form.setDisplay('cancellation_reference', false);
+        g_form.setDisplay('bk_to_bk_info', false);
+
+
+        g_form.setDisplay('fx_cx', false); //MSSCUSTODY-6087
+        g_form.setDisplay('gdi_indicator', false); //MSSCUSTODY-6087
+
+    }
+
+    function settleTrade() {
+
+        // Enable fields for Settle Trade Outcome
+        g_form.setMandatory('value_date', true);
+        g_form.setDisplay('value_date', true);
+        g_form.setMandatory('settlement_date', false);
+        g_form.setDisplay('settlement_date', true);
+        g_form.setDisplay('settlement_date', true);
+        g_form.setDisplay('settlement_type', true);
+        g_form.setReadOnly('settlement_type', true);
+
+
+        // Disabling fields for Settle Trade
+        g_form.setValue('suspend', '');
+        g_form.setMandatory('reason_code', false);
+        g_form.setDisplay('reason_code', false);
+        g_form.setValue('reason_code', '');
+        g_form.setValue('reason_description', '');
+        g_form.setLabelOf('reason_code', 'Reason Code');
+        g_form.setMandatory('fxr_td', false);
+        g_form.setDisplay('fxr_td', false);
+        g_form.setDisplay('fx_cx', false); //MSSCUSTODY-6087
+        g_form.setDisplay('gdi_indicator', false); //MSSCUSTODY-6087
+
+
+    }
+
+    function confirmTrade() {
+
+        // Enable fields for Confirm Trade Outcome
+        g_form.setMandatory('value_date', true);
+        g_form.setDisplay('value_date', true);
+
+        // Disabling fields for confirm trade
+        g_form.setMandatory('settlement_type', false);
+        g_form.setDisplay('settlement_type', false);
+        g_form.setValue('settlement_type', '');
+        g_form.setMandatory('settlement_date', false);
+        g_form.setDisplay('settlement_date', false);
+        g_form.setMandatory('reason_code', false);
+        g_form.setDisplay('reason_code', false);
+        g_form.setValue('reason_code', '');
+        g_form.setValue('reason_description', '');
+        g_form.setLabelOf('reason_code', 'Reason Code');
+        g_form.setMandatory('fxr_td', false);
+        g_form.setDisplay('fxr_td', false);
+        g_form.setMandatory('cancellation_reference', false);
+        g_form.setDisplay('cancellation_reference', false);
+        g_form.setMandatory('bk_to_bk_info', false);
+        g_form.setDisplay('bk_to_bk_info', false);
+        g_form.setDisplay('fx_cx', false); //MSSCUSTODY-6087
+        g_form.setDisplay('gdi_indicator', false); //MSSCUSTODY-6087
+
+    }
+
+    function processTradeCancellation(market, reasonCodeDCC, reasonCodeGC, fxLoc) {
+
+        // Displaying fields for cancel Trade
+        g_form.setMandatory('reason_code', true);
+        g_form.setDisplay('reason_code', true);
+        g_form.setDisplay('fxr_td', true);
+        if (market == 'DCC UK') {
+            g_form.setValue('reason_code', reasonCodeDCC); // Set reason code as 'CCANI' for DCC UK trades
+        } else if (market == 'GC UK') {
+            g_form.setValue('reason_code', reasonCodeGC); // Set reason code as 'CCANI' for GC UK trades
+        }
+        g_form.setReadOnly('reason_code', true);
+        g_form.setMandatory('cancellation_reference', true);
+        g_form.setDisplay('cancellation_reference', true);
+
+        if ((fxLoc == 'L') || (fxLoc == 'O')) {
+            g_form.setMandatory('fxr_td', true); // Make FXRTD mandatory when FX location is L or O.
+        } else {
+            g_form.setReadOnly('fxr_td', true); //Make FXRTD read only //MSSCUSTODY-4883
+        }
+
+        // Disabling fields for Cancel Trade
+        g_form.setMandatory('settlement_type', false);
+        g_form.setDisplay('settlement_type', false);
+        g_form.setValue('settlement_type', '');
+        g_form.setMandatory('settlement_date', false);
+        g_form.setDisplay('settlement_date', false);
+        g_form.setMandatory('value_date', false);
+        g_form.setDisplay('value_date', false);
+        g_form.setLabelOf('reason_code', 'Reason Code');
+        g_form.setMandatory('bk_to_bk_info', false);
+        g_form.setDisplay('bk_to_bk_info', false);
+        g_form.setDisplay('fx_cx', false); //MSSCUSTODY-6087
+        g_form.setDisplay('gdi_indicator', false); //MSSCUSTODY-6087
+
+    }
+
+    function showFieldsForChecker() {
+        // Function for displaying fields for checker task
+
+
+        g_form.setDisplay('collect_cancel_charge', false);
+        g_form.setDisplay('fxr_td', false);
+        g_form.setDisplay('value_date', false);
+        g_form.setDisplay('settlement_date', false);
+        g_form.setDisplay('settlement_type', false);
+        g_form.setDisplay('reason_code', false);
+        g_form.setDisplay('reason_description', false);
+        g_form.setDisplay('cancellation_reference', false);
+        g_form.setDisplay('bk_to_bk_info', false);
+        g_form.setDisplay('advice', false);
+        g_form.setDisplay('fx_cx', false); //MSSCUSTODY-6087
+        g_form.setDisplay('gdi_indicator', false); //MSSCUSTODY-6087
+
+        var selectedOutcome = g_form.getValue('outcome');
+        // MSSCUSTODY - 4699
+        var settleTrade = ["value_date", "settlement_date", "settlement_type", "advice"];
+        var confirmTrade = ["value_date", "advice"];
+        var putTradeOnHold = ["advice", "suspend", "reason_code", "reason_description"];
+        var processTradeCancellation = ["reason_code", "reason_description", "cancellation_reference", "cancel_by", "advice", "fxr_td", "collect_cancel_charge"];
+
+        if (selectedOutcome == 'Confirm Trade') {
+            for (var i = 0; i < confirmTrade.length; i++) {
+                g_form.setDisplay(confirmTrade[i], true);
+            }
+        } else if (selectedOutcome == 'Settle Trade') {
+            for (i = 0; i < settleTrade.length; i++) {
+                g_form.setDisplay(settleTrade[i], true);
+            }
+            //g_form.setDisplay('bk_to_bk_info', false);
+        } else if (selectedOutcome == 'Process Trade Cancellation') {
+            for (i = 0; i < processTradeCancellation.length; i++) {
+                g_form.setDisplay(processTradeCancellation[i], true);
+            }
+        } else if (selectedOutcome == "Put Trade On-Hold" || selectedOutcome == "No corresponding Switch trade identified - put 'Trade on Hold'" || selectedOutcome == "Put 'Trade on Hold'" || selectedOutcome == "No remediation of corresponding Switch trade possible - put each 'Trade on Hold'")  {
+            for (i = 0; i < putTradeOnHold.length; i++) {
+                g_form.setDisplay(putTradeOnHold[i], true);
+            }
+        }
+
+    }
+
+} //Type appropriate comment here, and begin script below]]></script>
+        <sys_class_name>sys_script_client</sys_class_name>
+        <sys_created_by>45381533@hsbc.com</sys_created_by>
+        <sys_created_on>2024-11-18 13:08:16</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>34ee5c4c1bce16906ed00e1ad34bcbca</sys_id>
+        <sys_mod_count>116</sys_mod_count>
+        <sys_name>GCS - On Change of Outcome</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_client_34ee5c4c1bce16906ed00e1ad34bcbca</sys_update_name>
+        <sys_updated_by>44111348@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-12-11 11:12:28</sys_updated_on>
+        <table>x_hsb11_mss_c_proc_mss_custody_task</table>
+        <type>onChange</type>
+        <ui_type>10</ui_type>
+        <view/>
+    </sys_script_client>
+</record_update>

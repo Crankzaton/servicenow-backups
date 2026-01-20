@@ -1,0 +1,297 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.HSBCMSSEventUtils</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description>This script include is called by 24 schedule items in sys_trigger table.
+Objective :
+This script include has multiple functions for creation and updation of Records from staging table(MSS Event Inbound) to various tables like HSBC Trade, Business Process Instance, Trade case table.
+
+Functions:
+•	mssEventQueue 
+                              -This function is called by all 24 schedule items. The value from Queue Field in MSS Event Inbound table is passed as the parameter.
+                               -This function calls another function  'validateBusinessProcessInstanceAndHSBCEventForJob' which has multiple functions for creation and updation of Records and  also returns the Processing status value.
+
+•	checkIDandVersion
+                                -This function checks the ObjectId and Object Version in HSBCTrade table and performs action based on below criteria,
+                                -If Object ID is already present and Object Version is new then updation of the Record happens.
+                                -If Object ID and Object Version are  already present, then no insertion or updation happens.
+                                -If Object ID and Object Version are  not present, then insertion of new Record happens. 
+
+•	getHsbcTradeRecord
+                               -This function checks whether the Object ID is present in HSBC Trade table and returns it.
+
+•	insertHsbcRecFromMssEvent
+                              -This function is for Insertion of Record from MSS Event Inbound table to HSBC Trade table.
+
+•	updateHsbcRecFromMssEvent
+                              -This function is for Updation of Record from MSS Event Inbound table to HSBC Trade table.
+
+•	mssEventToHsbcTrade
+                             -This function calls  the functions "insertHsbcRecFromMssEvent" and "updateHsbcRecFromMssEvent" based on conditions.
+
+•	createHsbcBusinessProcessInstanceRec
+                            -This function is for Insertion of Record from MSS Event Inbound table to Business Process Instance table.
+
+•	updateHsbcBusinessProcessInstanceRec
+                           -This function is for Updation of Record from MSS Event Inbound table to Business Process Instance table.
+
+•	getBusinessProcessInstance
+                           -This function queries for ObjectID in Business Process Instance table.
+
+•	getBusinessProcessStageStatus
+                           -This function queries for Status in Business Process stages table.
+
+•	validateBusinessProcessInstanceAndHSBCEventForJob
+                           -This function has multiple functions for creation and updation of Records from staging table(MSS Event Inbound) to various tables like HSBC Trade, Business Process Instance, Trade case table and  also returns the Processing status value.
+
+</description>
+        <mobile_callable>false</mobile_callable>
+        <name>HSBCMSSEventUtils</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var HSBCMSSEventUtils = Class.create();
+var checkVersion = '';
+HSBCMSSEventUtils.prototype = {
+    initialize: function() {
+        this.HSBCTradeCaseException = new x_hsb11_hsbc_mss_t.HSBCTradeCaseException();
+    },
+
+    mssEventQueue: function(queue) { //creation of record in HSBC Trade from MSS Event Inbound table.
+        var processingStatus = '';
+        var mssEventTable = new GlideRecord('x_hsb11_hsbc_mss_o_mss_event_inbound');
+        mssEventTable.addQuery('queue', queue);
+        mssEventTable.addQuery('processing_status', 'Processing');
+        mssEventTable.query();
+        while (mssEventTable.next()) {
+            processingStatus = this.validateBusinessProcessInstanceAndHSBCEventForJob(mssEventTable.objectid, mssEventTable.objectversion, mssEventTable.eventstatus, mssEventTable.eventdatetime, mssEventTable.etc_service, mssEventTable.additional_attributes, mssEventTable.messageid, mssEventTable.source, mssEventTable.eventtype, mssEventTable.objectidtype, mssEventTable.objectversion, mssEventTable.objecttype);
+            mssEventTable.processing_status = processingStatus;
+            mssEventTable.update();
+        }
+    },
+    checkIDandVersion: function(object_version, object_id) { // Checking ID and Version in HSBC Trade Table
+        var validCase = '';
+        var checkDuplicateObjectId = this.getHsbcTradeRecord(object_id);        
+        if (checkDuplicateObjectId) {
+            checkVersion = checkDuplicateObjectId.u_version;
+            if (checkVersion == object_version) {
+                validCase = 0; // when version and object_id are already present
+            } else {
+                validCase = 1; // when version is unique and object_id is already present
+            }
+        } else {
+            validCase = 2; // when version and object_id are Unique 
+        }
+        return validCase;
+    },
+    getHsbcTradeRecord: function(objectID) { //getting HSBC Trade Record
+        var hsbcTradeRec = new GlideRecord("x_hsb11_hsbc_mss_t_hsbc_trade");
+        hsbcTradeRec.addQuery('u_id', objectID);
+        hsbcTradeRec.query();
+        if (hsbcTradeRec.next()) {
+            return hsbcTradeRec;
+        }
+    },
+    insertHsbcRecFromMssEvent: function(ObjectId, ObjectVersion) {
+        var hsbcTrade = new GlideRecord('x_hsb11_hsbc_mss_t_hsbc_trade');
+        hsbcTrade.initialize();
+        hsbcTrade.u_id = ObjectId;
+        hsbcTrade.u_version = ObjectVersion;
+        hsbcTrade.insert();
+    },
+    updateHsbcRecFromMssEvent: function(ObjectId, ObjectVersion) {
+        var hsbcTradeUpdate = new GlideRecord('x_hsb11_hsbc_mss_t_hsbc_trade');
+        hsbcTradeUpdate.addQuery('u_id', ObjectId);
+        hsbcTradeUpdate.query();
+        if (hsbcTradeUpdate.next()) {
+            hsbcTradeUpdate.u_version = ObjectVersion;
+            hsbcTradeUpdate.update();
+        }
+    },
+    mssEventToHsbcTrade: function(objectid, objectversion) {
+        checkVersion = this.checkIDandVersion(objectversion, objectid);
+        if (checkVersion == 1) // flag 1 for when version is unique and object_id are already present
+        {
+            this.updateHsbcRecFromMssEvent(objectid, objectversion);
+        } else if (checkVersion == 2) // flag 2 for when version and object_id are Unique
+        {
+            this.insertHsbcRecFromMssEvent(objectid, objectversion);
+        }
+    },
+    createHsbcBusinessProcessInstanceRec: function(gdt, objectid, businessProcess, businessProcessInstanceCtacStatus, executionTime, caseCreated, etcService, attribute, messageid, source, eventtype, objectidtype, objectversion, objecttype) { //create a record in Business process instance table from MSS event inbound.
+        var createProcessInstance = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_instance');
+        createProcessInstance.initialize();
+        createProcessInstance.expected_transition_time = gdt.getValue();
+        createProcessInstance.financial_object_record.setDisplayValue(objectid);
+        createProcessInstance.business_process_definition.setDisplayValue(businessProcess);
+        createProcessInstance.status.setDisplayValue(businessProcessInstanceCtacStatus);
+        createProcessInstance.execution_time = executionTime;
+        createProcessInstance.is_case_created = caseCreated;
+        createProcessInstance.additional_attributes = attribute;
+		createProcessInstance.messageid = messageid;
+		createProcessInstance.source = source;		
+        createProcessInstance.etc_service = etcService;
+		createProcessInstance.event_type = eventtype;
+	
+		createProcessInstance.objectidtype = objectidtype;
+		createProcessInstance.objectversion = objectversion;
+		createProcessInstance.object_type = objecttype;
+        createProcessInstance.insert();
+    },
+    updateHsbcBusinessProcessInstanceRec: function(gdt, objectid, businessProcess, businessProcessInstanceCtacStatus, executionTime, caseCreated, etcService, attribute, messageid, source, eventtype, objectidtype, objectversion, objecttype) { //Update record on business process instance table 
+        var updateBusinessProcessInstance = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_instance');
+        updateBusinessProcessInstance.addQuery('financial_object_record.u_id', objectid);
+        updateBusinessProcessInstance.query();
+        if (updateBusinessProcessInstance.next()) {
+            updateBusinessProcessInstance.expected_transition_time = gdt.getValue();
+            updateBusinessProcessInstance.business_process_definition.setDisplayValue(businessProcess);
+            updateBusinessProcessInstance.status.setDisplayValue(businessProcessInstanceCtacStatus);
+            updateBusinessProcessInstance.execution_time = executionTime;
+            updateBusinessProcessInstance.is_case_created = caseCreated;
+            updateBusinessProcessInstance.additional_attributes = attribute;
+			updateBusinessProcessInstance.messageid = messageid;
+			updateBusinessProcessInstance.source = source;
+			
+            updateBusinessProcessInstance.etc_service = etcService;
+			updateBusinessProcessInstance.event_type = eventtype;
+			updateBusinessProcessInstance.objectidtype = objectidtype;
+			updateBusinessProcessInstance.objectversion = objectversion;
+			updateBusinessProcessInstance.object_type = objecttype;
+            updateBusinessProcessInstance.update();
+        }
+    },
+
+    getBusinessProcessInstance: function(objectid) {
+        var processInstance = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_instance');
+        processInstance.addQuery('financial_object_record.u_id', objectid);
+        processInstance.query();
+        if (processInstance.next()) {
+            return processInstance;
+        }
+    },
+    getBusinessProcessStageStatus: function(mssEventStatus) {
+        var bpstg = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_stage');
+        bpstg.addQuery('ctac_code', mssEventStatus);
+        bpstg.query();
+        if (bpstg.next()) {
+            return bpstg.status;
+        }
+    },
+
+    //MAIN CALLING FUNCTION
+    validateBusinessProcessInstanceAndHSBCEventForJob: function(objectid, objectversion, eventstatus, eventdatetime, etcService, attribute, messageid, source, eventtype, objectidtype, objectversionbpi, objecttype) { //, processingStatusFlag
+        var processingStatusFlag = '';
+        var exceptionFlag = false;
+        var transactionalStatusFlag = false;
+        var anomalyFlag = false;
+        var statusFlag = '';
+        var shortDescription = '';
+        var caseCreated = '';
+        var timeFlag = false;
+        var checkVersion = this.checkIDandVersion(objectversion, objectid);
+        var isexeption = '';
+        var dur = '';
+        var busProcess = '';
+        var businessProcess = '';
+        var gdt = new GlideDateTime(eventdatetime.getDisplayValue());
+        var bpiTime = "";
+        var mssTime = "";
+        var businessProcessInstanceCtacStatus = this.getBusinessProcessStageStatus(eventstatus);
+        var businessProcessInstanceObj = this.getBusinessProcessInstance(objectid);
+        var businessProcessStage = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_stage'); //Glide Business process Stage table
+        businessProcessStage.addQuery('status', businessProcessInstanceCtacStatus);
+        businessProcessStage.query();
+        if (businessProcessStage.next()) {
+            isexeption = businessProcessStage.is_exception;
+            dur = businessProcessStage.expected_duration;
+            busProcess = businessProcessStage.business_process;
+
+        }
+
+        if (businessProcessInstanceCtacStatus) {
+            transactionalStatusFlag = true;
+            if (isexeption == true) {
+                exceptionFlag = true;
+            }
+        }
+        if (checkVersion == 1 || checkVersion == 2) {
+            if (businessProcessInstanceCtacStatus) {
+                businessProcess = busProcess.getDisplayValue();
+                // ms = dur.dateNumericValue();
+                gdt.add(dur.dateNumericValue());
+            }
+
+            //code for Ignored state
+            var mssEventTime = new GlideRecord('x_hsb11_hsbc_mss_o_mss_event_inbound');
+            mssEventTime.addQuery('objectid', objectid);
+            mssEventTime.orderByDesc('sys_created_on');
+            mssEventTime.setLimit(1);
+            mssEventTime.query();
+            if (mssEventTime.next()) {
+                mssTime = GlideDateTime(mssEventTime.eventdatetime.getDisplayValue());
+            }
+            var processInstanceTime = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_instance');
+            processInstanceTime.addQuery('financial_object_record.u_id', objectid);
+            processInstanceTime.query();
+            if (processInstanceTime.next()) {
+                bpiTime = GlideDateTime(processInstanceTime.execution_time.getDisplayValue());
+            }
+            if (bpiTime > mssTime) {
+                processingStatusFlag = 'Ignored';
+                timeFlag = true;
+            }
+            if (timeFlag == false) {
+                if (checkVersion == 1) // flag 1 for when version is unique and object_id are already present
+                {
+                    this.updateHsbcRecFromMssEvent(objectid, objectversion);
+                } else if (checkVersion == 2) // flag 2 for when version and object_id are Unique
+                {
+                    this.insertHsbcRecFromMssEvent(objectid, objectversion);
+                }
+
+                if (exceptionFlag == false) {
+                    if (businessProcessInstanceObj) {
+                        processingStatusFlag = 'Processed';
+                        caseCreated = false;
+                        this.updateHsbcBusinessProcessInstanceRec(gdt, objectid, businessProcess, businessProcessInstanceCtacStatus, eventdatetime, caseCreated, etcService, attribute, messageid, source, eventtype, objectidtype, objectversionbpi, objecttype);
+                    } else {
+                        processingStatusFlag = 'Processed';
+                        caseCreated = false;
+                        this.createHsbcBusinessProcessInstanceRec(gdt, objectid, businessProcess, businessProcessInstanceCtacStatus, eventdatetime, caseCreated, etcService, attribute, messageid, source, eventtype, objectidtype, objectversionbpi, objecttype);
+                    }
+                } else if (exceptionFlag == true) {
+                    if (businessProcessInstanceObj) {
+                        processingStatusFlag = 'Processed';
+                        caseCreated = true;
+                        this.updateHsbcBusinessProcessInstanceRec(gdt, objectid, businessProcess, businessProcessInstanceCtacStatus, eventdatetime, caseCreated, etcService, attribute, messageid, source, eventtype, objectidtype, objectversionbpi, objecttype);
+                    } else {
+                        processingStatusFlag = 'Processed';
+                        caseCreated = true;
+                        this.createHsbcBusinessProcessInstanceRec(gdt, objectid, businessProcess, businessProcessInstanceCtacStatus, eventdatetime, caseCreated, etcService, attribute, messageid, source, eventtype, objectidtype, objectversionbpi, objecttype);
+                    }
+                    this.HSBCTradeCaseException.createHsbcTradeCase(objectid, businessProcessInstanceCtacStatus, attribute, processInstanceTime.payload);
+
+                }
+            }
+        }
+        return processingStatusFlag;
+
+
+    },
+    type: 'HSBCMSSEventUtils'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>45239368@hsbc.com</sys_created_by>
+        <sys_created_on>2022-11-04 08:08:23</sys_created_on>
+        <sys_id>6b6332401b03dd106ed00e1ad34bcb6e</sys_id>
+        <sys_mod_count>196</sys_mod_count>
+        <sys_name>HSBCMSSEventUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_6b6332401b03dd106ed00e1ad34bcb6e</sys_update_name>
+        <sys_updated_by>45312879@hsbc.com</sys_updated_by>
+        <sys_updated_on>2023-02-09 07:11:33</sys_updated_on>
+    </sys_script_include>
+</record_update>

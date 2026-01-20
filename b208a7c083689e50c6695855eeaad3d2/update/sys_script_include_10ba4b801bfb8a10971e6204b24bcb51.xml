@@ -1,0 +1,621 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.MSS_Funds_Utils</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description>MSSFUNDS-12: This script include contains libraries and functions to handle MSS Funds operations </description>
+        <mobile_callable>false</mobile_callable>
+        <name>MSS_Funds_Utils</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var MSS_Funds_Utils = Class.create();
+MSS_Funds_Utils.prototype = {
+    initialize: function() {},
+
+    //MSSFUND-174 and MSSFUNDS-175 : to get previous business day date in subject line 
+    getPreviousbusinessDay: function() {
+        var curDate = new GlideDateTime();
+        curDate.addSeconds(28800); //8Hrs - Difference between HK and UK timezone
+        var dayofweek = curDate.getDayOfWeekLocalTime();
+        if (dayofweek == 1) { //today is monday
+            curDate.addDaysLocalTime(-3); //substract 3 days to get friday
+        } else { //business days substract 1
+            curDate.addDaysLocalTime(-1);
+        }
+        return curDate.getLocalDate();
+    },
+
+    //MSSFUNDS-12: Create Cases for all active funds everyday
+    createCases: function() {
+        try {
+            var previousBusinessday = this.getPreviousbusinessDay();
+            grFundsMaster = new GlideRecord('x_hsb11_mss_fund_0_funds_master');
+            grFundsMaster.addQuery('fund_status', true);
+            grFundsMaster.query();
+            while (grFundsMaster.next()) {
+                if (this.checkActiveCase(grFundsMaster.sys_id) == false) {
+                    grFundsCase = new GlideRecord('x_hsb11_mss_fund_0_funds_case');
+                    grFundsCase.initialize();
+                    grFundsCase.fund_name = grFundsMaster.sys_id;
+                    grFundsCase.short_description = 'Recon/' + previousBusinessday + '/' + grFundsMaster.fund_name;
+                    grFundsCase.insert();
+                }
+            }
+        } catch (e) {
+            gs.info("Script Include - MSS_Funds_Utils - Unexpected Error While Processing" + e.message);
+        }
+
+    },
+
+    //MSSFunds-12: Check for active cases created today for fund, if found return true
+    checkActiveCase: function(fundid) {
+        var caseFlag = false;
+        var grCase = new GlideRecord('x_hsb11_mss_fund_0_funds_case');
+        grCase.addEncodedQuery('sys_created_onONToday@javascript:gs.beginningOfToday()@javascript:gs.endOfToday()^fund_name=' + fundid);
+        grCase.query();
+        if (grCase.next())
+            caseFlag = true;
+
+        return caseFlag;
+    },
+
+    //MSSFunds-14: Create Funds Tasks for every break received in payload. 
+    createBreaks: function(payload) {
+        try {
+            var breakPayload = JSON.parse(payload.toString());
+            var breakSub = breakPayload.Email_Subject;
+            var breakType;
+            if (breakSub.indexOf('Stock') > -1) //  check break type 
+                breakType = 'position';
+            else if (breakSub.indexOf('Cash') > -1)
+                breakType = 'cash';
+            var attachments = breakPayload.Email_Attachments;
+            for (var i = 0; i < attachments.length; i++) {
+                var fileName = attachments[i].Email_Attachment_Name; //field for file name
+                if (fileName.endsWith('.xls') || fileName.endsWith('.xlsx')) {
+                    var extractedBreaks = attachments[i].Email_Extracted_Breaks;
+                    for (var j = 0; j < extractedBreaks.length; j++) {
+                        var grTask = new GlideRecord('x_hsb11_mss_fund_0_funds_task');
+                        grTask.initialize();
+                        grTask.task_type = breakType;
+                        grTask.category_code = extractedBreaks[j].Category_Code;
+                        grTask.set_id = extractedBreaks[j].SET_ID;
+                        grTask.statement_date = extractedBreaks[j].Statement_Date;
+                        grTask.value_date = extractedBreaks[j].Value_Date;
+                        grTask.trade_date = extractedBreaks[j].Trade_Date;
+                        grTask.item_type = extractedBreaks[j].Item_Type;
+                        grTask.amount = extractedBreaks[j].Amount;
+                        grTask.ccy = extractedBreaks[j].CCY;
+                        grTask.reference1 = extractedBreaks[j].Reference1;
+                        grTask.reference2 = extractedBreaks[j].Reference2;
+                        grTask.reference3 = extractedBreaks[j].Reference3;
+                        grTask.reference4 = extractedBreaks[j].Reference4;
+                        grTask.department = extractedBreaks[j].Department;
+                        grTask.local_market_ccy = extractedBreaks[j].Local_Market_CCY;
+                        grTask.local_market_value = extractedBreaks[j].Local_Market_Value;
+                        grTask.asset_description = extractedBreaks[j].Asset_Description;
+                        grTask.asset_code = extractedBreaks[j].Asset_Code;
+                        grTask.quantity = extractedBreaks[j].Quantity;
+                        grTask.fund_name = this.getFundCode(extractedBreaks[j].Portfolio_Code);
+                        grTask.fund_case = this.getActiveCase(extractedBreaks[j].Portfolio_Code);
+                        grTask.exception_id = extractedBreaks[j].Exception_ID;
+                        if (extractedBreaks[j].Department == 'CORPORATE ACTION') { //MSSFUNDS-210: Assign to FA Ops Maker when Corporate Action
+                            var faMaker = gs.getProperty('x_hsb11_mss_fund_0.FA_Ops_Maker_Group');
+                            grTask.assignment_group = faMaker;
+                        }
+                        grTask.insert();
+                    }
+                }
+            }
+        } catch (e) {
+            gs.info("Script Include - MSS_Funds_Utils - Unexpected Error While Processing" + e.message);
+        }
+    },
+
+    //MSSFunds-12: Check for active cases created today for fund, if found return true
+    getActiveCase: function(fundcode) {
+        var grCase = new GlideRecord('x_hsb11_mss_fund_0_funds_case');
+        grCase.addEncodedQuery('sys_created_onONToday@javascript:gs.beginningOfToday()@javascript:gs.endOfToday()^ORsys_created_onONYesterday@javascript:gs.beginningOfYesterday()@javascript:gs.endOfYesterday()^fund_name.fund_code=' + fundcode);
+        grCase.orderByDesc('sys_created_on');
+        grCase.setLimit(1);
+        grCase.query();
+        if (grCase.next())
+            var caseFlag = grCase.sys_id;
+
+        return caseFlag;
+    },
+
+    //MSSFUNDS: Process Recon Signoff 
+    processReconSignoff: function(payload) {
+        try {
+            var gdreconStatementDate;
+            var reconPayload = JSON.parse(payload.toString());
+            var reconBody = reconPayload.Email_Body;
+            var reconString = reconBody.indexOf('Reconciliation statements as at '); //Get index of signoff date mentioned in body
+            var reconDate = reconBody.substr(reconString + 32, 10); //Take date from body, 32 is length of "Reconciliation statements as at " string and 10 is length of date format
+            var format = 'yyyy-MM-dd'; // format to convert date to given type
+            var gdt = new GlideDateTime(reconDate);
+            var curDate = new GlideDateTime(); //system time(Europe/London)
+			curDate.addSeconds(28800); //Add 8hrs to align with HKT
+            var today = curDate.getDayOfWeekUTC();
+            if (today == 1) { //MSSFUND-204: If today is monday then add 2 days to statement date in body
+                gdt.addDaysLocalTime(2);
+                gdreconStatementDate = gdt.getLocalDate().getByFormat(format);
+            } else {
+                //MSSFUNDS-204: If today is not monday then take actual body date
+                gdreconStatementDate = gdt.getLocalDate().getByFormat(format); //get final statement date in given format
+            }
+            var regex = /(<([^>]+)>)/ig;
+            var result1 = reconBody.replace(regex, "");
+            var result2 = result1.replace(/(\r\n|\r|\n)/g, ','); // MSSFunds-14: Replace styles
+            var fundCodes = result2.split(','); //MSSFunds-14: Split data into array
+            for (i = 0; i < fundCodes.length; i++) {
+                if (fundCodes[i] != '' && fundCodes[i].length < 10) { //MSSFunds-14: Loop over all fund codes
+                    var grFundCase = new GlideRecord('x_hsb11_mss_fund_0_funds_case');
+                    grFundCase.addEncodedQuery("sys_created_onON" + gdreconStatementDate + "@javascript:gs.dateGenerate('" + gdreconStatementDate + "','start')@javascript:gs.dateGenerate('" + gdreconStatementDate + "','end')^fund_name.fund_code=" + fundCodes[i].trim());
+                    grFundCase.query(); // MSSFunds-13: Query Funds Cased based on Fund Codes
+                    if (grFundCase.next()) {
+                        grFundCase.recon_signoff_status = 'auto_singed_off';
+                        grFundCase.update(); // MSSFunds-13: Update Recon Signoff Status to "Auto Signed Off"
+                    }
+                }
+            }
+        } catch (e) {
+            gs.info("Script Include - MSS_Funds_Utils - Unknown Excpetion While Processing Recon Signoff" + e.message);
+        }
+    },
+
+    //MSSFunds-13: Return Fund ID
+    getFundCode: function(portfolioCode) {
+        var grFund = new GlideRecord('x_hsb11_mss_fund_0_funds_master');
+        grFund.addQuery('fund_code', portfolioCode);
+        grFund.query();
+        if (grFund.next())
+            return grFund.sys_id;
+    },
+
+    //MSSFUNDS-34: Return true if user is part of assignment group
+    isPartOfAssignmentGroup: function(assignmentGroup) {
+        var grGroup = new GlideRecord('sys_user_grmember');
+        grGroup.addQuery('user', gs.getUserID());
+        grGroup.addQuery('group', assignmentGroup);
+        grGroup.query();
+        if (grGroup.next())
+            return true;
+    },
+
+    // MSSFUNDS-4: Send Chaser Email
+    createChaserRecord: function(event, emailBody) {
+        try {
+            // event = array of fund details such as fund family, client, department, sla, statement date
+            //email subject is subject of initial email
+            var eventArray = event.split(","); //Split array
+            var receiverEmail, senderEmail, fundFamily, taskDepartment, taskFundid = [];
+			var createdDate = new GlideDateTime(eventArray[4].trim()).getDate();//get created date
+            var grTask = new GlideRecord('x_hsb11_mss_fund_0_funds_task');
+            grTask.addEncodedQuery("fund_name.fund_family=" + eventArray[1].trim() + "^department=" + eventArray[2].trim() + "^state=1^sys_created_onON"+createdDate+"@javascript:gs.dateGenerate('"+createdDate+"','start')@javascript:gs.dateGenerate('"+createdDate+"','end')");
+            grTask.query(); // MSSFUNDS-4: Check applicable tasks
+            if (grTask.hasNext()) {
+                while (grTask.next()) {
+                    receiverEmail = grTask.department_email;
+                    senderEmail = grTask.department_sender_email;
+                    fundFamily = grTask.fund_name.fund_family;
+                    taskDepartment = grTask.department;
+                }
+                var getMaster1 = new GlideRecord('x_hsb11_mss_fund_0_funds_master');
+                getMaster1.addEncodedQuery('fund_family=' + grTask.fund_name.fund_family);
+                getMaster1.setLimit(1);
+                getMaster1.query();
+                if (getMaster1.next()) {
+                    var hkCutOffTimeNonCA = this.convertTimeToHK(getMaster1.sla_for_1st_chaser); //MSSFUNDS-209: Convert timezone to HK
+                    var grEmailLog = new GlideRecord('x_hsb11_hsbcmss_eh_hsbc_email_log'); // Create Chaser Email
+                    grEmailLog.initialize();
+                    grEmailLog.type = 'Outbound';
+                    grEmailLog.body = emailBody.toString();
+                    grEmailLog.fund_family = fundFamily;
+                    grEmailLog.fund_department = taskDepartment;
+                    grEmailLog.from = senderEmail;
+                    grEmailLog.recipients = receiverEmail;
+                    grEmailLog.business_line = 'Funds';
+                    grEmailLog.api_response_from_qtrack = 'Sent-Ready';
+                    grEmailLog.subject = "Chaser Email: " + eventArray[5].toString();
+                    var emailSysID = grEmailLog.insert();
+                    var grEmailLogCreated = new GlideRecord('x_hsb11_hsbcmss_eh_hsbc_email_log'); // MSSFUNDS-4: Update Email Subject to contain SNE number in it
+                    grEmailLogCreated.get(emailSysID);
+                    var subCreated = grEmailLogCreated.subject;
+                    grEmailLogCreated.subject = grEmailLogCreated.email_id + " " + subCreated;
+                    grEmailLogCreated.update();
+                    return emailSysID;
+                }
+            }
+        } catch (e) {
+            gs.info("Script Include - MSS_Funds_Utils - Unknown Exception While Handling Chaser Email" + e);
+        }
+    },
+
+    //MSSFUNDS-4: Send Email to upstream teams when tasks created
+    triggerInitialEmail: function() {
+        try {
+            //MSSFunds-4: Return all task
+            var previousBusinessday = this.getPreviousbusinessDay();
+            var fundFam = new GlideAggregate('x_hsb11_mss_fund_0_funds_task');
+            fundFam.addEncodedQuery('fund_name.fund_family!=NULL^departmentINSETTLEMENTS,TRADE PROCESSING,TREASURY SERVICES DELIVERY^state=1^sys_created_onONToday@javascript:gs.beginningOfToday()@javascript:gs.endOfToday()');
+            fundFam.groupBy('fund_name.fund_family');
+            fundFam.query();
+            while (fundFam.next()) {
+                var Dept = new GlideAggregate('x_hsb11_mss_fund_0_funds_task');
+                Dept.addEncodedQuery('fund_name.fund_family=' + fundFam.getDisplayValue('fund_name.fund_family') + '^departmentINSETTLEMENTS,TRADE PROCESSING,TREASURY SERVICES DELIVERY^state=1^sys_created_onONToday@javascript:gs.beginningOfToday()@javascript:gs.endOfToday()');
+                Dept.groupBy('department');
+                Dept.query();
+                while (Dept.next()) {
+                    var record1 = new GlideRecord('x_hsb11_mss_fund_0_funds_task');
+                    record1.addEncodedQuery('fund_name.fund_family=' + fundFam.getDisplayValue('fund_name.fund_family') + '^department=' + Dept.getDisplayValue('department') + '^state=1^sys_created_onONToday@javascript:gs.beginningOfToday()@javascript:gs.endOfToday()');
+                    record1.query();
+                    var Taskarr = [],
+                        arr = [];
+                    while (record1.next())
+                        Taskarr.push(Dept.getDisplayValue('department') + "--" + record1.number);
+                    for (var i = 0; i < Taskarr.length; i++)
+                        arr.push(Taskarr[i].substr(-13));
+                    var record = new GlideRecord('x_hsb11_mss_fund_0_funds_task');
+                    record.addEncodedQuery('numberIN' + arr);
+                    record.query();
+                    if (record.hasNext()) {
+                        var receiverEmail, senderEmail, fundFamily, taskDepartment;
+                        var bodyStart = '<!DOCTYPE html><html> <div style="background-color: #ecf0f1;"> <p><span style="color: #000000; background-color: #ecf0f1; font-size: 10pt;">Hi Team</span></p> <p><span style="color: #000000; background-color: #ecf0f1; font-size: 10pt;">Could you please help to check and advise the cash & position breaks by ';
+                        var body = '</span></p> <p><span style="color: #000000; background-color: #ecf0f1; font-size: 10pt;">Cash breaks:</span></p> <br /> <table id= "table1" style="border-collapse: collapse; height: 112.409px; border-color: #ced4d9; table-layout:fixed; width:100% text-align: left; font-size: 14px; font-family: calibri; border-style: solid; float: left;" border="3"> <tbody> <tr style="height: 58.8068px; border-style: solid; background-color: #34495e;"> <td style="width: 8.78347%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Exception ID</span></td> <td style="width: 8.14699%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Client</span></td> <td style="width: 8.50514%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Portfolio Code</span></td> <td style="width: 8.17073%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">SET ID</span></td> <td style="width: 8.52888%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Statement Date</span></td> <td style="width: 8.52888%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Value Date</span></td> <td style="width: 8.14699%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Trade Date</span></td> <td style="width: 8.14699%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Item Type</span></td> <td style="width: 8.52888%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">CCY</span></td> <td style="width: 8.52888%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Amount</span></td> <td style="width: 8.91077%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Reference 1</span></td> <td style="width: 8.91077%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Reference 2</span></td> <td style="width: 8.91077%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Reference 3</span></td> <td style="width: 8.91077%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Reference 4</span></td><td style="width: 8.91077%; border-style: solid; height: 58.8068px;background-color:#FFBF00;"><span style="color: #000000;">Break Resolved (Yes/No Selection)</span></td> <td style="width: 8.91077%; border-style: solid; height: 58.8068px;background-color:#FFBF00;"><span style="color: #000000;">Comments</span></td> </tr>';
+                        var body2 = '</table><!DOCTYPE html><html> <div style="background-color: #ecf0f1;"><p><span style="color: #000000; background-color: #ecf0f1; font-size: 10pt;">Position breaks:</span></p> <br /> <table id="table2" style="border-collapse: collapse; height: 112.409px; border-color: #ced4d9; table-layout:fixed; width:100% text-align: left; font-size: 14px; font-family: calibri; border-style: solid; float: left;" border="3"> <tbody> <tr style="height: 58.8068px; border-style: solid; background-color: #34495e;"> <td style="width: 8.78347%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Exception ID</span></td> <td style="width: 8.14699%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Client</span></td> <td style="width: 8.14699%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Category Code</span></td> <td style="width: 8.50514%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Portfolio Code</span></td> <td style="width: 8.17073%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">SET ID</span></td> <td style="width: 8.52888%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Item Type</span></td> <td style="width: 8.52888%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Asset Description</span></td> <td style="width: 8.14699%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Asset Code</span></td> <td style="width: 8.14699%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Quantity</span></td> <td style="width: 8.52888%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Statement Date</span></td> <td style="width: 8.52888%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Trade Date</span></td> <td style="width: 8.52888%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Local Market CCY</span></td> <td style="width: 8.52888%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Local Market Value</span></td> <td style="width: 8.91077%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Reference 1</span></td> <td style="width: 8.91077%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Reference 2</span></td> <td style="width: 8.91077%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Reference 3</span></td> <td style="width: 8.91077%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Reference 4</span></td> <td style="width: 8.91077%; border-style: solid; height: 58.8068px;background-color:#FFBF00;"><span style="color: #000000;">Break Resolved (Yes/No Selection)</span></td> <td style="width: 8.91077%; border-style: solid; height: 58.8068px;background-color:#FFBF00;"><span style="color: #000000;">Comments</span></td> </tr>';
+                        var body3 = '</table><div> <div style="font-family: calibri;"><br /></div> <div style="font-family: calibri;"><br /></div> <div style="font-family: calibri;"><b>Thanks &amp; Regards,</b></div> <div style="font-family: calibri;">Accounting &amp; Valuation| Securities Services, Guangdong</div> <div style="font-family: calibri;">Global Banking and Markets Centers | HSBC</div></div>';
+                        while (record.next()) {
+                            receiverEmail = record.department_email;
+                            senderEmail = record.department_sender_email;
+                            fundFamily = record.fund_name.fund_family;
+                            taskDepartment = record.department;
+                            if (record.task_type == "cash")
+                                body = body + '<tr style="color: #000000;"> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.exception_id + '</td><td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.fund_name.client + '</td><td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.fund_name.fund_code + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.set_id + '</td><td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.statement_date + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.value_date + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.trade_date + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.item_type + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.ccy + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.amount + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.reference1 + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.reference2 + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.reference3 + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.reference4 + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;input type="text""></td><td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.comments + '</td> </tr>';
+                            else if (record.task_type == "position")
+                                body2 = body2 + '<tr style="color: #000000;"><td style="width: 8.78347%; height: 53.6023px; border-style: so-style: solid;">' + record.exception_id + '</td><td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.fund_name.client + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: so-style: solid;">' + record.category_code + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.fund_name.fund_code + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.set_id + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.item_type + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.asset_description + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.asset_code + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.quantity + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.statement_date + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.trade_date + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.local_market_ccy + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.local_market_value + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.reference1 + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.reference2 + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.reference3 + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.reference4 + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;input type="text""></td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.comments + '</td> </tr>';
+                            Taskarr.splice(0, Taskarr.length);
+                            arr.splice(0, arr.length);
+                        }
+                        var getMaster = new GlideRecord('x_hsb11_mss_fund_0_funds_master');
+                        getMaster.addEncodedQuery('fund_family=' + record1.fund_name.fund_family);
+                        getMaster.setLimit(1);
+                        getMaster.query();
+                        if (getMaster.next()) {
+                            var hkCutOffTime = this.convertTimeToHK(getMaster.sla_for_1st_chaser); //MSSFUNDS-209: Convert timezone to HK
+                            var recCreate1 = new GlideRecord('x_hsb11_hsbcmss_eh_hsbc_email_log');
+                            recCreate1.initialize();
+                            recCreate1.from = senderEmail;
+                            recCreate1.recipients = receiverEmail;
+                            recCreate1.fund_family = fundFamily;
+                            recCreate1.fund_department = taskDepartment;
+                            recCreate1.type = 'Outbound';
+                            recCreate1.business_line = 'Funds';
+                            recCreate1.api_response_from_qtrack = 'Sent-Ready';
+                            recCreate1.subject = "[" + getMaster.client + ": " + record.fund_name.fund_family + " - " + record.department + "] [ Cut Off " + hkCutOffTime + " HKT] Cash & Position Break Query for valuation as of VD -" + previousBusinessday;
+                            recCreate1.body = bodyStart + hkCutOffTime + body + body2 + body3;
+                            var emailLogCreated = recCreate1.insert();
+                            var grEmailLog = new GlideRecord('x_hsb11_hsbcmss_eh_hsbc_email_log'); // MSSFUNDS-4: Update Subject line to have SNE number 
+                            grEmailLog.get(emailLogCreated);
+                            var subCreated = grEmailLog.subject;
+                            grEmailLog.subject = grEmailLog.email_id + " " + subCreated;
+                            grEmailLog.update();
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            gs.info("Script Include - MSS_Funds_Utils - Unknown Exception While Processing Intial Emails to Upstream Teams" + e.message);
+        }
+    },
+
+    //MSSFUNDS-4: Trigger Email for CORPORATE ACTION department breaks created on same day
+    triggerCorpActEmail: function() {
+        try {
+            var previousBusinessday = this.getPreviousbusinessDay();
+            var fundFam = new GlideAggregate('x_hsb11_mss_fund_0_funds_task');
+            fundFam.addEncodedQuery('fund_name.fund_family!=NULL^department=CORPORATE ACTION^state=1^sys_created_onONToday@javascript:gs.beginningOfToday()@javascript:gs.endOfToday()');
+            fundFam.groupBy('fund_name.fund_family');
+            fundFam.query(); // Query Breaks with Department as CORPORATE ACTION, created today and group by fund family
+            while (fundFam.next()) {
+                var record1 = new GlideRecord('x_hsb11_mss_fund_0_funds_task');
+                record1.addEncodedQuery('fund_name.fund_family=' + fundFam.getDisplayValue('fund_name.fund_family') + '^department=CORPORATE ACTION^state=1^sys_created_onONToday@javascript:gs.beginningOfToday()@javascript:gs.endOfToday()');
+                record1.query(); // Query Breaks with Department as CORPORATE ACTION, created today and funds family from group by fund family
+                var Taskarr = [],
+                    arr = [];
+                while (record1.next())
+                    Taskarr.push(fundFam.getDisplayValue('fund_name.fund_family') + "--" + record1.number); // Push Fund family and number in array
+                for (var i = 0; i < Taskarr.length; i++)
+                    arr.push(Taskarr[i].substr(-13)); // push only break number in array
+                var record = new GlideRecord('x_hsb11_mss_fund_0_funds_task');
+                record.addEncodedQuery('numberIN' + arr);
+                record.query();
+                if (record.hasNext()) {
+                    var receiverEmail, senderEmail, taskFundid = [];
+                    var body = '<p><span style="color: #000000; background-color: #ecf0f1; font-size: 10pt;">Cash breaks:</span></p> <br /><table id="table1" style="border-collapse: collapse; height: 112.409px; border-color: #ced4d9; table-layout:fixed; width:100% text-align: left; font-size: 14px; font-family: calibri; border-style: solid; float: left;" border="3"><tbody><tr style="height: 58.8068px; border-style: solid; background-color: #34495e;"><td style="width: 8.78347%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Exception ID</span></td><td style="width: 8.14699%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Client</span></td><td style="width: 8.50514%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Portfolio Code</span></td><td style="width: 8.17073%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">SET ID</span></td><td style="width: 8.52888%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Statement Date</span></td><td style="width: 8.52888%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Value Date</span></td><td style="width: 8.14699%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Trade Date</span></td><td style="width: 8.14699%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Item Type</span></td><td style="width: 8.52888%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">CCY</span></td><td style="width: 8.52888%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Amount</span></td><td style="width: 8.91077%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Reference 1</span></td><td style="width: 8.91077%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Reference 2</span></td><td style="width: 8.91077%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Reference 3</span></td><td style="width: 8.91077%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Reference 4</span></td><td style="width: 8.91077%; border-style: solid; height: 58.8068px;background-color:#FFBF00;"><span style="color: #ffffff;">Break Resolved (Yes/No Selection)</span></td><td style="width: 8.91077%; border-style: solid; height: 58.8068px;background-color:#FFBF00;"><span style="color: #ffffff;">Comments</span></td></tr>';
+                    var body2 = '</table><p><span style="color: #000000; background-color: #ecf0f1; font-size: 10pt;">Position breaks:</span></p> <br /><table id="table2" style="border-collapse: collapse; height: 112.409px; border-color: #ced4d9; table-layout:fixed; width:100% text-align: left; font-size: 14px; font-family: calibri; border-style: solid; float: left;" border="3"><tbody><tr style="height: 58.8068px; border-style: solid; background-color: #34495e;"><td style="width: 8.78347%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Exception ID</span></td><td style="width: 8.14699%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Client</span></td><td style="width: 8.14699%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Category Code</span></td><td style="width: 8.50514%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Portfolio Code</span></td><td style="width: 8.17073%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">SET ID</span></td><td style="width: 8.52888%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Item Type</span></td><td style="width: 8.52888%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Asset Description</span></td><td style="width: 8.14699%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Asset Code</span></td><td style="width: 8.14699%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Quantity</span></td><td style="width: 8.52888%; height: 58.8068px; border-style: solid;"><span style="color: #ffffff;">Statement Date</span></td><td style="width: 8.52888%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Trade Date</span></td><td style="width: 8.52888%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Local Market CCY</span></td><td style="width: 8.52888%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Local Market Value</span></td><td style="width: 8.91077%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Reference 1</span></td><td style="width: 8.91077%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Reference 2</span></td><td style="width: 8.91077%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Reference 3</span></td><td style="width: 8.91077%; border-style: solid; height: 58.8068px;"><span style="color: #ffffff;">Reference 4</span></td><td style="width: 8.91077%; border-style: solid; height: 58.8068px;background-color:#FFBF00;"><span style="color: #ffffff;">Break Resolved (Yes/No Selection)</span></td><td style="width: 8.91077%; border-style: solid; height: 58.8068px;background-color:#FFBF00;"><span style="color: #ffffff;">Comments</span></td></tr>';
+                    var body3 = '</table>';
+                    while (record.next()) {
+                        receiverEmail = record.department_email;
+                        senderEmail = record.department_sender_email;
+                        taskFundid.push(record.fund_name.fund_code.toString());
+                        if (record.task_type == "cash")
+                            body = body + '<tr style="color: #000000;"> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.exception_id + '</td><td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.fund_name.client + '</td><td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.fund_name.fund_code + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.set_id + '</td><td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.statement_date + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.value_date + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.trade_date + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.item_type + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.ccy + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.amount + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.reference1 + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.reference2 + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.reference3 + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.reference4 + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;input type="text""></td><td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.comments + '</td> </tr>';
+                        else if (record.task_type == "position")
+                            body2 = body2 + '<tr style="color: #000000;"><td style="width: 8.78347%; height: 53.6023px; border-style: so-style: solid;">' + record.exception_id + '</td><td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.fund_name.client + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: so-style: solid;">' + record.category_code + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.fund_name.fund_code + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.set_id + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.item_type + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.asset_description + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.asset_code + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.quantity + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.statement_date + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.trade_date + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.local_market_ccy + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.local_market_value + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.reference1 + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.reference2 + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.reference3 + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.reference4 + '</td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;input type="text""></td> <td style="width: 8.78347%; height: 53.6023px; border-style: solid;">' + record.comments + '</td> </tr>';
+                    }
+                    var taskFundID = taskFundid.filter((c, index) => { // MSSFUNDS-195: Remove duplicates from array
+                        return taskFundid.indexOf(c) === index;
+                    });
+                    Taskarr.splice(0, Taskarr.length); // Make array empty
+                    arr.splice(0, arr.length); // Make array empty
+                    var getMaster = new GlideRecord('x_hsb11_mss_fund_0_funds_master');
+                    getMaster.addEncodedQuery('fund_family=' + record1.fund_name.fund_family);
+                    getMaster.setLimit(1);
+                    getMaster.query();
+                    if (getMaster.next()) {
+                        var hkCutOffTime = this.convertTimeToHK(getMaster.sla_for_1st_chaser); //MSSFUNDS-209: Convert timezone to HK
+                        var aggregatedRecord = body + body2 + body3;
+                        var recCreate1 = new GlideRecord('x_hsb11_hsbcmss_eh_hsbc_email_log'); // Create Email Log Record
+                        recCreate1.initialize();
+                        recCreate1.from = senderEmail;
+                        recCreate1.fund_family = fundFam.getDisplayValue('fund_name.fund_family');
+                        recCreate1.fund_department = 'CORPORATE ACTION';
+                        recCreate1.recipients = receiverEmail;
+                        recCreate1.type = 'Outbound';
+                        recCreate1.business_line = 'Funds';
+                        recCreate1.api_response_from_qtrack = 'Draft';
+                        recCreate1.subject = "[" + getMaster.client + ": " + record.fund_name.fund_family + " - " + record.department + "] [ Cut Off " + hkCutOffTime + " HKT] Corporate Actions Break Query for valuation as of VD -" + previousBusinessday;
+                        recCreate1.body = '<body><p>Hi Team,</p><p>Could you please help to check and advise the Corporate Actions breaks by ' + hkCutOffTime + '.</p><table id="inputTable" border="3"><thead><tr><th></th><th>Corporate Action Request / Enquiry Form</th><th></th></tr></thead><tbody><tr><td></td><td></td></tr><tr><td>System</td><td>' + getMaster.source.getDisplayValue() + '</td></tr><tr><td>Request / Enquiry Category</td><td>New Enquiry</td></tr><tr><td>Request / Enquiry Type</td><td>Settlement issue</td></tr><tr><td>Contact Person Name</td><td>' + senderEmail + '</td></tr><tr><td>CA Ref (if available)</td><td></td></tr><tr><td>Fund ID</td><td>' + taskFundID + '</td></tr><tr><td>Event Type</td><td></td></tr><tr><td>Service provided to the account</td><td>A&V and GC</td></tr><tr><td>Security ID in A and V System</td><td></td></tr><tr><td>ISIN (if available)</td><td></td></tr><tr><td>Security Name</td><td></td></tr><tr><td>Client Name</td><td>' + getMaster.client + '</td></tr><tr><td>Ex-date</td><td></td></tr><tr><td>Settlement Date</td><td></td></tr><tr><td>Request Requirement / Enquiry Description</td><td></td></tr><tr><td>Expected Completion Deadline</td><td>' + hkCutOffTime + '</td></tr><tr><td>Supporting Documents / Screen Shot</td><td id="response">' + aggregatedRecord + '</td></tr><tr><td id="root">Root cause (to be updated by GC CA)</td><td></td></tr><tr><td>Status (to be updated by GC CA)</td><td></td></tr><tr><td>Issue Identified (to be updated by GC CA)</td><td></td></tr><tr><td>Solution / Action Taken (to be updated by GC CA)</td><td></td></tr><tr><td>MF Transaction Reference# (Optional)</td><td></td></tr></tbody></table></body>';
+                        var emailLogCreated = recCreate1.insert();
+                        var grEmailLog = new GlideRecord('x_hsb11_hsbcmss_eh_hsbc_email_log'); // MSSFUNDS-4: Update Subject line to have SNE number 
+                        grEmailLog.get(emailLogCreated);
+                        var subCreated = grEmailLog.subject;
+                        grEmailLog.subject = grEmailLog.email_id + " " + subCreated;
+                        grEmailLog.update();
+                    }
+                }
+            }
+        } catch (e) {
+            gs.info("Script Include - MSS_Funds_Utils - Unknown Exception While Processing Intial Emails to Corporate Action Teams" + e.message);
+        }
+
+    },
+
+    //MSSFUNDS-60: Process Response from Upstream teams
+    responseFromUpstream: function(payload) { //story 60
+        // Example usage with your HTML content as a string
+        try {
+            var faMakerGroup = gs.getProperty('x_hsb11_mss_fund_0.FA_Ops_Maker_Group'); // MSSFUNDS-210: Sys ID Of FA Ops Maker Group
+            var parsePayload = JSON.parse(payload.toString());
+            var getBody = parsePayload.Email_Body;
+            var htmlContent = getBody;
+            var breakBody = htmlContent.indexOf("Position breaks:");
+            var parts = htmlContent.split('Position breaks:');
+            var s1 = parts[0];
+            var s2 = parts[1];
+            var before = this.extractTableData(s1);
+            var arr1 = [];
+            before.forEach((before, tableIndex) => {
+                before.forEach((row, rowIndex) => {
+                    arr1.push(row[0] + "-" + row[14] + "-" + row[15]);
+                });
+            });
+            var after = this.extractTableData(s2);
+            var arr2 = [];
+            after.forEach((after, tableIndex) => {
+                after.forEach((row, rowIndex) => {
+                    arr2.push(row[0] + "-" + row[17] + "-" + row[18]);
+                });
+
+            });
+            var arr3 = arr1.concat(arr2);
+            for (var i = 1; i < arr3.length; i++) {
+                var response = arr3[i];
+                var firstdash = response.indexOf('-');
+                var secdash = response.indexOf('-', firstdash + 1);
+                var thirddash = response.lastIndexOf('-');
+                var excid = response.substr(0, firstdash);
+                var res = response.substr(firstdash + 1, secdash - firstdash - 1);
+                var com = response.substr(thirddash + 1);
+                var gr = new GlideRecord('x_hsb11_mss_fund_0_funds_task');
+                gr.addQuery('exception_id', excid);
+                gr.query();
+                while (gr.next()) {
+                    if (res.toLowerCase() === 'yes') {
+                        gr.state = '201'; //Resolved
+                        gr.break_outcome = 'Resolved';
+                        gr.update();
+                    } else if (res.toLowerCase() === 'no') {
+                        gr.state = '202'; // Open - Unresolved
+                        gr.break_outcome = 'Unresolved';
+                        gr.assignment_group = faMakerGroup; //FA Operations - Maker
+                        gr.work_notes = com;
+                        gr.update();
+                    }
+                }
+            }
+        } catch (e) {
+            gs.info("Script Include - MSS_Funds_Utils - Unknown Exception While Receiving and Processing Response Emails from Upstream Teams " + e.message);
+        }
+    },
+
+    //MSSFUNDS-4: Processing Response From Corporate Action
+    responseFromCA: function(payload) {
+        try {
+            var faMakerGroup = gs.getProperty('x_hsb11_mss_fund_0.FA_Ops_Maker_Group'); // MSSFUNDS-210: Sys ID Of FA Ops Maker Group
+            var parsePayload = JSON.parse(payload.toString());
+            var getBody = parsePayload.Email_Body;
+            var startIndex = getBody.indexOf('<td id="response">');
+            var endIndex = getBody.indexOf('<td id="root">');
+            var finalResponse = getBody.substr(startIndex + 18, endIndex - startIndex - 32); // index adjustment to take only inside part
+            //var htmlContent = finalResponse;
+            var htmlContent = finalResponse.replaceAll('&nbsp;', ''); //Remove non breaking spaces
+            var breakBody = htmlContent.indexOf("Position breaks:");
+            var parts = htmlContent.split('Position breaks:');
+            var s1 = parts[0];
+            var s2 = parts[1];
+            var before = this.extractTableData(s1);
+            var arr1 = [];
+            before.forEach((before, tableIndex) => { // Loop on Case breaks table
+                before.forEach((row, rowIndex) => {
+                    arr1.push(row[0] + "-" + row[14] + "-" + row[15]);
+                });
+            });
+            var after = this.extractTableData(s2);
+            var arr2 = [];
+            after.forEach((after, tableIndex) => { // Loop on Position breaks table
+                after.forEach((row, rowIndex) => {
+                    arr2.push(row[0] + "-" + row[17] + "-" + row[18]);
+                });
+            });
+            var arr3 = arr1.concat(arr2); // merge cash and position breaks
+            for (var i = 1; i < arr3.length; i++) {
+                var response = arr3[i];
+                var firstdash = response.indexOf('-');
+                var secdash = response.indexOf('-', firstdash + 1);
+                var thirddash = response.lastIndexOf('-');
+                var excid = response.substr(0, firstdash);
+                var res = response.substr(firstdash + 1, secdash - firstdash - 1);
+                var com = response.substr(thirddash + 1);
+                var gr = new GlideRecord('x_hsb11_mss_fund_0_funds_task');
+                gr.addQuery('exception_id', excid);
+                gr.query(); // take breaks and update response
+                while (gr.next()) {
+                    if (res.toLowerCase() === 'yes') {
+                        gr.state = '201'; //Resolved
+                        gr.break_outcome = 'Resolved';
+                        gr.update();
+                    } else if (res.toLowerCase() === 'no') {
+                        gr.state = '202'; // Open - Unresolved
+                        gr.break_outcome = 'Unresolved';
+                        gr.assignment_group = faMakerGroup; //FA Operations - Maker
+                        gr.work_notes = com;
+                        gr.update();
+                    }
+                }
+            }
+        } catch (e) {
+            gs.info("Script Include - MSS_Funds_Utils - Unknown Exception While Receiving and Processing Response Emails from Corporate Action Teams " + e.message);
+        }
+    },
+
+    //MSSFUNDS-60: Remove HTML tags
+    cleanString: function(str) {
+        //Removing HTML tags
+        var cleanedStr = str.replace(/<\/?[^>]+(>|$)/g, "");
+        //Replace common HTML entities with their corresponding characters
+        cleanedStr = cleanedStr.replace(/&amp;/g, '&')
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/&quot;/g, '"')
+            .replace(/&#39;/g, "'");
+        return cleanedStr.trim();
+    },
+
+    //MSSFUNDS-60: Get contains from reponse table
+    extractTableData: function(htmlContent) {
+        // Use a more specific regex to match only the content within <table> tags
+        const tableRegex = /<table[\s\S]*?>[\s\S]*?<\/table>/gi;
+        var tables = [];
+        var match;
+        while ((match = tableRegex.exec(htmlContent)) !== null) {
+            var tableContent = match[0];
+            var rows = [];
+            // Match rows within the table
+            var rowMatches = tableContent.match(/<tr[\s\S]*?>[\s\S]*?<\/tr>/gi);
+            if (rowMatches) {
+                rowMatches.forEach(row => {
+                    var cells = [];
+                    // Match cells within the row, including both td and th tags
+                    var cellMatches = row.match(/<(td|th)[\s\S]*?>[\s\S]*?<\/(td|th)>/gi);
+                    if (cellMatches) {
+                        cellMatches.forEach(cell => {
+                            // Clean cell content
+                            cells.push(this.cleanString(cell));
+                        });
+                    }
+                    rows.push(cells);
+                });
+            }
+            tables.push(rows);
+        }
+        return tables;
+    },
+    //MSSFUNDS-210: Return Task IDs from email body
+    emailLogTaskIDs: function(dept, body) {
+        try {
+            var htmlContent;
+            if (dept == 'CORPORATE ACTION') { //Take body part if department = CA
+                var startIndex = body.indexOf('<td id="response">');
+                var endIndex = body.indexOf('<td id="root">');
+                var finalResponse = body.substr(startIndex + 18, endIndex - startIndex - 32); // index adjustment to take only inside part
+                //var htmlContent = finalResponse;
+                htmlContent = finalResponse.replaceAll('&nbsp;', ''); //Remove non breaking spaces
+            } else {
+                // For upstream, no cascaded table, so return current body directly
+                htmlContent = body;
+            }
+            var breakBody = htmlContent.indexOf("Position breaks:");
+            var parts = htmlContent.split('Position breaks:');
+            var s1 = parts[0];
+            var s2 = parts[1];
+            var before = this.extractTableData(s1);
+            var arr1 = [];
+            before.forEach((before, tableIndex) => { // Loop on Case breaks table
+                before.forEach((row, rowIndex) => {
+                    arr1.push(row[0] + "-" + row[14] + "-" + row[15]);
+                });
+            });
+            var after = this.extractTableData(s2);
+            var arr2 = [];
+            after.forEach((after, tableIndex) => { // Loop on Position breaks table
+                after.forEach((row, rowIndex) => {
+                    arr2.push(row[0] + "-" + row[17] + "-" + row[18]);
+                });
+            });
+            var excIDArray = []; // array to store task ids
+            var arr3 = arr1.concat(arr2); // merge cash and position breaks
+            for (var i = 1; i < arr3.length; i++) {
+                var response = arr3[i];
+                var firstdash = response.indexOf('-');
+                var excid = response.substr(0, firstdash);
+                var grFundTask = new GlideRecord('x_hsb11_mss_fund_0_funds_task');
+                grFundTask.addQuery('exception_id', excid);
+                grFundTask.query(); // take breaks and update response
+                while (grFundTask.next()) {
+                    //Push task numbers into array
+                    excIDArray.push(grFundTask.number.toString());
+                }
+            }
+            return excIDArray; // Return Array of Fund Task Numbers
+        } catch (e) {
+            gs.info("Script Include - MSS_Funds_Utils - Unknown Exception While Returnin Task IDs" + e.message);
+        }
+    },
+    //MSSFUNDS-209: Convert UK to HK using fix timezone
+    convertTimeToHK: function(slaTimer) {
+        var gdt = new GlideDateTime(slaTimer);
+        gdt.addSeconds(28800); //8Hrs - Difference between HK and UK timezone
+        var hkTime = gdt.getTime().getByFormat('HH:mm:ss');
+        return hkTime;
+    },
+
+    type: 'MSS_Funds_Utils'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>45368699@hsbc.com</sys_created_by>
+        <sys_created_on>2024-07-30 05:09:54</sys_created_on>
+        <sys_id>10ba4b801bfb8a10971e6204b24bcb51</sys_id>
+        <sys_mod_count>169</sys_mod_count>
+        <sys_name>MSS_Funds_Utils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_10ba4b801bfb8a10971e6204b24bcb51</sys_update_name>
+        <sys_updated_by>45368699@hsbc.com</sys_updated_by>
+        <sys_updated_on>2024-11-27 06:41:55</sys_updated_on>
+    </sys_script_include>
+</record_update>

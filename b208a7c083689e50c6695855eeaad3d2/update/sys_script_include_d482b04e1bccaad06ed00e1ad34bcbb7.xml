@@ -1,0 +1,1313 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.MSS_Treasury_Utils</api_name>
+        <caller_access/>
+        <client_callable>true</client_callable>
+        <description/>
+        <mobile_callable>false</mobile_callable>
+        <name>MSS_Treasury_Utils</name>
+        <sandbox_callable>true</sandbox_callable>
+        <script><![CDATA[var MSS_Treasury_Utils = Class.create();
+MSS_Treasury_Utils.prototype = Object.extendsObject(global.AbstractAjaxProcessor, {
+    initialize: function() {},
+
+    validateInboundHeader: function(requestData) {
+        try {
+            var errMsg = "";
+            // Mandatory Field checks and logging of error if missing or invalid fields
+            if (requestData.message_id == '' || requestData.message_id == undefined) {
+                errMsg += 'Missing Message Id\n';
+            }
+            if (requestData.event_type == '' || requestData.event_type == undefined) {
+                errMsg += 'Missing Event Type\n';
+            }
+            if (requestData.source == '' || requestData.source == undefined) {
+                errMsg += 'Missing Source\n';
+            }
+            if (requestData.object_id == '' || requestData.object_id == undefined) {
+                errMsg += 'Missing Object Id\n';
+            }
+            if (requestData.object_type == '' || requestData.object_type == undefined) {
+                errMsg += 'Missing Object Type\n';
+            }
+            if (requestData.object_id_type == '' || requestData.object_id_type == undefined) {
+                errMsg += 'Missing Object Id Type\n';
+            }
+            if (requestData.object_version == '' || requestData.object_version == undefined) {
+                errMsg += 'Missing Object Version\n';
+            }
+            if (requestData.event_status == '' || requestData.event_status == undefined) {
+                errMsg += 'Missing Event Status\n';
+            }
+            if (requestData.event_date_time == '' || requestData.event_date_time == undefined) {
+                errMsg += 'Missing Event Date Time\n';
+            }
+            return errMsg;
+        } catch (e) {
+            this.errorLogAndXmatterAlert("MINOR", "Function: validateInboundHeader :- Unknown execption while processing  " + e.message);
+        }
+
+    },
+
+    /*
+     * Insert the incoming data.
+     */
+    insertInboundWidgetRecord: function(requestData, payload) {
+        try {
+            grWidget = new GlideRecord('x_hsb11_hsbc_mss_o_mss_widget_inbound');
+            grWidget.initialize();
+            grWidget.object_id = requestData.objectid;
+            grWidget.object_version = requestData.objectversion;
+            grWidget.object_type = requestData.objecttype;
+            grWidget.object_id_type = requestData.objectidtype;
+            grWidget.event_status = requestData.eventstatus;
+            grWidget.setValue('event_date_time', requestData.eventdatetime.replace('T', ' '));
+            grWidget.source = requestData.source;
+            grWidget.message_id = requestData.messageid;
+            grWidget.event_type = requestData.eventtype;
+            grWidget.additional_attributes = requestData.additionalattributes;
+            grWidget.payload = JSON.stringify(payload);
+            // Validate before insert
+            var errMsg = this.validateInboundHeader(grWidget);
+            if (errMsg != '') {
+                this.errorLogAndXmatterAlert("WARNING", "(insertInboundWidgetRecord) known exception while processing Widget Inbound Request " + errMsg);
+                return;
+            }
+
+            grWidget.status = 'Success';
+            var widInbound = grWidget.insert();
+            if (widInbound != '') {
+                gs.eventQueue('x_hsb11_mss_tsd.handleEventLayerRequest', current, widInbound.toString());
+            }
+        } catch (e) {
+            this.errorLogAndXmatterAlert("WARNING", '- (insertInboundWidgetRecord) Unknown exception while processing Widget Inbound Request ' + e.message);
+        }
+    },
+
+    //Handle the incoming request from EL
+    handleEventLayerRequest: function(inboundSysID) {
+        try {
+            var grInbound = new GlideRecord('x_hsb11_hsbc_mss_o_mss_widget_inbound');
+            if (grInbound.get(inboundSysID)) {
+                this.updateInstructionCase(grInbound);
+            } else {
+                this.errorLogAndXmatterAlert("MINOR", '- (handleEventLayerRequest) Unknown exception while processing Widget Inbound Request ' + inboundSysID);
+            }
+        } catch (e) {
+            this.errorLogAndXmatterAlert("MINOR", "Function : handleEventLayerRequest :- Unknown execption while processing  " + e.message);
+        }
+    },
+
+    //Insert the unstruction case
+    insertInstructionCase: function(item, event_status, uninstructionCaseId, market, code) {
+        try {
+            var instructionCaseId;
+            var grInstructionCase = new GlideRecord('x_hsb11_mss_tsd_treasury_case');
+            grInstructionCase.initialize();
+            grInstructionCase.unstructured_case_id = uninstructionCaseId;
+            grInstructionCase.u_objectid = item?.Id;
+            grInstructionCase.event_status = event_status;
+            grInstructionCase.market = market;
+            grInstructionCase.currency = this.getCurrencySysId(code);
+            //MSSTRESURY-218:Implementation - TSD Maker/ Team Id/Client Group mapping
+            var payment = item?.Transaction?.Payment?.[0];
+            var trustId = payment?.["Trust ID"] || '';
+            var grStatic = new GlideRecord('x_hsb11_mss_tsd_treasury_static_data');
+            grStatic.addQuery('tsd_code', trustId);
+            grStatic.query();
+            if (grStatic.next()) {
+                grInstructionCase.tsd_code = trustId;
+                grInstructionCase.task_owner = grStatic.task_owner;
+                grInstructionCase.tsd_maker = grStatic.tsd_maker;
+                grInstructionCase.team_id = grStatic.team_id;
+                grInstructionCase.client_group = grStatic.client_group;
+            }
+            instructionCaseId = grInstructionCase.insert();
+            if (!instructionCaseId) {
+                this.errorLogAndXmatterAlert("MINOR", '-Unknown exception while creating unstruction case and the task will not be created. objectId:' + item?.Id + '.And parentCaseId:' + parentCaseId);
+            }
+            return instructionCaseId;
+        } catch (e) {
+            this.errorLogAndXmatterAlert("MINOR", '- Unknown exception while creating  child case (insertInstructionCase) ' + e.message);
+        }
+
+    },
+    /**
+     * use in Flow Action: HSBC Treasury iQube Create Instruction Case
+     * MSSTRESURY-527
+     */
+    flowUpdateInstructionCase(instructionCaseId = "", caseInfo = {}, eventInfo = {}) {
+        try {
+            let instructionCaseGR = new GlideRecord('x_hsb11_mss_tsd_treasury_case');
+            instructionCaseGR.addQuery("sys_id", instructionCaseId);
+            instructionCaseGR.query();
+            if (!instructionCaseGR.next()) {
+                this.errorLogAndXmatterAlert("MINOR", 'flowUpdateInstructionCase - can not find instruction case:' + caseInfo?.Id);
+                return;
+            }
+            let SWB_FIELD_MAP = JSON.parse(gs.getProperty("x_hsb11_mss_tsd.MSS_Treasury_SWB_Field_Map"));
+            Object.keys(SWB_FIELD_MAP).forEach(swbKey => {
+                let iQubeKey = SWB_FIELD_MAP[swbKey];
+                instructionCaseGR[iQubeKey] = caseInfo?.[`transactionPayment0_${iQubeKey}`] || instructionCaseGR[iQubeKey];
+            });
+            let currency = null;
+            if (caseInfo?.transactionPayment0_currency) {
+                currency = this.getCurrencySysId(caseInfo?.transactionPayment0_currency);
+                instructionCaseGR.currency = currency;
+            }
+            let amount = caseInfo?.amount_32;
+
+            if (this.getMarket(caseInfo?.Properties?.GTME)) {
+                instructionCaseGR.market = this.getMarket(caseInfo?.Properties?.GTME);
+            }
+            if (caseInfo?.transactionPayment0SourceType) {
+                instructionCaseGR.source_type = caseInfo.transactionPayment0SourceType;
+            }
+            if (amount) {
+                instructionCaseGR.transaction_amount = amount;
+            }
+            if (caseInfo?.instruction_type) {
+                instructionCaseGR.instruction_type = caseInfo.instruction_type;
+            }
+            if (caseInfo?.format_value_date_32) {
+                instructionCaseGR.value_date = caseInfo.format_value_date_32;
+            }
+            if (caseInfo?.transactionPayment0ReceiverBIC) {
+                instructionCaseGR.receiverbic = caseInfo.transactionPayment0ReceiverBIC;
+            }
+            if (caseInfo?.transactionPayment0SenderBIC) {
+                instructionCaseGR.senderbic = caseInfo.transactionPayment0SenderBIC;
+            }
+            if (caseInfo?.transactionPayment0FundCode) {
+                instructionCaseGR.fund_id = caseInfo.transactionPayment0FundCode;
+            }
+            if (caseInfo?.message_type) {
+                instructionCaseGR.swift_message = caseInfo.message_type;
+            }
+            if (eventInfo?.event_status) {
+                instructionCaseGR.event_status = eventInfo.event_status;
+            }
+            if (eventInfo?.event_type) {
+                instructionCaseGR.u_event_type = eventInfo.event_type;
+            }
+            if (currency == 'USD') {
+                instructionCaseGR.amount_in_usd = amount || instructionCaseGR.amount_in_usd;
+            } else if (currency) {
+                instructionCaseGR.amount_in_usd = this.ConvertToUSD(currency, amount) || instructionCaseGR.amount_in_usd;
+            }
+            if (caseInfo?.Properties?.awd_id) {
+                instructionCaseGR.first_received_timestamp = caseInfo?.Properties?.awd_id;
+            }
+
+            instructionCaseGR.tsd_code = caseInfo?.transactionPayment0TrustID || caseInfo?.Properties?.GHID || instructionCaseGR.tsd_code;
+            //MSSTRESURY-218:Implementation - TSD Maker/ Team Id/Client Group mapping
+            let grStatic = new GlideRecord('x_hsb11_mss_tsd_treasury_static_data');
+            grStatic.addQuery('tsd_code', instructionCaseGR.tsd_code);
+            grStatic.query();
+            if (grStatic.hasNext() && grStatic.next()) {
+                instructionCaseGR.task_owner = grStatic.task_owner;
+                instructionCaseGR.tsd_maker = grStatic.tsd_maker;
+                instructionCaseGR.team_id = grStatic.team_id;
+                instructionCaseGR.client_group = grStatic.client_group;
+            } else {
+                instructionCaseGR.task_owner = "";
+                instructionCaseGR.tsd_maker = "";
+                instructionCaseGR.team_id = "";
+                instructionCaseGR.client_group = "";
+            }
+            let instructionUpdate = instructionCaseGR.update();
+            if (!instructionUpdate) {
+                this.errorLogAndXmatterAlert("WARNING", 'flowUpdateInstructionCase - Unknown exception instruction case will not be created. objectId: ' + caseInfo?.Id);
+            }
+        } catch (errorInfo) {
+            this.errorLogAndXmatterAlert("WARNING", '- Unknown exception while update child case (flowUpdateInstructionCase) ' + errorInfo.message);
+        }
+    },
+    checkExistingTask: function(tableName, TaskType, instructionCaseId) {
+        var gr = new GlideRecord(tableName);
+        try {
+            gr.addQuery('state', '3');
+            gr.addOrCondition('state', '4');
+            gr.addQuery('task_type', TaskType);
+            gr.addQuery('instruction_case', instructionCaseId);
+            gr.query();
+            if (gr.next()) {
+                return true;
+            }
+        } catch (e) {
+            this.errorLogAndXmatterAlert("WARNING", 'Query error for' + TaskType);
+        }
+        return false;
+    },
+
+    // Create Instruction task
+    /** */
+    insertInstructionCaseTask: function(instructionCaseId, taskItem, event_status) {
+        try {
+            var instructionTaskId;
+            var grInstructionCaseTask = new GlideRecordSecure('x_hsb11_mss_tsd_treasury_case_task');
+            var grCase = new GlideRecord('x_hsb11_mss_tsd_treasury_case');
+            grCase.get(instructionCaseId);
+            var num = grCase.number_of_checker_task;
+            var bandingGroup = this.getBandingGroup(grCase.market, grCase.instruction_Type, grCase.transaction_Amount, grCase.currency);
+            grInstructionCaseTask.instruction_case = instructionCaseId;
+            grInstructionCaseTask.setValue('required_banding_group', bandingGroup);
+            if (event_status == 'MAKER_WORKING.NEW_CHECKER' && taskItem?.Status == 'Checker') {
+                grInstructionCaseTask.task_type = 'Checker 1';
+
+            } else if (event_status == 'MAKER_WORKING.SUBMIT_TO_CHECKER' && taskItem?.Status == 'Checker') {
+                grInstructionCaseTask.task_type = 'Checker 1';
+                if (this.checkExistingTask('x_hsb11_mss_tsd_treasury_case_task', 'Checker 1', instructionCaseId)) {
+                    return;
+                }
+
+            } else if (event_status == 'CHECKER_REVIEW.APPROVE' && taskItem?.Status == 'Checker') {
+
+                if (num == 2) {
+                    var checkCheck2Task = new GlideRecord('x_hsb11_mss_tsd_treasury_case_task');
+                    if (this.checkExistingTask('x_hsb11_mss_tsd_treasury_case_task', 'Checker 2', instructionCaseId)) {
+                        return;
+                    }
+                    grInstructionCaseTask.task_type = 'Checker 2';
+                } else
+                    return;
+            } else
+                grInstructionCaseTask.task_type = taskItem?.Status;
+            // MSSTRESURY-215 - Update case_status in treasury case table based on task_type
+            var grTreasuryCase = new GlideRecord('x_hsb11_mss_tsd_treasury_case');
+            if (grTreasuryCase.get(instructionCaseId)) {
+                grTreasuryCase.case_status = grInstructionCaseTask.task_type; // Update case_status
+                grTreasuryCase.update();
+            }
+            if (taskItem?.Status == 'Maker' || taskItem?.Status == 'Indexing') {
+                grInstructionCaseTask.url = taskItem?.Url; // MSSTRESURY-171
+            }
+            if (taskItem?.Status == 'Callback') { //MSSTRESURY-150
+                grInstructionCaseTask.url = taskItem?.Url; // MSSTRESURY-150, MSSTRESURY-171
+            } else {
+                grInstructionCaseTask.url = taskItem?.Url; // MSSTRESURY-171
+            }
+            instructionTaskId = grInstructionCaseTask.insert();
+            if (!instructionTaskId) {
+                this.errorLogAndXmatterAlert("MINOR", '-Unknown exception while creating instruction taks. instructionCaseId:' + instructionCaseId);
+            }
+            return instructionTaskId;
+        } catch (e) {
+            this.errorLogAndXmatterAlert("MINOR", '- Unknown exception while creating a child case task(insertinstructionCaseTask) ' + e.message);
+        }
+    },
+
+    updateInstructionCase: function(grInbound) {
+        try {
+            var errMsg = this.validateInboundHeader(grInbound);
+            var grInstructionCase = new GlideRecord('x_hsb11_mss_tsd_treasury_case');
+            grInstructionCase.initialize();
+            grInstructionCase.addQuery("u_objectid", grInbound.object_id);
+            if (grInstructionCase.next()) {
+                grInstructionCase.event_status = grInbound.event_status;
+                if (errMsg != '') {
+                    grInstructionCase.state = 3;
+                    grInstructionCase.comments = errMsg;
+                }
+                updateCaseId = grInstructionCase.update();
+                if (!updateCaseId) {
+                    this.errorLogAndXmatterAlert("WARNING", '-Unknown exception while updating case. objectId:' + grInbound.object_id);
+                }
+            }
+        } catch (e) {
+            this.errorLogAndXmatterAlert("WARNING", '- Unknown exception while creating case from widget inbound record(updateInstructionCase) ' + e.message);
+        }
+    },
+    /**
+     * Queries a table based on the provided parameters.
+     * @param {Object} params - The parameters for querying the table.
+     * @param {string} params.name - The name of the table to query.
+     * @param {Array} params.queryArray - An array of query conditions, where each condition is an array.
+     * @returns {GlideRecord|null} - The GlideRecord object containing the query results, or null.
+     */
+    queryTable: function(params) {
+        var queryTableRecord = null;
+        try {
+            var tableName = params?.name ?? '';
+            var queryArray = params?.queryArray ?? [];
+            queryTableRecord = new GlideRecord(tableName);
+            queryArray.forEach(function addQueryCondition(conditionItem) {
+                if (!Array.isArray(conditionItem)) {
+                    return;
+                }
+                queryTableRecord.addQuery(...conditionItem);
+            });
+            queryTableRecord.query();
+        } catch (error) {
+            this.errorLogAndXmatterAlert("WARNING", "Function : queryTable :- Unknown execption while processing  " + error.message);
+        }
+        return queryTableRecord;
+    },
+
+    /**
+     * Retrieves the market value based on the provided GTME (business region) code.
+     * If a matching routing rule exists for the given GTME, returns that market value;
+     * otherwise, returns the default market (default: 'HK').
+     *
+     * @param {string} GTME - The business region code to look up. Defaults to an empty string if not provided.
+     * @returns {string} The market value determined by the routing rule or the default market value.
+     */
+    getMarket(GTME = '') {
+        try {
+            // MSSTRESURY-314
+            var payloadMarketValue = this.readPayloadattribute(GTME);
+            var defaultMarket = gs.getProperty('x_hsb11_mss_tsd.default_market', 'HK');
+            if (payloadMarketValue) {
+                var grMarket = new GlideRecord('x_hsb11_mss_tsd_treasury_assignment_routing_rule');
+                grMarket.addQuery('business_region', payloadMarketValue);
+                grMarket.query();
+                if (grMarket.hasNext()) {
+                    defaultMarket = payloadMarketValue;
+                }
+            }
+            return defaultMarket;
+        } catch (e) {
+            this.errorLogAndXmatterAlert("WARNING", "Function : getMarket :- Unknown execption while processing  " + e.message);
+        }
+
+    },
+
+    /*
+     * Currency convertion
+     */
+    ConvertToUSD: function(inputCurrency, inputAmount) {
+        try {
+            var conv = new sn_currency.GlideCurrencyConverter(inputCurrency, 'USD');
+            conv.setAmount(inputAmount);
+            var convertValues = conv.convert();
+            var convertedAmount = convertValues.getAmount();
+            return convertedAmount;
+        } catch (e) {
+            gs.error("Function : ConvertToUSD :- Unknown execption while processing  " + e.message);
+        }
+    },
+    /*
+     * read the payload attribute
+     */
+    readPayloadattribute: function(value) {
+        try {
+            let return_value = '';
+            if (value != undefined) {
+                return_value = value;
+            }
+            return return_value;
+        } catch (e) {
+            this.errorLogAndXmatterAlert("WARNING", "Function : readPayloadattribute :- Unknown execption while processing  " + e.message);
+        }
+    },
+
+    /**
+     * Sends Treasury Task Details to the SWB API and updates the outbound record accordingly.
+     *
+     * @param {GlideRecord} gr - The outbound record to update with the request and response details.
+     * @param {Object} body - The payload to send in the API request.
+     */
+    sendMessageExec(gr, body) {
+        try {
+            var swbToken = gs.getProperty('x_hsb11_hsbcmss_sw.hsbcmss_swb_api_token');
+            var r = new sn_ws.RESTMessageV2('x_hsb11_hsbcmss_sw.HSBC SWB API', 'Send Treasury Task Details');
+            r.setStringParameterNoEscape('swb_token', swbToken);
+            var toSend = JSON.stringify(body);
+            r.setRequestBody(toSend);
+            gr.state = 'Processing';
+            gr.request_date = new GlideDateTime();
+            gr.update(); // update send time
+
+            var response = r.execute(); //Send request.
+            var responseBody = response.getBody();
+            var resp_parsed = JSON.parse(responseBody);
+            var httpStatus = resp_parsed.Status || resp_parsed.status;
+            gr.response_date = new GlideDateTime();
+            if (httpStatus == '202' || httpStatus == '200') {
+                gr.response_body = responseBody + "\nSend Payload:" + toSend;
+                gr.state = "Processed";
+                gr.error_body = '';
+                gr.error_code = '';
+            } else if (httpStatus == '401' || httpStatus == '403' || httpStatus == '404' || httpStatus == '429' || httpStatus == '500' || httpStatus == '502' || httpStatus == '503') { //added as part of MSSTRESURY-806 Development
+                var count = gr.getValue("counter");
+                if (count < 3) {
+                    count++;
+                    gr.counter = count;
+                    gr.state = "Retrying";
+                    gr.error_body = responseBody + "\nSend Payload:" + toSend;
+                    gr.error_code = httpStatus;
+                    var processTime = new GlideDateTime;
+                    processTime.addSeconds(300);
+                    gs.eventQueueScheduled('x_hsb11_mss_tsd.Treasury_SWB_Outbound', gr, gr.sys_id, '', processTime);
+                } else {
+                    gr.error_body = responseBody + "\nSend Payload:" + toSend;
+                    gr.error_code = httpStatus;
+                    gr.state = 'Error';
+                    gr.update();
+                    throw new Error('Max retries reached (counter=' + count + ') HTTP ' + httpStatus + ' outbound_sys_id=' + gr.getUniqueValue());
+                }
+            } else {
+                gr.error_body = responseBody + "\nSend Payload:" + toSend;
+                gr.error_code = httpStatus;
+                gr.state = 'Error';
+            }
+            var grOutbuoundUpdate = gr.update();
+            if (!grOutbuoundUpdate) {
+                this.errorLogAndXmatterAlert("MINOR", '- Unknown exception while Sending Task Details to SWB, Update Outbound record fail, sysID' + grOutbuoundUpdate.sys_id);
+            }
+        } catch (e) {
+            this.errorLogAndXmatterAlert("MINOR", "Function : sendMessageExec :- Unknown execption while processing  " + e.message);
+        }
+
+    },
+
+    // Send Event to SWB via Outbound Integration // MSSTRESURY-56
+    sendMessage: function(SysID) {
+        try {
+            var isRquestError = false;
+            var comments = "";
+            var grTreasuryCaseTask = new GlideRecord('x_hsb11_mss_tsd_treasury_case_task');
+            var gr = new GlideRecord('x_hsb11_hsbcmss_sw_hsbc_swb_outbound_table');
+            if (gr.get(SysID)) {
+                var caseTaskId = gr.getValue('treasury_reference_id');
+                if (grTreasuryCaseTask.get(caseTaskId)) {
+                    var isFinal = this.isFinal(grTreasuryCaseTask);
+                    var body = this.build_sendout_body(gr, grTreasuryCaseTask, isFinal);
+                    this.sendMessageExec(gr, body);
+                } else {
+                    var callbackBody = this.build_sendout_callback_body(gr);
+                    this.sendMessageExec(gr, callbackBody);
+                }
+            }
+        } catch (e) {
+            this.errorLogAndXmatterAlert("MINOR", "Function : sendMessage :- Unknown execption while processing  " + e.message);
+        }
+    },
+    isFinal: function(grTreasuryCaseTask) {
+        try {
+            var gr = new GlideRecord('x_hsb11_mss_tsd_treasury_case');
+            if (gr.get(grTreasuryCaseTask.instruction_case)) {
+                var num = gr.number_of_checker_task;
+                if (num == 1 && gr.event_status == 'CHECKER_REVIEW.APPROVE' && grTreasuryCaseTask.task_type == 'Checker 1' && grTreasuryCaseTask.state == 3) {
+                    return true;
+                } else if (num == 2 && gr.event_status == 'CHECKER_REVIEW.APPROVE' && grTreasuryCaseTask.task_type == 'Checker 1' && grTreasuryCaseTask.state == 3) {
+                    return false;
+                } else if (num == 2 && gr.event_status == 'CHECKER_REVIEW.APPROVE' && grTreasuryCaseTask.task_type == 'Checker 2' && grTreasuryCaseTask.state == 3) {
+                    return true;
+                } else if (gr.event_status == 'CHECKER_REVIEW.APPROVE' && grTreasuryCaseTask.task_type == 'Checker 2' && grTreasuryCaseTask.state == '1')
+                    return false;
+                else {
+                    return true;
+                }
+
+            }
+        } catch (e) {
+            this.errorLogAndXmatterAlert("MINOR", "Function : isFinal :- Unknown execption while processing  " + e.message);
+        }
+    },
+    /*
+     * Build out bound SWB body // MSSTRESURY-56
+     */
+    build_sendout_body: function(grOutBound, grTreasuryCaseTask, isFinal) {
+        try {
+            var body = "";
+            var status = isFinal ? 'Completed' : 'Checker';
+            var message = grOutBound.getValue('treasury_message_id');
+            var swb = grOutBound.getValue('swb_id');
+            var proccess_status = grOutBound.getValue('treasury_process_status');
+            var gdt = new GlideDateTime();
+            var dateTimeString = gdt.getDisplayValueInternal().split(" ");
+            var date = dateTimeString[0];
+            var time = dateTimeString[1];
+            var milliseconds = gdt.getNumericValue() % 1000;
+            var formattedDate = date + "T" + time + "." + milliseconds.toString().padStart(3, '0') + "Z";
+            var caseTaskId = grOutBound.getValue('treasury_reference_id');
+            // Prepare header // MSSTRESURY-110
+            var header = {
+                "MessageID": message,
+                "SwbID": swb,
+                "SourceSystem": "iQube",
+                "Process": "SMARTWORKBENCH_TSD_CASH",
+                "ProcessStatus": proccess_status,
+                "OperationTime": formattedDate,
+                "ReferenceID": caseTaskId,
+                "PayloadVersion": "1"
+            };
+            var objectId = "";
+            var caseSysId = grTreasuryCaseTask.getValue('instruction_case');
+            var grCase = new GlideRecord('x_hsb11_mss_tsd_treasury_case');
+            if (grCase.get(caseSysId)) {
+                objectId = grCase.getValue('u_objectid');
+            }
+
+            if (grTreasuryCaseTask.task_type == "Checker 2" || grTreasuryCaseTask.task_type == "Maker" || grTreasuryCaseTask.task_type == "Checker 1") {
+
+                body = {
+                    "Header": header,
+                    "Payload": {
+                        "Id": objectId,
+                        "IsFinal": isFinal,
+                        "Status": status
+                    }
+                };
+            } else if (grTreasuryCaseTask.task_type == 'Callback Checker') { //MSSTREASURY-153: Trigger Outbound Call When Callback Completed
+                body = {
+                    "Header": {
+                        "MessageID": message,
+                        "SwbID": swb,
+                        "SourceSystem": "iQube",
+                        "Process": "SMARTWORKBENCH_TSD_CASH",
+                        "ProcessStatus": proccess_status,
+                        "OperationTime": formattedDate,
+                        "ReferenceID": caseTaskId,
+                        "PayloadVersion": "1"
+                    },
+                    "Payload": {
+                        "Id": objectId,
+                        "Status": status
+                    }
+                };
+            }
+            return body;
+        } catch (e) {
+            this.errorLogAndXmatterAlert("MINOR", "Function - build_sendout_body : Unknown exception while building SWB Outbound Body " + e.message);
+        }
+
+    },
+    build_sendout_callback_body: function(grOutBound) {
+        try {
+            var message = grOutBound.getValue('treasury_message_id');
+            var swb = grOutBound.getValue('swb_id');
+            var proccess_status = grOutBound.getValue('treasury_process_status');
+            var gdt = new GlideDateTime();
+            var dateTimeString = gdt.getDisplayValueInternal().split(" ");
+            var date = dateTimeString[0];
+            var time = dateTimeString[1];
+            var milliseconds = gdt.getNumericValue() % 1000;
+            var formattedDate = date + "T" + time + "." + milliseconds.toString().padStart(3, '0') + "Z";
+            var caseId = grOutBound.getValue('treasury_reference_id');
+            var treasurycase = new GlideRecord('x_hsb11_mss_tsd_treasury_case');
+            var objectId = '';
+            var body = "";
+            if (proccess_status == "trigger_extraction") {
+                body = {
+                    "Header": {
+                        "MessageID": message,
+                        "SwbID": swb,
+                        "SourceSystem": "iQube",
+                        "Process": "SMARTWORKBENCH_TSD_CASH",
+                        "ProcessStatus": proccess_status,
+                        "OperationTime": formattedDate,
+                        "ReferenceID": caseTaskId,
+                        "PayloadVersion": "1"
+                    },
+                    "Payload": {}
+
+                };
+            } else {
+                if (treasurycase.get(caseId))
+                    objectId = treasurycase.getValue('u_objectid');
+                body = {
+                    "Header": {
+                        "CallBackUrl": null,
+                        "MessageID": message,
+                        "SwbID": swb,
+                        "SourceSystem": "iQube",
+                        "Process": "SMARTWORKBENCH_TSD_CASH",
+                        "ProcessStatus": proccess_status,
+                        "OperationTime": formattedDate,
+                        "ReferenceID": null,
+                        "PayloadVersion": "1"
+                    },
+                    "Payload": {
+                        "Id": objectId,
+                        "Status": "Not_Required"
+                    }
+                };
+            }
+            return body;
+        } catch (e) {
+            this.errorLogAndXmatterAlert("MINOR", "Function - build_sendout_callback_body : Unknown exception while building SWB Outbound Body " + e.message);
+        }
+    },
+
+    isCallback: function(objectID, transactionAmount, transactionCurrency, market) { // MSSTRESURY-150
+        try {
+            if (!market) {
+                //throw new Error('Market value is null or undefined');
+                this.errorLogAndXmatterAlert("MINOR", '- Market value is null or undefined');
+            }
+            var shouldCallback = false;
+            var convertToUSD = this.ConvertToUSD(transactionCurrency, transactionAmount);
+            var grCase = new GlideRecord('x_hsb11_mss_tsd_treasury_case');
+            grCase.addQuery('u_objectid', objectID);
+            grCase.query();
+            if (grCase.next() && grCase.instruction_type == 'Payment') {
+                var sourceType = grCase.source_type;
+                var transactionThreshold = new GlideRecord('x_hsb11_mss_tsd_treasury_transaction_threshold');
+                transactionThreshold.addQuery("transaction_type", "Payment");
+                transactionThreshold.addQuery("market", market);
+                transactionThreshold.query();
+                if (transactionThreshold.next()) {
+                    var threshold = transactionThreshold.approved_limit;
+                    if (('FAX' == sourceType || 'EMAIL' == sourceType) && convertToUSD >= threshold) {
+                        shouldCallback = true;
+                    }
+                }
+            }
+            return shouldCallback;
+        } catch (ex) {
+            this.errorLogAndXmatterAlert("MINOR", '- Exception while checking isCallback for ObjectID: ' + objectID + '. Error: ' + ex.message);
+        }
+
+    },
+
+    // MSSTRESURY-452/641 -- Remove 'Assigned To' under Task for same users performing maker & checker
+    taskAlreadyAssignTo(currentTask) {
+        var assignToInfo = {};
+        try {
+            // MSSTRESURY-299/296/298/314/732 - Preventing Same User performing Maker and Checker Task
+            var config = global.JSON.parse(gs.getProperty('x_hsb11_mss_tsd.MSS_Treasury_Fetch_Task_Type'));
+            var propertyHasIndexing = false;
+            var makerTaskExist = false;
+            if (config.hasOwnProperty(currentTask.task_type) && currentTask.instruction_case) {
+                propertyHasIndexing = config[currentTask.task_type].indexOf('Indexing') > -1;
+                var grTask = new GlideRecord('x_hsb11_mss_tsd_treasury_case_task');
+                var grTaskQuery = null;
+                grTaskQuery = grTask.addQuery("instruction_case", currentTask.instruction_case);
+                config[currentTask.task_type].forEach((taskTypeName, index) => {
+                    if (index == 0) {
+                        grTaskQuery = grTask.addQuery("task_type", taskTypeName);
+                    } else {
+                        grTaskQuery.addOrCondition("task_type", taskTypeName);
+                    }
+                });
+                grTask.query();
+                while (grTask.next()) {
+                    if (grTask.task_type == 'Maker')
+                        makerTaskExist = true;
+                    if (grTask.assigned_to) {
+                        assignToInfo[grTask.assigned_to] = grTask.getValue("task_type");
+                    }
+                }
+            }
+
+            if (propertyHasIndexing && !makerTaskExist) {
+                var caseRec = currentTask.instruction_case && currentTask.instruction_case.getRefRecord();
+                if (caseRec && caseRec.isValidRecord()) {
+                    var usr = new GlideRecord('sys_user');
+                    var login = caseRec.getValue('operator_id');
+                    if (login) {
+                        usr.addQuery('user_name', 'STARTSWITH', login);
+                        usr.setLimit(1);
+                        usr.query();
+                        if (usr.next())
+                            assignToInfo[usr.getUniqueValue()] = 'Indexing';
+                    }
+                }
+            }
+            return assignToInfo;
+        } catch (e) {
+            this.errorLogAndXmatterAlert("WARNING", `Function : taskAlreadyAssignTo :- Unknown exception while processing. error message:  ${e.message}`);
+            return assignToInfo;
+        }
+    },
+
+    //MSSTRESURY-160 // checking if the user is a member of the group that the task is assigned to
+    canAssignToMe: function(state, assignmentGroup) {
+        try {
+            var isManager = false;
+            var role = gs.getProperty('x_hsb11_mss_tsd.MSS_Treasury_Manager_Group_Role');
+            var groupMemberGR = new GlideRecord('sys_user_grmember');
+            groupMemberGR.addEncodedQuery('groupDYNAMICd6435e965f510100a9ad2572f2b47744^userDYNAMIC90d1921e5f510100a9ad2572f2b477fe^group.nameLIKEManager');
+            groupMemberGR.addQuery('group.roles', role);
+            groupMemberGR.query();
+            if (groupMemberGR.next()) {
+                isManager = true;
+            }
+            var closedStates = gs.getProperty('x_hsb11_mss_tsd.MSS_Treasury_Closed_States', '').split(',').map(Number);
+            var isStateOpen = !closedStates.includes(Number(state));
+            var isInAssignmentGroup = gs.getUser().isMemberOf(assignmentGroup);
+            var flag = isStateOpen && isInAssignmentGroup;
+            // Return both values as an object
+            return {
+                isManager: isManager,
+                flag: flag
+            };
+        } catch (e) {
+            this.errorLogAndXmatterAlert("WARNING", "Function : canAssignToMe :- Unknown exception while processing  " + e.message);
+            return {
+                isManager: false,
+                flag: false
+            }; // Return default values in case of an error
+        }
+    },
+
+    //MSSTRESURY-153: Create Instruction Case Task without Payload
+    createInstructionCaseTask: function(eventStatus, instructionCaseId, taskType, url, qtrackID) {
+        try {
+            var grInstructionCaseTask = new GlideRecordSecure('x_hsb11_mss_tsd_treasury_case_task');
+            grInstructionCaseTask.initialize();
+            grInstructionCaseTask.instruction_case = instructionCaseId;
+            grInstructionCaseTask.task_type = taskType;
+            grInstructionCaseTask.url = url; //MSSTRESURY-171
+            grInstructionCaseTask.qtrack_id = qtrackID;
+            grInstructionCaseTask.insert();
+        } catch (e) {
+            this.errorLogAndXmatterAlert("MINOR", "Function : createInstructionCaseTask :- Unknown execption while creating task  " + e.message);
+        }
+    },
+
+    //MSSTRESURY-192: Implementation - Task Lock/Unlock with SWB Integration
+    getUserAuthDetail: function(user_id, role_name, task_sys_id, instruction_case_id) {
+        try {
+            var role, groupNameLike, caseSysId, isAuthenticated;
+            var result = {
+                authenticated: false,
+                role: "",
+                isAssigned: false,
+                withinBandingApproval: null,
+                error: null
+            };
+            var userRec = new GlideRecord('sys_user'); // Validate user existence
+            userRec.addQuery('employee_number', user_id);
+            userRec.query();
+            if (!userRec.next()) {
+                return {
+                    error: "Invalid user ID."
+                };
+            }
+
+            if (role_name === "maker") { // Determine role and group name
+                groupNameLike = "Maker";
+                role = gs.getProperty('x_hsb11_mss_tsd.MSS_Treasury_Maker_Group_Role');
+            } else if (role_name === "checker") {
+                groupNameLike = "Checker";
+                role = gs.getProperty('x_hsb11_mss_tsd.MSS_Treasury_Checker_Group_Role');
+            } else {
+                return {
+                    error: "Invalid role name provided."
+                };
+            }
+
+            var groupRec = new GlideRecord('sys_user_grmember'); // Check if user is in the correct group with the required role
+            groupRec.addQuery('user', userRec.sys_id);
+            groupRec.addQuery('group.name', 'CONTAINS', groupNameLike);
+            groupRec.addQuery('group.name', 'CONTAINS', 'Treasury');
+            groupRec.addQuery('group.roles', role);
+            groupRec.query();
+            isAuthenticated = groupRec.next();
+            // If no task_sys_id provided, return authentication status only
+            if (!task_sys_id) {
+                return {
+                    authenticated: isAuthenticated
+                };
+            }
+
+            if (!isAuthenticated) { // If not authenticated, return error
+                result.error = "User group does not match the provided role name.";
+                return result;
+            }
+
+            result.authenticated = true;
+            result.role = role_name;
+
+            // Validate case existence
+            var caseRec = new GlideRecord('x_hsb11_mss_tsd_treasury_case');
+            caseRec.addQuery('u_objectid', instruction_case_id);
+            caseRec.query();
+            if (!caseRec.next()) {
+                result.error = "Invalid case object ID.";
+                return result;
+            }
+            caseSysId = caseRec.sys_id;
+
+            // Validate task existence and assignment
+            var taskRec = new GlideRecord('x_hsb11_mss_tsd_treasury_case_task');
+            if (!taskRec.get(task_sys_id)) {
+                result.error = "The task does not exist.";
+                return result;
+            }
+            if (taskRec.instruction_case != caseSysId)
+                result.error = "The task does not belong to the specified case.";
+            else if (taskRec.assigned_to == userRec.sys_id)
+                result.isAssigned = true;
+
+            if (taskRec.task_type == "Checker 1" || taskRec.task_type == "Checker 2") // MSSTREASURY-316: If Data Checker 1 or 2 Review then return band
+                result.withinBandingApproval = this.getBandApproval(taskRec.required_banding_group, userRec.sys_id);
+
+            return result;
+        } catch (e) {
+            this.errorLogAndXmatterAlert("WARNING", "Function : getUserAuthDetail :- Unknown exception while processing " + e.message);
+            return {
+                error: "Internal Server Error"
+            };
+        }
+    },
+
+    /**
+     * MSSTREASURY-209
+     * Gives the sys_id of the currency reference field related to the currency code.
+     */
+    getCurrencySysId: function(currencyCode) {
+        // Validate input
+        if (!currencyCode) {
+            this.errorLogAndXmatterAlert("WARNING", "Currency code is required.");
+            return null;
+        }
+
+        // Initialize GlideRecord for the fx_currency table
+        var currencyRecord = new GlideRecord('fx_currency');
+
+        // Add query to match the currency code
+        currencyRecord.addQuery('code', currencyCode);
+
+        // Execute the query
+        currencyRecord.query();
+
+        // Check if a record is found
+        if (currencyRecord.next()) {
+            // Return the sys_id of the matching record
+            return currencyRecord.sys_id;
+        } else {
+            // Log an error if no record is found
+            this.errorLogAndXmatterAlert("WARNING", "No currency record found for code: " + currencyCode);
+            return null;
+        }
+    },
+    //get banding group from STS
+    getBandingGroup: function(region, type, transactionAmount, currency) {
+        if (region && type && transactionAmount && currency) {
+            if (transactionAmount > 3000) {
+                return 'Band5';
+            } else {
+                return 'Band7';
+            }
+
+        } else if (region == null) {
+            return 'Band7';
+        } else if (region != null) {
+            return 'Band7';
+        }
+        var isRquestError = false;
+        var bandingGroup = '';
+        try {
+            ///var gr = new GlideRecord('x_hsb11_hsbcmss_sw_hsbc_swb_outbound_table');
+            var stsToken = gs.getProperty('x_hsb11_mss_tsd.eventOutbound_STS_token');
+
+            var r = new sn_ws.RESTMessageV2('HSBC STS API', 'Get The type Of group');
+            r.setStringParameterNoEscape('getToken', stsToken);
+
+            var body = this.build_sendout_body(region, type, transactionAmount, currency);
+
+            var toSend = JSON.stringify(body);
+            r.setRequestBody(toSend);
+
+
+            var response = r.execute(); //Send request, will throw exception.
+            var responseBody = response.getBody();
+
+            var resp_parsed = JSON.parse(responseBody); //will throw exception, but http status already got.
+            //var httpStatus = response.getStatusCode();
+            var httpStatus = resp_parsed.Status || resp_parsed.status;
+            if (httpStatus == '202' || httpStatus == '200') {
+                bandingGroup = resp_parsed.Banding_Group;
+                return bandingGroup;
+                //return 'Band4';
+            } else {
+                isRquestError = true;
+                this.errorLogAndXmatterAlert("WARNING", '- Unknown exception while call STS transaction threshold API');
+                return false;
+            }
+        } catch (e) {
+            comments = '- Unknown exception while while call STS transaction threshold API  ' + e.message;
+            this.errorLogAndXmatterAlert("WARNING", comments);
+            isRquestError = true;
+        }
+    },
+    //to get Required banding groups
+    generateBandRange: function(bandNumber) {
+        try {
+            var bandGroups = '';
+            if (bandNumber == "BreakGlass") {
+                return bandNumber;
+            }
+            const number = parseInt(bandNumber.slice(-1), 10);
+            if (number < 4 || number > 7) {
+                throw new Error("Number must be between 4 and 7");
+            }
+            const result = [];
+            for (let num = 4; num <= 7; num++) {
+                if (num <= number) {
+                    result.push(`Band${num}`);
+                }
+            }
+            bandGroups = result.join(",");
+            return bandGroups;
+        } catch (e) {
+            comments = 'Unknown exception while while call function of generateBandRange()' + e.message;
+            this.errorLogAndXmatterAlert("WARNING", comments);
+            isRquestError = true;
+        }
+
+    },
+    getBand: function(role) {
+        try {
+            const roleToBandMap = {
+                "FX_SETTLEMENT_CHECKER_1": "Band 7",
+                "PAYMENT_CHECKER_1": "Band 7",
+                "FX_SETTLEMENT_CHECKER_2": "Band 6",
+                "PAYMENT_CHECKER_2": "Band 6",
+                "FX_SETTLEMENT_CHECKER_3": "Band 5",
+                "PAYMENT_CHECKER_3": "Band 5",
+                "FX_SETTLEMENT_CHECKER_4": "Band 4",
+                "PAYMENT_CHECKER_4": "Band 4",
+                // MSSTRESURY-816
+                "PAYMENT_CHECKER_BREAK_GLASS": "BreakGlass",
+            };
+
+            return roleToBandMap[role] || "Unknown Band";
+        } catch (error) {
+            let comments = 'Unknown exception while while call function of getBand()' + error.message;
+            this.errorLogAndXmatterAlert("WARNING", comments);
+        }
+    },
+    // MSSTRESURY-816/906/746
+    getDefaultBandGroupAndTaskNumber(currency, transactionAmount) {
+        currency = typeof currency == "string" ? currency : (currency?.getValue?.("code") || "USD");
+        let usCurreny = currency == "USD" ? transactionAmount : this.ConvertToUSD(currency, transactionAmount);
+        let numberOfApproversAmount = gs.getProperty('x_hsb11_mss_tsd.STS_numberOfApprovers');
+        let approverPermission = "";
+        let amountLimitArr = gs.getProperty('x_hsb11_mss_tsd.STS_approverPermission').split(",").map(amount => Number(amount.trim()));
+        let breakGlassLimit = amountLimitArr.shift();
+        if (usCurreny > breakGlassLimit) {
+            approverPermission = "BreakGlass";
+        } else {
+            let limitIndex = amountLimitArr.findIndex(amount => usCurreny > amount);
+            approverPermission = limitIndex == -1 ? "Band 7" : "Band " + (limitIndex + 4);
+        }
+        let numberOfApprovers = 1;
+        if ((usCurreny - numberOfApproversAmount) >= 0) {
+            numberOfApprovers = 2;
+        }
+        return {
+            approverPermission,
+            numberOfApprovers: numberOfApprovers,
+        };
+    },
+
+    //to get number of task and Required banding groups from STS
+    //MSSTRESURY-873
+    getNumOfTaskAndBandingGroup: function(currency, transactionAmount, outboundSysId, attempt, maxRetries) {
+        attempt = (typeof attempt !== 'undefined') ? attempt : 1;
+        maxRetries = (typeof maxRetries !== 'undefined') ? maxRetries : 3;
+        var resultObj = {};
+        var requestBody = '';
+        // Load outbound record
+        var outGR = new GlideRecord('x_hsb11_hsbc_mss_o_mss_event_outbound');
+        if (!outGR.get(outboundSysId)) {
+            this.errorLogAndXmatterAlert("WARNING", "(getNumOfTaskAndBandingGroup) outbound not found: " + outboundSysId);
+            return this.getDefaultBandGroupAndTaskNumber(currency, transactionAmount);
+        }
+        requestBody = outGR.getValue('request_body') || '';
+        try {
+            var stsToken = gs.getProperty('x_hsb11_mss_tsd.eventOutbound_STS_token');
+            var getNumAndBandGroupUri = gs.getProperty('x_hsb11_mss_tsd.hsbcmss_getNumAndBandGroup_STS_api');
+            var r = new sn_ws.RESTMessageV2('HSBC STS API', 'Get The Details');
+            r.setStringParameterNoEscape('getToken', stsToken);
+            r.setStringParameterNoEscape('eventoutbound_base_sts_uri', getNumAndBandGroupUri);
+            r.setStringParameterNoEscape('requestbody', requestBody);
+            var response = r.execute();
+            var responseBody = response.getBody();
+            var resp_parsed = JSON.parse(responseBody);
+            var httpStatus = resp_parsed.Status || resp_parsed.status;
+            // Update outbound with response details
+            outGR.response_date = new GlideDateTime();
+            if (httpStatus == 'OK') {
+                var approverPermission = resp_parsed.approverPermission;
+                var numberOfApprovers = resp_parsed.numberOfApprovers;
+                // Fallback when either is missing
+                if (!approverPermission || numberOfApprovers == null || numberOfApprovers === '') {
+                    resultObj = this.getDefaultBandGroupAndTaskNumber(currency, transactionAmount);
+                } else {
+                    resultObj.approverPermission = this.getBand(approverPermission);
+                    resultObj.numberOfApprovers = numberOfApprovers;
+                }
+
+                outGR.state = 'Processed';
+                outGR.response_body = responseBody;
+                outGR.error_body = '';
+                outGR.error_code = '';
+                outGR.retry_count = attempt - 1;
+                outGR.update();
+                return resultObj;
+            } else {
+                outGR.state = 'Error';
+                outGR.error_body = responseBody;
+                outGR.error_code = httpStatus;
+                outGR.retry_count = attempt;
+                outGR.update();
+                this.errorLogAndXmatterAlert("WARNING", "- STS Checker Approval Limit API non-OK; Response Body: " + responseBody);
+            }
+        } catch (e) {
+            outGR.state = 'Error';
+            outGR.error_body = 'Exception: ' + e.message;
+            outGR.error_code = 'EX';
+            outGR.response_date = new GlideDateTime();
+            outGR.retry_count = attempt;
+            outGR.update();
+            this.errorLogAndXmatterAlert("WARNING", 'Exception on attempt ' + attempt + ': ' + e.message);
+        }
+        // Retry if allowed
+        if (attempt < maxRetries) {
+            return this.getNumOfTaskAndBandingGroup(currency, transactionAmount, outboundSysId, attempt + 1, maxRetries);
+        }
+        resultObj = this.getDefaultBandGroupAndTaskNumber(currency, transactionAmount);
+        // Final fallback
+        this.errorLogAndXmatterAlert("WARNING", '(getNumOfTaskAndBandingGroup) - All retry attempts failed for outbound ' + outboundSysId);
+        return resultObj;
+    },
+
+    checkGroup: function() {
+        var taskSysId = this.getParameter('taskSysId');
+        try {
+            var grCaseTask = new new GlideRecord('x_hsb11_mss_tsd_treasury_case_task');
+            grCaseTask.addQuery('sys_id', taskSysId);
+            grCaseTask.query();
+            if (!grCaseTask.next()) {
+                return;
+            }
+            var grCase = new GlideRecord('x_hsb11_mss_tsd_treasury_case');
+            grCase.addQuery('sys_id', grCaseTask.instruction_case);
+            grCase.query();
+            if (!grCase.next()) {
+                return;
+            }
+            var userGroupBandNameNumber = null;
+            var result;
+            var bandingGroup = this.getBandingGroup(grCase.market, grCase.instructionType, grCase.transactionAmount, grCase.currency);
+            var userGroups = this.getUserGroups();
+            userGroups = JSON.parse(userGroups);
+
+            userGroups.forEach(grGroup => {
+                if (grGroup.name.indexOf('Band') > -1 && (grGroup.name.slice(-1) < userGroupBandNameNumber || userGroupBandNameNumber == null)) {
+                    userGroupBandNameNumber = grGroup.name;
+                }
+            });
+            if (userGroupBandNameNumber.indexOf('Band') > -1) {
+                if (userGroupBandNameNumber > Number(bandingGroup.slice(-1))) {
+                    //return false;
+                    result = 'false';
+                    //return '1'; //You do not have sufficient permissions
+                } else {
+                    //return true;
+                    result = 'true';
+                    //return '2'; //Can approve
+                }
+            } else {
+                //return false;
+                result = 'false';
+                //return '3'; //Does not belong to the Bind group and cannot approve
+            }
+            //return result;
+            this.setValue('answer', result);
+        } catch (ex) {
+            this.errorLogAndXmatterAlert("WARNING", '- Exception while checking isCallback for ObjectID: ' + objectID + '. Error: ' + ex.message);
+        }
+    },
+
+    //MSSTRESURY-538:Show number of rejected tasks by users
+    updateRejection: function(taskType, reopened, assignedToDisplay, existingRejection) {
+        gs.info('taskType' + taskType + 'assignedToDisplay' + assignedToDisplay + 'existingRejection' + existingRejection);
+
+        // Parse existing rejection if it is a JSON string
+        let existing = existingRejection;
+        if (typeof existing == 'string') {
+            try {
+                existing = JSON.parse(existing);
+            } catch (e) {
+                existing = null;
+            }
+        }
+        gs.info('rejection=existing' + existing);
+        existing = JSON.parse(existing);
+        // Base structure
+        let rejection = (existing && Array.isArray(existing.users)) ? {
+            total: Number(existing.total) || 0,
+            taskType: existing.taskType || taskType,
+            users: existing.users.slice()
+        } : {
+            total: 0,
+            taskType: taskType,
+            users: []
+        };
+        // Sanitize user entries
+        rejection.users = rejection.users
+            .filter(u =>
+                u &&
+                typeof u.assignedToDisplay == 'string' &&
+                Number.isInteger(u.count) &&
+                u.count >= 0
+            );
+
+        // Deduplicate by sys_id
+        if (rejection.users.length > 1) {
+            const map = {};
+            for (const u of rejection.users) {
+                if (!map[u.assignedToDisplay]) {
+                    map[u.assignedToDisplay] = {
+                        ...u
+                    };
+                } else {
+                    map[u.assignedToDisplay].count += u.count;
+                }
+            }
+            rejection.users = Object.values(map);
+        }
+        // Update / insert
+        if (assignedToDisplay) {
+            let found = rejection.users.find(u => u.assignedToDisplay == assignedToDisplay);
+
+            if (found) {
+                found.count += 1;
+            } else {
+                rejection.users.push({
+                    assignedToDisplay,
+                    count: 1
+                });
+            }
+        }
+        gs.info('rejection=' + JSON.stringify(rejection));
+        // Recalculate total
+        rejection.total = rejection.users.reduce((sum, u) => sum + u.count, 0);
+        // Optional override rule
+        if (reopened !== null && reopened >= rejection.total) {
+            rejection.total = reopened;
+        }
+
+        // Persist detailed structure
+        existingRejection = JSON.stringify(rejection);
+        gs.info('Rejection: ' + JSON.stringify(rejection));
+        return rejection;
+    },
+
+
+    //MSSTREASURY-316: Get Banding Approvals
+    getBandApproval: function(taskBand, userSysID) {
+        try {
+            var groupType;
+            var grGroupType = new GlideRecord('sys_user_group_type'); // Get Group Type SysID
+            grGroupType.addEncodedQuery('name=' + taskBand);
+            grGroupType.query();
+            if (grGroupType.next())
+                groupType = grGroupType.sys_id;
+
+            var grMember = new GlideRecord('sys_user_grmember');
+            grMember.addEncodedQuery('group.typeLIKE' + groupType + '^user=' + userSysID); // check if user has band permissions
+            grMember.query();
+            if (grMember.next())
+                return true;
+            else
+                return false;
+        } catch (e) {
+            this.errorLogAndXmatterAlert("WARNING", 'Function : getBandApproval :- Unknown exception while processing' + e.message);
+        }
+    },
+
+    //MSSTRESURY-627: Disable Record History in Treasury Workspace
+    handleUnstructuredCaseClosure: function(unstructuredCaseSysId) {
+        try {
+            // Check if all related Instruction Cases for this Unstructured Case are closed
+            var instrCaseGR = new GlideRecord('x_hsb11_mss_tsd_treasury_case');
+            instrCaseGR.addQuery('unstructured_case_id', unstructuredCaseSysId); // assuming 'parent_case' links to unstructured case
+            instrCaseGR.addQuery('case_type', 'Instruction Case');
+            instrCaseGR.addQuery('state', '!=', '2');
+            instrCaseGR.query();
+            if (!instrCaseGR.hasNext()) {
+                // All related instruction cases are closed, so close the unstructured case
+                var unstructuredCaseGR = new GlideRecord('x_hsb11_mss_tsd_treasury_case');
+                if (unstructuredCaseGR.get(unstructuredCaseSysId)) {
+                    unstructuredCaseGR.state = 2;
+                    unstructuredCaseGR.update();
+                }
+            }
+        } catch (e) {
+            this.errorLogAndXmatterAlert("MINOR", 'Function : handleUnstructuredCaseClosure :- Unknown exception while processing' + e.message);
+        }
+    },
+
+    // MSSTRESURY-685: ITM closed-complete Treasury case check
+    isClosedCompleteITMTreasuryCase: function(payload) {
+        try {
+            if (!payload || !Array.isArray(payload.Data) || !payload.Data.length)
+                return false;
+            var caseId = payload.Data[0].Id;
+            if (!caseId)
+                return false;
+            var gr = new GlideRecord('x_hsb11_mss_tsd_treasury_case');
+            if (gr.get(caseId) && gr.state == 2 || gr.task_status == 'INSTRUCTION_NACK_RECEIVED') // 2 = Closed Complete
+                return caseId;
+            return false;
+        } catch (e) {
+            this.errorLogAndXmatterAlert("WARNING", 'Function : isClosedCompleteITMTreasuryCase :- Unknown exception while processing' + e.message);
+            return false;
+        }
+    },
+
+    //MSSTREASURY-941 To Display Request new limit button
+    isCallbackThresholdCaseOpen: function(market) {
+
+        try {
+            var table = new GlideRecord('x_hsb11_mss_tsd_treasury_case');
+            table.addQuery('case_type', 'Threshold Case');
+            table.addQuery('state', '1');
+            table.addQuery('market', market);
+            table.query();
+            if (table.hasNext()) {
+
+                return false;
+            }
+            return true;
+        } catch (error) {
+            gs.error("MSS_Treasury: MSS_Treasury_Utils.isCallbackThresholdCaseOpen() " + error);
+        }
+
+
+    },
+    /**
+     * @param {'CRITICAL'|'MAJOR'|'MINOR'|'WARNING'|'INFO'} severity
+     * @param {string} txt
+     */
+    xMatterAlert(severity, txt) {
+        try {
+            new x_hsb11_hsbc_mss_t.hsbcWidgetFailureHandler().createITIDEvent(severity || "WARNING", txt, 'MSSiQubeSN');
+        } catch (errorInfo) {
+            gs.error('Treasury - Script Include - MSS_Treasury_Utils: Function : xMatterAlert :- Unknown exception while processing' + errorInfo.message);
+        }
+    },
+
+    errorLogAndXmatterAlert(severity, message) {
+        const logPrefix = "Treasury - Script Include - MSS_Treasury_Utils: ";
+        const finalMessage = logPrefix + message;
+        gs.error(finalMessage);
+        this.xMatterAlert(severity, finalMessage);
+    },
+
+    type: 'MSS_Treasury_Utils'
+});]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>45423106@hsbc.com</sys_created_by>
+        <sys_created_on>2025-03-04 05:39:51</sys_created_on>
+        <sys_id>d482b04e1bccaad06ed00e1ad34bcbb7</sys_id>
+        <sys_mod_count>990</sys_mod_count>
+        <sys_name>MSS_Treasury_Utils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_d482b04e1bccaad06ed00e1ad34bcbb7</sys_update_name>
+        <sys_updated_by>45442272@hsbc.com</sys_updated_by>
+        <sys_updated_on>2026-01-15 12:04:34</sys_updated_on>
+    </sys_script_include>
+</record_update>

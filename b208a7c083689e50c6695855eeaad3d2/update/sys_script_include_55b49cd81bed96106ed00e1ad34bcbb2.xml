@@ -1,0 +1,2557 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.MSS_Unstructured_Instruction_Utils</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description/>
+        <mobile_callable>false</mobile_callable>
+        <name>MSS_Unstructured_Instruction_Utils</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var MSS_Unstructured_Instruction_Utils = Class.create();
+MSS_Unstructured_Instruction_Utils.prototype = {
+    initialize: function() {},
+
+    //MSSCUSTODY-4383: Create Widget Inbound Record for payload...
+    insertInboundWidgetRecord: function(requestData, payload) {
+        try {
+            var eventsArray = [];
+            grWidget = new GlideRecord('x_hsb11_hsbc_mss_o_mss_widget_inbound');
+            grWidget.initialize();
+            grWidget.object_id = requestData.objectid;
+            grWidget.object_version = requestData.objectversion;
+            grWidget.object_type = requestData.objecttype;
+            grWidget.object_id_type = requestData.objectidtype;
+            grWidget.event_status = requestData.eventstatus;
+            grWidget.setValue('event_date_time', requestData.eventdatetime.replace('T', ' '));
+            grWidget.source = requestData.source;
+            grWidget.message_id = requestData.messageid;
+            grWidget.event_type = requestData.eventtype;
+            grWidget.additional_attributes = requestData.additionalattributes;
+            grWidget.payload = JSON.stringify(payload);
+            var widInbound = grWidget.insert(); //MSSCUSTODY-4383;MSSCUSTODY-4416: Insert Widget Inbound Record
+            if (widInbound != '') {
+
+                if (requestData.eventstatus.toUpperCase().indexOf('NEW_CASE') > -1) {
+                    // MSSCUSTODY-4383: Trigger event to create case for inbound record.
+                    gs.eventQueue('x_hsb11_mss_unst_0.create_unstr_instr_ca', current, widInbound.toString());
+                    eventsArray.push({ // MSSCUSTODY-4383: Push Status 200 when processed successfully
+                        'Status': '200',
+                    });
+                    //MSSCUSTODY-6109-update Mixed Instructions Cases via Inbound record.
+                } else if (requestData.eventstatus.toUpperCase().indexOf('HIERARCHY_DATA_UPDATE_COMPLETED') > -1) {
+                    gs.eventQueue('x_hsb11_mss_unst_0.update_mixed_instr_ca', current, widInbound.toString());
+                    eventsArray.push({ //  //MSSCUSTODY-6109: Push Status 200 when processed successfully
+                        'Status': '200',
+                    });
+                } else {
+                    //MSSCUSTODY-4416 Create Case Task via Inbound integration | SWB | EL
+                    gs.eventQueue('x_hsb11_mss_unst_0.cr_un_in_ca_ta', current, widInbound.toString());
+                    eventsArray.push({ // MSSCUSTODY-4416: Push Status 200 when processed successfully
+                        'Status': '200',
+                    });
+                }
+
+                return eventsArray;
+            }
+            /* grWidget.addQuery('source', grWidget.Source);
+             grWidget.query();
+             if (grWidget.next()) {
+                 eventsArray.push({
+                     'Status': '200',
+                 });
+
+             }
+             return eventsArray;*/
+        } catch (e) {
+            gs.info('Script Include - MSS_Unstructured_Instruction_Utils:- Unknown exception while processing Widget Inbound Request ' + e.message);
+        }
+    },
+
+    //MSSCUSTODY-4383: Create Instruction Case record for Widget Inbound Record.
+    insertInstructionCase: function(inboundSysID) {
+        try {
+            var grInbound = new GlideRecord('x_hsb11_hsbc_mss_o_mss_widget_inbound');
+            grInbound.addQuery('sys_id', inboundSysID);
+            grInbound.query(); // MSSCUSTODY-4383: Query for inbound event
+            if (grInbound.next()) {
+                var grInstructionCase = new GlideRecord('x_hsb11_mss_unst_0_instructions_case');
+                grInstructionCase.initialize();
+                grInstructionCase.u_message_id = grInbound.message_id;
+                grInstructionCase.u_source = grInbound.source;
+                grInstructionCase.u_event_type = grInbound.event_type;
+                grInstructionCase.event_status = grInbound.event_status;
+                grInstructionCase.event_date_time = grInbound.event_date_time;
+                grInstructionCase.u_object_type = grInbound.object_type;
+                grInstructionCase.u_objectidtype = grInbound.object_id_type;
+                grInstructionCase.u_objectid = grInbound.object_id;
+                grInstructionCase.u_objectversion = grInbound.object_version;
+                grInstructionCase.state = 1;
+                // grInstructionCase.status = 'Open';
+                grInstructionCase.task_status = 'PENDING_PREPROCESSING'; // MSSCUSTODY-5708
+                // grInstructionCase.task_status = 'Pending Preprocessing';
+                var payload = JSON.parse(grInbound.payload.toString());
+                grInstructionCase.source_type = payload.SourceType;
+                grInstructionCase.external_line_no = payload.ExternalLineNo;
+                grInstructionCase.owning_business = this._updateOwningBusiness(payload.SourceType, this.readPayloadattribute(payload?.ExternalLineNo), this.readPayloadattribute(payload?.ReceiverBIC)); //MSSCUSTODY-6102
+                grInstructionCase.instruction_type = this._updateInstructionType(payload.SourceType, this.readPayloadattribute(payload?.ExternalLineNo), this.readPayloadattribute(payload?.ReceiverBIC));
+                grInstructionCase.username = payload.UserName;
+                grInstructionCase.duration_of_call = payload.DurationOfCall;
+                grInstructionCase.number_of_pages = payload.NumberOfPages;
+                grInstructionCase.error_codes = payload.ErrorCodes;
+                grInstructionCase.transaction_id = payload.TransactionId;
+                grInstructionCase.date_time_of_call = payload.DateTimeOfCall;
+                if (grInbound.event_status == 'NEW_CASE.SWIFT') { //MSSCUSTODY-6102
+                    grInstructionCase.senderbic = payload.SenderBIC;
+                    grInstructionCase.receiverbic = payload.ReceiverBIC;
+                }
+                if (grInbound.event_status == 'NEW_CASE.FAIL') { // MSSCUSTODY-4442: Populate additional fields when event status is NEW_CASE.FAIL
+                    grInstructionCase.error_message = payload.ErrorMessage;
+                    grInstructionCase.source_file_url = payload.SourceFileUrl;
+                }
+                grInstructionCase.insert(); // MSSCUSTODY-4383: Insert Instruction Case Record
+            }
+        } catch (e) {
+            gs.info('Script Include - MSS_Unstructured_Instruction_Utils:- Unknown exception while creating case from widget inbound record ' + e.message);
+        }
+    },
+
+    //MSSCUSTODY-4416: Create Case Task via Inbound integration | SWB | EL
+    insertInstructionCaseTask: function(inboundSysID) {
+        try {
+            var grInbound = new GlideRecordSecure('x_hsb11_hsbc_mss_o_mss_widget_inbound');
+            grInbound.addQuery('sys_id', inboundSysID);
+            grInbound.query(); // MSSCUSTODY-4383: Query for inbound event
+            if (grInbound.next()) {
+                var client_region = '';
+                var sender_bic = ''; //8494
+                var index_queue = '';
+                var case_status = '';
+                var grInstructionCaseTask = new GlideRecordSecure('x_hsb11_mss_unst_0_instructions_case_task');
+                //  grInstructionCaseTask.initialize();
+                grInstructionCaseTask.addQuery('instruction_case.u_objectid', grInbound.object_id);
+                grInstructionCaseTask.addActiveQuery();
+                grInstructionCaseTask.addEncodedQuery('task_typeNOT INInstruction,Maker ITM,Checker ITM,trade_cancellation_maker,trade_cancellation_checker'); //MSSCUSTODY-7169
+                grInstructionCaseTask.query();
+
+                if (grInstructionCaseTask.next()) {
+                    var event_status = grInbound.event_status;
+                    var payload = JSON.parse(grInbound.payload.toString());
+
+                    //if the mandatory filed bank how to handle or ignore 
+                    // grInstructionCaseTask.state = 3;
+                    grInstructionCaseTask.event_status = event_status;
+
+                    if (event_status.toUpperCase().indexOf('PREPROCESSING') > -1) {
+                        grInstructionCaseTask.source_file_url = this.readPayloadattribute(payload?.SourceFileUrl);
+                        grInstructionCaseTask.indexing_ui_url = this.readPayloadattribute(payload?.IndexingUiUrl);
+                        grInstructionCaseTask.signature_ui_url = this.readPayloadattribute(payload?.SignatureUiUrl);
+                        grInstructionCaseTask.callback_ui_url = this.readPayloadattribute(payload?.CallbackUiUrl);
+                        //MSSCUSTODY-5218 --> Updating value of below fields via inbound integration.
+                        grInstructionCaseTask.source_file_ui_url = this.readPayloadattribute(payload?.SourceFileUiUrl);
+                        grInstructionCaseTask.error_details = this.readPayloadattribute(payload?.ErrorMessage);
+                        grInstructionCaseTask.source_file_id = this.readPayloadattribute(payload?.SourceFileId);
+
+
+                        // MSSCUSTODY-5317 --> Updating Signature Verification and Signature Comment in Indexing itself.
+                    } else if (event_status.toUpperCase().indexOf('INDEXING') > -1) {
+                        client_region = this.readPayloadattribute(payload?.ClientRegion);
+                        sender_bic = this.readPayloadattribute(payload?.SenderBIC); //8494
+                        grInstructionCaseTask.operator_id = this.readPayloadattribute(payload?.OperatorID);
+                        grInstructionCaseTask.client_name = this.readPayloadattribute(payload?.ClientName); //MSSCUSTODY-7341
+                        grInstructionCaseTask.in_scope = this.readPayloadattribute(payload?.InScope);
+                        grInstructionCaseTask.index_comment = this.readPayloadattribute(payload?.IndexingComment);
+                        index_queue = this.readPayloadattribute(payload?.InstructionType);
+                        grInstructionCaseTask.comments = this.readPayloadattribute(payload?.Comment);
+                        grInstructionCaseTask.signature_verified = this.readPayloadattribute(payload?.SignatureVerified);
+                        grInstructionCaseTask.signature_comment = this.readPayloadattribute(payload?.SignatureComment);
+                        if (((event_status.toUpperCase() == 'INDEXING_COMPLETED.IN_SCOPE') && (payload?.SignatureVerified == true)) || (event_status.toUpperCase() == 'INDEXING_COMPLETED.INPROGRESS')) {
+                            var types = this.readPayloadattribute(payload?.SelectedUIInstructionTypes);
+                            if (types.split(',').length > 1) { // MSSCUSTODY-5970
+                                grInstructionCaseTask.setValue('index_queue_multiple', types);
+                                if (!(event_status.toUpperCase() == 'INDEXING_COMPLETED.INPROGRESS')) {
+                                    this.insertChildCase(grInstructionCaseTask.instruction_case, payload?.HierarchyData.Children, inboundSysID);
+                                }
+                            }
+                        }
+                        if (this.readPayloadattribute(payload?.AdditionalData) != '') { //MSSCUSTODY-7031
+                            var input = payload?.AdditionalData;
+                            for (let i = 0; i < input.length; i++) {
+                                if (input[i].name == 'Balance Verification') {
+                                    grInstructionCaseTask.balance_verification = input[i].data.status;
+                                    grInstructionCaseTask.balance_comment = input[i].data.comment;
+                                } else if (input[i].name == 'Cash Forecasting Input') {
+                                    grInstructionCaseTask.cash_forecasting_input = input[i].data.status;
+                                    grInstructionCaseTask.cash_comment = input[i].data.comment;
+                                }
+                            }
+                        }
+
+                    } else if (event_status.toUpperCase().indexOf('CASE_FORWARDED') > -1) {
+                        if (event_status.toUpperCase() == 'CASE_FORWARDED.FAIL') {
+                            grInstructionCaseTask.error_details = this.readPayloadattribute(payload?.ErrorMessage);
+                        } else if (event_status.toUpperCase() == 'CASE_FORWARDED.SUCCESS') {
+                            case_status = '3';
+                        }
+
+                    } else if (event_status.toUpperCase().indexOf('CALLBACK_VERIFICATION') > -1) {
+                        grInstructionCaseTask.operator_id = this.readPayloadattribute(payload?.OperatorID);
+                        grInstructionCaseTask.callback_verified = this.readPayloadattribute(payload?.CallbackVerified);
+                        grInstructionCaseTask.callback_option_comment = this.readPayloadattribute(payload?.Comment);
+
+                    } else if (event_status.toUpperCase().indexOf('EXTRACTION') > -1) {
+                        grInstructionCaseTask.checker_url_1 = this.readPayloadattribute(payload?.Checker1Url);
+                        grInstructionCaseTask.checker_url_2 = this.readPayloadattribute(payload?.Checker2Url);
+                        if (event_status.toUpperCase() == 'EXTRACTION_COMPLETED.FAIL') {
+                            // MSSCUSTODY-5148
+                            grInstructionCaseTask.error_details = this.readPayloadattribute(payload?.ErrorMessage);
+                            // case_status = 'Close Complete';
+                        } else if (event_status.toUpperCase() == 'EXTRACTION_COMPLETED.SUCCESS') {
+                            let status = '';
+                            grInstructionCaseTask.data = this.readPayloadattribute(JSON.stringify(payload?.PredicatedData));
+                            //MSSCUSTODY-6400
+                            status = this.processDataToTasks(grInstructionCaseTask.instruction_case, payload?.PredicatedData, event_status);
+                            if (status == 'INSTRUCTIONS.FAILED')
+                                event_status = status;
+                        }
+
+                    } else if (event_status.toUpperCase().indexOf('REVIEW_COMPLETED.AMEND') > -1 || event_status.toUpperCase().indexOf('REVIEW_COMPLETED.REJECT') > -1 || event_status.toUpperCase().indexOf('REVIEW_COMPLETED.INPROGRESS') > -1) {
+                        grInstructionCaseTask.operator_id = this.readPayloadattribute(payload?.OperatorID);
+                        grInstructionCaseTask.description = this.readPayloadattribute(payload?.Comment);
+                        if ((event_status.toUpperCase() == 'REVIEW_COMPLETED.AMEND') || (event_status.toUpperCase() == 'REVIEW_COMPLETED.INPROGRESS')) { //MSSCUSTODY-7015
+                            // MSSCUSTODY-6939 
+                            this.deactivateExistingInstructions(grInstructionCaseTask.instruction_case); //MSSCUSTODY-6395
+                            let status = '';
+                            grInstructionCaseTask.data = this.readPayloadattribute(JSON.stringify(payload?.Data));
+                            //MSSCUSTODY-6400
+                            status = this.processDataToTasks(grInstructionCaseTask.instruction_case, payload?.Data, event_status);
+                            if (status == 'INSTRUCTIONS.FAILED')
+                                event_status = status;
+                        } //MSSCUSTODY-6276
+                    } else if (event_status.toUpperCase().indexOf('REVIEW_COMPLETED.APPROVE') > -1) {
+                        grInstructionCaseTask.operator_id = this.readPayloadattribute(payload?.OperatorID);
+                        grInstructionCaseTask.data = this.readPayloadattribute(JSON.stringify(payload?.Data));
+                        this.deactivateCANCInstructions(grInstructionCaseTask.instruction_case); //MSSCUSTODY-8462
+                        //MSSCUSTODY-4549  MSSCUSTODY-5472
+                        //MSSCUSTODY-6939     status = this.processDataToTasks(grInstructionCaseTask.instruction_case, payload?.Data, event_status);                      
+                    } else if (event_status.toUpperCase().indexOf('CALLBACK_DATA_UPDATE_COMPLETED') > -1) {
+                        if (event_status.toUpperCase() == 'CALLBACK_DATA_UPDATE_COMPLETED.SUCCESS') {
+                            grInstructionCaseTask.callback_ui_url = this.readPayloadattribute(payload?.CallbackUiUrl);
+                        }
+                        if (event_status.toUpperCase() == 'CALLBACK_DATA_UPDATE_COMPLETED.FAIL') {
+                            grInstructionCaseTask.error_details = this.readPayloadattribute(payload?.ErrorMessage);
+                        }
+                    }
+
+                    if (!((event_status.toUpperCase() == 'INDEXING_COMPLETED.OUT_OF_SCOPE') || (event_status.toUpperCase() == 'CALLBACK_VERIFICATION_COMPLETED.INPROGRESS') || (event_status.toUpperCase() == 'INDEXING_COMPLETED.INPROGRESS') || (event_status.toUpperCase() == 'REVIEW_COMPLETED.INPROGRESS') || (event_status.toUpperCase() == 'REVIEW_COMPLETED.DISCARD'))) { //MSSCUSTODY-7015 MSSCUSTODY-7330
+                        grInstructionCaseTask.state = 3;
+                    } else {
+                        var processTime = new GlideDateTime;
+                        processTime.addSeconds(720); //MSSCUSTODY-5529
+                        gs.eventQueueScheduled('x_hsb11_mss_unst_0.updateOnTask', grInstructionCaseTask, grInstructionCaseTask.sys_id, '', processTime);
+                        grInstructionCaseTask.work_start = new GlideDateTime().getDisplayValue();
+                    }
+                    grInstructionCaseTask.update(); // MSSCUSTODY-4383: update Instruction Case task Record
+
+                    //Update case information 
+                    if (!(event_status.toUpperCase().indexOf('CALLBACK_DATA_UPDATE_COMPLETED') > -1))
+                        this.updateCase(grInstructionCaseTask.instruction_case, event_status, case_status, index_queue, client_region, sender_bic);
+                    // if update fail how handle the flow will be stuck.
+                } else {
+                    gs.info('Script Include - MSS_Unstructured_Instruction_Utils: - cannot find the case from the header objectID');
+                }
+
+
+
+            }
+        } catch (e) {
+            gs.info('Script Include - MSS_Unstructured_Instruction_Utils:- Unknown exception while creating case task from widget inbound record ' + e.message);
+        }
+    },
+
+    //MSSCUSTODY-6395
+    deactivateExistingInstructions: function(caseId) {
+        var grInstructionTask = new GlideRecord('x_hsb11_mss_unst_0_instructions_case_task');
+        grInstructionTask.addEncodedQuery('task_type=Instruction^instruction_case=' + caseId);
+        grInstructionTask.query();
+        while (grInstructionTask.next()) {
+            grInstructionTask.setValue('state', 4);
+            grInstructionTask.update();
+        }
+
+    },
+
+    updateMixedInstructionCases: function(inboundSysID) { //MSSCUSTODY-6109
+        var grInbound = new GlideRecordSecure('x_hsb11_hsbc_mss_o_mss_widget_inbound');
+        grInbound.addQuery('sys_id', inboundSysID);
+        grInbound.query();
+        if (grInbound.next()) {
+            var payload = JSON.parse(grInbound.payload.toString());
+            var objectid = grInbound.object_id;
+            var grCase = new GlideRecord('x_hsb11_mss_unst_0_instructions_case');
+            grCase.addEncodedQuery('parent.ref_sn_bom_case.u_objectid=' + objectid + '^ORu_objectid=' + objectid);
+            grCase.query();
+            while (grCase.next()) {
+                grCase.error_message = this.readPayloadattribute(payload?.ErrorMessage);
+                grCase.task_status = grInbound.event_status;
+                grCase.update();
+            }
+        }
+    },
+
+    insertChildCase: function(caseId, children, inboundSysID) {
+        var data = [];
+        // MSSCUSTODY-5970
+        var grInbound = new GlideRecord('x_hsb11_hsbc_mss_o_mss_widget_inbound');
+        grInbound.addQuery('sys_id', inboundSysID);
+        grInbound.query(); // MSSCUSTODY-5970
+        if (grInbound.next()) {
+            var parentCase = new GlideRecord('x_hsb11_mss_unst_0_instructions_case');
+            if (parentCase.get(caseId)) {
+                for (var i = 0; i < children.length; i++) {
+                    try {
+                        let newCase = null;
+                        var grInstructionCase = new GlideRecord('x_hsb11_mss_unst_0_instructions_case');
+                        grInstructionCase.initialize();
+                        grInstructionCase.parent = caseId;
+                        grInstructionCase.source_type = parentCase.source_type;
+                        grInstructionCase.external_line_no = parentCase.external_line_no;
+                        grInstructionCase.owning_business = parentCase.owning_business;
+                        grInstructionCase.date_time_of_call = parentCase.date_time_of_call;
+                        grInstructionCase.transaction_id = parentCase.transaction_id;
+                        grInstructionCase.username = parentCase.username;
+                        grInstructionCase.duration_of_call = parentCase.duration_of_call;
+                        grInstructionCase.number_of_pages = parentCase.number_of_pages;
+                        grInstructionCase.error_codes = parentCase.error_codes;
+                        grInstructionCase.senderbic = parentCase.senderbic;
+                        grInstructionCase.receiverbic = parentCase.receiverbic;
+                        grInstructionCase.u_message_id = grInbound.message_id;
+                        grInstructionCase.u_source = grInbound.source;
+                        grInstructionCase.u_event_type = grInbound.event_type;
+                        grInstructionCase.task_status = grInbound.event_status;
+                        grInstructionCase.event_date_time = grInbound.event_date_time;
+                        grInstructionCase.u_object_type = grInbound.object_type;
+                        grInstructionCase.u_objectidtype = grInbound.object_id_type;
+                        grInstructionCase.u_objectversion = grInbound.object_version;
+                        grInstructionCase.state = 1;
+                        grInstructionCase.instruction_type = this.readPayloadattribute(children[i]?.['InstructionType']);
+                        grInstructionCase.u_objectid = this.readPayloadattribute(children[i]?.['SwbID']);
+                        newCase = grInstructionCase.insert();
+                        if (newCase != "") { //MSSCUSTODY-6109
+                            var requestBody = {};
+                            requestBody.SwbID = grInstructionCase.getValue('u_objectid');
+                            requestBody.InstructionType = grInstructionCase.getValue('instruction_type');
+                            requestBody.CaseID = grInstructionCase.getValue('number');
+                            requestBody.SysID = grInstructionCase.getValue('sys_id');
+                        }
+                        data.push(requestBody);
+                    } catch (e) {
+                        gs.info('Script Include - MSS_Unstructured_Instruction_Utils:- Unknown exception while creating case ' + e.message);
+                    }
+                }
+                //MSSCUSTODY-6109
+                var jsonObj = {};
+                jsonObj.Parent = {
+                    "SwbID": parentCase.getValue('u_objectid'),
+                    "InstructionType": parentCase.getValue('instruction_type'),
+                    "CaseID": parentCase.getValue('number'),
+                    "SysID": parentCase.getValue('sys_id')
+                };
+                jsonObj.Children = data;
+                var body = {};
+                body.HierarchyData = jsonObj;
+                //MSSCUSTODY-6109
+                var record = new GlideRecord("x_hsb11_hsbcmss_sw_hsbc_swb_outbound_table");
+                record.initialize();
+                var uuid = gs.generateGUID();
+                var formattedUuid = uuid.substring(0, 8) + '-' + uuid.substring(8, 12) + '-' + uuid.substring(12, 16) + '-' + uuid.substring(16, 20) + '-' + uuid.substring(20);
+                record.u_message_id = formattedUuid;
+                record.reference_id = parentCase.sys_id.toString();
+                record.payload_version = parentCase.payload_version;
+                record.state = 'Ready to be sent';
+                record.instruction_type = parentCase.instruction_type;
+                record.source_system = 'iQube';
+                record.owningbusiness = parentCase.owning_business;
+                record.process = 'SMARTWORKBENCH_UNSTRUCTURED_INSTRUCTIONS';
+                record.swb_id = parentCase.u_objectid.toString();
+                record.request_body = JSON.stringify(body);
+                record.process_status = 'UPDATE_HIERARCHY_DATA';
+                record.insert();
+            }
+        }
+    },
+
+    //8269
+    clientname: function(caseId) {
+        if (!caseId) {
+            return '';
+        }
+        var caseRecord = new GlideRecord('x_hsb11_mss_unst_0_instructions_case');
+        if (caseRecord.get(caseId)) {
+
+            var parentCase = caseRecord.getValue('parent') || caseId;
+
+            var parentCaseRecord = new GlideRecord('x_hsb11_mss_unst_0_instructions_case');
+            if (parentCaseRecord.get(parentCase)) {
+
+                var grTaskRecord = new GlideRecord('x_hsb11_mss_unst_0_instructions_case_task');
+                grTaskRecord.addQuery('instruction_case', parentCase);
+                grTaskRecord.addQuery('task_type', 'indexing');
+                grTaskRecord.query();
+
+                if (grTaskRecord.next()) {
+                    return grTaskRecord.getValue('client_name');
+                }
+            }
+        }
+        return '';
+    },
+    //8269 end
+
+
+    /*
+     * read the payload attribute
+     */
+    readPayloadattribute: function(value) {
+        let return_value = '';
+        if (value != undefined) {
+            return_value = value;
+        }
+        return return_value;
+    },
+
+    convertToUpperCase: function(value) { //MSSCUSTODY-7841
+        let return_value = '';
+        if (value != undefined) {
+            return_value = value.toUpperCase();
+        }
+        return return_value;
+    },
+    /*
+     *	update case information
+     */
+    updateCase: function(caseID, event_status, case_status, index_queue, client_region, sender_bic) {
+        var updatesysID = null;
+        var grInstructionCase = new GlideRecord('x_hsb11_mss_unst_0_instructions_case');
+        grInstructionCase.initialize();
+        if (grInstructionCase.get(caseID)) {
+            grInstructionCase.setValue('task_status', event_status);
+            if (!gs.nil(case_status)) {
+                grInstructionCase.setValue('state', case_status);
+            }
+            if (!gs.nil(index_queue)) {
+                grInstructionCase.setValue('instruction_type', index_queue);
+            }
+            if (!gs.nil(client_region)) {
+                grInstructionCase.setValue('legal_entity', client_region);
+            }
+            if (!gs.nil(sender_bic)) {
+                grInstructionCase.setValue('senderbic', sender_bic); //8494
+            }
+            updatesysID = grInstructionCase.update();
+        } else {
+            gs.info('Script Include - MSS_Unstructured_Instruction_Utils: - cannot find the case from the header objectID');
+        }
+
+        return updatesysID;
+    },
+
+    /*
+     * Review Approved Data handling
+     * MSSCUSTODY-4549
+     */
+    //MSSCUSTODY-5471,5472,5914
+    processDataToTasks: function(caseId, data, event_status) {
+        if (data == undefined) {
+            gs.info('Script Include - MSS_Unstructured_Instruction_Utils: - Review Approve Data is undefined, caseID:' + caseId);
+        }
+        let count = 0;
+        for (let i = 0; i < data.length; i++) {
+
+            let paymentType = this.readPayloadattribute(data[i]?.["OutputMessageType"]);
+            let grInstructionCaseTask = new GlideRecordSecure('x_hsb11_mss_unst_0_instructions_case_task');
+            grInstructionCaseTask.initialize();
+            var currency, inputCurrency;
+            if (paymentType == 'MT380') {
+                //MT380
+                grInstructionCaseTask.senders_reference = this.readPayloadattribute(data[i]?.["Sender's Reference"]);
+                grInstructionCaseTask.action = this.readPayloadattribute(data[i]?.["Action"]);
+                grInstructionCaseTask.credit_account_number = this.readPayloadattribute(data[i]?.["Credit Account Number"]);
+                grInstructionCaseTask.debit_account_number = this.readPayloadattribute(data[i]?.["Debit Account Number"]);
+                grInstructionCaseTask.on_behalf_of = this.readPayloadattribute(data[i]?.["On Behalf of"]);
+                grInstructionCaseTask.details_of_deal = this.readPayloadattribute(data[i]?.["Details of Deal"]);
+                grInstructionCaseTask.fx_direction = this.readPayloadattribute(data[i]?.["FX Direction"]);
+                var baseCurrency = this.readPayloadattribute(data[i]?.["Base Currency"]); //6253
+                grInstructionCaseTask.currency = this.setCurrency(this.readPayloadattribute(data[i]?.["Base Currency"])); //6253 //7972
+                grInstructionCaseTask.counter_currency = this.setCurrency(this.readPayloadattribute(data[i]?.["Counter Currency"])); //7972
+                inputCurrency = this.readPayloadattribute(data[i]?.["Base Currency"]).trim();
+                let inputAmount = this.readPayloadattribute(data[i]?.["Amount"]).trim();
+                inputAmount = inputAmount.replace(/[^0-9.]/g, ''); //MSSCUSTODY-7226
+                if (inputCurrency != "") {
+                    let convertedAmount = this.ConvertToUSD(inputCurrency, inputAmount);
+                    convertedAmount = parseFloat(convertedAmount).toFixed(3); //MSSCUSTODY-6844
+                    gs.info('coverted amoount1 ' + convertedAmount);
+                    grInstructionCaseTask.amount_usd.setDisplayValue(convertedAmount);
+                }
+                grInstructionCaseTask.account_id = this.readPayloadattribute(data[i]?.["Account ID"]);
+                grInstructionCaseTask.reason_code = this.readPayloadattribute(data[i]?.["Reason Code"]);
+                grInstructionCaseTask.client_name = this.readPayloadattribute(data[i]?.["Client Name"]); //MSSCUSTODY-7791
+            } else if (paymentType == 'MT599') {
+                //MT599
+                grInstructionCaseTask.senders_reference = this.readPayloadattribute(data[i]?.["Sender's Reference"]);
+                grInstructionCaseTask.action = this.readPayloadattribute(data[i]?.["Action"]);
+                grInstructionCaseTask.credit_account_number = this.readPayloadattribute(data[i]?.["Credit Account Number"]);
+                grInstructionCaseTask.debit_account_number = this.readPayloadattribute(data[i]?.["Debit Account Number"]);
+                grInstructionCaseTask.restrictedccy = this.readPayloadattribute(data[i]?.["RestrictedCCY"]);
+                grInstructionCaseTask.mt599_output_text = this.readPayloadattribute(data[i]?.["MT599OutputText"]);
+                grInstructionCaseTask.on_behalf_of = this.readPayloadattribute(data[i]?.["On Behalf of"]);
+                grInstructionCaseTask.details_of_deal = this.readPayloadattribute(data[i]?.["Details of Deal"]);
+                grInstructionCaseTask.fx_direction = this.readPayloadattribute(data[i]?.["FX Direction"]);
+                grInstructionCaseTask.currency = this.setCurrency(this.readPayloadattribute(data[i]?.["Base Currency"])); //MSSCUSTODY-7844 //7972
+                grInstructionCaseTask.counter_currency = this.setCurrency(this.readPayloadattribute(data[i]?.["Counter Currency"])); //7972
+                grInstructionCaseTask.client_name = this.readPayloadattribute(data[i]?.["Client Name"]); //MSSCUSTODY-7947
+                inputCurrency = this.readPayloadattribute(data[i]?.["Base Currency"]).trim();
+                let inputAmount = this.readPayloadattribute(data[i]?.["Amount"]).trim();
+                inputAmount = inputAmount.replace(/[^0-9.]/g, ''); //MSSCUSTODY-7226
+                if (inputCurrency != "") {
+                    let convertedAmount = this.ConvertToUSD(inputCurrency, inputAmount);
+                    // convertedAmount = parseFloat(convertedAmount).toFixed(3); //MSSCUSTODY-6844
+                    // gs.info('coverted amoount2 ' + convertedAmount);
+                    grInstructionCaseTask.amount_usd.setDisplayValue(convertedAmount);
+                } //MSSCUSTODY-7792
+                grInstructionCaseTask.account_id = this.readPayloadattribute(data[i]?.["Account ID"]);
+                grInstructionCaseTask.reason_code = this.readPayloadattribute(data[i]?.["Reason Code"]);
+                grInstructionCaseTask.security_account = this.readPayloadattribute(data[i]?.["Security Account"]);
+            } else if (data[i].hasOwnProperty('Sender To Receiver')) {
+                //Cash Payments
+                grInstructionCaseTask.senders_reference = this.readPayloadattribute(data[i]?.["Sender's Reference"]);
+                grInstructionCaseTask.action = this.readPayloadattribute(data[i]?.["Action"]);
+                currency = this.readPayloadattribute(data[i]?.["Currency"]); //6253
+                grInstructionCaseTask.currency = this.setCurrency(this.readPayloadattribute(data[i]?.["Currency"])); //6253 //7972
+                grInstructionCaseTask.debit_account_number = this.readPayloadattribute(data[i]?.["Debit Account Number"]);
+                grInstructionCaseTask.ordering_institution = this.readPayloadattribute(data[i]?.["Ordering Institution"]);
+                grInstructionCaseTask.ordering_institution_lei = this.readPayloadattribute(data[i]?.["Ordering institution LEI"]);
+                grInstructionCaseTask.intermediary_bank_code_type = this.readPayloadattribute(data[i]?.["Intermediary Bank Code Type"]);
+                grInstructionCaseTask.intermediary_bank_address = this.readPayloadattribute(data[i]?.["Intermediary Bank Address"]);
+                grInstructionCaseTask.intermediary_bank = this.readPayloadattribute(data[i]?.["Intermediary Bank Name"]); //MSSCUSTODY-7332
+                grInstructionCaseTask.intermediary_bank_code = this.readPayloadattribute(data[i]?.["Intermediary Bank Code"]);
+                grInstructionCaseTask.intermediary_bank_lei = this.readPayloadattribute(data[i]?.["Intermediary Bank LEI"]);
+                grInstructionCaseTask.intermediary_account_number = this.readPayloadattribute(data[i]?.["Intermediary Account Number"]);
+                inputCurrency = this.readPayloadattribute(data[i]?.["Currency"]).trim();
+                let inputAmount = this.readPayloadattribute(data[i]?.["Amount"]).trim();
+                inputAmount = inputAmount.replace(/[^0-9.]/g, ''); //MSSCUSTODY-7226
+                if (inputCurrency != "") {
+                    let convertedAmount = this.ConvertToUSD(inputCurrency, inputAmount);
+                    convertedAmount = parseFloat(convertedAmount).toFixed(3); //MSSCUSTODY-6844
+                    gs.info('coverted amoount3 ' + convertedAmount);
+                    grInstructionCaseTask.amount_usd.setDisplayValue(convertedAmount);
+                }
+                grInstructionCaseTask.account_with_institution = this.readPayloadattribute(data[i]?.["Account With Institution"]);
+                grInstructionCaseTask.account_with_institution_lei = this.readPayloadattribute(data[i]?.["Account with institution LEI"]);
+                grInstructionCaseTask.account_institution_number = this.readPayloadattribute(data[i]?.["Account With Institution Account Number"]);
+                grInstructionCaseTask.account_with_institution_code_type = this.readPayloadattribute(data[i]?.["Account with institution code type"]);
+                grInstructionCaseTask.account_with_institution_name = this.readPayloadattribute(data[i]?.["Account With Institution Name"]);
+                grInstructionCaseTask.account_with_institution_address = this.readPayloadattribute(data[i]?.["Account With Institution Address"]);
+                grInstructionCaseTask.sender_to_receiver = this.readPayloadattribute(data[i]?.["Sender To Receiver"]);
+                grInstructionCaseTask.credit_account_number = this.readPayloadattribute(data[i]?.["Credit Account Number"]);
+                grInstructionCaseTask.credit_account_name = this.readPayloadattribute(data[i]?.["Credit Account Name"]);
+                grInstructionCaseTask.credit_account_code_type = this.readPayloadattribute(data[i]?.["Credit account code type"]);
+                grInstructionCaseTask.credit_account_bic = this.readPayloadattribute(data[i]?.["Credit Account BIC"]);
+                grInstructionCaseTask.credit_account_name = this.readPayloadattribute(data[i]?.["Credit Account Name"]);
+                grInstructionCaseTask.credit_account_address = this.readPayloadattribute(data[i]?.["Credit Account Address"]);
+                grInstructionCaseTask.credit_account_lei = this.readPayloadattribute(data[i]?.["Credit Account LEI"]);
+                grInstructionCaseTask.sender_to_receiver_code = this.readPayloadattribute(data[i]?.["Sender To Receiver Code"]);
+                grInstructionCaseTask.instruction_to_bank = this.readPayloadattribute(data[i]?.["Remittance Information"]);
+                grInstructionCaseTask.instruction_to_bank_code = this.readPayloadattribute(data[i]?.["Remittance Information Code"]); //MSSCUSTODY-7841
+                grInstructionCaseTask.purpose_code = this.readPayloadattribute(data[i]?.["Purpose Code"]);
+                grInstructionCaseTask.purpose_of_payment_code = this.readPayloadattribute(data[i]?.["Purpose of payment code"]);
+                grInstructionCaseTask.client_name = this.clientname(caseId); //MSSCUSTODY-8269
+                if (data[i].hasOwnProperty('Charges')) {
+                    //MT103
+                    grInstructionCaseTask.ordering_customer = this.readPayloadattribute(data[i]?.["Ordering Customer"]);
+                    grInstructionCaseTask.ordering_customer_lei = this.readPayloadattribute(data[i]?.["Ordering Customer LEI"]);
+                    grInstructionCaseTask.ordering_customer_code_type = this.readPayloadattribute(data[i]?.["Ordering Customer code type"]);
+                    //MSSCUSTODY-7332
+                    grInstructionCaseTask.ordering_customer_name = this.readPayloadattribute(data[i]?.["Ordering Customer Name"]);
+                    grInstructionCaseTask.ordering_customer_address = this.readPayloadattribute(data[i]?.["Ordering Customer Address"]);
+                    grInstructionCaseTask.charges = this.readPayloadattribute(data[i]?.["Charges"]);
+                } else {
+                    //MT202
+                    grInstructionCaseTask.related_reference = this.readPayloadattribute(data[i]?.["Related Reference"]);
+                    //grInstructionCaseTask.credit_account_bic = this.readPayloadattribute(data[i]?.["Credit Account BIC"]);
+                    //MSSCUSTODY-7332
+                }
+            } else if (paymentType == 'MT540' || paymentType == 'MT541' || paymentType == 'MT542' || paymentType == 'MT543') { //MSSCUSTODY-5913
+                grInstructionCaseTask.groupid = this.readPayloadattribute(data[i]?.["GroupId"]);
+                grInstructionCaseTask.senders_reference = this.readPayloadattribute(data[i]?.["Sender's Reference"]);
+                grInstructionCaseTask.action = this.readPayloadattribute(data[i]?.["Action"]);
+                grInstructionCaseTask.previous_ref = this.readPayloadattribute(data[i]?.["Previous Reference"]);
+                grInstructionCaseTask.security_account = this.readPayloadattribute(data[i]?.["Security Account"]);
+                grInstructionCaseTask.instr_type = this.readPayloadattribute(data[i]?.["Instruction Type"]);
+                grInstructionCaseTask.security_type = this.readPayloadattribute(data[i]?.["Security Type"]);
+                grInstructionCaseTask.security_identifier = this.readPayloadattribute(data[i]?.["Security Identifier"]);
+                grInstructionCaseTask.pset = this.readPayloadattribute(data[i]?.["PSET"]);
+                grInstructionCaseTask.quant = this.readPayloadattribute(data[i]?.["Quantity"]); //8554
+                //grInstructionCaseTask.settlement_amount = this.readPayloadattribute(data[i]?.["Amount"]);
+                currency = this.readPayloadattribute(data[i]?.["Currency"]);
+                grInstructionCaseTask.currency = this.setCurrency(this.readPayloadattribute(data[i]?.["Currency"])); //7972
+                inputCurrency = this.readPayloadattribute(data[i]?.["Currency"]).trim();
+                let inputAmount = this.readPayloadattribute(data[i]?.["Amount"]).trim();
+                inputAmount = inputAmount.replace(/[^0-9.]/g, ''); //MSSCUSTODY-7226
+                if (inputCurrency != "") {
+                    let convertedAmount = this.ConvertToUSD(inputCurrency, inputAmount);
+                    convertedAmount = parseFloat(convertedAmount).toFixed(3); //MSSCUSTODY-6844
+                    gs.info('coverted amoount4 ' + convertedAmount);
+                    grInstructionCaseTask.amount_usd.setDisplayValue(convertedAmount);
+                }
+                grInstructionCaseTask.unit_price = this.readPayloadattribute(data[i]?.["Unit Price Amount"]);
+                grInstructionCaseTask.buyer_seller_format = this.readPayloadattribute(data[i]?.["Buyer/Seller Format"]);
+                grInstructionCaseTask.buyer_seller = this.readPayloadattribute(data[i]?.["Buyer/Seller"]);
+                grInstructionCaseTask.counterparty_type = this.readPayloadattribute(data[i]?.["Counterparty Type"]);
+                grInstructionCaseTask.counterparty = this.readPayloadattribute(data[i]?.["Counterparty"]);
+                grInstructionCaseTask.narrative = this.readPayloadattribute(data[i]?.["Narrative"]);
+                grInstructionCaseTask.switch_account = this.readPayloadattribute(data[i]?.["CP/SWITCH Account"]);
+                grInstructionCaseTask.setr = this.readPayloadattribute(data[i]?.["SETR"]);
+                grInstructionCaseTask.beneficiary_ownership = this.readPayloadattribute(data[i]?.["Beneficiary Ownership"]);
+                grInstructionCaseTask.exchange_name = this.readPayloadattribute(data[i]?.["Exchange Name"]);
+                grInstructionCaseTask.stamp_duty = this.readPayloadattribute(data[i]?.["Stamp Duty Indicator"]);
+                grInstructionCaseTask.nationality_declaration = this.readPayloadattribute(data[i]?.["Nationality Declaration"]);
+                grInstructionCaseTask.price_type = this.readPayloadattribute(data[i]?.["Price Type"]); // MSSCUSTODY-7013
+                grInstructionCaseTask.deal_amount = this.readPayloadattribute(data[i]?.["Deal Amount"]); // MSSCUSTODY-7013
+                grInstructionCaseTask.price_type_option = this.readPayloadattribute(data[i]?.["Price Type Option"]); // MSSCUSTODY-7013
+                grInstructionCaseTask.cp_account = this.readPayloadattribute(data[i]?.["DEAG/REAG Account"]); // MSSCUSTODY-7343
+                //MSSCUSTODY-8075
+                grInstructionCaseTask.rtgs = this.readPayloadattribute(data[i]?.["RTGS"]);
+                grInstructionCaseTask.interest_accrued_amount = this.readPayloadattribute(data[i]?.["Accrued Interest"]);
+                grInstructionCaseTask.interest_accrued_days = this.readPayloadattribute(data[i]?.["Accrued Interest Days"]);
+                grInstructionCaseTask.stamp_duty_charge = this.readPayloadattribute(data[i]?.["Stamp Duty Charge"]);
+                grInstructionCaseTask.local_tax_charge = this.readPayloadattribute(data[i]?.["Local Tax Charge"]);
+                grInstructionCaseTask.broker_commission_charge = this.readPayloadattribute(data[i]?.["Broker Commission Charge"]);
+                grInstructionCaseTask.stco = this.readPayloadattribute(data[i]?.["STCO"]);
+                //*MSSCUSTODY-8075
+                grInstructionCaseTask.pset_bic = this.readPayloadattribute(data[i]?.["PSET BIC"]);
+                grInstructionCaseTask.other_charge = this.readPayloadattribute(data[i]?.["Other Charge"]);
+            } else if (paymentType == 'CANC') { //MSSCUSTODY-8462
+                grInstructionCaseTask.action = this.readPayloadattribute(data[i]?.["Action"]);
+                grInstructionCaseTask.previous_ref = this.readPayloadattribute(data[i]?.["Previous Reference"]);
+                grInstructionCaseTask.senders_reference = this.readPayloadattribute(data[i]?.["Sender's Reference"]);
+            } //*MSSCUSTODY-8462 ends
+
+            let newCaseTaskId = null;
+            let dateString = this.readPayloadattribute(data[i]?.["Value Date"]);
+            if (dateString != "") {
+                grInstructionCaseTask.value_date = this.stringConvertToDate(dateString);
+            }
+            let tradeString = this.readPayloadattribute(data[i]?.["Trade Date"]);
+            if (tradeString != "") {
+                grInstructionCaseTask.trade_date = this.stringConvertToDate(tradeString);
+            }
+            let settlementString = this.readPayloadattribute(data[i]?.["Settlement Date"]);
+            if (settlementString != "") {
+                grInstructionCaseTask.value_date = this.stringConvertToDate(settlementString);
+            }
+            //MSSCUSTODY-6253
+            let inputAmount = this.readPayloadattribute(data[i]?.["Amount"]).trim();
+            inputAmount = inputAmount.replace(/[^0-9.]/g, ''); //MSSCUSTODY-7226
+            gs.info("input amount" + inputAmount);
+            convertedInputAmount = parseFloat(inputAmount).toFixed(3); //MSSCUSTODY-6844
+            gs.info('converted amount5 ' + convertedInputAmount);
+            grInstructionCaseTask.amount.setDisplayValue(convertedInputAmount); //MSSCUSTODY-6403
+            //MSSCUSTODY-8462
+            if (paymentType !== 'CANC') {
+                grInstructionCaseTask.callback_verification_required = this.getCallbackValue(caseId, paymentType, inputAmount, baseCurrency, currency); //MSSCUSTODY-6253
+                grInstructionCaseTask.high_value_indicator = this.getHighValue(caseId, paymentType, inputAmount, baseCurrency, currency); //MSSCUSTODY-6081
+            } //*MSSCUSTODY-8462 ends
+            grInstructionCaseTask.outputmessagetype = paymentType;
+            grInstructionCaseTask.swbrowid = this.readPayloadattribute(data[i]?.["SwbRowId"]);
+            grInstructionCaseTask.task_type = 'Instruction';
+            grInstructionCaseTask.event_status = 'INSTRUCTIONS.RECEIVED';
+            grInstructionCaseTask.state = 1;
+            grInstructionCaseTask.instruction_case = caseId;
+            grInstructionCaseTask.parent = caseId;
+            grInstructionCaseTask.parent_case = caseId;
+            newCaseTaskId = grInstructionCaseTask.insert();
+            if (!newCaseTaskId) {
+                gs.info('Script Include - MSS_Unstructured_Instruction_Utils: - Review Approve, create Instruction task fail. caseID:' + caseId);
+            } else {
+                count++;
+            }
+        }
+
+        if (count == data.length) {
+            return 'INSTRUCTIONS_RECEIVED';
+        } else {
+            return 'INSTRUCTIONS.FAILED';
+        }
+    },
+
+    getAbbreviation: function(fullName) {
+        //MSSCUSTODY-7714
+        switch (fullName) {
+            case 'BIC Code':
+                return 'BIC Code';
+            case 'Name and address':
+                return 'Name and address';
+            case 'Austrian Bankleitzahl':
+                return 'AT';
+            case 'Australian BSB Code':
+                return 'AU';
+            case 'German Bankleitzahl':
+                return 'BL';
+            case 'Canadian Payment Routing code':
+                return 'CC';
+            case 'CHIPS ID':
+                return 'CH';
+            case 'CHIPS Participant Identifier':
+                return 'CP';
+            case 'Spanish Interbanking code':
+                return 'ES';
+            case 'Fed Wire code':
+                return 'FW';
+            case 'HEBIC':
+                return 'GR';
+            case 'Hong Kong Clearing code':
+                return 'HK';
+            case 'Indian Financial System Code':
+                return 'IN';
+            case 'Italian Identification code':
+                return 'IT';
+            case 'New Zealand Clearing code':
+                return 'NZ';
+            case 'Polish Clearing code':
+                return 'PL';
+            case 'Portuguese Clearing code':
+                return 'PT';
+            case 'Russian Central Bank Id code':
+                return 'RU';
+            case 'UK Sort Code':
+                return 'SC';
+            case 'Swiss Clearing code (BC code)':
+                return 'SW';
+            case 'South African Clearing code':
+                return 'ZA';
+            default:
+                return '';
+        }
+    },
+
+    getFormattedName: function(name) {
+        //MSSCUSTODY-7790
+        if (!name) {
+            return '';
+        }
+        return name.length > 35 ? name.substring(0, 35) : name;
+    },
+
+    getFormattedAddress: function(name, address) {
+        //MSSCUSTODY-7790
+        if (!address) {
+            address = '';
+        }
+
+        var prefix = '';
+        if (name && name.length > 35) {
+            prefix = name.substring(35);
+        }
+
+        var finalAddress = (prefix + address).trim();
+        finalAddress = this.addChar(finalAddress, 35);
+        return finalAddress;
+    },
+
+    addChar: function(str, interval) {
+        if (!str) {
+            return '';
+        }
+        return str.match(new RegExp('.{1,' + interval + '}', 'g')).join('|');
+    },
+
+    getCallbackValue: function(caseID, outputmessagetype, amount, basecurrency, currency) {
+        //MSSCUSTODY-6253 
+        try {
+            var callbackflag = 'false'; // Default value
+
+            var grcase = new GlideRecord("x_hsb11_mss_unst_0_instructions_case");
+            if (grcase.get(caseID)) {
+                var owningBusiness = grcase.getValue('owning_business');
+                var sourceType = grcase.getValue('source_type');
+                var sett = grcase.getValue('instruction_type');
+            }
+            // Query the threshold table
+            var tsh = new GlideRecord('x_hsb11_mss_unst_0_business_region_threshold');
+            tsh.addEncodedQuery('owning_business=' + owningBusiness + '^source_type=' + sourceType + '^instruction_type=' + sett + '^outputmessagetype=' + outputmessagetype + '^callback_flag=true');
+            tsh.query();
+            if (tsh.next()) {
+                var thrValue = Number(tsh.getValue('criteria'));
+                var inputCurrency = (outputmessagetype === "MT380") ? basecurrency : currency;
+
+                if (outputmessagetype === "MT542") {
+                    callbackflag = 'true';
+                } else if (inputCurrency.trim() && amount) {
+                    var convertedAmount = this.ConvertToUSD(inputCurrency, amount);
+                    callbackflag = convertedAmount > thrValue ? 'true' : 'false';
+                }
+            }
+            return callbackflag;
+        } catch (e) {
+            gs.info('Script Include - MSS_Unstructured_Instruction_Utils: getCallbackValue- Unknown exception while returning CallbackFlag  ' + e.message);
+        }
+    },
+
+    getHighValue: function(caseID, outputmessagetype, amount, basecurrency, currency) {
+        //MSSCUSTODY-6081
+        try {
+            var isHighValue = 'No';
+            var inputCurrency, inputAmount, convertedAmount, thrValue;
+
+            var grcase = new GlideRecord("x_hsb11_mss_unst_0_instructions_case");
+            if (grcase.get(caseID)) {
+                var owningBusiness = grcase.getValue('owning_business');
+                var instructionType = grcase.getValue('instruction_type');
+            }
+            var tsh = new GlideRecord('x_hsb11_mss_unst_0_business_region_threshold');
+            tsh.addEncodedQuery('owning_business=' + owningBusiness + '^instruction_type=' + instructionType + '^outputmessagetype=' + outputmessagetype + '^hv_flag=true');
+            tsh.query();
+
+            if (tsh.next()) {
+                thrValue = Number(tsh.getValue('hv_threshold_usd'));
+                inputCurrency = (outputmessagetype === "MT380") ? basecurrency : currency;
+                if (inputCurrency.trim() && amount) {
+                    convertedAmount = this.ConvertToUSD(inputCurrency, amount);
+                } else {
+                    convertedAmount = 0;
+                }
+
+                if (convertedAmount > thrValue) {
+                    isHighValue = 'Yes';
+                } else {
+                    isHighValue = 'No';
+                }
+            }
+            return isHighValue;
+        } catch (e) {
+            gs.info('Script Include - MSS_Unstructured_Instruction_Utils: getHighValue- Unknown exception while returning HighValue  ' + e.message);
+        }
+
+    },
+
+
+    updateCallbackTask: function(caseId) {
+        var gTask = new GlideRecord('x_hsb11_mss_unst_0_instructions_case_task');
+        gTask.addQuery('instruction_case', caseId);
+        gTask.addQuery('task_type', 'Instruction');
+        gTask.addActiveQuery();
+        gTask.query();
+        var row = gTask.getRowCount();
+        var count = 0;
+        while (gTask.next()) {
+            if (gTask.outputmessagetype == "MT599") {
+                count++;
+            } else if (gTask.callback_verification_required == 'false') {
+                count++;
+            }
+        }
+        if (row != count) {
+            return true;
+        } else {
+            return false;
+        }
+    },
+
+    //MSSCUSTODY-7972:Currency visibility
+    setCurrency: function(curr) {
+        try {
+            if (!curr) {
+                gs.info('Currency is empty in payload');
+                return;
+            }
+            var fxCurr = new GlideRecord('fx_currency');
+            fxCurr.addQuery('code', curr);
+            fxCurr.query();
+            if (fxCurr.next()) {
+                return fxCurr.sys_id;
+            } else {
+                gs.info('Currency not found in fx_currency');
+            }
+        } catch (e) {
+            gs.error('Error in setCurrency: ' + e.message);
+        }
+    },
+
+    //MSSCUSTODY-5471
+    ConvertToUSD: function(inputCurrency, inputAmount) {
+        try { //MSSCUSTODY-7972
+            var conv = new sn_currency.GlideCurrencyConverter(inputCurrency, 'USD');
+            conv.setAmount(inputAmount);
+            var convertValues = conv.convert();
+            var convertedAmount = convertValues.getAmount();
+            return convertedAmount;
+        } catch (e) {
+            return '';
+        }
+    },
+
+    /*
+     * Convert the yyyymmdd to Date
+     */
+    stringConvertToDate: function(dateString) {
+        // Extract year, month, and day
+        let year = dateString.substring(0, 4);
+        let month = dateString.substring(4, 6);
+        let day = dateString.substring(6, 8);
+
+        // Create a new Date object
+        // Note: JavaScript months are zero-based, so subtract 1 from the month
+        let dtstr = year + '-' + month + '-' + day;
+        let valuedate = new GlideDateTime(dtstr);
+        return valuedate;
+    },
+
+    //MSSCUSTODY-5148 validating loggedin user's role
+    isMember: function() {
+        var grmember = new GlideRecord('sys_user_grmember');
+        grmember.addEncodedQuery('group.sys_idIN' + gs.getProperty('x_hsb11_mss_unst_0.Unstructured_structured_Groups'));
+        grmember.addQuery('user', gs.getUserID());
+        grmember.query();
+        if (grmember.next()) {
+            return true;
+        } else {
+            return false;
+        }
+
+    },
+
+    sendMessage: function(SysID) {
+        try {
+            var gr = new GlideRecord('x_hsb11_hsbcmss_sw_hsbc_swb_outbound_table');
+            gr.get(SysID);
+            gr.query();
+            while (gr.next()) {
+                var status = gr.getValue('process_status');
+                var swbToken = gs.getProperty('x_hsb11_hsbcmss_sw.hsbcmss_swb_api_token');
+                var message = gr.getValue('u_message_id');
+                var swb = gr.getValue('swb_id');
+                var business = gr.getValue('owningbusiness');
+                var caseId = gr.getValue('reference_id');
+                var url = gr.getValue('callback_url');
+                var type = gr.getValue('instruction_type');
+                var gdt = new GlideDateTime();
+                var dateTimeString = gdt.getDisplayValueInternal().split(" ");
+                var date = dateTimeString[0];
+                var time = dateTimeString[1];
+                var milliseconds = gdt.getNumericValue() % 1000;
+                var formattedDate = date + "T" + time + "." + milliseconds.toString().padStart(3, '0') + "Z";
+
+                var r = new sn_ws.RESTMessageV2('x_hsb11_hsbcmss_sw.HSBC SWB API', 'Send Task Details ');
+                r.setStringParameterNoEscape('swb_token', swbToken);
+
+
+                if (status == 'TRIGGER_PREPROCESSING') {
+                    var grCaseRecord = new GlideRecord('x_hsb11_mss_unst_0_instructions_case');
+                    grCaseRecord.get(caseId);
+                    grCaseRecord.query();
+                    if (grCaseRecord.next()) {
+                        var external_no = grCaseRecord.getValue('external_line_no');
+                        var ar = new GlideRecord('x_hsb11_mss_unst_0_mss_external_line_number_mapping');
+                        ar.addQuery('external_line_number', external_no);
+                        ar.query();
+                        if (ar.next()) {
+                            var workType = ar.getValue('work_type');
+                            var section = ar.getValue('section');
+                            var dept = ar.getValue('department');
+                        }
+                    }
+                    var body = {
+                        "Header": {
+                            "MessageID": message,
+                            "SwbID": swb,
+                            "SourceSystem": "iQube",
+                            "Process": "SMARTWORKBENCH_UNSTRUCTURED_INSTRUCTIONS",
+                            "ProcessStatus": status,
+                            "OperationTime": formattedDate,
+                            "ReferenceID": caseId,
+                            "PayloadVersion": "1",
+                            "CallBackUrl": url
+                        },
+                        "Payload": {
+                            "OwningBusiness": business,
+                            "InstructionType": type,
+                            "WorkType": workType,
+                            "Section": section,
+                            "Dept": dept
+                        }
+                    };
+                } else if (status == 'TRIGGER_CASE_FORWARD') {
+                    var body = {
+                        "Header": {
+                            "MessageID": message,
+                            "SwbID": swb,
+                            "SourceSystem": "iQube",
+                            "Process": "SMARTWORKBENCH_UNSTRUCTURED_INSTRUCTIONS",
+                            "ProcessStatus": status,
+                            "OperationTime": formattedDate,
+                            "ReferenceID": caseId,
+                            "PayloadVersion": "1",
+                            "CallBackUrl": url
+                        },
+                        "Payload": {
+                            "Receiver": ""
+                        }
+                    };
+
+                } else if (status == 'TRIGGER_EXTRACTION') {
+                    var body = {
+                        "Header": {
+                            "MessageID": message,
+                            "SwbID": swb,
+                            "SourceSystem": "iQube",
+                            "Process": "SMARTWORKBENCH_UNSTRUCTURED_INSTRUCTIONS",
+                            "ProcessStatus": status,
+                            "OperationTime": formattedDate,
+                            "ReferenceID": caseId,
+                            "PayloadVersion": "1",
+                            "CallBackUrl": url
+                        }
+                    };
+                } else if (status == 'UPDATE_CALLBACK_DATA' || status == 'UPDATE_HIERARCHY_DATA') {
+                    var body = {
+                        "Header": {
+                            "MessageID": message,
+                            "SwbID": swb,
+                            "SourceSystem": "iQube",
+                            "Process": "SMARTWORKBENCH_UNSTRUCTURED_INSTRUCTIONS",
+                            "ProcessStatus": status,
+                            "OperationTime": formattedDate,
+                            "ReferenceID": caseId,
+                            "PayloadVersion": "1",
+                        },
+                    };
+                    body.Payload = JSON.parse(gr.getValue('request_body'));
+                } else if (status == 'CLOSE_CASE') {
+                    var body = {
+                        "Header": {
+                            "MessageID": message,
+                            "SwbID": swb,
+                            "SourceSystem": "iQube",
+                            "Process": "SMARTWORKBENCH_UNSTRUCTURED_INSTRUCTIONS",
+                            "ProcessStatus": status,
+                            "OperationTime": formattedDate,
+                            "ReferenceID": caseId,
+                            "PayloadVersion": "1",
+                            "CallBackUrl": url
+                        },
+                        "Payload": {
+                            "Result": "Success",
+                            "Message": " ",
+                        }
+                    };
+                }
+                var toSend = JSON.stringify(body);
+                r.setRequestBody(toSend);
+                gr.state = 'Processing';
+                gr.request_date = new GlideDateTime();
+                gr.update();
+                var response = r.execute();
+                var responseBody = response.getBody();
+                var httpStatus = response.getStatusCode();
+                try {
+                    var resp_parsed = JSON.parse(responseBody);
+                } catch (err) {
+                    gr.error_body = 'Response is coming in HTML format.Unable to Parse';
+                    gr.error_code = httpStatus;
+                    gr.state = 'Error';
+                    gr.response_body = responseBody;
+                    gr.update();
+                    //response.setStatus(400); 
+                    //response.setBody({ "status": "failure", "error": { "message": "Invalid JSON", "detail": err.message } }); 
+                    return;
+                }
+
+
+                if (httpStatus == '202' || httpStatus == '200') {
+
+                    gr.response_body = responseBody;
+                    gr.response_code = httpStatus;
+                    gr.swb_id = resp_parsed.swbId;
+                    gr.response_date = new GlideDateTime();
+                    gr.state = "Processed";
+                } else if (httpStatus == '500' || httpStatus == '504') { //added as part of MSSCUSTODY-4739 Development
+                    var count = gr.getValue("counter");
+                    if (count < 2) {
+                        count++;
+                        gr.counter = count;
+                        gr.state = "Retrying";
+                        var processTime = new GlideDateTime;
+                        processTime.addSeconds(300);
+                        gs.eventQueueScheduled('x_hsb11_hsbcmss_sw.create_un_in_task_swb', gr, gr.sys_id, '', processTime);
+                    } else {
+                        gr.response_code = httpStatus;
+                        gr.error_body = responseBody;
+                        gr.error_code = resp_parsed.status;
+                        gr.response_message = response.getErrorMessage();
+                        gr.state = 'Error';
+                    }
+                } else if (httpStatus == '404' || httpStatus == '502') { //added as part of MSSCUSTODY-4739 Development
+                    var count = gr.getValue("counter");
+                    if (count < 2) {
+                        count++;
+                        gr.counter = count;
+                        gr.state = "Retrying";
+                        gs.eventQueue('x_hsb11_hsbcmss_sw.create_un_in_task_swb', gr, gr.sys_id);
+                    } else {
+                        gr.response_code = httpStatus;
+                        gr.error_body = responseBody;
+                        gr.error_code = resp_parsed.status;
+                        gr.response_message = response.getErrorMessage();
+                        gr.state = 'Error';
+                    }
+                } else {
+                    gr.response_code = httpStatus;
+                    gr.error_body = responseBody;
+                    gr.error_code = resp_parsed.status;
+                    gr.response_message = response.getErrorMessage();
+                    gr.state = 'Error';
+
+                }
+                gr.response_date = new GlideDateTime();
+                gr.update();
+            }
+        } catch (e) {
+            gs.info('Script Include - MSS_Unstructured_Instruction_Utils:- Unknown exception while Sending Task Details to SWB  ' + e.message);
+        }
+    },
+
+    sendItmInstructions: function(SysID, messagetype) { //MSSCUSTODY-7051
+        try {
+            var gr = new GlideRecord('x_hsb11_hsbc_mss_o_mss_event_outbound');
+            gr.get(SysID); //MSSCUSTODY-7930
+            gr.query();
+            while (gr.next()) {
+                var r = new sn_ws.RESTMessageV2('x_hsb11_mss_tsd.ITM Outbound Api', 'ITM Instruction Outbound');
+                r.setStringParameterNoEscape("itm_api_token", gs.getProperty('x_hsb11_mss_tsd.itm_api_token'));
+                r.setStringParameterNoEscape("base_itm_endpoint", gs.getProperty('x_hsb11_mss_tsd.itm_base_endpoint'));
+                if (messagetype == 'MT103' || messagetype == 'MT202') { //MSSCUSTODY-8301
+                    //  r.setStringParameterNoEscape("itm_instruction_api", gs.getProperty('x_hsb11_mss_tsd.itm_instruction_api'));  //8434
+                    gs.info("Script Include - MSS_Unstructured_Instruction_Utils:- Record ID =" + SysID + " Endpoint utilized =" + gs.getProperty('x_hsb11_mss_tsd.itm_instruction_api'));
+                } else if (messagetype == 'MT380') {
+                    r.setStringParameterNoEscape("itm_instruction_api", gs.getProperty('x_hsb11_mss_tsd.itm_instruction_fx_api'));
+                    gs.info("Script Include - MSS_Unstructured_Instruction_Utils:- Record ID =" + SysID + " Endpoint utilized =" + gs.getProperty('x_hsb11_mss_tsd.itm_instruction_fx_api'));
+                } else if (messagetype == 'MT540' || messagetype == 'MT541' || messagetype == 'MT542' || messagetype == 'MT543') {
+                    r.setStringParameterNoEscape("itm_instruction_api", gs.getProperty('x_hsb11_mss_tsd.itm_instruction_trade_api'));
+                    gs.info("Script Include - MSS_Unstructured_Instruction_Utils:- Record ID =" + SysID + " Endpoint utilized =" + gs.getProperty('x_hsb11_mss_tsd.itm_instruction_trade_api'));
+                }
+                var toSend = gr.request_body;
+                r.setRequestBody(toSend);
+                gr.state = 'Processing';
+                gr.request_date = new GlideDateTime();
+                gr.update();
+                var response = r.execute();
+                var responseBody = response.getBody();
+                var httpStatus = response.getStatusCode();
+                if (httpStatus == '200') {
+                    //   this.itmVerification('Pass', gr.document_id, responseBody.message); //MSSCUSTODY-7199
+                    gr.response_body = responseBody;
+                    gr.state = "Processed";
+                } else {
+                    if (messagetype == 'MT103' || messagetype == 'MT202') { //8434
+                        this.itmVerification('Fail', gr.document_id, 'Cash instruction cannot be processed yet in iQube, Manual handling is required');
+                    } //MSSCUSTODY-7199
+                    gr.error_body = responseBody;
+                    gr.error_code = httpStatus;
+                    gr.state = 'Error';
+                }
+                gr.request_type = 'Post Payload'; //MSSCUSTODY-7199
+                gr.response_date = new GlideDateTime();
+                gr.update();
+            }
+        } catch (e) {
+            gs.info('Script Include - MSS_Unstructured_Instruction_Utils:- Unknown exception while Sending Instructions to ITM  ' + e.message);
+        }
+    },
+
+    itmVerification: function(status, taskID, message) { //MSSCUSTODY-7199
+        var grtask = new GlideRecord('x_hsb11_mss_unst_0_instructions_case_task');
+        if (grtask.get(taskID)) {
+            grtask.itm_verification = status;
+            grtask.error_details = message;
+            grtask.state = 3;
+            grtask.update();
+        }
+    },
+
+    _updateOwningBusiness: function(sourcetype, extlineno, receiverbic) {
+
+        var recBIC = receiverbic.substring(0, 8);
+        var gr = new GlideRecord("x_hsb11_mss_unst_0_mss_external_line_number_mapping");
+        sourcetype === 'FAX' ? gr.addQuery('external_line_number', extlineno) : gr.addQuery('receiverbic', 'STARTSWITH', recBIC);
+        gr.query();
+        if (gr.next()) {
+            return gr.business_area;
+        }
+    },
+
+    _updateInstructionType: function(sourcetype, extlineno, receiverbic) {
+
+        var recBIC = receiverbic.substring(0, 8);
+        var gr = new GlideRecord("x_hsb11_mss_unst_0_mss_external_line_number_mapping");
+        sourcetype === 'FAX' ? gr.addQuery('external_line_number', extlineno) : gr.addQuery('receiverbic', 'STARTSWITH', recBIC);
+        gr.query();
+        if (gr.next()) {
+            return gr.index_q;
+        }
+
+    },
+
+
+
+    getUserAuthDetail: function(user_id, role_name) {
+        var url = '',
+            gr_usr = new GlideRecord('sys_user');
+        gr_usr.addQuery('user_name', 'STARTSWITH', user_id);
+        gr_usr.query();
+        if (gr_usr.next()) {
+            //compare maker with request details
+            if (role_name == 'maker') {
+                gs.info(role_name);
+                url = 'user=' + gr_usr.sys_id + '^group.sys_idIN' + gs.getProperty('x_hsb11_mss_unst_0.Unstructured_structured_Groups'); //7922
+            } else if (role_name == 'checker') {
+                gs.info(role_name);
+                url = 'user=' + gr_usr.sys_id + '^group.sys_idIN' + gs.getProperty('x_hsb11_mss_unst_0.Unstructured_structured_Groups'); //7922
+            }
+
+            var gr_ect = new GlideRecord('sys_user_grmember');
+            gr_ect.addEncodedQuery(url);
+            gr_ect.query();
+            // gs.info("BEOFRE LOOP");
+            if (gr_ect.next()) {
+                gs.info(true);
+                return true;
+            } else {
+                gs.info(false);
+                return false;
+            }
+        } else {
+            return 'invalid';
+        }
+        //return auth;
+
+    },
+
+    generateInstructionJSON: function(sysID, query, messageID, objID, owningbusiness, indexqueue) {
+        try {
+            var grtask = new GlideRecord('x_hsb11_mss_unst_0_instructions_case_task');
+            grtask.addEncodedQuery(query);
+            grtask.query();
+            while (grtask.next()) {
+                var num = grtask.getValue('number');
+                var messagetype = grtask.getValue('outputmessagetype');
+                var messageJSON = '';
+                var requestBody = '';
+                var grCase = grtask.instruction_case.getRefRecord();
+
+                if (messagetype == 'MT599')
+                    break;
+
+                switch (messagetype) {
+
+                    case 'MT103':
+                        messageJSON = this.cashPaymentsMT103(
+                            this.convertToUpperCase(grCase.getValue('source_type')),
+                            this.convertToUpperCase(grCase.getValue('senderbic')),
+                            this.convertToUpperCase(grtask.getValue('senders_reference')),
+                            this.convertToUpperCase(grtask.getValue('action')),
+                            this.formatDate(grtask.getValue('value_date')),
+                            this.convertToUpperCase(grtask.getDisplayValue('currency')),
+                            this.removeCommas(grtask.getValue('amount')),
+                            this.convertToUpperCase(grtask.getValue('ordering_institution').substring(0, 8)), //ONLY FOR PVT TESTING
+                            this.convertToUpperCase(grtask.getValue('ordering_customer')),
+                            this.convertToUpperCase(grtask.getValue('debit_account_number')),
+                            this.convertToUpperCase(grtask.getValue('credit_account_number')),
+                            this.convertToUpperCase(this.getFormattedName(grtask.getValue('credit_account_name'))), //MSSCUSTODY-7790
+                            this.convertToUpperCase(grtask.getValue('sender_to_receiver')),
+                            this.convertToUpperCase(grtask.getValue('charges')),
+                            this.convertToUpperCase(this.getFormattedName(grtask.getValue('intermediary_bank'))), //MSSCUSTODY-7790
+                            this.convertToUpperCase(grtask.getValue('intermediary_account_number')),
+                            this.convertToUpperCase(grtask.getValue('account_with_institution')),
+                            this.convertToUpperCase(grtask.getValue('credit_account_bic')),
+                            this.getAbbreviation(grtask.getDisplayValue('intermediary_bank_code_type')),
+                            this.getAbbreviation(grtask.getDisplayValue('account_with_institution_code_type')),
+                            grtask.getValue('credit_account_code_type'),
+                            this.convertToUpperCase(this.getFormattedAddress(grtask.getValue('intermediary_bank'), grtask.getValue('intermediary_bank_address'))), //MSSCUSTODY-7790
+                            this.convertToUpperCase(this.getFormattedName(grtask.getValue('account_with_institution_name'))), //MSSCUSTODY-7790
+                            this.convertToUpperCase(this.getFormattedAddress(grtask.getValue('account_with_institution_name'), grtask.getValue('account_with_institution_address'))), //MSSCUSTODY-7790
+                            this.convertToUpperCase(this.getFormattedAddress(grtask.getValue('credit_account_name'), grtask.getValue('credit_account_address'))), //MSSCUSTODY-7790
+                            grtask.getDisplayValue('ordering_customer_code_type'),
+                            this.convertToUpperCase(this.getFormattedName(grtask.getValue('ordering_customer_name'))), //MSSCUSTODY-7790
+                            this.convertToUpperCase(this.getFormattedAddress(grtask.getValue('ordering_customer_name'), grtask.getValue('ordering_customer_address'))),
+                            this.convertToUpperCase(grtask.getValue('intermediary_bank_code')), //MSSCUSTODY-7790
+                            this.convertToUpperCase(grtask.getValue('ordering_customer_lei')),
+                            this.convertToUpperCase(grtask.getValue('ordering_institution_lei')),
+                            this.convertToUpperCase(grtask.getValue('intermediary_bank_lei')),
+                            this.convertToUpperCase(grtask.getValue('account_with_institution_lei')),
+                            this.convertToUpperCase(grtask.getValue('credit_account_lei')),
+                            this.convertToUpperCase(grtask.getValue('instruction_to_bank')), // MSSCUSTODY-7841
+                            this.formatSourceDate(grCase.getValue('sys_created_on')), //MSSCUSTODY-7827
+                            this.convertToUpperCase(grtask.getValue('purpose_code')),
+                            this.convertToUpperCase(grtask.getValue('purpose_of_payment_code'))
+                        );
+                        break;
+
+                    case 'MT202':
+                        messageJSON = this.cashPaymentsMT202(
+                            this.convertToUpperCase(grCase.getValue('source_type')),
+                            this.convertToUpperCase(grCase.getValue('senderbic')),
+                            this.convertToUpperCase(grtask.getValue('senders_reference')),
+                            this.convertToUpperCase(grtask.getValue('related_reference')),
+                            this.convertToUpperCase(grtask.getValue('action')),
+                            this.formatDate(grtask.getValue('value_date')),
+                            this.convertToUpperCase(grtask.getDisplayValue('currency')),
+                            this.removeCommas(grtask.getValue('amount')),
+                            this.convertToUpperCase(grtask.getValue('ordering_institution').substring(0, 8)), //ONLY FOR PVT TESTING
+                            this.convertToUpperCase(grtask.getValue('debit_account_number')),
+                            this.convertToUpperCase(grtask.getValue('credit_account_number')),
+                            this.convertToUpperCase(this.getFormattedName(grtask.getValue('credit_account_name'))), //MSSCUSTODY-7790
+                            this.convertToUpperCase(grtask.getValue('sender_to_receiver')),
+                            this.convertToUpperCase(this.getFormattedName(grtask.getValue('intermediary_bank'))), //MSSCUSTODY-7790
+                            this.convertToUpperCase(grtask.getValue('intermediary_account_number')),
+                            this.convertToUpperCase(grtask.getValue('account_with_institution')),
+                            this.convertToUpperCase(grtask.getValue('credit_account_bic')),
+                            this.getAbbreviation(grtask.getDisplayValue('intermediary_bank_code_type')),
+                            this.getAbbreviation(grtask.getDisplayValue('account_with_institution_code_type')),
+                            grtask.getValue('credit_account_code_type'),
+                            this.convertToUpperCase(this.getFormattedAddress(grtask.getValue('intermediary_bank'), grtask.getValue('intermediary_bank_address'))), //MSSCUSTODY-7790
+                            this.convertToUpperCase(this.getFormattedName(grtask.getValue('account_with_institution_name'))), //MSSCUSTODY-7790
+                            this.convertToUpperCase(this.getFormattedAddress(grtask.getValue('account_with_institution_name'), grtask.getValue('account_with_institution_address'))), //MSSCUSTODY-7790
+                            this.convertToUpperCase(this.getFormattedAddress(grtask.getValue('credit_account_name'), grtask.getValue('credit_account_address'))),
+                            this.convertToUpperCase(grtask.getValue('intermediary_bank_code')), //MSSCUSTODY-7790
+                            this.convertToUpperCase(grtask.getValue('ordering_institution_lei')),
+                            this.convertToUpperCase(grtask.getValue('intermediary_bank_lei')),
+                            this.convertToUpperCase(grtask.getValue('account_with_institution_lei')),
+                            this.convertToUpperCase(grtask.getValue('credit_account_lei')),
+                            this.formatSourceDate(grCase.getValue('sys_created_on')), //MSSCUSTODY-7827
+                            this.convertToUpperCase(grtask.getValue('purpose_code')),
+                            this.convertToUpperCase(grtask.getValue('purpose_of_payment_code'))
+                        );
+                        break;
+
+                    case 'MT540':
+                    case 'MT541':
+                    case 'MT542':
+                    case 'MT543':
+                        messageJSON = this.tradeSettlementsMT54x(
+                            this.convertToUpperCase(grCase.getValue('source_type')),
+                            this.convertToUpperCase(grCase.getValue('senderbic')),
+                            this.getTransactionType(grtask.getValue('outputmessagetype')),
+                            this.convertToUpperCase(grtask.getValue('senders_reference')),
+                            this.convertToUpperCase(grtask.getValue('action')),
+                            this.convertToUpperCase(grtask.getValue('previous_ref')),
+                            this.formatDate(grtask.getValue('trade_date')),
+                            this.formatDate(grtask.getValue('value_date')),
+                            this.removeCommas(grtask.getValue('unit_price')),
+                            this.getSecurityType(this.convertToUpperCase(grtask.getValue('security_type'))),
+                            this.convertToUpperCase(grtask.getValue('security_identifier')),
+                            this.convertToUpperCase(grtask.getValue('setr')),
+                            this.removeCommas(grtask.getValue('quant')),  //8554
+                            grtask.getValue('security_account'),
+                            this.convertToUpperCase(grtask.getValue('stamp_duty')),
+                            this.convertToUpperCase(grtask.getValue('counterparty')),
+                            this.convertToUpperCase(grtask.getValue('counterparty_type')),
+                            this.convertToUpperCase(grtask.getValue('buyer_seller_format')),
+                            this.convertToUpperCase(grtask.getValue('buyer_seller')),
+                            this.convertToUpperCase(grtask.getValue('switch_account')),
+                            this.removeCommas(grtask.getValue('amount')),
+                            this.convertToUpperCase(grtask.getValue('pset_bic')), //MSSCUSTODY-8387
+                            this.convertToUpperCase(grtask.getValue('exchange_name')),
+                            this.convertToUpperCase(grtask.getValue('narrative')),
+                            this.convertToUpperCase(grtask.getValue('nationality_declaration')),
+                            messagetype === 'MT540' || messagetype === 'MT541' ? 'SELL' : 'BUYR',
+                            messagetype === 'MT540' || messagetype === 'MT541' ? 'DEAG' : 'REAG',
+                            this.convertToUpperCase(grtask.getValue('beneficiary_ownership')),
+                            this.convertToUpperCase(grtask.getDisplayValue('currency')),
+                            this.formatSourceDate(grCase.getValue('sys_created_on')), //MSSCUSTODY-7827
+                            this.convertToUpperCase(grtask.getValue('stco')),
+                            this.convertToUpperCase(grtask.getValue('rtgs')),
+                            this.convertToUpperCase(grtask.getValue('cp_account')),
+                            this.convertToUpperCase(grtask.getValue('interest_accrued_days')),
+                            this.removeCommas(grtask.getValue('interest_accrued_amount')),
+                            this.convertToUpperCase(grtask.getValue('price_type')),
+                            this.convertToUpperCase(grtask.getValue('price_type_option')),
+                            this.removeCommas(grtask.getValue('deal_amount')),
+                            this.removeCommas(grtask.getValue('broker_commission_charge')),
+                            this.removeCommas(grtask.getValue('local_tax_charge')),
+                            this.removeCommas(grtask.getValue('stamp_duty_charge')),
+                            this.removeCommas(grtask.getValue('other_charge'))
+                        );
+                        break;
+                    case 'MT380':
+                        var orderdate = new GlideDate();
+                        var fxdirection = grtask.getValue('fx_direction');
+                        messageJSON = this.fxPaymentsMT380(
+                            this.convertToUpperCase(grCase.getValue('source_type')),
+                            this.convertToUpperCase(grCase.getValue('senderbic')),
+                            this.convertToUpperCase(grtask.getValue('senders_reference')),
+                            this.convertToUpperCase(grtask.getValue('action')),
+                            fxdirection == 'BUY' ? 'BUYI' : 'SELL',
+                            this.formatDate(grtask.getValue('value_date')),
+                            this.convertToUpperCase(grtask.getDisplayValue('currency')),
+                            this.removeCommas(grtask.getValue('amount')),
+                            this.convertToUpperCase(grtask.getDisplayValue('counter_currency')),
+                            this.convertToUpperCase(grtask.getValue('account_id')),
+                            fxdirection == 'BUY' ? 'SELL' : 'BUYI',
+                            this.formatDate(orderdate),
+                            this.convertToUpperCase(grtask.getValue('details_of_deal')),
+                            this.formatSourceDate(grCase.getValue('sys_created_on')) //MSSCUSTODY-7827
+                        );
+                        break;
+
+                    default:
+                        break;
+                }
+
+                if (messageJSON) {
+                    requestBody = this.itmHeader( //MSSCUSTODY-6747
+                        grtask.getValue('sys_id'),
+                        grCase.getValue('legal_entity'),
+                        grtask.getValue('action'),
+                        grtask.getValue('outputmessagetype'),
+                        grCase.getValue('owning_business'),
+                        grtask.getValue('fx_direction'),
+                        messageJSON
+                    );
+                    var groutbound = new GlideRecord('x_hsb11_hsbc_mss_o_mss_event_outbound');
+                    groutbound.request_body = requestBody;
+                    groutbound.state = 'Ready to be sent';
+                    /*  groutbound.swb_id = objID;
+                    groutbound.u_message_id = messageID;
+                    groutbound.source_system = 'iQube';
+                    groutbound.instruction_type = indexqueue;
+					groutbound.owningbusiness = owningbusiness;
+                    groutbound.process = 'ITM VERIFICATION';
+                    groutbound.process_status = 'ITM VERIFICATION'; MSSCUSTODY-7051*/
+                    groutbound.source_table = 'x_hsb11_mss_unst_0_instructions_case_task';
+                    groutbound.document_id = grtask.getValue('sys_id');
+                    groutbound.sys_scope = "b208a7c083689e50c6695855eeaad3d2"; //MSSCUSTODY-7930
+                    groutbound.request_date = new GlideDateTime();
+                    groutbound.insert();
+                }
+            }
+        } catch (e) {
+            gs.info('Script Include - MSS_Unstructured_Instruction_Utils: generateInstructionJSON - Unknown exception while Sending Task Details to ITM  ' + e.message);
+
+        }
+    },
+
+
+    getSecurityType: function(type) { //8435
+        switch (type) {
+            case 'ISIN':
+                return 'ISIN';
+            case 'CUSIP':
+                return 'US';
+            case 'SEDOL':
+                return 'GB';
+            default:
+                return '';
+        }
+    },
+
+
+    getTransactionType: function(messageType) { //MSSCUSTODY-7930
+        switch (messageType) {
+            case 'MT103':
+                return 'PAYM';
+            case 'MT202':
+                return 'PAYM';
+            case 'MT380':
+                return 'FXRQ';
+            case 'MT540':
+                return 'RFP';
+            case 'MT541':
+                return 'RVP';
+            case 'MT542':
+                return 'DFP';
+            case 'MT543':
+                return 'DVP';
+            default:
+                return '';
+        }
+    },
+
+    getTransactionSubType: function(messageType, fxdirection) { //MSSCUSTODY-7930
+        var value = '';
+        if (messageType == 'MT103') {
+            value = 'CTRF';
+        } else if (messageType == 'MT202') {
+            value = 'FITRF';
+        } else if (messageType == 'MT380') {
+            value = fxdirection == 'BUY' ? 'BUYI' : 'SELL';
+        }
+        return value;
+    },
+
+
+    countryFormat: function(markets) { //MSSCUSTODY-7827
+        var value = '';
+        if (markets == 'HBEU')
+            value = 'UK';
+        else if (markets == 'HBFR')
+            value = 'FR';
+
+        return value;
+    },
+
+    itmHeader: function(taskId, legalEntity, action, messageType, owningBusiness, fxdirection, cmf) { //MSSCUSTODY-6747
+        var message = messageType.toString();
+        var body = {};
+        if (message == "MT103" || message == "MT202" || message == "MT380") {
+            body = {
+                "instructions": [{
+                    "sourceUniqueRef": taskId + '|Unstructured', //Append '|Unstructured' as separator MSSCUSTODY-7930
+                    "clientAccountRegion": legalEntity,
+                    "instructionType": action,
+                    "transactionType": this.getTransactionType(messageType), //MSSCUSTODY-7930
+                    "transactionSubType": this.getTransactionSubType(messageType, fxdirection), //MSSCUSTODY-7930
+                    "messageCategory": messageType,
+                    "productIdentifier": owningBusiness.substring(0, owningBusiness.indexOf(' ')),
+                    "countryIdentifier": this.countryFormat(legalEntity), //MSSCUSTODY-7827
+                    "payload": cmf
+                }]
+            };
+        } else {
+            body = {
+                "instructions": [{
+                    "sourceUniqueRef": taskId + '|Unstructured', //Append '|Unstructured' as separator MSSCUSTODY-7930
+                    "clientAccountRegion": legalEntity,
+                    "instructionType": action,
+                    "transactionType": "SETT",
+                    "transactionSubType": this.getTransactionType(messageType), //MSSCUSTODY-7930
+                    "messageCategory": messageType,
+                    "productIdentifier": owningBusiness.substring(0, owningBusiness.indexOf(' ')),
+                    "countryIdentifier": this.countryFormat(legalEntity), //MSSCUSTODY-7827
+                    "payload": cmf
+                }]
+            };
+        }
+        return JSON.stringify(body);
+    },
+
+    formatDate: function(dateValue) {
+        if (dateValue) {
+            var gdt = new GlideDateTime(dateValue);
+            var formatteddate = gdt.getDate().getByFormat('yyyy-MM-dd');
+            return formatteddate;
+        }
+        return "";
+    },
+
+
+    formatSourceDate: function(dateValue) { //MSSCUSTODY-7827
+        if (dateValue) {
+            var gdt = new GlideDateTime(dateValue);
+            var datePart = gdt.getDate().getByFormat('yyyy-MM-dd');
+            var timePart = gdt.getTime().getByFormat('HH:mm:ss.');
+            var a = datePart + "T" + timePart + '000+00:00';
+            return a;
+        }
+        return "";
+    },
+
+    removeCommas: function(integerString) { //MSSCUSTODY-8387
+        if (integerString)
+            return integerString.replace(/,/g, '');
+        else {
+            return '';
+        }
+    },
+
+    fxPaymentsMT380: function(source_type, senderbic, sendref, action, fxdirection, valdate, basecurr, amount, countercurr, accountid, roletype, ordrdate, dealDetails, sourceDate) {
+        try {
+            var body = {
+                "wrapper": {
+                    "transactions": {
+                        "sourceCreateDate": sourceDate,
+                        "sourceName": source_type, //MSSCUSTODY-6746
+                        "clientShortName": source_type === 'FAX' ? "NULL" : senderbic.slice(0, 8) + senderbic.slice(9, senderbic.length), //MSSCUSTODY-6746
+                        "trade": {
+                            "tradeOrderDetails": {
+                                "orderReason": 'EQUI',
+                                "customerReference": sendref,
+                                "orderDate": ordrdate,
+                                "orderValueDate": valdate,
+                                "orderTransactionDetails": {
+                                    "orderAmountDetail": [{
+                                        "amountType": 'ORDR',
+                                        "amount": amount,
+                                        "currencyDetails": {
+                                            "currencyCode": basecurr
+                                        }
+                                    }]
+                                }
+                            },
+                            "currenciesInvolved": {
+                                "tradeCurrencyDetails": [{
+                                    "currencyDetails": {
+                                        "currencyCode": countercurr
+                                    },
+                                    "currencyRoleType": "CNTR"
+                                }]
+                            },
+                            "accountsInvolved": {
+                                "tradeAccountDetails": [{
+                                    "accountRoleType": "SAFE",
+                                    "accountDetails": {
+                                        "accountId": accountid
+                                    }
+                                }]
+                            },
+                            "fxTrade": {
+                                "transactionType": "FXRQ",
+                                "contractReference": sendref,
+                                "transactionSubType": fxdirection
+                            },
+
+                            "tradeInstructions": {
+                                "tradeInstruction": [{
+                                    "instructionType": action
+                                }]
+                            },
+                            ...(dealDetails && { //if details of deal present, add this block
+                                "tradeComments": {
+                                    "comments": [{
+                                        "commentType": "TRDE",
+                                        "comment": this.getFormattedAddress('', dealDetails)
+                                    }]
+                                }
+                            })
+                        },
+
+                    }
+                }
+            };
+
+            return JSON.stringify(body);
+        } catch (ex) {
+            gs.info('Script Include - MSS_Unstructured_Instruction_Utils:fxPaymentsMT380 - Exception occurred: ' + ex.message);
+        }
+    },
+
+    cashPaymentsMT103: function(source_type, senderbic, senreference, action, valuedate, currency, amount, ordinstitution, ordcustomer, debitaccnum, creditaccnum, creditaccname, sendereceiver, charges, intermediarybank, intermediaryaccnum, accwithinstution, creditaccbic, intermediarybanktype, accwithinstutiontype, creditacctype, intermediarybankaddress, accwithinstutionname, accwithinstutionaddress, creditaccaddress, orderingcustomertype, orderingcustomername, orderingcustomeraddress, intermediarybankcode, orderingcustomerlei, orderinginstitutionlei, intermediarybanklei, accountwithinstitutionlei, creditaccountlei, remittanceinfo, sourceDate, purposecode, purposepayment) {
+        try {
+            var body = {
+                "wrapper": {
+                    "transactions": {
+                        "sourceCreateDate": sourceDate,
+                        "sourceName": source_type, //MSSCUSTODY-6746
+                        "clientShortName": source_type === 'FAX' ? "NULL" : senderbic.slice(0, 8) + senderbic.slice(9, senderbic.length), //MSSCUSTODY-6746
+                        "trade": {
+                            "tradeOrderDetails": {
+                                "customerReference": senreference,
+                                "customerOrderType": action,
+                                "orderValueDate": valuedate,
+                                ...(purposecode && {
+                                    "orderReason": purposecode
+                                }),
+                                "orderTransactionDetails": {
+                                    "orderAmountDetail": [{
+                                            "amountType": "32A",
+                                            "amount": amount,
+                                            "currencyDetails": {
+                                                "currencyCode": currency
+                                            }
+                                        },
+                                        {
+                                            "amountType": "33B",
+                                            "amount": amount,
+                                            "currencyDetails": {
+                                                "currencyCode": currency
+                                            }
+                                        }
+                                    ]
+                                }
+                            },
+                            "tradeComments": {
+                                "comments": []
+                            },
+                            // Spread operator to add tradeMarketCharges block here if charges == "BEN" or "SHA" //MSSCUSTODY-5956
+                            ...(charges == "BEN" && {
+                                "tradeMarketCharges": {
+                                    "marketCharge": [{
+                                        "chargeType": "71F",
+                                        "chargeAmount": "0",
+                                        "currencyDetails": {
+                                            "currencyCode": 'GBP'
+                                        }
+                                    }]
+                                }
+                            }),
+
+                            "partiesInvolved": {
+                                "partyRoleDetails": [{
+                                    "partyRoleType": "52A",
+                                    "partyDetails": {
+                                        "partyIdentifiers": {
+                                            "partyIds": [{
+                                                    "partyIdType": "BIC",
+                                                    "partyId": ordinstitution
+                                                },
+                                                ...[orderinginstitutionlei && {
+                                                    "partyIdtype": 'LEI',
+                                                    'partyId': orderinginstitutionlei
+                                                }]
+                                            ]
+                                        }
+                                    }
+                                }]
+                            },
+                            "accountsInvolved": {
+                                "tradeAccountDetails": [{
+                                    "accountRoleType": "53B",
+                                    "accountDetails": {
+                                        "accountId": debitaccnum
+                                    }
+                                }]
+                            },
+                            "cashTrade": {
+                                "transactionType": "PAYM",
+                                "transactionSubType": "CTRF"
+                            },
+                            "tradeSuplDetails": { //MSSCUSTODY-5956
+                                "otherSuplDetails": [{
+                                    "fieldName": "23B",
+                                    "fieldValue": "CRED"
+                                }],
+                            }
+                        }
+                    }
+                }
+            };
+
+
+            /*   if (orderinginstitutionlei) {
+                   addPartyRoleDetailsLEI("52A", "LEI", orderinginstitutionlei);
+               } */
+            // Add intermediary bank details if both intermediarybank and intermediaryaccnum exist
+            if (intermediarybanktype == 'BIC Code') {
+                addPartyRoleDetails("56A", "BIC", intermediarybankcode, intermediarybanklei);
+                if (intermediaryaccnum) {
+                    addAccountDetails('56A', intermediaryaccnum);
+                }
+                /*  if (intermediarybanklei) {
+                      addPartyRoleDetailsLEI("56A", "LEI", intermediarybanklei);
+                  } */
+            } else if (intermediarybanktype == 'Name and address') {
+                addPartyNameDetails("56D", intermediarybank, intermediarybankaddress, intermediarybanklei);
+                if (intermediaryaccnum) {
+                    addAccountDetails('56D', intermediaryaccnum);
+                }
+                /*   if (intermediarybanklei) {
+                       addPartyRoleDetailsLEI("56D", "LEI", intermediarybanklei);
+                   } */
+            } else if (intermediarybanktype) {
+                //code for local code
+                addLocalCodeDetails("56D", intermediarybank, intermediarybankaddress, intermediarybanktype, intermediarybankcode, intermediarybanklei);
+                if (intermediaryaccnum) {
+                    addAccountDetails('56D', intermediaryaccnum);
+                }
+                /*   if (intermediarybanklei) {
+                       addPartyRoleDetailsLEI("56D", "LEI", intermediarybanklei);
+                   } */
+            }
+
+            // Add account with institution details if accwithinstution exists
+            if (accwithinstutiontype == 'BIC Code' && accwithinstution) {
+                addPartyRoleDetails("57A", "BIC", accwithinstution, accountwithinstitutionlei);
+                /*     if (accountwithinstitutionlei) {
+                         addPartyRoleDetailsLEI("57A", "LEI", accountwithinstitutionlei);
+                     } */
+            } else if (accwithinstutiontype == 'Name and address') {
+                addPartyNameDetails("57D", accwithinstutionname, accwithinstutionaddress, accountwithinstitutionlei);
+                /* if (accountwithinstitutionlei) {
+                     addPartyRoleDetailsLEI("57D", "LEI", accountwithinstitutionlei);
+                 } */
+            } else {
+                //code for Local Codes
+                addLocalCodeDetails("57D", accwithinstutionname, accwithinstutionaddress, accwithinstutiontype, accwithinstution, accountwithinstitutionlei);
+                /*    if (accountwithinstitutionlei) {
+                        addPartyRoleDetailsLEI("57D", "LEI", accountwithinstitutionlei);
+                    } */
+            }
+
+            if (creditacctype == 'BIC Code') {
+                addAccountDetails('59A', creditaccnum);
+                addPartyRoleDetails("59A", "BIC", creditaccbic, creditaccountlei);
+                /*   if (creditaccountlei) {
+                       addPartyRoleDetailsLEI("59A", "LEI", creditaccountlei);
+                   } */
+            } else if (creditacctype == 'Name and address') {
+                addAccountDetails('59', creditaccnum);
+                addPartyNameDetails("59", creditaccname, creditaccaddress, creditaccountlei);
+                /*  if (creditaccountlei) {
+                      addPartyRoleDetailsLEI("59", "LEI", creditaccountlei);
+                  } */
+            }
+
+            if (orderingcustomertype == 'BIC Code') {
+                addPartyRoleDetails("50A", "BIC", ordcustomer, orderingcustomerlei);
+                /*    if (orderingcustomerlei) {
+                         addPartyRoleDetailsLEI("50A", "LEI", orderingcustomerlei);
+                    } */
+            } else if (orderingcustomertype == 'Name and address') {
+                addAccountDetails('50K', ordcustomer);
+                addPartyNameDetails("50K", orderingcustomername, orderingcustomeraddress, orderingcustomerlei);
+                /*   if (orderingcustomerlei) {
+                       addPartyRoleDetailsLEI("50K", "LEI", orderingcustomerlei);
+                   } */
+            }
+
+            // Add Remittance info if exists          MSSCUSTODY-7841          
+            if (remittanceinfo) {
+                body.wrapper.transactions.trade.tradeComments.comments.push({
+                    "commentType": "70",
+                    "comment": this.getFormattedAddress('', remittanceinfo)
+                });
+            }
+
+            if (charges) {
+                body.wrapper.transactions.trade.tradeComments.comments.push({
+                    "commentType": "71A",
+                    "comment": charges
+                });
+            }
+
+            if (purposepayment) {
+                body.wrapper.transactions.trade.tradeComments.comments.push({
+                    "commentType": "72",
+                    "comment": "/REC/" + purposepayment
+                });
+            }
+            var a = JSON.stringify(body);
+
+            return a.replaceAll(',""', "");
+
+        } catch (ex) {
+            gs.info('Script Include - MSS_Unstructured_Instruction_Utils:cashPaymentsMT103 - Exception occurred: ' + ex.message);
+        }
+        // function to add optional partyRoleDetails
+        function addPartyRoleDetails(roleType, partyIdType, partyId, lei) {
+            body.wrapper.transactions.trade.partiesInvolved.partyRoleDetails.push({
+                "partyRoleType": roleType,
+                "partyDetails": {
+                    "partyIdentifiers": {
+                        "partyIds": [{
+                                "partyIdType": partyIdType,
+                                "partyId": partyId
+                            },
+                            ...[lei && {
+                                "partyIdtype": 'LEI',
+                                'partyId': lei
+                            }]
+                        ]
+                    }
+                }
+            });
+        };
+
+        function addPartyRoleDetailsLEI(roleType, partyIdType, partyId) {
+            body.wrapper.transactions.trade.partiesInvolved.partyRoleDetails.partyDetails.partyIdentifiers.partyIds.push({
+                "partyIdType": partyIdType,
+                "partyId": partyId
+            });
+        };
+
+        function addPartyNameDetails(roleType, partyName, partyAddress, lei) { //MSSCUSTODY-7342
+            body.wrapper.transactions.trade.partiesInvolved.partyRoleDetails.push({
+                "partyRoleType": roleType,
+                "partyDetails": {
+                    ...(lei && {
+                        "partyIdentifiers": {
+                            "partyIds": [{
+                                "partyIdType": "LEI",
+                                "partyId": lei
+                            }]
+                        }
+                    }),
+                    "partyName": partyName,
+                    "partyAddress": partyAddress
+                }
+            });
+        };
+
+        function addLocalCodeDetails(roleType, partyName, partyAddress, partyIdType, partyId, lei) { //MSSCUSTODY-7645
+            body.wrapper.transactions.trade.partiesInvolved.partyRoleDetails.push({
+                "partyRoleType": roleType,
+                "partyDetails": {
+                    "partyName": partyName,
+                    "partyAddress": partyAddress,
+                    "partyIdentifiers": {
+                        "partyIds": [{
+                                "partyIdType": partyIdType,
+                                "partyId": partyId
+                            },
+                            ...[lei && {
+                                "partyIdtype": 'LEI',
+                                'partyId': lei
+                            }]
+                        ]
+                    }
+                }
+            });
+        };
+
+        function addAccountDetails(roleType, accountNumber) { //MSSCUSTODY-7342
+            body.wrapper.transactions.trade.accountsInvolved.tradeAccountDetails.push({
+                "accountRoleType": roleType,
+                "accountDetails": {
+                    "accountId": accountNumber
+                }
+            });
+        };
+    },
+
+    cashPaymentsMT202: function(source_type, senderbic, senreference, relreference, action, valuedate, currency, amount, ordinstitution, debitaccnum, creditaccnum, creditaccname, sendereceiver, intermediarybank, intermediaryaccnum, accwithinstution, creditaccbic, intermediarybanktype, accwithinstutiontype, creditacctype, intermediarybankaddress, accwithinstutionname, accwithinstutionaddress, creditaccaddress, intermediarybankcode, orderinginstitutionlei, intermediarybanklei, accountwithinstitutionlei, creditaccountlei, sourceDate, purposecode, purposepayment) {
+        try {
+            var body = {
+                "wrapper": {
+                    "transactions": {
+                        "sourceCreateDate": sourceDate,
+                        "sourceName": source_type, //MSSCUSTODY-6746
+                        "clientShortName": source_type === 'FAX' ? "NULL" : senderbic.slice(0, 8) + senderbic.slice(9, senderbic.length), //MSSCUSTODY-6746
+                        "trade": {
+                            "tradeOrderDetails": {
+                                "customerReference": senreference,
+                                "customerOrderType": action,
+                                "relatedCustomerReference": relreference,
+                                "orderValueDate": valuedate,
+                                ...(purposecode && {
+                                    "orderReason": purposecode
+                                }),
+                                "orderTransactionDetails": {
+                                    "orderAmountDetail": [{
+                                        "amountType": "32A",
+                                        "amount": amount,
+                                        "currencyDetails": {
+                                            "currencyCode": currency
+                                        }
+                                    }]
+                                }
+                            },
+                            // Spread operator to add tradeComments block conditionally here if sendereceiver exists
+                            ...(currency != 'CNY' && sendereceiver && { //MSSCUSTODY-7827
+                                "tradeComments": {
+                                    "comments": [{
+                                        "commentType": "72",
+                                        "comment": this.getFormattedSenderReceiver(sendereceiver)
+                                    }]
+                                }
+                            }),
+
+                            ...(currency == 'CNY' && { //MSSCUSTODY-7827
+                                "tradeComments": {
+                                    "comments": [{
+                                        "commentType": "72",
+                                        "comment": this.getFormattedSenderReceiver(sendereceiver) + "|/REC/" + purposepayment
+                                    }]
+                                }
+                            }),
+
+                            "partiesInvolved": {
+                                "partyRoleDetails": [{
+                                    "partyRoleType": "52A",
+                                    "partyDetails": {
+                                        "partyIdentifiers": {
+                                            "partyIds": [{
+                                                    "partyIdType": "BIC",
+                                                    "partyId": ordinstitution
+                                                },
+                                                ...[orderinginstitutionlei && {
+                                                    "partyIdtype": 'LEI',
+                                                    'partyId': orderinginstitutionlei
+                                                }]
+                                            ]
+                                        }
+                                    }
+                                }]
+                            },
+                            "accountsInvolved": {
+                                "tradeAccountDetails": [{
+                                    "accountRoleType": "53B",
+                                    "accountDetails": {
+                                        "accountId": debitaccnum
+                                    }
+                                }]
+                            },
+                            "cashTrade": {
+                                "transactionType": "PAYM",
+                                "transactionSubType": "FITRF"
+                            }
+                        }
+                    }
+                }
+            };
+
+            /*   if (orderinginstitutionlei) {
+                   addPartyRoleDetailsLEI("52A", "LEI", orderinginstitutionlei);
+               } */
+            // Add intermediary bank details if both intermediarybank and intermediaryaccnum exist
+            if (intermediarybanktype == 'BIC Code') {
+                addPartyRoleDetails("56A", "BIC", intermediarybankcode, intermediarybanklei);
+                if (intermediaryaccnum) {
+                    addAccountDetails('56A', intermediaryaccnum);
+                }
+                /*    if (intermediarybanklei) {
+                        addPartyRoleDetailsLEI("56A", "LEI", intermediarybanklei);
+                    } */
+            } else if (intermediarybanktype == 'Name and address') {
+                addPartyNameDetails("56D", intermediarybank, intermediarybankaddress, intermediarybanklei);
+                if (intermediaryaccnum) {
+                    addAccountDetails('56D', intermediaryaccnum);
+                }
+                /*     if (intermediarybanklei) {
+                         addPartyRoleDetailsLEI("56D", "LEI", intermediarybanklei);
+                     } */
+            } else if (intermediarybanktype) {
+                //code for local code
+                addLocalCodeDetails("56D", intermediarybank, intermediarybankaddress, intermediarybanktype, intermediarybankcode, intermediarybanklei);
+                if (intermediaryaccnum) {
+                    addAccountDetails('56D', intermediaryaccnum);
+                }
+                /*     if (intermediarybanklei) {
+                         addPartyRoleDetailsLEI("56D", "LEI", intermediarybanklei);
+                     }  */
+            }
+
+
+            // Add account with institution details if accwithinstution exists
+            if (accwithinstutiontype == 'BIC Code' && accwithinstution) {
+                addPartyRoleDetails("57A", "BIC", accwithinstution, accountwithinstitutionlei);
+                /*   if (accountwithinstitutionlei) {
+                       addPartyRoleDetailsLEI("57A", "LEI", accountwithinstitutionlei);
+                   } */
+            } else if (accwithinstutiontype == 'Name and address') {
+                addPartyNameDetails("57D", accwithinstutionname, accwithinstutionaddress, accountwithinstitutionlei);
+                /*   if (accountwithinstitutionlei) {
+                       addPartyRoleDetailsLEI("57D", "LEI", accountwithinstitutionlei);
+                   }  */
+            } else {
+                //code for Local Codes
+                addLocalCodeDetails("57D", accwithinstutionname, accwithinstutionaddress, accwithinstutiontype, accwithinstution, accountwithinstitutionlei);
+                /*     if (accountwithinstitutionlei) {
+                         addPartyRoleDetailsLEI("57D", "LEI", accountwithinstitutionlei);
+                     } */
+            }
+
+            if (creditacctype == 'BIC Code') {
+                addAccountDetails('58A', creditaccnum);
+                addPartyRoleDetails("58A", "BIC", creditaccbic, creditaccountlei);
+                /*  if (creditaccountlei) {
+                      addPartyRoleDetailsLEI("58A", "LEI", creditaccountlei);
+                  } */
+            } else if (creditacctype == 'Name and address') {
+                addAccountDetails('58D', creditaccnum);
+                addPartyNameDetails("58D", creditaccname, creditaccaddress, creditaccountlei);
+                /* if (creditaccountlei) {
+                     addPartyRoleDetailsLEI("58D", "LEI", creditaccountlei);
+                 }*/
+            }
+
+            var a = JSON.stringify(body);
+
+            return a.replaceAll(',""', "");
+        } catch (ex) {
+            gs.info('Script Include - MSS_Unstructured_Instruction_Utils:cashPaymentsMT202 - Exception occurred: ' + ex.message);
+        }
+
+        // function to add optional partyRoleDetails
+        function addPartyRoleDetails(roleType, partyIdType, partyId, lei) {
+            body.wrapper.transactions.trade.partiesInvolved.partyRoleDetails.push({
+                "partyRoleType": roleType,
+                "partyDetails": {
+                    "partyIdentifiers": {
+                        "partyIds": [{
+                                "partyIdType": partyIdType,
+                                "partyId": partyId
+                            },
+                            ...[lei && {
+                                "partyIdtype": 'LEI',
+                                'partyId': lei
+                            }]
+                        ]
+                    }
+                }
+            });
+        };
+
+        function addPartyRoleDetailsLEI(roleType, partyIdType, partyId) {
+            body.wrapper.transactions.trade.partiesInvolved.partyRoleDetails.partyDetails.partyIdentifiers.partyIds.push({
+                "partyIdType": partyIdType,
+                "partyId": partyId
+            });
+        };
+
+        function addPartyNameDetails(roleType, partyName, partyAddress, lei) { //MSSCUSTODY-7342
+            body.wrapper.transactions.trade.partiesInvolved.partyRoleDetails.push({
+                "partyRoleType": roleType,
+                "partyDetails": {
+                    ...(lei && {
+                        "partyIdentifiers": {
+                            "partyIds": [{
+                                "partyIdType": "LEI",
+                                "partyId": lei
+                            }]
+                        }
+                    }),
+                    "partyName": partyName,
+                    "partyAddress": partyAddress
+                }
+            });
+        };
+
+        function addLocalCodeDetails(roleType, partyName, partyAddress, partyIdType, partyId, lei) { //MSSCUSTODY-7645
+            body.wrapper.transactions.trade.partiesInvolved.partyRoleDetails.push({
+                "partyRoleType": roleType,
+                "partyDetails": {
+                    "partyName": partyName,
+                    "partyAddress": partyAddress,
+                    "partyIdentifiers": {
+                        "partyIds": [{
+                                "partyIdType": partyIdType,
+                                "partyId": partyId
+                            },
+                            ...[lei && {
+                                "partyIdtype": 'LEI',
+                                'partyId': lei
+                            }]
+                        ]
+                    }
+                }
+            });
+        };
+
+        function addAccountDetails(roleType, accountNumber) { //MSSCUSTODY-7342
+            body.wrapper.transactions.trade.accountsInvolved.tradeAccountDetails.push({
+                "accountRoleType": roleType,
+                "accountDetails": {
+                    "accountId": accountNumber
+                }
+            });
+        };
+    },
+
+    /*  getFormattedRemittanceInfo: function(address) {
+          //MSSCUSTODY-7790
+          if (!address) {
+              address = '';
+          }
+          var finalAddress = (address).trim();
+          finalAddress = this.addChar(finalAddress, 35);
+          var delimeter = "|";
+          var parts = finalAddress.split(delimeter);
+          var prefixed = parts.map(part => "/RFB/" + part);
+          var result = prefixed.join(delimeter);
+          return result;
+      }, */
+
+    getFormattedSenderReceiver: function(address) {
+        //MSSCUSTODY-7790
+        if (!address) {
+            address = '';
+        }
+        var finalAddress = (address).trim();
+        finalAddress = this.addChar(finalAddress, 30);
+        var delimeter = "|";
+        var parts = finalAddress.split(delimeter);
+        var prefixed = parts.map(part => "/BNF/" + part);
+        var result = prefixed.join(delimeter);
+        return result;
+    },
+
+    tradeSettlementsMT54x: function(source_type, senderbic, instType, senreference, action, prevreference, tradedate, settdate, unitprice, sectype, secidentifier, setr, quantty, secaccount, stampduty, counterparty, counterpartytype, buysellformat, buysell, switchaccount, settamount, pset, exchngname, narrative, nationality, accroletype, partyRoleType, beneownership, currency, sourceDate, stcovalue, rtgsvalue, cpaccount, interestdays, interestamount, pricetype, pricetypeoption, dealamount, brokercommission, localtax, stampcharge, othercharge) {
+        try {
+            var marketCharges = [];
+
+            if (brokercommission) {
+                marketCharges.push({
+                    "chargeType": 'EXEC',
+                    "chargeAmount": brokercommission,
+                    "currencyDetails": {
+                        "currencyCode": currency
+                    }
+                });
+            }
+            if (localtax) {
+                marketCharges.push({
+                    "chargeType": 'LOCL',
+                    "chargeAmount": localtax,
+                    "currencyDetails": {
+                        "currencyCode": currency
+                    }
+                });
+            }
+            if (stampcharge) {
+                marketCharges.push({
+                    "chargeType": 'STAM',
+                    "chargeAmount": stampcharge,
+                    "currencyDetails": {
+                        "currencyCode": currency
+                    }
+                });
+            }
+            if (othercharge) {
+                marketCharges.push({
+                    "chargeType": 'OTHR',
+                    "chargeAmount": othercharge,
+                    "currencyDetails": {
+                        "currencyCode": currency
+                    }
+                });
+            }
+            var tradeCurrencyDetail = [];
+            if (settamount) {
+                tradeCurrencyDetail.push({
+                    "currencyRoleType": "SETT",
+                    "currencyDetails": {
+                        "currencyCode": currency
+                    }
+                });
+            }
+            if (interestamount) {
+                tradeCurrencyDetail.push({
+                    "currencyRoleType": "ACRU",
+                    "currencyDetails": {
+                        "currencyCode": currency
+                    }
+                });
+            }
+            if (pricetypeoption == 'B') {
+                tradeCurrencyDetail.push({
+                    "currencyRoleType": 'DEAL',
+                    "currencyDetails": {
+                        "currencyCode": currency
+                    }
+                });
+            }
+
+            var body = {
+                "wrapper": {
+                    "transactions": {
+                        "sourceCreateDate": sourceDate,
+                        "sourceName": source_type, //MSSCUSTODY-6746
+                        "clientShortName": source_type === 'FAX' ? "NULL" : senderbic.slice(0, 8) + senderbic.slice(9, senderbic.length), //MSSCUSTODY-6746
+                        "trade": {
+                            "tradeDate": tradedate,
+                            "tradeSettlementDate": settdate,
+                            ...(settamount && { // Add tradeSettlementAmount block here if settamount exists
+                                "tradeSettlementAmount": settamount
+                            }),
+                            "tradeOrderDetails": {
+                                "customerReference": senreference,
+
+                                ...(dealamount && { // Add dealamount block here if exists
+                                    "orderTransactionDetails": {
+                                        "orderAmountDetail": {
+                                            "amountType": 'DEAL',
+                                            "amount": dealamount,
+                                            "currencyDetails": {
+                                                "currencyCode": currency
+                                            }
+                                        }
+                                    }
+                                }),
+                            },
+
+                            ...(marketCharges.length && {
+                                "tradeMarketCharges": {
+                                    "marketCharge": marketCharges
+                                }
+                            }),
+
+                            ...(narrative && { // Add tradeComments block here if narrative exists
+                                "tradeComments": {
+                                    "comments": {
+                                        "commentType": "SPRO",
+                                        "comment": this.getFormattedAddress('', narrative)
+                                    }
+                                }
+                            }),
+
+                            "partiesInvolved": {
+                                "partyRoleDetails": []
+                            },
+                            "accountsInvolved": {
+                                "tradeAccountDetails": [{
+                                    "accountDetails": {
+                                        "accountId": secaccount
+                                    },
+                                    "accountRoleType": "SAFE"
+                                }]
+                            },
+
+                            ...(tradeCurrencyDetail.length && {
+                                "currenciesInvolved": {
+                                    "tradeCurrencyDetails": tradeCurrencyDetail
+                                }
+                            }),
+
+                            "instrumentsInvolved": {
+                                "tradeInstrumentDetails": {
+                                    "instrumentDetails": {
+                                        "instrumentIdentifiers": {
+                                            "instrumentIds": {
+                                                "instrumentIdType": sectype,
+                                                "instrumentId": secidentifier
+                                            }
+                                        }
+                                    }
+                                }
+                            },
+                            "securitiesTrade": {
+                                "transactionType": "SETT",
+                                "transactionSubType": instType,
+                                "quantity": quantty,
+                                "pset": pset,
+                                ...(rtgsvalue && { // Add tradeComments block here if narrative exists 
+                                    "rTGSFlag": rtgsvalue
+                                }),
+                                ...(pricetype && { // Add tradeComments block here if narrative exists 
+                                    "tradePriceType": pricetype
+                                }), //8435
+                                ...(interestdays && { // Add tradeComments block here if narrative exists
+                                    "interestAccruedDays": interestdays
+                                }),
+                                ...(interestamount && { // Add tradeComments block here if narrative exists
+                                    "accruedInterestAmount": interestamount
+                                }),
+                                ...(unitprice && { // Add unitprice block here if exists
+                                    "tradeUnitPrice": unitprice
+                                }),
+                            },
+
+                            "tradeInstructions": {
+                                "tradeInstruction": {
+                                    "instructionType": action
+                                }
+                            },
+                            ...(prevreference && { //Add tradeReferences block here if prevreference exists
+                                "tradeReferences": {
+                                    "tradeReference": {
+                                        "referenceType": "PREV",
+                                        "referenceValue": prevreference
+                                    }
+                                }
+                            }),
+                            ...(exchngname && { //Add tradeLocations block here if exchngname exists
+                                "tradeLocations": {
+                                    "tradeLocation": [{
+                                        "locationRoleType": "TRAD",
+                                        "locationType": "EXCH",
+                                        "locationValue": exchngname
+                                    }]
+                                }
+                            }),
+                            "tradeTransactionConditions": {
+                                "tradeTransactionCondition": [{
+                                    "conditionType": "SETR",
+                                    "conditionValue": setr
+                                }]
+                            }
+                        }
+                    }
+                }
+            };
+
+
+            // Add tradeTransactionConditions if stampduty exists
+            if (stampduty && stampduty.trim() !== "")
+                addTransactionCondition("STAM", stampduty);
+
+            // Add tradeTransactionConditions if beneficiary exists
+            if (beneownership)
+                addTransactionCondition("BENE", beneownership);
+
+            if (stcovalue)
+                addTransactionCondition("STCO", stcovalue);
+
+            // Add switchaccount if it exists
+            if (switchaccount) {
+                body.wrapper.transactions.trade.accountsInvolved.tradeAccountDetails.push({
+                    "accountDetails": {
+                        "accountId": switchaccount,
+                        "accountType": "SAFE"
+                    },
+                    "accountRoleType": accroletype
+                });
+            }
+
+
+            if (cpaccount) {
+                body.wrapper.transactions.trade.accountsInvolved.tradeAccountDetails.push({
+                    "accountDetails": {
+                        "accountId": cpaccount,
+                        "accountType": "SAFE"
+                    },
+                    "accountRoleType": partyRoleType
+                });
+            }
+            //Add nationality if it exists
+            if (nationality) {
+                body.wrapper.transactions.trade.partiesInvolved.partyRoleDetails.push({
+                    "partyRoleType": "INVE",
+                    "partyDetails": {
+                        "partyType": "OTHRPRTY",
+                        "partyAddress": nationality
+                    },
+                });
+            }
+
+            // Add counterparty details based on counterpartytype
+            switch (counterpartytype) {
+                case 'P':
+                    addPartyRoleDetails(partyRoleType, "BIC", counterparty);
+                    break;
+                case 'Q':
+                    addPartyRoleDetails(partyRoleType, "partyName", counterparty);
+                    break;
+                default:
+                    addPartyRoleDetails(partyRoleType, counterpartytype.substring(0, counterpartytype.indexOf('|')), counterparty);
+                    break; //8387
+
+            }
+
+            // Add buyer/seller details based on buysellformat
+            switch (buysellformat) {
+                case 'P':
+                    addPartyRoleDetails(accroletype, "BIC", buysell);
+                    break;
+                case 'Q':
+                    addPartyRoleDetails(accroletype, "partyName", buysell);
+                    break;
+                default:
+                    addPartyRoleDetails(accroletype, buysellformat.substring(0, buysellformat.indexOf('|')), buysell); //8387
+                    break;
+
+            }
+
+            return JSON.stringify(body);
+        } catch (ex) {
+            gs.info('Script Include - MSS_Unstructured_Instruction_Utils:tradeSettlementsMT54x - Exception occurred: ' + ex.message);
+        }
+
+        // function to add tradetransactionconditions
+        function addTransactionCondition(conditionType, conditionValue) {
+            const transactioncond = {
+                "conditionType": conditionType,
+                "conditionValue": conditionValue
+            };
+            body.wrapper.transactions.trade.tradeTransactionConditions.tradeTransactionCondition.push(transactioncond);
+        }
+
+        function addTransactionTypeCondition(conditionType, conditionValue) {
+            const transactioncond = {
+                "conditionType": conditionType,
+                "conditionSubType": conditionValue
+            };
+            body.wrapper.transactions.trade.tradeTransactionConditions.tradeTransactionCondition.push(transactioncond);
+        }
+
+        //function to add partyRoleDetails
+        function addPartyRoleDetails(roleType, partyIdType, partyId) {
+            const partyDetails = {
+                "partyRoleType": roleType,
+                "partyDetails": {
+                    "partyType": "SETPRTY"
+                }
+            };
+
+            // Dynamically add partyIdType or partyName
+            if (partyIdType === "partyName") { //8387
+                partyDetails.partyDetails.partyName = partyId; //8387
+            } else {
+                const partyIdentifier = {
+                    "partyIds": {
+                        "partyIdType": partyIdType,
+                        "partyId": partyId
+                    }
+                };
+                partyDetails.partyDetails.partyIdentifiers = partyIdentifier;
+            }
+
+            body.wrapper.transactions.trade.partiesInvolved.partyRoleDetails.push(partyDetails);
+        }
+    },
+
+
+    //MSSCUSTODY-5529
+    canAssignToMe: function(state, assignedTo, assignmentGroup) {
+        //This is called from the UI Action 'Assign to Me' on the Instruction Case Task table.  Requirement is to only allow this button to be displayed if the user is a member of the group that the task is assigned to
+
+        if (state != 3 && assignedTo != gs.getUserID() && gs.getUser().isMemberOf(assignmentGroup)) {
+            return true;
+        } else {
+            return false;
+        }
+
+    },
+
+    //MSSCUSTODY-7169 - deactivate Restricted Ccy Instructions
+    deactivateMT599Instructions: function(caseId) {
+        var grInstructionTask = new GlideRecord('x_hsb11_mss_unst_0_instructions_case_task');
+        grInstructionTask.addEncodedQuery('task_type=Instruction^instruction_case=' + caseId);
+        grInstructionTask.addQuery('restrictedccy', 'true');
+        grInstructionTask.addActiveQuery(); // MSSCUSTODY-7844
+        grInstructionTask.query();
+        while (grInstructionTask.next()) {
+            grInstructionTask.setValue('state', 3);
+            grInstructionTask.update();
+        }
+    },
+
+    //MSSCUSTODY-8462
+    deactivateCANCInstructions: function(caseId) {
+        var grInstructionTask = new GlideRecord('x_hsb11_mss_unst_0_instructions_case_task');
+        grInstructionTask.addEncodedQuery('task_type=Instruction^instruction_case=' + caseId);
+        grInstructionTask.addQuery('outputmessagetype', 'CANC');
+        grInstructionTask.addActiveQuery(); // MSSCUSTODY-7844
+        grInstructionTask.query();
+        while (grInstructionTask.next()) {
+            grInstructionTask.setValue('state', 3);
+            grInstructionTask.update();
+        }
+    },
+
+    //*MSSCUSTODY-8462 ends
+
+    //MSSCUSTODY-5738 - Auto Unlock the tasks if not updated for more than 10 mins
+    checkUpdate: function(sysID) {
+        var gdt = new GlideDateTime();
+        var task = new GlideRecordSecure('x_hsb11_mss_unst_0_instructions_case_task');
+        task.get(sysID);
+        task.addActiveQuery();
+        task.query();
+        if (task.next()) {
+            var dur = gdt.getNumericValue() - new GlideDateTime(task.sys_updated_on).getNumericValue();
+            if (dur > 720000) {
+                task.assigned_to = "";
+                task.state = 1;
+                task.update();
+            }
+        }
+    },
+
+
+    type: 'MSS_Unstructured_Instruction_Utils'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>45368699@hsbc.com</sys_created_by>
+        <sys_created_on>2024-10-25 10:22:41</sys_created_on>
+        <sys_id>55b49cd81bed96106ed00e1ad34bcbb2</sys_id>
+        <sys_mod_count>848</sys_mod_count>
+        <sys_name>MSS_Unstructured_Instruction_Utils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_55b49cd81bed96106ed00e1ad34bcbb2</sys_update_name>
+        <sys_updated_by>45417052@hsbc.com</sys_updated_by>
+        <sys_updated_on>2026-01-14 11:23:39</sys_updated_on>
+    </sys_script_include>
+</record_update>

@@ -1,0 +1,174 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="sys_script">
+    <sys_script action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>false</action_insert>
+        <action_query>false</action_query>
+        <action_update>false</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection>x_hsb11_mss_c_proc_mss_custody_task</collection>
+        <condition/>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition/>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>HSBC -Get Trigger by status</name>
+        <order>100</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function executeRule(current, previous /*null when async*/ ) {
+    try {
+        //return trigger by status used in on load , on change client scripts 
+        g_scratchpad.triggerby = current.trade_case_id.triggered_by.status.toString();
+        g_scratchpad.owningBus = current.trade_id.owning_business.toString();
+        g_scratchpad.trdSourceSystem = current.trade_id.source_system.toString();
+        g_scratchpad.settlementDate = current.trade_id.settlement_date;
+        g_scratchpad.settlementCurrency = current.trade_id.settlement_amount_currency.code;
+        // MSSCUSTODY - 4763 - Added new fields for GCS
+        g_scratchpad.gcsContractType = current.trade_id.contract_type.toString();
+        g_scratchpad.gcsTransactionType = current.trade_id.transaction_type.toString();
+        g_scratchpad.gcsFxLocation = current.trade_id.fx_location.toString();
+        var gcsSourceSystem = gs.getProperty('x_hsb11_mss_c_proc.hsbcmss_el_custody_source_system_swift_gcs');
+        g_scratchpad.validSourceSystemGCS = false;
+        var sourceSystem = g_scratchpad.trdSourceSystem;
+        var owningBusiness = g_scratchpad.owningBus;
+        if ((gcsSourceSystem.indexOf(sourceSystem) > -1) && (owningBusiness.indexOf('UK') > -1)) {
+            g_scratchpad.validSourceSystemGCS = true;
+        }
+        g_scratchpad.tskoutcome = current.outcome; // MSSCUSTODY-7419
+
+        //MSSCUSTODY-6529
+        var amendEnabledMarkets = gs.getProperty('x_hsb11_mss_c_proc.enableautomatedamend.market');
+        if (amendEnabledMarkets.indexOf(owningBusiness) > -1) {
+            g_scratchpad.validAmendMarket = true;
+        } else {
+            g_scratchpad.validAmendMarket = false;
+        }
+
+        var gcsSourceSystemUK = gs.getProperty('x_hsb11_mss_c_ghss.hsbcGCSWidgetTriggerSourceSystem');
+        g_scratchpad.validSourceSystemUK = false;
+        if ((gcsSourceSystemUK.indexOf(sourceSystem) > -1)) {
+            g_scratchpad.validSourceSystemUK = sourceSystem;
+        }
+        //g_scratchpad.trade_id.switch_indicator = current.trade_id.switch_indicator; // for 5196
+
+        //
+        //MSSCUSTODY-8054
+        var assignGroup = current.assignment_group ? current.assignment_group.getDisplayValue().indexOf('CST') > -1 : false;
+        if (((gs.hasRole('x_hsb11_mss_c_proc.DCCAUCSTUser') && !gs.hasRole('admin')) && (sourceSystem == 'HUB-MAS')) && assignGroup == true && (current.trade_id.owning_business.indexOf('DCC AU') > -1)) {
+            g_scratchpad.isCstTask = true;
+        } else {
+            g_scratchpad.isCstTask = false;
+        }
+        if (gs.hasRole('x_hsb11_mss_c_proc.DCCAUCSTUser') && assignGroup == false && current.trade_id.owning_business.indexOf('DCC AU') > -1) {
+            g_scratchpad.cstReadOnly = true;
+        } else {
+            g_scratchpad.cstReadOnly = false;
+        }
+        //MSSCUSTODY-8054
+
+        //Amendment Checker Counter
+        g_scratchpad.tradeTaskType = current.trade_task_type.toString(); //MSSCUSTODY-7157
+        var tradeID = current.trade_id.sys_id;
+        var caseID = current.trade_case_id.sys_id;
+        var taskTemplate = current.trade_task_template_id.getDisplayValue();
+
+        g_scratchpad.trdLifeCycle = current.trade_id.legacy_status.toString();
+        g_scratchpad.trdSubStatus = current.trade_id.legacy_sub_status.toString();
+        g_scratchpad.trdSwitchIndicator = current.trade_id.switch_indicator.toString(); // MSSCUSTODY-8065
+        g_scratchpad.multipleChecker = false;
+
+        var getChecker = new GlideAggregate("x_hsb11_mss_c_proc_mss_custody_task");
+        getChecker.addEncodedQuery('trade_id.sys_idSTARTSWITH' + tradeID + '^trade_case_id.sys_idSTARTSWITH' + caseID + '^trade_task_type=Checker');
+        getChecker.groupBy('trade_task_type');
+        getChecker.addAggregate('COUNT', 'number');
+        getChecker.query();
+        while (getChecker.next()) {
+            var checkerCounter = parseInt(getChecker.getAggregate('COUNT', 'number'));
+
+        }
+        if (checkerCounter > 1) {
+            g_scratchpad.multipleChecker = true;
+        }
+
+        //Amendement Checker Counter
+
+
+        //Extra outcome for Maker (Amend) - Review and Close the Task
+
+        var getTemplate = new GlideRecord('x_hsb11_mss_c_proc_custody_trade_task_outcome_mapping');
+        getTemplate.addEncodedQuery('trade_template_id.template_idSTARTSWITH' + taskTemplate + '^outcomeLIKEamend');
+        getTemplate.query();
+
+        g_scratchpad.multipleMaker = false;
+
+        if (getTemplate.next()) {
+            var getMaker = new GlideAggregate("x_hsb11_mss_c_proc_mss_custody_task");
+            getMaker.addEncodedQuery('trade_id.sys_idSTARTSWITH' + tradeID + '^trade_case_id.sys_idSTARTSWITH' + caseID + '^trade_task_type=Maker');
+            getMaker.groupBy('trade_task_type');
+            getMaker.addAggregate('COUNT', 'number');
+            getMaker.query();
+            while (getMaker.next()) {
+                var makerCounter = parseInt(getMaker.getAggregate('COUNT', 'number'));
+                if (makerCounter > 1) {
+                    g_scratchpad.multipleMaker = true;
+                }
+
+            }
+        }
+
+        //Extra outcome for Maker (Amend) - Review and Close the Task
+
+        //----------------- GC - HK Trade Details - MSSCUSTODY-7250---------------
+
+        var fxInstSts = current.trade_id.u_fx_inst_sts;
+        if (fxInstSts != 'NA' && fxInstSts != '') {
+            g_scratchpad.fx_inst_sts = true;
+            gs.info('FXCX Indicator is mandatory');
+        } else {
+            g_scratchpad.fx_inst_sts = false;
+            gs.info('FXCX Indicator is optional');
+        }
+        g_scratchpad.bCi = false;
+        if (current.trade_id.pend_canc_support_indicator == 'B' || current.trade_id.pend_canc_support_indicator == 'Y') {
+            g_scratchpad.bCi = true;
+        }
+        //------------------------------GC - HK Trade Details-------------------------
+
+
+    } catch (ex) {
+        gs.info('Error Recieved for HSBC -Get Trigger by status ' + ex);
+    }
+
+})(current, previous);]]></script>
+        <sys_class_name>sys_script</sys_class_name>
+        <sys_created_by>45344572@hsbc.com</sys_created_by>
+        <sys_created_on>2023-12-12 14:24:59</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>7b816fb51b0f35506ed00e1ad34bcb7c</sys_id>
+        <sys_mod_count>74</sys_mod_count>
+        <sys_name>HSBC -Get Trigger by status</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_7b816fb51b0f35506ed00e1ad34bcb7c</sys_update_name>
+        <sys_updated_by>45423148@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-12-19 09:21:46</sys_updated_on>
+        <template/>
+        <when>before_display</when>
+    </sys_script>
+    <sys_translated_text action="delete_multiple" query="documentkey=7b816fb51b0f35506ed00e1ad34bcb7c"/>
+</record_update>
