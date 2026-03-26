@@ -833,15 +833,8 @@ tradeLevelParse   ------>   bulkErrorValidation ------>  createBulkCaseTask  ---
             getOwningBusiness.get(owningBusiness);
             var market = getOwningBusiness.name;
             var bpiOutcome = "";
-
+            var enableNewDesign = gs.getProperty('x_hsb11_mss_c_proc.mssCustodyLinkTradesForBulk', false); //MSSCUSTODY-8813
             tskoutcome = tskoutcome.toString().trim();
-
-            gs.info('Bulk File Upload Array Trade Received Outcome from RP' + tskoutcome);
-            gs.info('Bulk File Upload Array Trade Received Outcome from RP' + typeof(tskoutcome));
-
-
-            gs.info('Bulk File Upload Array Trade Received Outcome from RP after trimming' + tskoutcome);
-
 
             switch (tskoutcome) {
                 case 'Resume Trade':
@@ -865,8 +858,6 @@ tradeLevelParse   ------>   bulkErrorValidation ------>  createBulkCaseTask  ---
                     break;
 
             }
-
-            gs.info('Bulk File Upload Array Trade Received Outcome ' + tskoutcome + ' BPIOutcome converted to ' + bpiOutcome);
 
             //getting the attachment
             var bulkgetAttachment = new GlideRecord('sys_attachment');
@@ -946,92 +937,117 @@ tradeLevelParse   ------>   bulkErrorValidation ------>  createBulkCaseTask  ---
 
             //write function to create case and link to bulk
 
+            //Switch between new or old design
+            if (enableNewDesign.toString() == 'true') { //MSSCUSTODY-8813
+                try {
+                    var getBulkData = new GlideRecord("x_hsb11_hsbc_mss_o_hsbc_bulk_transaction");
+                    getBulkData.get(bulkRecID);
+                    var tradesArray = validRecords;
+                    var bulkID = bulkRecID;
+                    var bulkNum = getBulkData.number ? getBulkData.number.toString() : "";
+                    var bulkStatus = getBulkData.state ? new x_hsb11_mss_c_proc.MSSCustodyBulkNowUtils().getBulkStateValue(getBulkData.state) : "";
+                    var tradesCount = validRecords.length;
+                    var outcomeSelected = tskoutcome;
+                    new x_hsb11_mss_c_proc.MSSCustodyBulkNowUtils().linkAssociatedBulk(tradesArray, bulkID, bulkNum, bulkStatus, tradesCount, outcomeSelected);
+                } catch (ex) {
+                    gs.info('Error from Bulk File Uploadew Design - createCreateBulkCaseBulkFielUpload ' + ex);
+                }
 
-            var tradeCount = validRecords.length;
-            var threshold = gs.getProperty('x_hsb11_mss_c_proc.bulk_threshold_event_queue');
-            var uploadtype = 'bulk_level';
-            var parm1 = bulkRecID + '|' + tskoutcome + '/' + uploadtype + '@' + owningBusiness;
+            } else { //MSSCUSTODY-8813
+
+                var tradeCount = validRecords.length;
+                var threshold = gs.getProperty('x_hsb11_mss_c_proc.bulk_threshold_event_queue');
+                var uploadtype = 'bulk_level';
+                var parm1 = bulkRecID + '|' + tskoutcome + '/' + uploadtype + '@' + owningBusiness;
 
 
-            var grCustodyTrade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
-            grCustodyTrade.addQuery('sys_id', 'IN', validRecords.join(','));
-            grCustodyTrade.query();
+                var grCustodyTrade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                grCustodyTrade.addQuery('sys_id', 'IN', validRecords.join(','));
+                grCustodyTrade.query();
 
-            if (parseInt(tradeCount, 10) > parseInt(threshold, 10) && gs.getProperty('x_hsb11_mss_c_proc.BulkEventQueue') == 'true') {
-                //If number of trades in the bulk is larger than threshold, use asyn event queue approach
-                var tradesArray = [],
-                    i = 0,
-                    tradesInSingleEvt = gs.getProperty('x_hsb11_mss_c_proc.number_of_items_in_bulk_event'); //number of trades to be processed via a single event for case creation
+                if (parseInt(tradeCount, 10) > parseInt(threshold, 10) && gs.getProperty('x_hsb11_mss_c_proc.BulkEventQueue') == 'true') {
+                    //If number of trades in the bulk is larger than threshold, use asyn event queue approach
+                    var tradesArray = [],
+                        i = 0,
+                        tradesInSingleEvt = gs.getProperty('x_hsb11_mss_c_proc.number_of_items_in_bulk_event'); //number of trades to be processed via a single event for case creation
 
-                while (grCustodyTrade.next()) {
-                    tradesArray.push(grCustodyTrade.sys_id.toString());
-                    i++;
-                    if (i == tradesInSingleEvt) {
+                    while (grCustodyTrade.next()) {
+                        tradesArray.push(grCustodyTrade.sys_id.toString());
+                        i++;
+                        if (i == tradesInSingleEvt) {
+                            gs.eventQueue("x_hsb11_hsbc_mss_o.upload_case_creation", null, parm1, tradesArray.join(','));
+                            //reset to initial
+                            i = 0;
+                            tradesArray = [];
+                        }
+                    }
+
+                    //create event for the remainings after loop completes
+                    if (i > 0) {
                         gs.eventQueue("x_hsb11_hsbc_mss_o.upload_case_creation", null, parm1, tradesArray.join(','));
-                        //reset to initial
-                        i = 0;
-                        tradesArray = [];
+                    }
+
+                } else {
+
+                    for (var j = 0; j < validRecords.length; j++) {
+
+                        (function executeRow(index) {
+
+
+                            var tradeSysId = validRecords[j];
+
+                            // Update the trade record
+                            var grcustodytrade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                            if (grcustodytrade.get(tradeSysId)) {
+                                grcustodytrade.case_type = 'manual';
+                                grcustodytrade.update();
+                            }
+
+                            // Create the custody case
+                            var grcustodycase = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_case");
+                            grcustodycase.initialize();
+                            grcustodycase.reinitiate_process = false;
+                            grcustodycase.state = 1;
+                            grcustodycase.short_description = 'Manually triggered by Bulk processing';
+                            grcustodycase.description = 'Manually triggered by Bulk processing';
+                            grcustodycase.trade_id = tradeSysId;
+                            grcustodycase.bulk_id = bulkRecID; // Use the bulk record ID passed to the function
+                            grcustodycase.triggered_by = '19c79fbb1ba30a10c6ada6c7b04bcbd5'; // Static sys_id as per your logic
+                            grcustodycase.case_status = 'ec34a3731b270a10c6ada6c7b04bcb7a';
+                            grcustodycase.insert();
+
+                            var caseObj = grcustodycase;
+                            var caseRec = grcustodycase.sys_id;
+
+
+                            try {
+                                var inputs = {};
+                                inputs['current'] = caseObj; // GlideRecord of table: 
+                                inputs['table_name'] = 'x_hsb11_mss_c_proc_mss_custody_case';
+                                var flowName = 'x_hsb11_mss_c_proc.hsbccustodymanual_bulk_task_generic_flow';
+
+                                // Starts the flow asynchronously.
+                                var contextId = sn_fd.FlowAPI.startFlow(flowName, inputs);
+
+                                //Identifier for the flow context
+                                var updateCase = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_case");
+                                updateCase.get(caseRec);
+                                updateCase.work_notes = 'Flow Executed for the bulk File Upload with Execution ID ' + contextId;
+                                updateCase.update();
+                                //Identifier for the flow context
+
+
+                            } catch (ex) {
+                                //var message = ex.getMessage();
+                                gs.info("Error Triggering Manual Flow ABCD " + ex.message);
+                            }
+
+                        })(j);
+
+
                     }
                 }
 
-                //create event for the remainings after loop completes
-                if (i > 0) {
-                    gs.eventQueue("x_hsb11_hsbc_mss_o.upload_case_creation", null, parm1, tradesArray.join(','));
-                }
-
-            } else {
-
-                for (var j = 0; j < validRecords.length; j++) {
-                    var tradeSysId = validRecords[j];
-
-                    // Update the trade record
-                    var grcustodytrade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
-                    if (grcustodytrade.get(tradeSysId)) {
-                        grcustodytrade.case_type = 'manual';
-                        grcustodytrade.update();
-                    }
-
-                    // Create the custody case
-                    var grcustodycase = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_case");
-                    grcustodycase.initialize();
-                    grcustodycase.reinitiate_process = false;
-                    grcustodycase.state = 1;
-                    grcustodycase.short_description = 'Manually triggered by Bulk processing';
-                    grcustodycase.description = 'Manually triggered by Bulk processing';
-                    grcustodycase.trade_id = tradeSysId;
-                    grcustodycase.bulk_id = bulkRecID; // Use the bulk record ID passed to the function
-                    grcustodycase.triggered_by = '19c79fbb1ba30a10c6ada6c7b04bcbd5'; // Static sys_id as per your logic
-                    grcustodycase.case_status = 'ec34a3731b270a10c6ada6c7b04bcb7a';
-                    grcustodycase.insert();
-
-                    var caseObj = grcustodycase;
-                    var caseRec = grcustodycase.sys_id;
-
-
-                    try {
-                        var inputs = {};
-                        inputs['current'] = caseObj; // GlideRecord of table: 
-                        inputs['table_name'] = 'x_hsb11_mss_c_proc_mss_custody_case';
-                        var flowName = 'x_hsb11_mss_c_proc.hsbccustodymanual_bulk_task_generic_flow';
-
-                        // Starts the flow asynchronously.
-                        var contextId = sn_fd.FlowAPI.startFlow(flowName, inputs);
-
-                        //Identifier for the flow context
-                        var updateCase = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_case");
-                        updateCase.get(caseRec);
-                        updateCase.work_notes = 'Flow Executed for the bulk File Upload with Execution ID ' + contextId;
-                        updateCase.update();
-                        //Identifier for the flow context
-
-
-                    } catch (ex) {
-                        //var message = ex.getMessage();
-                        gs.info("Error Triggering Manual Flow ABCD " + ex.message);
-                    }
-
-
-                }
             }
 
 
@@ -1059,17 +1075,11 @@ tradeLevelParse   ------>   bulkErrorValidation ------>  createBulkCaseTask  ---
             var filterArray = new global.ArrayUtil();
             var currentUser = gs.getUser().getName(); //to fetch the right attachment by user
             var modifiedReasonCode;
-
             outcome = outcome.toString().trim();
-
-            gs.info('Trade File Upload Array Trade Received Outcome from RP' + outcome);
-            gs.info('Trade File Upload Array Trade Received Outcome from RP' + typeof(outcome));
-
-
-            gs.info('Trade File Upload Array Trade Received Outcome from RP after trimming' + outcome);
 
 
             var bpiOutcome = "";
+            var enableNewDesign = gs.getProperty('x_hsb11_mss_c_proc.mssCustodyLinkTradesForBulk', false); //MSSCUSTODY-8813
 
 
             switch (outcome) {
@@ -1100,9 +1110,6 @@ tradeLevelParse   ------>   bulkErrorValidation ------>  createBulkCaseTask  ---
 
             }
 
-            gs.info('Trade File Upload Array Trade Received Outcome ' + outcome + ' BPIOutcome converted to ' + bpiOutcome);
-
-
             //getting attachment
             var getTempAttachment = new GlideRecord("sys_attachment");
             getTempAttachment.addEncodedQuery("table_name=ZZ_YYsc_cart_item^sys_created_by=" + currentUser);
@@ -1130,8 +1137,6 @@ tradeLevelParse   ------>   bulkErrorValidation ------>  createBulkCaseTask  ---
                 }
             }
 
-            gs.info('Ttotal Array Trade ' + bulkexcelRowArray.toString());
-
             if (bulkexcelRowArray.length > 0) {
 
                 for (var i = 0; i < bulkexcelRowArray.length; i++) {
@@ -1142,6 +1147,12 @@ tradeLevelParse   ------>   bulkErrorValidation ------>  createBulkCaseTask  ---
                         var trdRef = getData.tradeReference ? getData.tradeReference.trim() : ""; //trade reference
                         var reasonCode = getData.reasonCode ? getData.reasonCode.trim() : ""; //reason Code
                         var reasonDesc = getData.reasonDescription;
+                        if (reasonDesc != undefined && reasonDesc != null && reasonDesc != "") {
+                            reasonDesc = reasonDesc.replace(/\\./g, '');
+                            var controlRegex = /[\u0000-\u001F\u007F-\u009F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]/g;
+                            reasonDesc = reasonDesc.replace(controlRegex, "");
+                            reasonDesc = reasonDesc.trim();
+                        }; //MSSCUSTODY-8617 Removal of Control Characters
                         if (outcome == 'Process Trade Cancellation') {
                             var cancellationRef = getData.cancellationReference ? getData.cancellationReference : "";
                         }
@@ -1167,7 +1178,6 @@ tradeLevelParse   ------>   bulkErrorValidation ------>  createBulkCaseTask  ---
                             getTradeData.addEncodedQuery('transaction_reference=' + trdRef + '^owning_business=' + trdMarket + '^case_type=no_open_case' + '^trade_lifecycle_status!=TradSttld^trade_lifecycle_status!=TradCanc');
                             getTradeData.query();
                             if (getTradeData.next()) {
-                                gs.info('Trade File Upload ' + 'business_process.process_name=Trade Lifecycle Status^market=' + owningBusiness + '^ctac_code=' + getTradeData.trade_lifecycle_status + '^' + bpiOutcome + '=true');
 
                                 var grBulkEvents = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_stage'); //check for the matching record in BPS table
                                 grBulkEvents.addEncodedQuery('business_process.process_name=Trade Lifecycle Status^market=' + owningBusiness + '^ctac_code=' + getTradeData.trade_lifecycle_status + '^' + bpiOutcome + '=true');
@@ -1214,134 +1224,165 @@ tradeLevelParse   ------>   bulkErrorValidation ------>  createBulkCaseTask  ---
                 //gs.info('6821 File read completed: ' + new GlideDateTime());
             }
 
-            var tradeCount = validRecords.length;
-            var threshold = gs.getProperty('x_hsb11_mss_c_proc.bulk_threshold_event_queue');
-            var uploadtype = 'trade_level';
-            var parm1 = bulkRecID + '|' + outcome + '/' + uploadtype + '@' + owningBusiness;
+
+            if (enableNewDesign.toString() == 'true') { //MSSCUSTODY-8813
+
+                try {
+                    for (var v = 0; v < validRecords.length; v++) {
+                        var tradeRecords = JSON.parse(validRecords[v]);
+                        var tradeSysId = tradeRecords.tradeReference;
+                        (function executeRow(index) {
+                            //updation of trade
+                            var updateTradeData = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                            updateTradeData.addEncodedQuery('transaction_referenceSTARTSWITH' + tradeSysId + '^owning_business=' + owningBusiness);
+                            updateTradeData.setLimit(1);
+                            updateTradeData.query();
+                            if (updateTradeData.next()) {
+                                updateTradeData.setValue('associated_bulk_id', bulkRecID);
+                                updateTradeData.setValue('case_type', 'manual');
+                                updateTradeData.setValue('bulk_file_upload_data', JSON.parse(JSON.stringify(validRecords[v]))); // details will be used for the GHSS handler
+                                updateTradeData.update();
+                            }
+                            //updation of trade
+                        })(v);
+
+                    }
+                } catch (ex) {
+                    gs.info('Error from Bulk File Upload New Design - createBulkCaseTradeFileUpload ' + ex);
+                }
+
+            } else { //MSSCUSTODY-8813
+
+                var tradeCount = validRecords.length;
+                var threshold = gs.getProperty('x_hsb11_mss_c_proc.bulk_threshold_event_queue');
+                var uploadtype = 'trade_level';
+                var parm1 = bulkRecID + '|' + outcome + '/' + uploadtype + '@' + owningBusiness;
 
 
 
-            if (parseInt(tradeCount, 10) > parseInt(threshold, 10) && gs.getProperty('x_hsb11_mss_c_proc.BulkEventQueue') == 'true') {
-                //If number of trades in the bulk is larger than threshold, use asyn event queue approach
-                var tradesArray = [],
-                    j = 0,
-                    tradesInSingleEvt = gs.getProperty('x_hsb11_mss_c_proc.number_of_items_in_bulk_event');
+                if (parseInt(tradeCount, 10) > parseInt(threshold, 10) && gs.getProperty('x_hsb11_mss_c_proc.BulkEventQueue') == 'true') {
+                    //If number of trades in the bulk is larger than threshold, use asyn event queue approach
+                    var tradesArray = [],
+                        j = 0,
+                        tradesInSingleEvt = gs.getProperty('x_hsb11_mss_c_proc.number_of_items_in_bulk_event');
 
-                for (var idx = 0; idx < validRecords.length; idx++) {
-                    tradesArray.push(validRecords[idx]);
-                    j++;
-                    if (j == tradesInSingleEvt) {
+                    for (var idx = 0; idx < validRecords.length; idx++) {
+                        tradesArray.push(validRecords[idx]);
+                        j++;
+                        if (j == tradesInSingleEvt) {
+                            gs.eventQueue("x_hsb11_hsbc_mss_o.upload_case_creation", null, parm1, JSON.stringify(tradesArray));
+                            j = 0;
+                            tradesArray = [];
+                        }
+                    }
+
+                    //create event for the remainings after loop completes
+                    if (j > 0) {
                         gs.eventQueue("x_hsb11_hsbc_mss_o.upload_case_creation", null, parm1, JSON.stringify(tradesArray));
-                        j = 0;
-                        tradesArray = [];
+                    }
+                } else {
+                    for (var l = 0; l < validRecords.length; l++) {
+
+                        (function executeRow(index) {
+
+                            var tradeRecords = JSON.parse(validRecords[l]);
+                            var tradeSysId = tradeRecords.tradeReference;
+                            var reasonCode = tradeRecords.reasonCode;
+                            var reasonDescription = tradeRecords.reasonDescription;
+                            if (outcome == 'Process Trade Cancellation') {
+                                var cancellationReference = tradeRecords.cancellationReference;
+                            }
+                            // Update the trade record
+                            var grcustodytrade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
+                            grcustodytrade.addEncodedQuery('transaction_referenceSTARTSWITH' + tradeSysId + '^owning_business=' + owningBusiness);
+                            grcustodytrade.setLimit(1);
+                            grcustodytrade.query();
+                            if (grcustodytrade.next()) {
+                                grcustodytrade.case_type = 'manual';
+                                grcustodytrade.update();
+                                var tradeID = grcustodytrade.sys_id;
+                            }
+
+                            // Create the custody case
+                            var grcustodycase = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_case");
+                            grcustodycase.initialize();
+                            grcustodycase.reinitiate_process = false;
+                            grcustodycase.state = 1;
+                            grcustodycase.short_description = 'Manually triggered by Bulk processing';
+                            grcustodycase.description = 'Manually triggered by Bulk processing';
+                            grcustodycase.trade_id = tradeID;
+                            grcustodycase.bulk_id = bulkRecID; // Use the bulk record ID passed to the function
+                            grcustodycase.triggered_by = '19c79fbb1ba30a10c6ada6c7b04bcbd5'; // Static sys_id
+                            grcustodycase.case_status = 'ec34a3731b270a10c6ada6c7b04bcb7a';
+                            grcustodycase.insert();
+
+                            var caseObj = grcustodycase;
+                            var caseRec = grcustodycase.sys_id;
+
+                            var caseArrObj = {};
+                            caseArrObj.caseSysId = caseRec.toString();
+                            caseArrObj.tradeSysId = tradeSysId.toString();
+                            caseArrObj.reasonCode = reasonCode.toString();
+                            caseArrObj.reasonDescription = reasonDescription.toString();
+                            if (outcome == 'Process Trade Cancellation') {
+                                caseArrObj.cancellationReference = cancellationReference.toString();
+                            }
+                            caseArr.push(caseArrObj);
+
+                            try {
+                                var inputs = {};
+                                inputs['current'] = caseObj; // GlideRecord of table: 
+                                inputs['table_name'] = 'x_hsb11_mss_c_proc_mss_custody_case';
+                                var flowName = 'x_hsb11_mss_c_proc.hsbccustodymanual_bulk_task_generic_flow';
+                                // Starts the flow asynchronously.
+                                var contextId = sn_fd.FlowAPI.startFlow(flowName, inputs);
+                                //Identifier for the flow context
+                                var updateCase = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_case");
+                                updateCase.get(caseRec);
+                                updateCase.work_notes = 'Flow Executed for the bulk File Upload with Execution ID ' + contextId;
+                                updateCase.update();
+                                //Identifier for the flow context
+                            } catch (ex) {
+                                gs.info("Error triggering manual flow for Trade File upload:" + ex.message);
+                            }
+
+                        })(l);
                     }
                 }
 
-                //create event for the remainings after loop completes
-                if (j > 0) {
-                    gs.eventQueue("x_hsb11_hsbc_mss_o.upload_case_creation", null, parm1, JSON.stringify(tradesArray));
-                }
-            } else {
-                for (var l = 0; l < validRecords.length; l++) {
+                //gs.info('6821 case creation & flow trigger completed: ' + new GlideDateTime());
 
-                    (function executeRow(index) {
-
-                        var tradeRecords = JSON.parse(validRecords[l]);
-                        var tradeSysId = tradeRecords.tradeReference;
-                        var reasonCode = tradeRecords.reasonCode;
-                        var reasonDescription = tradeRecords.reasonDescription;
-                        if (outcome == 'Process Trade Cancellation') {
-                            var cancellationReference = tradeRecords.cancellationReference;
-                        }
-                        // Update the trade record
-                        var grcustodytrade = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_trade');
-                        grcustodytrade.addEncodedQuery('transaction_referenceSTARTSWITH' + tradeSysId + '^owning_business=' + owningBusiness);
-                        grcustodytrade.setLimit(1);
-                        grcustodytrade.query();
-                        if (grcustodytrade.next()) {
-                            grcustodytrade.case_type = 'manual';
-                            grcustodytrade.update();
-                            var tradeID = grcustodytrade.sys_id;
-                        }
-
-                        // Create the custody case
-                        var grcustodycase = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_case");
-                        grcustodycase.initialize();
-                        grcustodycase.reinitiate_process = false;
-                        grcustodycase.state = 1;
-                        grcustodycase.short_description = 'Manually triggered by Bulk processing';
-                        grcustodycase.description = 'Manually triggered by Bulk processing';
-                        grcustodycase.trade_id = tradeID;
-                        grcustodycase.bulk_id = bulkRecID; // Use the bulk record ID passed to the function
-                        grcustodycase.triggered_by = '19c79fbb1ba30a10c6ada6c7b04bcbd5'; // Static sys_id
-                        grcustodycase.case_status = 'ec34a3731b270a10c6ada6c7b04bcb7a';
-                        grcustodycase.insert();
-
-                        var caseObj = grcustodycase;
-                        var caseRec = grcustodycase.sys_id;
-
-                        var caseArrObj = {};
-                        caseArrObj.caseSysId = caseRec.toString();
-                        caseArrObj.tradeSysId = tradeSysId.toString();
-                        caseArrObj.reasonCode = reasonCode.toString();
-                        caseArrObj.reasonDescription = reasonDescription.toString();
-                        if (outcome == 'Process Trade Cancellation') {
-                            caseArrObj.cancellationReference = cancellationReference.toString();
-                        }
-                        caseArr.push(caseArrObj);
-
-                        try {
-                            var inputs = {};
-                            inputs['current'] = caseObj; // GlideRecord of table: 
-                            inputs['table_name'] = 'x_hsb11_mss_c_proc_mss_custody_case';
-                            var flowName = 'x_hsb11_mss_c_proc.hsbccustodymanual_bulk_task_generic_flow';
-                            // Starts the flow asynchronously.
-                            var contextId = sn_fd.FlowAPI.startFlow(flowName, inputs);
-                            //Identifier for the flow context
-                            var updateCase = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_case");
-                            updateCase.get(caseRec);
-                            updateCase.work_notes = 'Flow Executed for the bulk File Upload with Execution ID ' + contextId;
-                            updateCase.update();
-                            //Identifier for the flow context
-                        } catch (ex) {
-                            gs.info("Error triggering manual flow for Trade File upload:" + ex.message);
-                        }
-
-                    })(l);
-                }
-            }
-
-            //gs.info('6821 case creation & flow trigger completed: ' + new GlideDateTime());
-
-            // Updating the tasks with reason code and reason description
-            while (caseArr.length > 0) {
-                for (var k = 0; k < caseArr.length; k++) {
-                    (function executeRow(index) {
-                        var getData = caseArr[index]; // Parse the current case data
-                        var tradeRef = getData.tradeSysId;
-                        var caseRef = getData.caseSysId;
-                        var reasonCode = getData.reasonCode;
-                        var reasonDesc = getData.reasonDescription;
-                        if (outcome == 'Process Trade Cancellation') {
-                            var cancellationRef = getData.cancellationReference;
-                        }
-                        var grTask = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_task');
-                        grTask.addEncodedQuery('trade_case_id.sys_idSTARTSWITH' + caseRef + '^trade_id.transaction_referenceSTARTSWITH' + tradeRef + ' ^trade_task_type=Maker');
-                        grTask.query();
-                        if (grTask.next()) {
-                            grTask.reason_code = reasonCode;
-                            grTask.reason_description = reasonDesc;
+                // Updating the tasks with reason code and reason description
+                while (caseArr.length > 0) {
+                    for (var k = 0; k < caseArr.length; k++) {
+                        (function executeRow(index) {
+                            var getData = caseArr[index]; // Parse the current case data
+                            var tradeRef = getData.tradeSysId;
+                            var caseRef = getData.caseSysId;
+                            var reasonCode = getData.reasonCode;
+                            var reasonDesc = getData.reasonDescription;
                             if (outcome == 'Process Trade Cancellation') {
-                                grTask.cancellation_reference = cancellationRef;
+                                var cancellationRef = getData.cancellationReference;
                             }
-                            grTask.update();
-                            caseArr.splice(index, 1);
-                        }
-                    })(k);
+                            var grTask = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_task');
+                            grTask.addEncodedQuery('trade_case_id.sys_idSTARTSWITH' + caseRef + '^trade_id.transaction_referenceSTARTSWITH' + tradeRef + ' ^trade_task_type=Maker');
+                            grTask.query();
+                            if (grTask.next()) {
+                                grTask.reason_code = reasonCode;
+                                grTask.reason_description = reasonDesc;
+                                if (outcome == 'Process Trade Cancellation') {
+                                    grTask.cancellation_reference = cancellationRef;
+                                }
+                                grTask.update();
+                                caseArr.splice(index, 1);
+                            }
+                        })(k);
+                    }
                 }
+                //gs.info('6821 Task updation completed: ' + new GlideDateTime());
+                // return once all tasks are updated
+
             }
-            //gs.info('6821 Task updation completed: ' + new GlideDateTime());
-            // return once all tasks are updated
             return validRecords.length;
 
         } catch (ex) {
@@ -1449,7 +1490,7 @@ tradeLevelParse   ------>   bulkErrorValidation ------>  createBulkCaseTask  ---
 
         //return getUserData.u_associated_business_markets.toString();
 
-		//MSSCUSTODY - 8543
+        //MSSCUSTODY - 8543
         var userMarketsRaw = getUserData.u_associated_business_markets.toString().split(','); // Fetch user associated markets 
 
         var unavailableMarketsRaw = gs.getProperty('x_hsb11_mss_c_proc.custody_swift_unavailable_markets', '').split(','); // Get unavailable markets from system property
@@ -1469,7 +1510,7 @@ tradeLevelParse   ------>   bulkErrorValidation ------>  createBulkCaseTask  ---
                 unavailableMarkets.push(unMarket);
             }
         }
-		// Filter out unavailable markets
+        // Filter out unavailable markets
         var filteredMarkets = [];
         for (var k = 0; k < userMarkets.length; k++) {
             if (unavailableMarkets.indexOf(userMarkets[k]) === -1) {
@@ -1500,13 +1541,13 @@ tradeLevelParse   ------>   bulkErrorValidation ------>  createBulkCaseTask  ---
         <sys_created_by>45180553@hsbc.com</sys_created_by>
         <sys_created_on>2025-06-24 06:18:02</sys_created_on>
         <sys_id>a28da9061bde2e909e88ed32b24bcbb5</sys_id>
-        <sys_mod_count>257</sys_mod_count>
+        <sys_mod_count>282</sys_mod_count>
         <sys_name>MSSCustodyBulkFileUpload</sys_name>
         <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
         <sys_policy>read</sys_policy>
         <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
         <sys_update_name>sys_script_include_a28da9061bde2e909e88ed32b24bcbb5</sys_update_name>
-        <sys_updated_by>45180553@hsbc.com</sys_updated_by>
-        <sys_updated_on>2026-01-14 11:40:27</sys_updated_on>
+        <sys_updated_by>45381533@hsbc.com</sys_updated_by>
+        <sys_updated_on>2026-03-16 09:47:02</sys_updated_on>
     </sys_script_include>
 </record_update>

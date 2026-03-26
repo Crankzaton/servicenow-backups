@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="sys_script">
+    <sys_script action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>false</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection>x_hsb11_hsbcmss_qw_hsbc_qtrack_email_outbound</collection>
+        <condition/>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition table="x_hsb11_hsbcmss_qw_hsbc_qtrack_email_outbound">stateCHANGESTOProcessed^ORstateCHANGESTOError^sys_scope!=7d602cd11b0aea109e88ed32b24bcb9f^EQ<item endquery="true" field="" goto="false" newquery="false" operator="=" or="false" value=""/>
+        </filter_condition>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>mss.qtrack.process_email_response</name>
+        <order>1000</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function executeRule(current, previous /*null when async*/ ) {
+    var taskid = current.servicenow_task_id.number;
+    if (current.email_subject.includes("PRM Request") || current.email_subject.includes("SSI Request")) {
+
+        var elog_pf = new GlideRecord('x_hsb11_hsbcmss_eh_hsbc_email_log');
+        elog_pf.addQuery('subject', current.email_subject); // trade task table
+        elog_pf.addQuery('api_response_from_qtrack', 'Sent-Ready');
+        elog_pf.query();
+
+        if (elog_pf.next()) {
+            if (current.state == 'Processed') {
+                elog_pf.api_response_from_qtrack = 'Sent Successfully';
+                elog_pf.update();
+
+            } else if (current.state == 'Error') {
+                elog_pf.api_response_from_qtrack = 'Error';
+                elog_pf.update();
+				
+                var failureDescription_pf = "Service Operation Service Qtrack Email Outbound Widget failure, details of the error are as below - ServiceNow Reference -" + current.servicenow_task_id.number + " Email Subject : " + current.email_subject.substring(0, 10) + " Timestamp : " + current.response_date + "Error code : " + current.error_code + "Error Body : " + current.error_body; // MSSOTIQUBE-1358
+                var createEventForWidgetFailure_pf = new x_hsb11_hsbc_mss_t.hsbcWidgetFailureHandler().createITIDEvent('WARNING', failureDescription_pf, 'MSSiQubeSNWidget_QTRACK');
+            }
+        }
+
+
+    } else {
+        if (current.state == 'Processed') {
+
+            //MSSRBXCE-91:Fetching queryId from response_body field
+            var resp_body = new global.JSON.parse(current.response_body);
+            var queryId = resp_body.data.queryId;
+
+            var elog = new GlideRecord('x_hsb11_hsbcmss_eh_hsbc_email_log');
+            elog.addQuery('subject', current.email_subject); // trade task table
+            elog.query();
+            if (elog.next()) {
+                elog.api_response_from_qtrack = 'Sent Successfully';
+                //MSSRBXCE-91:Saving queryId in email_query_id field on HSBC Email Log record
+                elog.email_query_id = queryId;
+                elog.update();
+            }
+            //-------New code as part of 3250 story for Processed state
+            var childtable = new GlideRecord('x_hsb11_hsbcmss_eh_aggregated_trade_email_queue');
+            //childtable.addQuery('parent.trade_task_reference.number', taskid);
+            childtable.addQuery('parent', elog.email_log); //Defect MSSRBXCE-674,676
+            childtable.query();
+            while (childtable.next()) {
+                var task = childtable.trade_case_task.number;
+                var taskNumber = new GlideRecord('x_hsb11_hsbc_mss_t_trade_task');
+                taskNumber.addQuery('number', task);
+                taskNumber.query();
+                if (taskNumber.next()) {
+                    taskNumber.state = 3;
+                    taskNumber.update();
+                }
+            }
+
+        } else if (current.state == 'Error') {
+            // MSSOTIQUBE-1690 
+            var emailLog = new GlideRecord('x_hsb11_hsbcmss_eh_hsbc_email_log');
+            emailLog.addQuery('subject', current.email_subject);
+            emailLog.query();
+            if (emailLog.next()) {
+                emailLog.api_response_from_qtrack = 'Error';
+                emailLog.update();
+            }
+            //-------New code as part of 3250 story for Error state
+            var childtableError = new GlideRecord('x_hsb11_hsbcmss_eh_aggregated_trade_email_queue');
+            //childtableError.addQuery('parent.trade_task_reference.number', taskid);
+            childtableError.addQuery('parent', emailLog.email_log); //Defect MSSRBXCE-674,676: //MSSOTIQUBE-1690
+            childtableError.query();
+            // Calls the rest message configured to send widget failture details to ITID instance and creates an Event
+            while (childtableError.next()) {
+                var task1 = childtableError.trade_case_task.number;
+                var taskNumber1 = new GlideRecord('x_hsb11_hsbc_mss_t_trade_task');
+                taskNumber1.addQuery('number', task1);
+                taskNumber1.query();
+                if (taskNumber1.next()) {
+                    taskNumber1.state = 7;
+                    taskNumber1.update();
+                }
+            }
+            var failureDescription = "Cash Equities Qtrack Email Outbound Widget failure, details of the error are as below - ServiceNow Reference -" + current.servicenow_task_id.number + " Email Subject : " + current.email_subject.substring(0, 10) + " Timestamp : " + current.response_date + "Error code : " + current.error_code + "Error Body : " + current.error_body; // MSSOTIQUBE-1358
+            var createEventForWidgetFailure = new x_hsb11_hsbc_mss_t.hsbcWidgetFailureHandler().createITIDEvent('WARNING', failureDescription, 'MSSiQubeSNWidget_QTRACK');
+        }
+    }
+})(current, previous);]]></script>
+        <sys_class_name>sys_script</sys_class_name>
+        <sys_created_by>45310153@hsbc.com</sys_created_by>
+        <sys_created_on>2023-01-23 17:58:53</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>c00ab0c61bac65106ed00e1ad34bcb3a</sys_id>
+        <sys_mod_count>113</sys_mod_count>
+        <sys_name>mss.qtrack.process_email_response</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_c00ab0c61bac65106ed00e1ad34bcb3a</sys_update_name>
+        <sys_updated_by>45381534@hsbc.com</sys_updated_by>
+        <sys_updated_on>2026-01-16 06:15:23</sys_updated_on>
+        <template/>
+        <when>after</when>
+    </sys_script>
+    <sys_translated_text action="delete_multiple" query="documentkey=c00ab0c61bac65106ed00e1ad34bcb3a"/>
+</record_update>

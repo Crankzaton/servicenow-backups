@@ -1,0 +1,173 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="sys_script">
+    <sys_script action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>true</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>false</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection>x_hsb11_hsbc_mss_o_mss_event_outbound</collection>
+        <condition/>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition table="x_hsb11_hsbc_mss_o_mss_event_outbound">sys_scope=b208a7c083689e50c6695855eeaad3d2^stateCHANGESTOReady to be sent^EQ<item endquery="true" field="" goto="false" newquery="false" operator="=" or="false" value=""/>
+        </filter_condition>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>MSS Collateral EL Outbound</name>
+        <order>100</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function executeRule(current, previous /*null when async*/ ) {
+
+    treatsIntegration(); //Call to the main function for initiating the Treats Integration
+
+    function treatsIntegration() {
+        try {
+            var maxRetries = 3; //Max number of retries post the 1st attempt
+            var retryCount = 0;
+            var tokenValue = '';
+            var successflag = false;
+            var callGetToken = true; //Variable used to define when shall we need to refresh the Token.
+
+            //Base64 encoding of the request body in the format accepted by TREATS
+            var encodedPayload = gs.base64Encode(current.request_body);
+            var requestBody = 'data=' + encodeURIComponent(encodedPayload);
+
+
+            while (retryCount <= maxRetries && !successflag) {
+
+                //Refresh the token only when the callGetToken flag is set to TRUE
+                if (callGetToken) {
+                    tokenValue = new x_hsb11_mss_coll_0.MSS_Collateral_Treats_Integration().getToken(); //Call to the script include to refresh the token for TREATS
+                }
+
+                //Checking if the token value was recieved from TREATS
+                if (tokenValue) {
+
+                    //Call to the script include to send the request body and recieve the 1b response from TREATS
+                    var response = new x_hsb11_mss_coll_0.MSS_Collateral_Treats_Integration().callTradeInput(tokenValue, requestBody);
+                    var responseCatchException = response.catchExceptionMessage;
+                    var responseStatusCode = response.tradeCallStatusCode;
+
+                    if (responseCatchException == '') { //Checking if no exceptions caught in callTradeInput()
+                        if (responseStatusCode) { //Checking if callTradeInput() has returned any responsecode/errorcode
+                            switch (responseStatusCode) {
+                                case 200:
+                                    current.response_body = response.tradeCallResponseBody;
+                                    current.error_code = responseStatusCode;
+                                    current.response_date = new GlideDateTime();
+                                    current.retry_count = retryCount;
+                                    current.state = "Processed";
+                                    successflag = true; //Setting the successflag to TRUE to come out of the while loop
+                                    break;
+
+                                case 400:
+                                case 429:
+                                    current.error_body = response.tradeCallResponseBody;
+                                    current.error_code = responseStatusCode;
+                                    //current.response_message = response.errorMessage;
+                                    current.response_date = new GlideDateTime();
+                                    current.retry_count = retryCount;
+                                    current.state = "Error";
+                                    successflag = true; //Setting the successflag to TRUE to come out of the while loop
+                                    break;
+
+                                case 401:
+                                    current.error_body = response.tradeCallResponseBody;
+                                    current.error_code = responseStatusCode;
+                                    //current.response_message = response.errorMessage;
+                                    current.response_date = new GlideDateTime();
+                                    current.retry_count = retryCount;
+                                    current.state = "Error";
+                                    retryCount += 1;
+                                    callGetToken = true; //Refreshing the token in case of error 401 i.e. Authentication Failed
+                                    break;
+
+                                case 500:
+                                    current.error_body = response.tradeCallResponseBody;
+                                    current.error_code = responseStatusCode;
+                                    //current.response_message = response.errorMessage;
+                                    current.response_date = new GlideDateTime();
+                                    current.retry_count = retryCount;
+                                    current.state = "Error";
+                                    retryCount += 1;
+                                    callGetToken = false; //No refresh of the token in case of error 500
+                                    break;
+                            }
+                        } else {
+                            //Setting the MSS Event Outbound record to ERROR after 3 attempts, if no response received from TREATS
+                            current.error_body = "No response received from TREATS";
+                            current.error_code = "NEC"; //No Error Code
+                            //current.response_message = "No response received from TREATS";
+                            current.response_date = new GlideDateTime();
+                            current.retry_count = retryCount;
+                            current.state = "Error";
+                            retryCount += 1;
+                            callGetToken = false;
+                        }
+                    } else {
+                        //Setting the MSS Event Outbound record to ERROR, if any exception caught in the callTradeInput()
+                        current.error_body = "Exception caught while receiving 1b response from TREATS";
+                        current.error_code = "CE1B"; //Caught Exception for 1B response
+                        //current.response_message = "Exception caught while receiving 1b response from TREATS";
+                        current.response_date = new GlideDateTime();
+                        current.retry_count = retryCount;
+                        current.state = "Error";
+                        break;
+                    }
+                } else {
+                    //Setting the MSS Event Outbound record to ERROR after 3 attempts, if the token received is empty
+                    current.error_body = "Error while trying to fetch the token from TREATS";
+                    current.error_code = "NTR"; //No Token Received
+                    //current.response_message = "Error while trying to fetch the token from TREATS";
+                    current.response_date = new GlideDateTime();
+                    current.retry_count = retryCount;
+                    current.state = "Error";
+                    retryCount += 1;
+                    callGetToken = true;
+                }
+            }
+            current.update();
+        } catch (ex) {
+            //Setting the MSS Event Outbound record to ERROR, if any exception caught in the treatsIntegration()
+            current.error_body = "Error while trying to fetch the token and the 1b response from TREATS: "+ex.message;
+            current.error_code = "CE1B"; //Caught Exception for 1B response
+            //current.response_message = "Exception caught while receiving 1b response from TREATS";
+            current.response_date = new GlideDateTime();
+            current.retry_count = retryCount;
+            current.state = "Error";
+            current.update();
+        }
+    }
+})(current, previous);]]></script>
+        <sys_class_name>sys_script</sys_class_name>
+        <sys_created_by>45444982@hsbc.com</sys_created_by>
+        <sys_created_on>2026-02-05 07:47:45</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>ce48f9fe1bbab2582ac120a8b04bcba0</sys_id>
+        <sys_mod_count>60</sys_mod_count>
+        <sys_name>MSS Collateral EL Outbound</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_ce48f9fe1bbab2582ac120a8b04bcba0</sys_update_name>
+        <sys_updated_by>45444982@hsbc.com</sys_updated_by>
+        <sys_updated_on>2026-03-18 23:29:00</sys_updated_on>
+        <template/>
+        <when>async_always</when>
+    </sys_script>
+    <sys_translated_text action="delete_multiple" query="documentkey=ce48f9fe1bbab2582ac120a8b04bcba0"/>
+</record_update>

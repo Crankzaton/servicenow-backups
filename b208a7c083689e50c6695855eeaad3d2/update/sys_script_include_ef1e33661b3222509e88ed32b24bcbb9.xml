@@ -95,6 +95,7 @@ MSSCustodyBulkProcessUtils.prototype = Object.extendsObject(global.AbstractAjaxP
                             grcustodytask.outcome = 'Amend Trade';
                             grcustodytask.checker_decision = 'Amend';
                             grcustodytask.follow_up = new GlideDateTime();
+                            grcustodytask.sub_trade_task_type = 'Maker';
                             grcustodytask.insert();
 
                         } catch (ex) {
@@ -325,6 +326,14 @@ MSSCustodyBulkProcessUtils.prototype = Object.extendsObject(global.AbstractAjaxP
                         makerTasks.bulk_id.amend_cash_hold_indicator = holdInd;
                         makerTasks.bulk_id.settle_link = settleInd;
 
+                        //MSSCUSTODY-8162
+                        makerTasks.bulk_id.trade_link_reference = linkRef;
+                        makerTasks.bulk_id.d_transaction_reference = tranRef;
+                        makerTasks.bulk_id.d_transaction_type = dTxnType;
+                        makerTasks.bulk_id.d_settlement_quantity = dSettQntty;
+                        makerTasks.bulk_id.d_legacy_status = dLegacy;
+                        makerTasks.bulk_id.d_hold_indicator = dHold;
+
                         //added as part of 4901
                         if ((makerTasks.trade_id.contract_type == 'C') && (outcome == 'Confirm Trade')) {
                             makerTasks.value_date = valDate;
@@ -501,43 +510,44 @@ MSSCustodyBulkProcessUtils.prototype = Object.extendsObject(global.AbstractAjaxP
             return '';
         }
     },
-
     //MSSCUSTODY-7111
     getMakerTasks: function(bulkId) {
         try {
             var bulkGR = new GlideRecord('x_hsb11_hsbc_mss_o_hsbc_bulk_transaction');
             if (!bulkGR.get(bulkId)) return '';
 
-            var makerCount = 0;
             var totalTrades = parseInt(bulkGR.active_trade_count, 10) || 0;
-            var status = bulkGR.processing_status + '';
-            var decisionReason = bulkGR.decision_reason.toString();
+            var bulkCreatedOn = bulkGR.sys_created_on + '';
             var newStatus = '';
 
-            // If decision reason exists, count rejected/automation failed tasks
-            if (decisionReason !== '') {
-                if (decisionReason.indexOf('Handler Rejected') !== -1) {
-                    // Handler Rejected logic
-                    var gar = new GlideAggregate('x_hsb11_mss_c_proc_mss_custody_task');
-                    gar.addEncodedQuery('bulk_id=' + bulkId + '^trade_task_type=Maker^active=true^stateIN1,2');
-                    gar.addAggregate('COUNT');
-                    gar.query();
-                    if (gar.next()) {
-                        makerCount = gar.getAggregate('COUNT');
-                    }
-                    newStatus = 'Maker Tasks linked for : ' + makerCount + ' Rejected Handlers';
-                } else {
-                    // Checker Rejected logic
-                    var gr = new GlideAggregate('x_hsb11_mss_c_proc_mss_custody_task');
-                    gr.addEncodedQuery('active=true^trade_task_type=Maker^sub_trade_task_type=Checker-Rejected^bulk_id=' + bulkId);
-                    gr.addAggregate('COUNT');
-                    gr.query();
-                    if (gr.next()) {
-                        makerCount = gr.getAggregate('COUNT');
-                    }
-                    newStatus = 'Maker Task linked for : ' + makerCount + ' rejected tasks.';
-                }
+            // Count Checker-Rejected
+            var checkerRejectedCount = 0;
+            var grChecker = new GlideAggregate('x_hsb11_mss_c_proc_mss_custody_task');
+            grChecker.addEncodedQuery('bulk_id=' + bulkId + '^trade_task_type=Maker^active=true^sub_trade_task_type=Checker-Rejected^stateIN1,2^sys_created_on>=' + bulkCreatedOn);
+            grChecker.addAggregate('COUNT');
+            grChecker.query();
+            if (grChecker.next()) {
+                checkerRejectedCount = grChecker.getAggregate('COUNT');
+            }
+
+            // Count Automation Failed (Handler rejected)
+            var automationFailedCount = 0;
+            var grAuto = new GlideAggregate('x_hsb11_mss_c_proc_mss_custody_task');
+            grAuto.addEncodedQuery('bulk_id=' + bulkId + '^trade_task_type=Maker^active=true^sub_trade_task_type=Automation Failed^stateIN1,2^sys_created_on>=' + bulkCreatedOn);
+            grAuto.addAggregate('COUNT');
+            grAuto.query();
+            if (grAuto.next()) {
+                automationFailedCount = grAuto.getAggregate('COUNT');
+            }
+
+            // Combine both counts
+            var rejectedCount = parseInt(checkerRejectedCount, 10) + parseInt(automationFailedCount, 10);
+
+            if (rejectedCount > 0) {
+                newStatus = 'Maker Tasks linked for: ' + rejectedCount + ' Rejected Tasks';
             } else {
+                // No rejected tasks, show progress/completion
+                var makerCount = 0;
                 var ga = new GlideAggregate('x_hsb11_mss_c_proc_mss_custody_task');
                 ga.addEncodedQuery('bulk_id=' + bulkId + '^trade_task_type=Maker^active=true^stateIN1,2');
                 ga.addAggregate('COUNT');
@@ -564,17 +574,6 @@ MSSCustodyBulkProcessUtils.prototype = Object.extendsObject(global.AbstractAjaxP
         }
     },
 
-
-
-
-    getBulkTaskType: function() {
-        var bulkId = this.getParameter('sysparm_sys_id');
-        var bulkGR = new GlideRecord('x_hsb11_hsbc_mss_o_hsbc_bulk_transaction');
-        if (bulkGR.get(bulkId)) {
-            return bulkGR.bulk_task_type + "";
-        }
-
-    },
     //MSSCUSTODY-7111
     bulkProcess: function() {
         try {
@@ -598,6 +597,14 @@ MSSCustodyBulkProcessUtils.prototype = Object.extendsObject(global.AbstractAjaxP
         }
     },
 
+    getBulkTaskType: function() {
+        var bulkId = this.getParameter('sysparm_sys_id');
+        var bulkGR = new GlideRecord('x_hsb11_hsbc_mss_o_hsbc_bulk_transaction');
+        if (bulkGR.get(bulkId)) {
+            return bulkGR.bulk_task_type + "";
+        }
+
+    },
     getActiveTradeCount: function() {
         try {
             var bulkId = this.getParameter('sysparm_sys_id');
@@ -629,6 +636,7 @@ MSSCustodyBulkProcessUtils.prototype = Object.extendsObject(global.AbstractAjaxP
         try {
             var bulkID = this.getParameter('sysparm_bulkID'); //get the passed bulk_id
             var taskID = this.getParameter('sysparm_taskID'); //get the passed array of sys_ids
+            gs.info('Remove Selected - BulkdID ' + bulkID + ' task ID ' + taskID);
 
             if (!taskID) {
                 return;
@@ -645,7 +653,7 @@ MSSCustodyBulkProcessUtils.prototype = Object.extendsObject(global.AbstractAjaxP
             //MSSOTIQUBE-2539 --> Fetching case type (Automated/Manual) only once
             var caseType = "";
             if (gCustodyTask.next()) {
-                caseType = gCustodyTask.trade_id.case_type; // Fetch the case type directly
+                caseType = gCustodyTask.trade_id.case_type.toString(); // Fetch the case type directly
             }
 
             gCustodyTask.initialize();
@@ -659,6 +667,7 @@ MSSCustodyBulkProcessUtils.prototype = Object.extendsObject(global.AbstractAjaxP
             }
             if (caseType == 'manual') {
                 // ------Process Manual cases in bulk------
+                gs.info('Remove Selected - In manual');
                 var gCustodyManualCase = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_case');
                 gCustodyManualCase.addQuery('sys_id', 'IN', caseIds.join(',')); // Query for manual cases
                 // Set the values for the fields to be updated
@@ -668,34 +677,46 @@ MSSCustodyBulkProcessUtils.prototype = Object.extendsObject(global.AbstractAjaxP
 
                 // ------Process Manual tasks in bulk------
                 gCustodyTask.initialize(); // Reuse the common GlideRecord object
-                gCustodyTask.addQuery('sys_idIN' + taskID); // Query for specific tasks
+                gCustodyTask.addEncodedQuery('sys_idIN' + taskID); // Query for specific tasks
                 // Set the values for the fields to be updated
                 gCustodyTask.setValue('state', '7'); // Set state to 'closed'
                 gCustodyTask.setValue('active', 'false'); // Mark task as inactive
                 gCustodyTask.setValue('lock', false); // Unlock the task
-                gCustodyTask.assigned_to = 'NULL'; // Clear assigned user
-                gCustodyTask.assignment_group = 'NULL'; // Clear assignment group
+                gCustodyTask.setValue('assigned_to', ''); // Clear assigned user
+                gCustodyTask.setValue('assignment_group', ''); // Clear assignment group
+                gs.info('Remove Selected - Before update');
                 // Perform the bulk update
                 gCustodyTask.updateMultiple();
+                gs.info('Remove Selected - After update');
 
             } else if (caseType == 'automated') {
                 // ------Process Automated cases in bulk------
+                gs.info('Remove Selected - In automated');
                 var gCustodyAutomatedCase = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_case');
                 gCustodyAutomatedCase.addQuery('sys_id', 'IN', caseIds.join(',')); // Query for automated cases
-                gCustodyAutomatedCase.setValue('bulk_id', ''); // Clear the bulk ID
-                gCustodyAutomatedCase.updateMultiple(); // Perform bulk update
+                gCustodyAutomatedCase.query();
+                while (gCustodyAutomatedCase.next()) {
+                    gCustodyAutomatedCase.setValue('bulk_id', '');
+                    gCustodyAutomatedCase.update();
+                }
 
                 // ------Process Automated Tasks in bulk------
-                gCustodyTask.initialize(); // Reuse the common GlideRecord object
-                gCustodyTask.addQuery('sys_idIN' + taskID); // Query for specific tasks
-                // Set the values for the fields to be updated
-                gCustodyTask.setValue('bulk_id', ''); // Clear the bulk ID
-                gCustodyTask.setValue('state', '1');
-                gCustodyTask.setValue('lock', false); // Unlock the task
-                gCustodyTask.assigned_to = 'NULL'; // Clear assigned user
-                gCustodyTask.assignment_group = 'NULL'; // Clear assignment group
-                // Perform the bulk update
-                gCustodyTask.updateMultiple();
+                var gCustodyTasks = new GlideRecord('x_hsb11_mss_c_proc_mss_custody_task'); // Reuse the common GlideRecord object
+                gCustodyTasks.addEncodedQuery('sys_idIN' + taskID); // Query for specific tasks
+                gCustodyTasks.query();
+                while (gCustodyTasks.next()) {
+                    // Set the values for the fields to be updated
+                    gCustodyTasks.setValue('bulk_id', ''); // Clear the bulk ID
+                    gCustodyTasks.setValue('state', '1');
+                    gCustodyTasks.setValue('lock', false); // Unlock the task
+                    gCustodyTasks.setValue('assigned_to', ''); // Clear assigned user
+                    gCustodyTasks.setValue('assignment_group', ''); // Clear assignment group
+
+                    // Perform the bulk update
+                    gs.info('Remove Selected - Before update');
+                    gCustodyTasks.update();
+                }
+                gs.info('Remove Selected - After update bulk ID ' + gCustodyTask.bulk_id.number);
 
             }
 
@@ -715,7 +736,7 @@ MSSCustodyBulkProcessUtils.prototype = Object.extendsObject(global.AbstractAjaxP
                         if (count === 0) {
                             gBulk.setValue('state', '7'); // Set state to 'Cancelled' if no active tasks remain
                         }
-                        gBulk.update(); // Save the change
+                        gBulk.update(); // Save the changes
                     }
                 }
             }
@@ -729,13 +750,13 @@ MSSCustodyBulkProcessUtils.prototype = Object.extendsObject(global.AbstractAjaxP
         <sys_created_by>43722084@hsbc.com</sys_created_by>
         <sys_created_on>2025-07-21 02:45:06</sys_created_on>
         <sys_id>ef1e33661b3222509e88ed32b24bcbb9</sys_id>
-        <sys_mod_count>76</sys_mod_count>
+        <sys_mod_count>91</sys_mod_count>
         <sys_name>MSSCustodyBulkProcessUtils</sys_name>
         <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
         <sys_policy>read</sys_policy>
         <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
         <sys_update_name>sys_script_include_ef1e33661b3222509e88ed32b24bcbb9</sys_update_name>
         <sys_updated_by>45423148@hsbc.com</sys_updated_by>
-        <sys_updated_on>2025-12-05 13:12:47</sys_updated_on>
+        <sys_updated_on>2026-03-04 04:33:10</sys_updated_on>
     </sys_script_include>
 </record_update>

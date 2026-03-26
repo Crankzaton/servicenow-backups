@@ -1,0 +1,163 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.MSS_Treasury_Utils_Extension</api_name>
+        <caller_access/>
+        <client_callable>true</client_callable>
+        <description>This Script Include is extension for MSS_Treasury_Utils.
+Please add new functions to this script include.</description>
+        <mobile_callable>false</mobile_callable>
+        <name>MSS_Treasury_Utils_Extension</name>
+        <sandbox_callable>true</sandbox_callable>
+        <script><![CDATA[var MSS_Treasury_Utils_Extension = Class.create();
+MSS_Treasury_Utils_Extension.prototype = {
+    initialize() {
+        this.mssTreasuryUtils = new x_hsb11_mss_tsd.MSS_Treasury_Utils();
+    },
+    // MSSTRESURY-1178
+    gawdReferenceUpdate(updateGR, unstructured_gawd_reference, isEligibleCallbackFunction = () => {}) {
+        try {
+            //mss treasury 963
+            var flag = false;
+            var instructionType = updateGR.instruction_type;
+            var includedTypes = gs.getProperty('x_hsb11_mss_tsd.intructionNotLive', '');
+            var includedList = includedTypes.split(',').map(function(type) {
+                return type.trim();
+            });
+            // If instructionType is in the included list, then instruction type is not live
+            if (includedList.indexOf(instructionType.trim()) !== -1) {
+                flag = true;
+            }
+            var isEligible = ((flag) || (updateGR.instruction_type == "Payment" && updateGR.action_type != "New"));
+            if (isEligible) {
+                if (updateGR.state != 2 && unstructured_gawd_reference) {
+                    updateGR.setValue("state", 2);
+                    updateGR.setValue("task_status", "CLOSED_COMPLETE");
+                }
+                updateGR.setValue("gawd_reference", unstructured_gawd_reference);
+                isEligibleCallbackFunction?.();
+            }
+        } catch (error) {
+            var errorMessage = "[iQube - Treasury]: Script Include - MSS_Treasury_Utils_Extension - gawdReferenceUpdate function Error: " + error.toString();
+            new x_hsb11_mss_tsd.MSS_Treasury_XMatter_ITID_WidgetFailureHandler().createITIDEvent("WARNING", errorMessage, 'MSS-OT-IQUBE-SERVICENOW-TREASURY');
+            gs.error(errorMessage);
+        }
+    },
+    /**
+     * use in Flow Action: HSBC Treasury iQube Create Instruction Case
+     * MSSTRESURY-527
+     */
+    flowUpdateInstructionCase(instructionCaseId = "", caseInfo = {}, eventInfo = {}) {
+        try {
+            let instructionCaseGR = new GlideRecord('x_hsb11_mss_tsd_treasury_case');
+            instructionCaseGR.addQuery("sys_id", instructionCaseId);
+            instructionCaseGR.query();
+            if (!instructionCaseGR.next()) {
+                var errorMssg = "[iQube - Treasury]: Script Include - MSS_Treasury_Utils_Extension.flowUpdateInstructionCase | Unknown exception instruction case will not be created. objectId: " + caseInfo?.Id;
+                new x_hsb11_mss_tsd.MSS_Treasury_XMatter_ITID_WidgetFailureHandler().createITIDEvent("WARNING", errorMssg, 'MSS-OT-IQUBE-SERVICENOW-TREASURY');
+                gs.error(errorMssg);
+                return;
+            }
+            let SWB_FIELD_MAP = JSON.parse(gs.getProperty("x_hsb11_mss_tsd.MSS_Treasury_SWB_Field_Map"));
+            Object.keys(SWB_FIELD_MAP).forEach(swbKey => {
+                let iQubeKey = SWB_FIELD_MAP[swbKey];
+                if (caseInfo?.[`transactionPayment0_${iQubeKey}`] != null)
+                    instructionCaseGR[iQubeKey] = caseInfo?.[`transactionPayment0_${iQubeKey}`];
+            });
+            let currency = null;
+            if (caseInfo?.transactionPayment0_currency) {
+                currency = this.mssTreasuryUtils.getCurrencySysId(caseInfo?.transactionPayment0_currency);
+                instructionCaseGR.currency = currency;
+            }
+            let amount = caseInfo?.amount_32;
+
+            if (this.mssTreasuryUtils.getMarket(caseInfo?.Properties?.GTME)) {
+                instructionCaseGR.market = this.mssTreasuryUtils.getMarket(caseInfo?.Properties?.GTME);
+            }
+            if (caseInfo?.transactionPayment0SourceType) {
+                instructionCaseGR.source_type = caseInfo.transactionPayment0SourceType;
+            }
+            if (amount) {
+                instructionCaseGR.transaction_amount = amount;
+            }
+            if (caseInfo?.instruction_type) {
+                instructionCaseGR.instruction_type = caseInfo.instruction_type;
+            }
+            if (caseInfo?.format_value_date_32) {
+                instructionCaseGR.value_date = caseInfo.format_value_date_32;
+            }
+            if (caseInfo?.transactionPayment0ReceiverBIC) {
+                instructionCaseGR.receiverbic = caseInfo.transactionPayment0ReceiverBIC;
+            }
+            if (caseInfo?.transactionPayment0SenderBIC) {
+                instructionCaseGR.senderbic = caseInfo.transactionPayment0SenderBIC;
+            }
+            if (caseInfo?.transactionPayment0FundCode) {
+                instructionCaseGR.fund_id = caseInfo.transactionPayment0FundCode;
+            }
+            if (caseInfo?.message_type) {
+                instructionCaseGR.swift_message = caseInfo.message_type;
+            }
+            if (eventInfo?.event_status) {
+                instructionCaseGR.event_status = eventInfo.event_status;
+            }
+            if (eventInfo?.event_type) {
+                instructionCaseGR.u_event_type = eventInfo.event_type;
+            }
+            if (currency == 'USD') {
+                instructionCaseGR.amount_in_usd = amount || instructionCaseGR.amount_in_usd;
+            } else if (currency) {
+                instructionCaseGR.amount_in_usd = this.mssTreasuryUtils.ConvertToUSD(currency, amount) || instructionCaseGR.amount_in_usd;
+            }
+            //MSSTRESURY-1132 - Update 'OutputDateTime' with CreateDateTime.
+            instructionCaseGR.first_received_timestamp = instructionCaseGR?.unstructured_case_id?.first_received_timestamp;
+
+            //MSSTRESURY-1154: Flow Refractoring for Static Data to be updated via BR
+            instructionCaseGR.tsd_code = caseInfo?.transactionPayment0TrustID || caseInfo?.Properties?.GHID || instructionCaseGR.tsd_code;
+
+            // MSSTRESURY-218:Implementation - TSD Maker/ Team Id/Client Group mapping
+            let grStatic = new GlideRecord('x_hsb11_mss_tsd_treasury_static_data');
+            grStatic.addQuery('tsd_code', instructionCaseGR.tsd_code);
+            grStatic.query();
+            if (grStatic.hasNext() && grStatic.next()) {
+                instructionCaseGR.task_owner = grStatic.task_owner;
+                instructionCaseGR.tsd_maker = grStatic.tsd_maker;
+                instructionCaseGR.team_id = grStatic.team_id;
+                instructionCaseGR.client_group = grStatic.client_group;
+            } else {
+                instructionCaseGR.task_owner = "";
+                instructionCaseGR.tsd_maker = "";
+                instructionCaseGR.team_id = "";
+                instructionCaseGR.client_group = "";
+            }
+            let instructionUpdate = instructionCaseGR.update();
+            if (!instructionUpdate) {
+                var errorMsg = "[iQube - Treasury]: Script Include - MSS_Treasury_Utils_Extension.flowUpdateInstructionCase | Unknown exception instruction case will not be created. objectId: " + caseInfo?.Id;
+                new x_hsb11_mss_tsd.MSS_Treasury_XMatter_ITID_WidgetFailureHandler().createITIDEvent("WARNING", errorMsg, 'MSS-OT-IQUBE-SERVICENOW-TREASURY');
+                gs.error(errorMsg);
+            }
+
+        } catch (error) {
+            var errorMessage = "[iQube - Treasury]: Script Include - MSS_Treasury_Utils_Extension - flowUpdateInstructionCase function Error: " + error.toString();
+            new x_hsb11_mss_tsd.MSS_Treasury_XMatter_ITID_WidgetFailureHandler().createITIDEvent("WARNING", errorMessage, 'MSS-OT-IQUBE-SERVICENOW-TREASURY');
+            gs.error(errorMessage);
+        }
+    },
+
+    type: 'MSS_Treasury_Utils_Extension'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>45442272@hsbc.com</sys_created_by>
+        <sys_created_on>2026-03-05 07:43:42</sys_created_on>
+        <sys_id>c3444ef31b9f7e100018eb53b24bcb6a</sys_id>
+        <sys_mod_count>24</sys_mod_count>
+        <sys_name>MSS_Treasury_Utils_Extension</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy>read</sys_policy>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_c3444ef31b9f7e100018eb53b24bcb6a</sys_update_name>
+        <sys_updated_by>45423111@hsbc.com</sys_updated_by>
+        <sys_updated_on>2026-03-16 10:13:59</sys_updated_on>
+    </sys_script_include>
+</record_update>

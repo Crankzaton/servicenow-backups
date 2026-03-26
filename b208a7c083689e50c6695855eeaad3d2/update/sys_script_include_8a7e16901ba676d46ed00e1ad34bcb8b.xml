@@ -1,0 +1,426 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_script_include">
+    <sys_script_include action="INSERT_OR_UPDATE">
+        <access>public</access>
+        <active>true</active>
+        <api_name>x_938076_now_utils.GlobalUtils</api_name>
+        <caller_access/>
+        <client_callable>false</client_callable>
+        <description/>
+        <mobile_callable>false</mobile_callable>
+        <name>GlobalUtils</name>
+        <sandbox_callable>false</sandbox_callable>
+        <script><![CDATA[var GlobalUtils = Class.create();
+GlobalUtils.prototype = {
+
+    initialize: function() {},
+
+    sleep: function(duration) {
+        gs.sleep(duration);
+    },
+    log: function(message) {
+        gs.info('[Background Script]: ' + message);
+    },
+
+
+    createWidgetInboundRecord: function(orderId) {
+
+        var objects = [];
+        for (i = 0; i < orderId.length; i++) {
+            var tempObject = '{"CPTY_VALUE":"47","ACTION":"HSBC","HSBC_VALUE":"49","ORDER_ID":"' + orderId[i] + '","MISMATCHED_FIELD":"TradeCommissions"}';
+
+            objects.push(tempObject);
+        }
+        var payload = '{"DETAILS":[' + objects + '],"EMPLOYEE_REFERENCE_CODE":"44002602","EMPLOYEE_REFERENCE_NAME":"Da Chao Clere Liang"}';
+
+        var widgetInbound = new GlideRecord('x_hsb11_hsbc_mss_o_mss_widget_inbound');
+        widgetInbound.initialize();
+        widgetInbound.event_status = 'HSBC';
+        widgetInbound.event_type = 'SYMPHONY_OUTPUT';
+        widgetInbound.message_id = 'TEST';
+        widgetInbound.object_id = 'TBC';
+        widgetInbound.object_id_type = 'ServiceNow Event Reference';
+        widgetInbound.object_type = 'SYMPHONY_MESSAGE';
+        widgetInbound.object_version = 1;
+
+        widgetInbound.payload = payload;
+        widgetInbound.source = 'SYMPHONY';
+
+
+        var result = widgetInbound.insert();
+        gs.info('[Background Script]: widget inbound record ' + result);
+        return result;
+    },
+
+    createTrade: function() {
+        var hsbcTrade = new GlideRecord('x_hsb11_hsbc_mss_t_hsbc_trade');
+        hsbcTrade.initialize();
+        hsbcTrade.u_id = this.buildTradeId();
+        hsbcTrade.u_version = 1;
+        var result = hsbcTrade.insert();
+        return result;
+    },
+
+    createBPI: function(num, tradeStatus, client, etcService, orderType) {
+        var result = [];
+
+        var additionalAttributes = '{"ETC_Service":"' + etcService + '","CTAC_TRADE_DID":"00001218203CTLO1","ORDER_TYPE":"' + orderType + '","COUNTERPARTY_CODE":"' + client + '"}';
+        additionalAttributes = additionalAttributes.replaceAll('<CLIENT>', client);
+        additionalAttributes = additionalAttributes.replaceAll('<ETC_SERVICE>', etcService);
+
+        var expectedTransitionTime = new GlideDateTime(); // Get the current date and time
+        expectedTransitionTime.addSeconds(-900);
+
+        for (i = 0; i < num; i++) {
+            var createProcessInstance = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_instance');
+            createProcessInstance.initialize();
+            createProcessInstance.expected_transition_time = expectedTransitionTime;
+            createProcessInstance.financial_object_record = this.createTrade();
+            createProcessInstance.business_process_definition = 'c0ccc3d21b079950ff37eb14b24bcb9f'; // Trade Capture and Allocation
+            createProcessInstance.status = tradeStatus;
+            createProcessInstance.execution_time = expectedTransitionTime;
+            createProcessInstance.is_case_created = false;
+            createProcessInstance.is_exception = false;
+            createProcessInstance.additional_attributes = additionalAttributes;
+            createProcessInstance.messageid = 'Test_dev_87467';
+            createProcessInstance.source = 'CTAC';
+            if (etcService == 'CTM BLOCK') {
+                createProcessInstance.etc_service = 'CTM Client';
+            } else if (etcService == 'MANUAL') {
+                createProcessInstance.etc_service = 'Manual Client';
+            }
+            createProcessInstance.event_type = 'CTAC_EVENT';
+            createProcessInstance.objectidtype = 'CTAC_TRADE_DID';
+            createProcessInstance.objectversion = 1;
+            createProcessInstance.object_type = 'TRADE';
+            var bpiSys = createProcessInstance.insert();
+            result.push(bpiSys);
+        }
+
+        gs.info('[Background Script]: ' + 'BPI List:' + result);
+        return result;
+    },
+
+    getBusinessProcessStageSysId: function(tradeStatus) {
+        var bpstg = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_stage');
+        bpstg.addQuery('status', tradeStatus);
+        bpstg.query();
+        if (bpstg.next()) {
+            return bpstg.sys_id;
+        }
+    },
+
+    getExchangeMic: function(isStockConnect) {
+        var result = '';
+        if (isStockConnect) {
+            result = 'XSSC';
+        } else {
+            result = 'XHKG';
+        }
+        gs.info('[Background Script]: ' + 'exchangeMic: ' + result);
+        return result;
+    },
+
+    getETCService: function(tradeStatus) {
+        var result = '';
+        if (tradeStatus == 'Trade Mismatch' || tradeStatus == 'Allocation Trade Mismatch') {
+            result = 'CTM BLOCK';
+        } else if (tradeStatus == 'Trade Confirmed') {
+            result = 'MANUAL';
+        } else {
+            result = 'MANUAL';
+        }
+        gs.info('[Background Script]: ' + 'ETCService: ' + result);
+        return result;
+    },
+
+    getClient: function(tradeStatus) {
+        var result = '';
+        if (tradeStatus == 'Trade Mismatch' || tradeStatus == 'Allocation Trade Mismatch') {
+            result = 'ARCP';
+        } else if (tradeStatus == 'Trade Confirmed') {
+            result = 'RACP';
+        } else {
+            result = 'RACP';
+        }
+        gs.info('[Background Script]: ' + 'client: ' + result);
+        return result;
+    },
+	updateExpectedProcessTimeInSymphonyParent: function(tradeCases) {
+        for (i = 0; i < 30; i++) {
+            var parent = new GlideRecord('x_hsb11_mss_smh_parent_aggregated_trade_chat_queue');
+            parent.addQuery('trade_task_reference.hsbc_trade_case', 'IN', tradeCases);
+            parent.addQuery('trade_count', tradeCases.length);
+            parent.query();
+            this.log('trade_task_reference.hsbc_trade_caseIN' + tradeCases);
+            if (parent.next()) {
+                var newExpectedTransitionTime = new GlideDateTime(); // Get the current date and time
+                newExpectedTransitionTime.addSeconds(-900);
+                parent.setValue('expected_processing_date', newExpectedTransitionTime);
+                parent.update();
+                break;
+            } else {
+                this.sleep(1000);
+            }
+        }
+    },
+
+    updateExpectedProcessTimeInParent: function(tradeCases) {
+        for (i = 0; i < 30; i++) {
+            var parent = new GlideRecord('x_hsb11_mss_smh_parent_aggregated_trade_chat_queue');
+            parent.addQuery('trade_task_reference.hsbc_trade_case', 'IN', tradeCases);
+            parent.addQuery('trade_count', tradeCases.length);
+            parent.query();
+            this.log('trade_task_reference.hsbc_trade_caseIN' + tradeCases);
+            if (parent.next()) {
+
+                var newExpectedTransitionTime = new GlideDateTime(); // Get the current date and time
+                newExpectedTransitionTime.addSeconds(-900);
+                parent.setValue('expected_processing_date', newExpectedTransitionTime);
+                parent.update();
+                this.log('[Background Script]: ' + 'parent https://hsbcmssdev.service-now.com/x_hsb11_mss_smh_parent_aggregated_trade_chat_queue.do?sys_id=' + parent.sys_id);
+                break;
+            } else {
+                this.sleep(1000);
+            }
+        }
+    },
+
+    getBPIrecords: function(num, tradeStatus) {
+        var result = [];
+
+        var BPS = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_stage');
+        BPS.addQuery('status', tradeStatus);
+        BPS.query();
+        if (BPS.next()) {
+            var BPI = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_instance');
+            BPI.addQuery('status', BPS.sys_id);
+            BPI.orderBy('sys_created_on');
+            BPI.query();
+            while (BPI.next()) {
+                if (result.length < num) {
+                    result.push(BPI.getValue('sys_id'));
+                } else {
+                    break;
+                }
+            }
+        }
+        gs.info('[Background Script]: ' + 'BPI List: ' + result);
+        return result;
+    },
+    isSLAtaskCreated: function(tradeCases) {
+        var slaTask = new GlideRecord('x_hsb11_hsbc_mss_t_trade_task');
+        slaTask.addQuery('hsbc_trade_case', 'IN', tradeCases);
+        slaTask.addQuery('short_description', 'SLA for client responding to symphony message has been exceeded - User to follow up and determine next steps and close the existing task');
+        slaTask.query();
+        if (slaTask.next()) {
+            gs.info('[Background Script]: slaTask: ' + slaTask);
+            return slaTask;
+        } else {
+            return false;
+        }
+
+    },
+    getCase: function(bpi) {
+        var result = [];
+        var tradeCases = new GlideRecord('x_hsb11_hsbc_mss_t_trade_case');
+        tradeCases.addQuery('u_business_process_instance', bpi);
+        tradeCases.query();
+        if (tradeCases.next()) {
+            return tradeCases.sys_id;
+        }
+    },
+    getTradeId: function(tradeCaseSysId) {
+        var tradeCase = new GlideRecord('x_hsb11_hsbc_mss_t_trade_case');
+        if (tradeCase.get(tradeCaseSysId)) {
+            this.log(tradeCase.financial_object.u_id);
+            return tradeCase.financial_object.u_id;
+        }
+    },
+
+    waitUntilCaseAreCreated: function(bpiList) {
+        var isCaseFullyCreated = false;
+        for (i = 0; i < 30; i++) {
+            if (this.getRecordCount(bpiList)) {
+                isCaseFullyCreated = true;
+                break;
+            } else {
+                this.sleep(1000);
+            }
+        }
+        return isCaseFullyCreated;
+    },
+
+    isCaseFullyCreated: function(bpiList) {
+        if (this.getCaseCount(bpiList) == bpiList.length) {
+            return true;
+        } else {
+            return false;
+        }
+    },
+
+    deleteLegacyCases: function(bpiList) {
+        // Delete Case
+        var tradeCase = new GlideRecord('x_hsb11_hsbc_mss_t_trade_case');
+        tradeCase.addQuery('u_business_process_instance', 'IN', bpiList);
+        tradeCase.query();
+        while (tradeCase.next()) {
+            gs.info('[Background Script]: ' + 'Removing ' + tradeCase.getValue('number'));
+            tradeCase.deleteRecord();
+            // tradeCase.u_business_process_instance = '';
+            // tradeCase.update();
+        }
+
+        gs.info('* * * * * * * * * * * * * * * * * * * * ');
+    },
+
+    updatePayloadInBPI: function(bpiSysId, payload) {
+        var bpi = new GlideRecord('x_hsb11_hsbc_mss_o_business_process_instance');
+        if (bpi.get(bpiSysId)) {
+            this.log('Updating ' + bpi.getValue('number') + ' with payload ' + payload);
+            bpi.payload = payload;
+            bpi.update();
+            return bpi;
+        } else {
+            this.log('BPI record not found');
+        }
+    },
+
+    buildIAWPayload: function() {
+        var hsbcValue = Math.random() * 1000;
+        var cptyValue = Math.random() * 1000;
+        mismatchedAttribute = Math.random() * 10;
+        mismatchedAttribute = mismatchedAttribute.toFixed(0) % 3;
+        if (mismatchedAttribute == 1) {
+            mismatchedAttribute = 'SettlementDate';
+        } else if (mismatchedAttribute == 2) {
+            mismatchedAttribute = 'DealPrice';
+        } else {
+            mismatchedAttribute = 'TradeCommissions';
+        }
+        var iawPayload = '[{"MISMATCHED_ATTRIBUTE":"' + mismatchedAttribute + '","SUGGESTED_ACTION":"HSBC potentially at fault","MISMATCHED_DATA":{"CTAC_CTM_TL_ID":"2260251536","CTAC_CTM_FIELD_NAME":"' + mismatchedAttribute + '","CTAC_CTM_BROKER_VALUE":"' + hsbcValue.toFixed(0) + '","CTAC_CTM_CPTY_VALUE":"' + cptyValue.toFixed(0) + '","CTAC_CTM_MACH_STATUS":"MISM","CTAC_CTM_MACH_RULE":"CommissionExact"}}]';
+        return iawPayload;
+    },
+    buildSwbPayload: function() {
+        var swbPayload = '[{"Sub_Account_Identifier":"12345678","Trade_Date":"11/25/2025","Financial_Instrument_Identifier":"002372.ZK","Block_Trade_ID":"00001224851CTLO1","Direction":"BUY","ISIN":"CNE100000MK9","Custodian":"","Gross_Price":10.61,"Value_Date":"11/25/2025","Financial_Instrument_Identifier_Type":"RIC","Allocation_Quantity":4800,"Classification_Type":"Allocation Instructions - HSBC Driven"}]';
+        return swbPayload;
+
+    },
+
+    updateIAWPayloadInTradeCase: function(tradeCaseSysId, iawPayload, iawWidgetOutcome, swbPayload, swbWidgetOutcome) {
+        var tradeCase = new GlideRecord('x_hsb11_hsbc_mss_t_trade_case');
+        if (tradeCase.get(tradeCaseSysId)) {
+            this.log('Updating ' + tradeCase.getValue('number') + ', IAW Outcome and IAW Payload');
+            tradeCase.iaw_widget_payload = iawPayload;
+            tradeCase.widget_outcome = iawWidgetOutcome;
+            tradeCase.swb_payload = swbPayload;
+            tradeCase.swb_widget_outcome = swbWidgetOutcome;
+            tradeCase.update();
+        } else {
+            this.log('Trade Case not found');
+        }
+    },
+
+    updateSubStatusInTradeCase: function(tradeCaseSysId, subStatus) {
+        // var subStatus = '';
+        // if (tradeStatus == 'Trade Mismatch' || tradeStatus == 'Allocation Trade Mismatch') {
+        //     subStatus = '24c602371bdf5dd06ed00e1ad34bcb93'; //HSBC Potentially at fault for mismatch
+        // } else if (tradeStatus == 'Trade Confirmed') {
+        //     subStatus = 'ba559bde1b079950ff37eb14b24bcb1c'; // Sub-Account Update required
+        // }
+
+        var tradeCase = new GlideRecord('x_hsb11_hsbc_mss_t_trade_case');
+        if (tradeCase.get(tradeCaseSysId)) {
+            gs.info('[Background Script]: ' + 'Updating ' + tradeCase.getValue('number') + ': sub_status to ' + subStatus);
+            tradeCase.setValue('sub_status', subStatus);
+            tradeCase.update();
+        }
+    },
+
+    buildOrderId: function(num) {
+        var result = [];
+        for (i = 0; i < num; i++) {
+            var orderId = Math.random() * 100000000000; // 11 digital
+            result.push(orderId.toFixed(0) + 'ORLO1');
+        }
+        gs.info('[Background Script]: ' + 'orderId: ' + result);
+
+        return result;
+    },
+
+    buildTradeId: function() {
+        var orderId = Math.random() * 100000000000; // 11 digital
+        var result = '';
+        result = orderId.toFixed(0) + 'CTLO1';
+        gs.info('[Background Script]: ' + 'tradeId: ' + result);
+        return result;
+    },
+
+    buildBasketId: function() {
+        var orderId = Math.random() * 100000000000; // 11 digital
+        return orderId.toFixed(0) + 'BTLO1';
+    },
+    buildValueDate: function() {
+        var valueDate = Math.random() * 10;
+        return '2025121' + valueDate.toFixed(0);
+    },
+    buildBuyOrSell: function() {
+        var buyOrSell = Math.random() * 10;
+        buyOrSell = buyOrSell.toFixed(0) % 2;
+        if (buyOrSell == 0) {
+            buyOrSell = 'B';
+        } else {
+            buyOrSell = 'S';
+        }
+        return buyOrSell;
+    },
+    buildRic: function() {
+        var ric = Math.random() * 10000;
+        return ric.toFixed(0) + '.HK';
+    },
+
+
+    buildPayload: function(client, exchangeMic, eTCService, orderId, orderType, basketId, valueDate, buyOrSell, ric, entity) {
+        var payload = '{"data":[{"message_id":"00002163030CULO1","source":"CTAC","payload":{"MESSAGE_SOURCE":"CTAC","MESSAGE_TYPE":"DS_MESSAGE","DATASTREAM_REF":"20250818 11:18:32.619057 +0100s","CTAC_EVENT":"TMSM","ETC_SERVICE":"' + eTCService + '","COUNTERPARTY_ETC_SERVICE":"CTM BLOCK","CTAC_TRADE_STATUS":"TMSM","CTAC_TRANS_MSG_ID":"CTAC_TRADE_MISMATCHED","CTAC_TRANS_MSG_P0":"1","CTAC_TRANS_MSG_P1":"","CTAC_TRANS_MSG_P2":"","CTAC_TRANS_MSG_P3":"","CTAC_TRANS_MSG_P4":"","CTAC_TRANS_MSG_P5":"","CTAC_TRANS_MSG_P6":"","CTAC_TRANS_MSG_P7":"","CTAC_TRANS_MSG_P8":"","CTAC_TRANS_MSG_P9":"","CTAC_ALLOCS_AGAINST_MSN":" ","EVENT_DESCRIPTION":"Version 1 of Trade mismatched","CTAC_TRADE_DID":"00001198775CTLO1","CTAC_TRADE_VERSION":1,"CTAC_ALLOCATION_DID":"","CTAC_ALLOCATION_VERSION":0,"CTAC_AUDIT_DID":"00002163030CULO1","SUMMARY":"20250818 11:18:32.619057 +0100s|5|<CLIENT>|HBAP|00002163030CULO1|00001198775CTLO1|CTM BLOCK|TMSM|TMSM||| |Version 1 of Trade mismatched|","CTAC_TRADE_AUDIT":[{"COUNTERPARTY_CODE":"' + client + '","COUNTERPARTY_DESCRIPTION":"Client ID is - 1042052","COUNTERPARTY_GROUP_ID":"","ETC_SERVICE":"' + eTCService + '","CTAC_TRADE_STATUS":"TMSM","INSTRUMENT_DESCRIPTION":"CK HUTCHISON HOLDINGS ORD SHS HKD 1.00","INSTRUMENT_VIEW":"0001.HK","INSTRUMENT_RIC":"' + ric + '","INSTRUMENT_BBG":"1 HK","INSTRUMENT_BBC":"1 HK","INSTRUMENT_ISIN":"KYG217651051","INSTRUMENT_SEDL":"BW9P816","EXCHANGE_ID":"HKG","EXCHANGE_MIC":"' + exchangeMic + '","EXCHANGE_DESCRIPTION":"Hong Kong Stock Exchange","MARKET_ID":"HKG-MAIN","MARKET_DESCRIPTION":"Main HKG Market","BUY_SELL":"' + buyOrSell + '","GROSS_PRICE":51.2,"CTAC_TRADE_QUANTITY":6100.0,"GROSS_CONSIDERATION":312320.0,"NET_CONSIDERATION":312632.32,"NET_NET_CONSIDERATION":313065.87,"SETTLEMENT_CONSIDERATION":313065.87,"CTAC_TRADE_DATE":"20250818","CTAC_TRADE_TIME":"11172748","VALUE_DATE":"' + valueDate + '","CTAC_DEALT_CCY":"HKD","CTAC_SETTLEMENT_CCY":"HKD","EXCHANGE_RATE":1.0,"MULTIPLY_DIVIDE":"M","TRADING_ENTITY_ID":"' + entity + '","CLEARING_SERVICE_ID":"CCASS","ORDER_TYPE":"SINGLE","PREALLOCATION_SUBACCOUNT_VIEW":"","PREALLOCATION_SUBACCOUNT_FUND":"","PREALLOCATION_SUBACCOUNT_ALRT":"","PREALLOCATION_SUBACCOUNT_DESCRIPTION":"","ORDER_ID":"' + orderId + '","CLIENT_ORDER_ID":"","ORDER_BOOKING_ID":"24122109552TRLO1","BASKET_ID":"' + basketId + '","BARGAIN_CONDITIONS":"","SETELLEMENT_NOTES":"","PRIMARY_SALES_TRADER_ID":"","PRIMARY_SALES_TRADER_NAME":" ","BOOKED_BY_TRADER_ID":"UMcintyreL","BOOKED_BY_TRADER_NAME":"Leon Mcintyre","SETTLE_TO_USD_RATE":0.12786333966256866,"SETTLE_TO_GBP_RATE":0.0944407455152451,"AMENDED_BY_TRADER_ID":"","AMENDED_BY_TRADER_NAME":" ","INVESTMENT_DECISION_MAKER":"UMcintyreL","INVESTMENT_DECISION_SHORT_CODE":43289053,"EXECUTION_DECISION_MAKER":"UMcintyreL","EXECUTION_DECISION_SHORT_CODE":43289053,"PRIMARY_SALES_TRADER_EMAIL":"","BOOKED_BY_EMAIL":"UMcintyreL@testemail.com","AMENDED_BY_EMAIL":"","INVESTMENT_DECISION_MAKER_NAME":"Leon Mcintyre","EXECUTION_DECISION_MAKER_NAME":"Leon Mcintyre","INVESTMENT_DECISION_MAKER_EMAIL":"UMcintyreL@testemail.com","EXECUTION_DECISION_MAKER_EMAIL":"UMcintyreL@testemail.com"}],"CTAC_TRADE_CHARGES":[{"CHARGE_ID":"ACOMMISSION","CHARGE_AMOUNT":312.32,"CALCULATION_VALUE":0.0,"CALCULATION_METHOD":""},{"CHARGE_ID":"AMARKET","CHARGE_AMOUNT":433.55,"CALCULATION_VALUE":0.0,"CALCULATION_METHOD":""},{"CHARGE_ID":"AOTHER","CHARGE_AMOUNT":0.0,"CALCULATION_VALUE":0.0,"CALCULATION_METHOD":""},{"CHARGE_ID":"COMMISSION","CHARGE_AMOUNT":312.32,"CALCULATION_VALUE":10.0,"CALCULATION_METHOD":"BASIS_POINT"},{"CHARGE_ID":"FEE","CHARGE_AMOUNT":17.65,"CALCULATION_VALUE":0.00565,"CALCULATION_METHOD":"PERCENTAGE"},{"CHARGE_ID":"FRCLEVY","CHARGE_AMOUNT":0.47,"CALCULATION_VALUE":1.5E-4,"CALCULATION_METHOD":"PERCENTAGE"},{"CHARGE_ID":"INVCOMPLEVY","CHARGE_AMOUNT":0.0,"CALCULATION_VALUE":0.0,"CALCULATION_METHOD":"PERCENTAGE"},{"CHARGE_ID":"LEVY","CHARGE_AMOUNT":8.43,"CALCULATION_VALUE":0.0027,"CALCULATION_METHOD":"PERCENTAGE"},{"CHARGE_ID":"MARKUP","CHARGE_AMOUNT":0.0,"CALCULATION_VALUE":0.0,"CALCULATION_METHOD":"NONE"},{"CHARGE_ID":"REBATE","CHARGE_AMOUNT":0.0,"CALCULATION_VALUE":0.0,"CALCULATION_METHOD":"FIXED_AMOUNT"},{"CHARGE_ID":"SALESCREDIT","CHARGE_AMOUNT":0.0,"CALCULATION_VALUE":0.0,"CALCULATION_METHOD":"NONE"},{"CHARGE_ID":"STAMP","CHARGE_AMOUNT":407.0,"CALCULATION_VALUE":0.13,"CALCULATION_METHOD":"PERCENTAGE"}],"CTAC_CTM_TRADE_LEVEL_FLD_COMP":[{"CTAC_CTM_TL_ID":"1894161330","CTAC_CTM_FIELD_NAME":"TradeCommissions","CTAC_CTM_BROKER_VALUE":"312,32","CTAC_CTM_CPTY_VALUE":"312,31","CTAC_CTM_MACH_STATUS":"MISM","CTAC_CTM_MACH_RULE":"CommissionExact"}],"COUNTERPARTY_ACCOUNT":[],"CTAC_CTM_TRADE_DETAIL_FLD_COMP":[],"CTAC_ALLOCATION_AUDIT":[],"CTAC_ALLOCATION_CHARGES":[],"CTAC_CTM_ALLEGED_TRADE_LEVEL":[{"CTAC_CTM_TL_ID":"1894161330","CTAC_ENTITY_CODE":"TSTHSBCEQHK","TRADING_ENTITY_ID":"' + entity + '"}]}}],"total":1,"offset":0,"count":1}';
+        return payload;
+    },
+
+    getRecordCount: function(bpiList) {
+        var result = false;
+        var count = new GlideAggregate('x_hsb11_hsbc_mss_t_trade_case');
+        count.addQuery('u_business_process_instance', 'IN', bpiList);
+        count.addAggregate('COUNT');
+        count.query();
+        if (count.next()) {
+            if (bpiList.length == count.getAggregate('COUNT')) {
+                result = true;
+            }
+        }
+        return result;
+    },
+    getCaseCount: function(bpiList) {
+        var result = 0;
+        var count = new GlideAggregate('x_hsb11_hsbc_mss_t_trade_case');
+        count.addQuery('u_business_process_instance', 'IN', bpiList);
+        count.addAggregate('COUNT');
+        count.query();
+        if (count.next()) {
+            result = count.getAggregate('COUNT')
+        }
+        return result;
+    },
+    type: 'GlobalUtils'
+};]]></script>
+        <sys_class_name>sys_script_include</sys_class_name>
+        <sys_created_by>44002602@hsbc.com</sys_created_by>
+        <sys_created_on>2026-01-16 05:48:58</sys_created_on>
+        <sys_id>8a7e16901ba676d46ed00e1ad34bcb8b</sys_id>
+        <sys_mod_count>2</sys_mod_count>
+        <sys_name>GlobalUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_include_8a7e16901ba676d46ed00e1ad34bcb8b</sys_update_name>
+        <sys_updated_by>45408677@hsbc.com</sys_updated_by>
+        <sys_updated_on>2026-02-16 13:28:36</sys_updated_on>
+    </sys_script_include>
+</record_update>

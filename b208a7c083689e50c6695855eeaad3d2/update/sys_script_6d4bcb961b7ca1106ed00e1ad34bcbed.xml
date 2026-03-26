@@ -1,0 +1,159 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="sys_script">
+    <sys_script action="INSERT_OR_UPDATE">
+        <abort_action>false</abort_action>
+        <access>package_private</access>
+        <action_delete>false</action_delete>
+        <action_insert>false</action_insert>
+        <action_query>false</action_query>
+        <action_update>true</action_update>
+        <active>true</active>
+        <add_message>false</add_message>
+        <advanced>true</advanced>
+        <change_fields>false</change_fields>
+        <client_callable>false</client_callable>
+        <collection>x_hsb11_mss_sw_hsbc_outbound_symphony_message_log</collection>
+        <condition/>
+        <description/>
+        <execute_function>false</execute_function>
+        <filter_condition table="x_hsb11_mss_sw_hsbc_outbound_symphony_message_log">state=Processed^encrypted_message_idISNOTEMPTY^source=Equities^NQstate=Error^source=Equities^NQstate=Processed^type=Recall^sourceSTARTSWITHEquities^EQ<item endquery="true" field="" goto="false" newquery="false" operator="=" or="false" value=""/>
+        </filter_condition>
+        <is_rest>false</is_rest>
+        <message/>
+        <name>mss.symphony_process_message_response</name>
+        <order>100</order>
+        <priority>100</priority>
+        <rest_method/>
+        <rest_method_text/>
+        <rest_service/>
+        <rest_service_text/>
+        <rest_variables/>
+        <role_conditions/>
+        <script><![CDATA[(function executeRule(current, previous /*null when async*/ ) {
+    try {
+        var encryptedMsgId = current.encrypted_message_id;
+        var taskId = current.servicenow_task_id;
+        var caseId = current.servicenow_task_id.parent;
+        var eLog = new GlideRecord("x_hsb11_mss_smh_hsbc_symphony_message_log");
+        eLog.addQuery("servicenow_task_id", taskId);
+        eLog.addQuery("encrypted_message_id", '=', null);
+        eLog.addQuery("state", '=', 'Draft');
+        eLog.addQuery("type", current.type);
+        eLog.query();
+        if (eLog.next()) {
+            eLog.encrypted_message_id = encryptedMsgId;
+            eLog.response_body = current.response_body;
+            eLog.response_code = current.response_code;
+            eLog.response_date = current.response_date;
+            eLog.state = current.state;
+            eLog.update();
+        }
+        var taskState = 1;
+        if (current.state == "Processed") {
+            taskState = 3;
+        } else if (current.state == "Error") {
+            taskState = 7;
+        }
+        var parent = new GlideRecord("x_hsb11_mss_smh_parent_aggregated_trade_chat_queue");
+        parent.addQuery("trade_task_reference.parent", caseId);
+        parent.query();
+        if (parent.next()) {
+            parent.encryptedmessageid = encryptedMsgId;
+            parent.aggregation_status = 'Sent';
+            parent.update();
+
+            if (parent.trade_count > 1) {
+                var parentnumber = parent.getDisplayValue('number');
+                var child = new GlideRecord("x_hsb11_mss_smh_child_aggregated_trade_chat_queue");
+                child.addQuery("parent.number", parentnumber);
+                child.query();
+                while (child.next()) {
+                    updateTradeTask(child.trade_case_task.sys_id, taskState);
+                }
+            } else {
+                updateTradeTask(taskId.sys_id, taskState);
+            }
+
+            // if children are all actioned, mark SLA task as cancelled. 
+            var tradeCases = [];
+			var newTradeCase = '';
+            var isAllActioned = true;
+            var children = new GlideRecord("x_hsb11_mss_smh_child_aggregated_trade_chat_queue");
+            children.addQuery('parent', parent.sys_id);
+            children.query();
+
+            while (children.next()) {
+                if (children.actioned == false) {
+					newTradeCase = children.getValue('trade_case');
+                    isAllActioned = false;
+                    break;
+                } else {
+                    tradeCases.push(children.getValue('trade_case')); // get trade case list from child
+                }
+            }
+            var slaTask = new GlideRecord('x_hsb11_hsbc_mss_t_trade_task');
+            slaTask.addQuery('parent', 'IN', tradeCases);
+            slaTask.addQuery('short_description', 'SLA for client responding to symphony message has been exceeded - User to follow up and determine next steps and close the existing task');
+            slaTask.query();
+            if (slaTask.next()) { // if SLA task exists
+                if (isAllActioned) { // if children are all actioned
+                    slaTask.state = 7; // update state to cancel
+                    slaTask.update();
+                }else { // if children NOT all actioned
+					if(slaTask.hsbc_trade_case != newTradeCase){ 
+						slaTask.hsbc_trade_case = newTradeCase;
+						slaTask.parent = newTradeCase;
+						slaTask.parent_case = newTradeCase;
+						slaTask.update();
+					}
+				}
+            }
+
+        } else {
+            updateTradeTask(taskId.sys_id, encryptedMsgId, taskState);
+            // tradeTask = new GlideRecord("x_hsb11_hsbc_mss_t_trade_task");
+            // tradeTask.addQuery("number", taskId.number);
+            // tradeTask.query();
+            // if (tradeTask.next()) {
+            //     tradeTask.encryptedmessageid = encryptedMsgId;
+            //     tradeTask.state = taskState;
+            //     tradeTask.update();
+            // }
+        }
+        if (current.state == "Error") {
+            var failureDescription = "Cash Equities Symphony Outbound message processing Widget failure, details of the error are as below - ServiceNow Reference -" + current.servicenow_task_id.number + " Timestamp : " + current.response_date + "Error code - " + current.response_code + "Error Body - " + current.error_body; //MSSOTIQUBE-1358
+            var createEventForWidgetFailure = new x_hsb11_hsbc_mss_t.hsbcWidgetFailureHandler().createITIDEvent('WARNING', failureDescription, 'MSSiQubeSNWidget_Symphony');
+        }
+    } catch (e) {
+        gs.error('[BR][mss.symphony_process_message_response]: ' + e.getMessage());
+    }
+
+    function updateTradeTask(taskId, taskState) {
+        var tradeTask = new GlideRecord("x_hsb11_hsbc_mss_t_trade_task");
+        tradeTask.addQuery('sys_id', taskId);
+        tradeTask.query();
+        if (tradeTask.next()) {
+            tradeTask.state = taskState;
+            tradeTask.update();
+        }
+    }
+})(current, previous);]]></script>
+        <sys_class_name>sys_script</sys_class_name>
+        <sys_created_by>45315639@hsbc.com</sys_created_by>
+        <sys_created_on>2023-02-06 10:23:18</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>6d4bcb961b7ca1106ed00e1ad34bcbed</sys_id>
+        <sys_mod_count>63</sys_mod_count>
+        <sys_name>mss.symphony_process_message_response</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_script_6d4bcb961b7ca1106ed00e1ad34bcbed</sys_update_name>
+        <sys_updated_by>45423137@hsbc.com</sys_updated_by>
+        <sys_updated_on>2025-12-23 09:41:27</sys_updated_on>
+        <template/>
+        <when>after</when>
+    </sys_script>
+    <sys_translated_text action="delete_multiple" query="documentkey=6d4bcb961b7ca1106ed00e1ad34bcbed"/>
+</record_update>

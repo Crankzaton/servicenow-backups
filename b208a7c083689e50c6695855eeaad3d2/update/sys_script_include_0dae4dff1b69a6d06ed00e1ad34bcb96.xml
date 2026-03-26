@@ -4,412 +4,198 @@
         <active>true</active>
         <api_name>x_938076_now_utils.TaskPriorityCalc</api_name>
         <caller_access/>
-        <client_callable>false</client_callable>
+        <client_callable>true</client_callable>
         <description>Calculation of task priority dynamically  based on configuration values.
 //SN5106 - Dynamic Prioritization</description>
         <mobile_callable>false</mobile_callable>
         <name>TaskPriorityCalc</name>
         <sandbox_callable>false</sandbox_callable>
         <script><![CDATA[var TaskPriorityCalc = Class.create();
-TaskPriorityCalc.prototype = {
-    initialize: function(taskRecord) {
-        this.taskRecord = taskRecord;
-        this.totalPoints = 0;
-        this.msg_log = "Dynamic Priority - " + this.taskRecord.sys_id + ".";
-		this.worknotes = "";
-		this.process_element = "";
-    },
-
-    calculatePriority: function() {
-
-        try {
-            var configGR = new GlideRecord('x_hsb11_hsbc_mss_o_task_priority_config');
-            configGR.addQuery('enabled', true);
-			configGR.addQuery('entity', this.taskRecord.hsbc_trade_case.entity);
-            configGR.query();
-            if (!configGR.hasNext()) {
-                gs.info(this.msg_log + 'No records found in x_hsb11_hsbc_mss_o_task_priority_config.');
-				this.taskRecord.priority = 4; // Default priority
-				this.taskRecord.work_notes = "No Rules records. \r\n";
-				return this.taskRecord;
+TaskPriorityCalc.prototype = prototype = Object.extendsObject(global.AbstractAjaxProcessor, {
+    calculate: function(taskGR, tableName) {
+        var score = 0;
+        var workNotes = "";
+        var configureRules = new GlideRecord('x_hsb11_hsbc_mss_o_task_priority_config');
+        configureRules.addQuery('enabled', true);
+        configureRules.addQuery('table', tableName);
+        configureRules.query();
+        while (configureRules.next()) {
+            var isMatch = GlideFilter.checkRecord(taskGR, configureRules.getValue('conditions'));
+            if (isMatch) {
+                var readableCondition = configureRules.getValue('conditions');
+                var readableQuery = new global.GlobalQueryUtil().getReadableQuery(tableName, readableCondition);
+                workNotes += 'Getting ' + configureRules.getValue('points') + ' points, condition: ' + readableQuery + '\n';
+                score = score + parseFloat(configureRules.getValue('points'));
             }
-
-            while (configGR.next()) {
-                // --- Resolve sys_dictionary record ---
-                var dicFieldSysId = configGR.getValue('field_from_task');
-                if (!dicFieldSysId) {
-                    //gs.info('Dynamic Priority - field_from_task is empty. Skipping.');
-                    continue;
-                }
-
-                var dicFieldGR = new GlideRecord('sys_dictionary');
-                if (!dicFieldGR.get(dicFieldSysId)) {
-                    //gs.info('Dynamic Priority - Could not load sys_dictionary for sys_id: ' + dicFieldSysId);
-                    continue;
-                }
-
-                var attributeName = dicFieldGR.getValue('element'); // technical column name
-                var elementLabel = dicFieldGR.getValue('column_label'); // human-readable label
-                var tableSource = configGR.getValue('from_table');
-                var targetApp = configGR.getValue('u_target_app');
-                var expValue = configGR.getValue('expected_value');
-                var points = parseInt(configGR.getValue('points'), 10);
-                var freeFormField = configGR.getValue('u_fff');
-                var expected_display = configGR.getValue('expected_display');
-
-				this.process_element = elementLabel;
-
-                // ---------- Special logic for Trade Date / Value Date ----------
-                if (freeFormField && (elementLabel.toLowerCase() == "trade date" || elementLabel.toLowerCase() == "value date")) {
-                    // Parse the freeFormField to extract the operator and offset
-                    var comparisonOperator = freeFormField.charAt(0); // First character is the operator (<, >, or =)
-                    var offsetString = freeFormField.substring(1); // Remaining string is the offset (e.g., +1, -2)
-                    var offsetDays = parseInt(offsetString, 10); // Convert offset to an integer
-
-                    if (isNaN(offsetDays) || (comparisonOperator !== '<' && comparisonOperator !== '>' && comparisonOperator !== '=')) {
-                        gs.info(this.msg_log + 'Invalid Free Form Field value: ' + freeFormField);
-                        continue;
-                    }
-
-                    //entity HBEU GMT, HSI -5, HBAP + 8, Trade Date & Value Date user input local date. Convert today to corresbonding time zone
-                    // Adjust the date based on the offset
-                    var today = new GlideDateTime();
-                    today.addDaysUTC(offsetDays); // Adjust the date in UTC
-                    var todayLocalTimeZone = this.convertTimeZone();
-                    var adjustedDateOnly = todayLocalTimeZone.getDate().getDisplayValueInternal(); // Extract only the date portion in UTC (yyyy-MM-dd)
-
-                    var tradeRecord = this.getTradeRecord();
-                    if (!tradeRecord) {
-                        gs.info(this.msg_log + 'No trade record found via double dot-walk.');
-                        continue;
-                    }
-
-                    var taskDateStr = (elementLabel.toLowerCase() == "trade date") ?
-                        tradeRecord.getValue('u_trade_date') :
-                        tradeRecord.getValue('u_value_date');
-
-                    if (!taskDateStr) {
-                        gs.info(this.msg_log + 'Trade date/value date field is empty. Skipping.');
-                        continue;
-                    }
-
-                    // Convert task date to GlideDateTime and extract the date portion
-                    var task_date = new Date(taskDateStr);
-                    var task_day = String(task_date.getUTCDate()).padStart(2, '0');
-                    var task_month = String(task_date.getUTCMonth() + 1).padStart(2, '0');
-                    var task_year = task_date.getUTCFullYear();
-                    var taskDateOnly = task_month + "-" + task_day + "-" + task_year;
-
-                    // Perform the comparison based on the operator
-                    if (comparisonOperator === '<' && taskDateOnly < adjustedDateOnly) {
-                        this.totalPoints += points;
-                    } else if (comparisonOperator === '>' && taskDateOnly > adjustedDateOnly) {
-                        this.totalPoints += points;
-                    } else if (comparisonOperator === '=' && taskDateOnly === adjustedDateOnly) {
-                        this.totalPoints += points;
-                    } else {
-                        points = 0;
-                    }
-					this.worknotes += elementLabel.toLowerCase() + " - " + taskDateOnly + " " + comparisonOperator + " " + adjustedDateOnly + " .Points: " + points + "\r\n";
-                    //gs.info(this.msg_log + elementLabel.toLowerCase() + ":" + taskDateOnly + " " + freeFormField + " " + adjustedDateOnly + " .Points added: " + points + "|" + "today (GMT):" + today + ".Local time:" + todayLocalTimeZone + ".ConvertDate:" + adjustedDateOnly);
-                    continue;
-                }
-                // ---------- END Special logic ----------
-
-
-                // ---------- Special logic for Trade Status ----------
-                if (elementLabel.toLowerCase() === "trade status") {
-                    tradeRecord = this.getTradeRecord();
-                    var tradeValue = tradeRecord.getDisplayValue('u_trade_status');
-
-                    // Compare the trade status value with the expected display value
-                    if (tradeValue === expected_display) {
-                        this.totalPoints += points;
-                    } else {
-                        points = 0;
-                    }
-
-					this.worknotes += elementLabel.toLowerCase() + " - " + "trade status: " + tradeValue + ".Expected:" + expected_display + " .Points: " + points + "\r\n";
-                    //gs.info(this.msg_log + elementLabel.toLowerCase() + ":" + tradeValue + ".Expected." + expected_display + " .Points added: " + points);
-                    continue; // Skip to the next configuration
-                }
-                // ---------- END Special logic for Trade Status ----------
-
-                // ---------- Special logic for Gross Price ----------
-                if (freeFormField && elementLabel.toLowerCase() == "gross consideration") {
-                    //gs.info('Dynamic Priority - Special handling for Gross Consideration.');
-                    // Double dot-walk to get the trade record
-                    tradeRecord = this.getTradeRecord();
-                    if (!tradeRecord) {
-                        //gs.info('Dynamic Priority - No trade record found via double dot-walk.');
-                        continue;
-                    }
-                    // Retrieve u_ctac_trade_audit_0_gross_consideration_f64 and convert to integer
-                    var grossConsideration = parseInt(tradeRecord.getValue('u_ctac_trade_audit_0_gross_consideration_f64'), 10);
-                    if (isNaN(grossConsideration)) {
-                        //gs.info('Dynamic Priority - Gross Consideration is not a valid number. Skipping.');
-                        continue;
-                    }
-                    // Multiply grossPrice with grossConsideration
-                    var calculatedValue = grossConsideration;
-                    //gs.info('Dynamic Priority - Gross Consideration is: ' + calculatedValue);
-                    // Retrieve u_ctac_trade_audit_0_ctac_dealt_ccy_s (currency details)
-                    var currency = tradeRecord.getValue('u_ctac_trade_audit_0_ctac_dealt_ccy_s');
-                    if (!currency) {
-                        //gs.info('Dynamic Priority - Currency field is empty. Skipping.');
-                        continue;
-                    }
-                    //gs.info('Dynamic Priority - Currency: ' + currency);
-                    // Convert currency to USD
-                    var conversionRate = this.getCurrencyConversionRate(currency.toUpperCase());
-                    if (!conversionRate) {
-                        //gs.info('Dynamic Priority - No conversion rate found for currency: ' + currency + '. Skipping.');
-                        continue;
-                    }
-                    var valueInUSD = calculatedValue * conversionRate;
-                    //gs.info('Dynamic Priority - Value in USD: ' + valueInUSD);
-                    // Compare with the value in u_fff (converted to a number)
-                    var thresholdValue = parseFloat(freeFormField);
-                    if (isNaN(thresholdValue)) {
-                        //gs.info('Dynamic Priority - u_fff is not a valid number. Skipping.');
-                        continue;
-                    }
-                    //gs.info('Dynamic Priority - Threshold value from u_fff: ' + thresholdValue);
-                    if (valueInUSD > thresholdValue) {
-                        this.totalPoints += points;
-                    } else {
-                        points = 0;
-                    }
-
-					this.worknotes += elementLabel.toLowerCase() + " - " + "Currency:" + currency + ".original Gross consideration:" + grossConsideration + ".Convert Gross consideration:" + valueInUSD + ".Threshold:" + thresholdValue + ".FX Rate:" + conversionRate + " .Points: " + points + "\r\n";
-                    //gs.info(this.msg_log + elementLabel.toLowerCase() + ":" + "Currency:" + currency + ".original gross consideration:" + grossConsideration + ".Convert gross consideration:" + valueInUSD + ".thresholdValue:" + threshold + ".FX Rate:" + conversionRate + " .Points added: " + points);
-                    continue; // Skip to the next configuration
-                }
-
-                // ---------- Generic logic ----------
-                var fieldValue = this.getFieldValue(attributeName, tableSource, targetApp);
-                if (fieldValue === null) {
-                    //gs.info('Dynamic Priority - Field value is null for field: ' + elementLabel + '. Skipping this configuration.');
-                    continue;
-                }
-                if (!freeFormField && fieldValue == expValue) {
-                    this.totalPoints += points;
-					this.worknotes += elementLabel.toLowerCase() + " - " + 'Matched field: ' + elementLabel + ', Points: ' + points + "\r\n";
-                    //gs.info(this.msg_log + 'Matched field: ' + elementLabel + ', Points added: ' + points);
-                } else if (freeFormField && fieldValue == freeFormField) {
-                    this.totalPoints += points;
-					this.worknotes += elementLabel.toLowerCase() + " - " + 'Matched free form field: ' + freeFormField + ', Points: ' + points + "\r\n";
-                    //gs.info(this.msg_log + 'Matched free form field: ' + freeFormField + ', Points added: ' + points);
-                }
-                // ---------- END Generic logic ----------
-
-            }
-            //gs.info(this.msg_log + 'Total points calculated: ' + this.totalPoints);
-			this.taskRecord.priority = this.mapPointsToPriority(this.totalPoints);
-			this.worknotes += 'Total points: ' + this.totalPoints + ".Priority is:" + this.taskRecord.priority + ".(4 LOW, 3 Medium, 2 High, 1 Critical)";
-			this.taskRecord.work_notes = this.worknotes;
-            return this.taskRecord;
-        } catch (e) {
-            gs.error(this.msg_log + 'Error in calculatePriority: Element: ' + this.process_element + ".Error Message:" + e.message);
-			this.taskRecord.priority = 4;
-			this.taskRecord.work_notes = this.worknotes + "\r\n Caculation error in " + this.process_element + ", return default LOW. \r\n";
-            return this.taskRecord;
         }
-    },
 
-    // Fetch value dynamically based on table and app
-    getFieldValue: function(attributeName, tableSource, targetApp) {
-        try {
-            var sourceRecord = this.taskRecord;
-            //gs.info('Dynamic Priority - Fetching field value for attribute: ' + attributeName + ', Table Source: ' + tableSource + ', Target App: ' + targetApp);
-
-            if (targetApp == 'mss_custody') {
-                if (tableSource == 'x_hsb11_mss_c_proc_mss_custody_task') {
-                    sourceRecord = this.taskRecord;
-                } else if (tableSource == 'x_hsb11_mss_c_proc_mss_custody_trade') {
-                    if (!this.taskRecord.trade_id) {
-                        //gs.info('Dynamic Priority - trade_id is null or undefined.');
-                        return null;
-                    }
-                    var extensionGR = this.taskRecord.trade_id.getRefRecord();
-                    if (extensionGR && extensionGR.isValidRecord()) {
-                        sourceRecord = extensionGR;
-                    } else {
-                        //gs.info('Dynamic Priority - No matching record found in trade table.');
-                        return null;
-                    }
-                } else {
-                    //gs.info('Dynamic Priority - Invalid value for table_source: ' + tableSource);
-                    return null;
-                }
-            } else if (targetApp == 'cash_equity') {
-                if (tableSource == 'x_hsb11_hsbc_mss_t_trade_case') {
-                    var tradeCaseRecord = this.taskRecord.parent.getRefRecord();
-                    if (tradeCaseRecord && tradeCaseRecord.isValidRecord()) {
-                        sourceRecord = tradeCaseRecord;
-                    } else {
-                        //gs.info('Dynamic Priority - No matching record found in x_hsb11_hsbc_mss_t_trade_case for sys_id: ' + this.taskRecord.getUniqueValue());
-                        return null;
-                    }
-                } else if (tableSource == 'x_hsb11_hsbc_mss_t_trade_task') {
-                    var cashEquityGR = new GlideRecord('x_hsb11_hsbc_mss_t_trade_task');
-                    cashEquityGR.addQuery('sys_id', this.taskRecord.getUniqueValue());
-                    cashEquityGR.query();
-                    if (cashEquityGR.next()) {
-                        sourceRecord = cashEquityGR;
-                    } else {
-                        //gs.info('Dynamic Priority - No matching record found in x_hsb11_hsbc_mss_t_trade_task for sys_id: ' + this.taskRecord.getUniqueValue());
-                        return null;
-                    }
-                } else if (tableSource == 'sn_bom_trade') {
-                    var tradeTaskGR = new GlideRecord('x_hsb11_hsbc_mss_t_trade_task');
-                    tradeTaskGR.addQuery('sys_id', this.taskRecord.getUniqueValue());
-                    tradeTaskGR.query();
-                    if (tradeTaskGR.next()) {
-                        var tradeCaseGR = tradeTaskGR.parent.getRefRecord();
-                        if (tradeCaseGR && tradeCaseGR.isValidRecord()) {
-                            var tradeGR = tradeCaseGR.financial_object.getRefRecord();
-                            if (tradeGR && tradeGR.isValidRecord()) {
-                                sourceRecord = tradeGR;
-                            } else {
-                                //gs.info('Dynamic Priority - No valid record found in x_hsb11_hsbc_mss_t_hsbc_trade for financial_object.');
-                                return null;
-                            }
-                        } else {
-                            //gs.info('Dynamic Priority - No valid record found in x_hsb11_hsbc_mss_t_trade_case for parent.');
-                            return null;
-                        }
-                    } else {
-                        //gs.info('Dynamic Priority - No matching record found in x_hsb11_hsbc_mss_t_trade_task for sys_id: ' + this.taskRecord.getUniqueValue());
-                        return null;
-                    }
-                } else {
-                    //gs.info('Dynamic Priority - Unsupported table source for cash_equity: ' + tableSource);
-                    return null;
-                }
-            } else {
-                //gs.info('Dynamic Priority - Unsupported target app: ' + targetApp);
-                return null;
-            }
-
-            var value = sourceRecord.getValue(attributeName);
-            //gs.info('Dynamic Priority - Retrieved value: ' + value + ' for attribute: ' + attributeName);
-            return value;
-        } catch (e) {
-            gs.error(this.msg_log + 'Error retrieving value for field: ' + attributeName + ' from table: ' + tableSource + '. Error: ' + e.message);
-            return null;
-        }
-    },
-
-    // Helper: fetch Trade record via double dot-walk (task → case → trade)
-    getTradeRecord: function() {
-        try {
-            var caseRecord = this.taskRecord.parent.getRefRecord();
-            if (!caseRecord || !caseRecord.isValidRecord()) return null;
-
-            var tradeRecord = caseRecord.financial_object.getRefRecord();
-            if (!tradeRecord || !tradeRecord.isValidRecord()) return null;
-
-            return tradeRecord;
-        } catch (e) {
-            gs.error(this.msg_log + 'Error retrieving trade record: ' + e.message);
-            return null;
-        }
-    },
-
-    getCurrencyConversionRate: function(currency) {
-        try {
-            var conversionRateFromCurrencyToEUR = 1; // Default conversion rate from the given currency to EUR
-            var conversionRateFromEURToUSD = 1; // Default conversion rate from EUR to USD
-
-            // Step 1: Fetch conversion rate from the given currency to EUR
-            if (!currency.includes('EUR')) { // Skip if the currency is already EUR
-                var fxRateFromCurrencyToEURGR = new GlideRecord('fx_rate'); // Replace 'fx_rate' with the actual table name
-                fxRateFromCurrencyToEURGR.addQuery('currency', currency); // Assuming 'currency' is the field for the currency
-                fxRateFromCurrencyToEURGR.orderByDesc('sys_created_on'); // Order by the latest created record
-                fxRateFromCurrencyToEURGR.query();
-
-                if (fxRateFromCurrencyToEURGR.next()) {
-                    var rateToCurrency = parseFloat(fxRateFromCurrencyToEURGR.getValue('rate')); // Assuming 'rate' is the field for the rate
-                    if (rateToCurrency > 0) {
-                        conversionRateFromCurrencyToEUR = 1 / rateToCurrency; // Convert to EUR (1 EUR = X currency → 1 currency = 1/X EUR)
-                    } else {
-                        gs.info(this.msg_log + 'Invalid rate for currency ' + currency + '. Rate must be greater than 0.');
-                        return 1; // Default conversion rate if the rate is invalid
-                    }
-                } else {
-                    gs.info(this.msg_log + 'No conversion rate found for currency: ' + currency + ' to EUR.');
-                    return 1; // Default conversion rate if no rate is found
-                }
-            }
-
-            // Step 2: Fetch conversion rate from EUR to USD
-            var fxRateFromEURToUSDGR = new GlideRecord('fx_rate'); // Replace 'fx_rate' with the actual table name
-            fxRateFromEURToUSDGR.addQuery('currency', 'USD'); // Fetch the rate for USD (relative to EUR)
-            fxRateFromEURToUSDGR.orderByDesc('sys_created_on'); // Order by the latest created record
-            fxRateFromEURToUSDGR.query();
-
-            if (fxRateFromEURToUSDGR.next()) {
-                var rateToUSD = parseFloat(fxRateFromEURToUSDGR.getValue('rate'));
-                if (rateToUSD > 0) {
-                    conversionRateFromEURToUSD = rateToUSD; // 1 EUR = X USD
-                } else {
-                    gs.info(this.msg_log + 'Invalid rate for EUR to USD. Rate must be greater than 0.');
-                    return 1; // Default conversion rate if the rate is invalid
-                }
-            } else {
-                gs.info(this.msg_log + 'No conversion rate found for EUR to USD.');
-                return 1; // Default conversion rate if no rate is found
-            }
-
-            // Step 3: Calculate the final conversion rate
-            var finalConversionRate = conversionRateFromCurrencyToEUR * conversionRateFromEURToUSD;
-            //gs.info(this.msg_log + 'Conversion rate for currency ' + currency + ' to USD: ' + finalConversionRate);
-
-            return finalConversionRate;
-        } catch (e) {
-            gs.error(this.msg_log + 'Error in getCurrencyConversionRate: ' + e.message);
-            return 1; // Default conversion rate in case of error
-        }
+        return {
+            priority: this.mapPointsToPriority(score),
+            workNotes: workNotes
+        };
     },
 
     mapPointsToPriority: function(points) {
-        if (points >= 90) return 1;
-        if (points >= 50) return 2;
-        if (points >= 20) return 3;
-        return 4;
+        if (points >= 90) {
+            return 1;
+        } else if (points >= 50) {
+            return 2;
+        } else if (points >= 20) {
+            return 3;
+        } else {
+            return 4;
+        }
     },
-
-    convertTimeZone: function() {
-        //entity HBEU GMT, HSI -5, HBAP + 8
-        var entity = this.taskRecord.hsbc_trade_case.entity;
-        var today = new GlideDateTime();
-        var convertedTime = today;
-        if (entity != "") {
-            if (entity.toUpperCase().includes('HSI')) {
-                convertedTime = new GlideDateTime(global.rmConvertTimeZone(today, "GMT", "US/Eastern"));
-            } else if (entity.toUpperCase().includes('HBAP')) {
-                convertedTime = new GlideDateTime(global.rmConvertTimeZone(today, "GMT", "Hongkong"));
-            }
+    getuserDepartment: function() {
+        function splitRoles(propName) {
+            var v = gs.getProperty(propName, '') + '';
+            if (!v) return [];
+            var arr = v.split(',');
+            for (var i = 0; i < arr.length; i++) arr[i] = (arr[i] || '').trim();
+            return arr;
         }
 
-
-        return convertedTime;
+        function hasAnyRole(list) {
+            for (var i = 0; i < list.length; i++) {
+                if (list[i] && gs.hasRole(list[i])) return true;
+            }
+            return false;
+        }
+        var equity = hasAnyRole(splitRoles('x_hsb11_hsbc_mss_o.cash_equities_roles_to_select_target_app'));
+        var custody = hasAnyRole(splitRoles('x_hsb11_hsbc_mss_o.custody_roles_to_select_target_app'));
+        if (custody && equity) return 'both';
+        if (equity) return 'equity';
+        if (custody) return 'custody';
+        return ''; // same behavior as "undefined" for client comparisons (no rule matched)
     },
 
+
+    convertStringToDateTimeByEntity: function(dateStr, entity, viewTz) {
+        if (!dateStr) {
+			return null;
+        }
+
+        var normalizedDate = normalizeDateString(dateStr);
+        var ent = entity || '';
+        var baseline = viewTz || 'GMT';
+        if (ent === 'HSI') {
+            baseline = 'America/New_York';
+        } else if (ent === 'HBAP') {
+            baseline = 'Asia/Hong_Kong';
+        }
+
+        var gdt = stringToGlideDateTimeByBaseline(normalizedDate, baseline);
+        return gdt;
+
+
+
+        function normalizeDateString(dateStr) {
+            if (/^\d{8}$/.test(dateStr)) {
+                return dateStr.substring(0, 4) + '-' + dateStr.substring(4, 6) + '-' + dateStr.substring(6, 8);
+            }
+
+            if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+                return dateStr;
+            }
+
+            throw 'Unsupported date format: ' + dateStr;
+        }
+
+        function stringToGlideDateTimeByBaseline(dateOnly, tzName) {
+            var offsetHours = getOffsetHours(dateOnly, tzName);
+            var utcDateTime = addHoursToDateTimeString(dateOnly + ' 00:00:00', -offsetHours);
+
+            return new GlideDateTime(utcDateTime);
+        }
+
+        function getOffsetHours(dateOnly, tzName) {
+            if (tzName === 'GMT') {
+                return 0;
+            }
+
+            if (tzName === 'Asia/Hong_Kong') {
+                return 8;
+            }
+
+            // Default to America/New_York-style Eastern time.
+            if (tzName && tzName !== 'America/New_York') {
+                return 0;
+            }
+
+            var year = parseInt(dateOnly.substring(0, 4), 10);
+            var dstStart = getSecondSundayOfMarch(year);
+            var dstEnd = getFirstSundayOfNovember(year);
+
+            // For a date-only value interpreted as midnight local time:
+            // - Before the DST start date: EST (-5)
+            // - From the day after DST start through the DST end date: EDT (-4)
+            // - After DST end date: EST (-5)
+            if (dateOnly > dstStart && dateOnly <= dstEnd) {
+                return -4;
+            }
+
+            return -5;
+        }
+
+        function getSecondSundayOfMarch(year) {
+            return getNthSundayOfMonth(year, 3, 2);
+        }
+
+        function getFirstSundayOfNovember(year) {
+            return getNthSundayOfMonth(year, 11, 1);
+        }
+
+        function getNthSundayOfMonth(year, month, occurrence) {
+            var firstDay = new Date(Date.UTC(year, month - 1, 1));
+            var firstSundayOffset = (7 - firstDay.getUTCDay()) % 7;
+            var dayOfMonth = 1 + firstSundayOffset + (occurrence - 1) * 7;
+            return pad4(year) + '-' + pad2(month) + '-' + pad2(dayOfMonth);
+        }
+
+        function addHoursToDateTimeString(dateTimeStr, hoursToAdd) {
+            var year = parseInt(dateTimeStr.substring(0, 4), 10);
+            var month = parseInt(dateTimeStr.substring(5, 7), 10);
+            var day = parseInt(dateTimeStr.substring(8, 10), 10);
+            var hour = parseInt(dateTimeStr.substring(11, 13), 10);
+            var minute = parseInt(dateTimeStr.substring(14, 16), 10);
+            var second = parseInt(dateTimeStr.substring(17, 19), 10);
+
+            var utcMillis = Date.UTC(year, month - 1, day, hour, minute, second);
+            utcMillis += hoursToAdd * 60 * 60 * 1000;
+
+            var adjusted = new Date(utcMillis);
+            return adjusted.getUTCFullYear() + '-' + pad2(adjusted.getUTCMonth() + 1) + '-' + pad2(adjusted.getUTCDate()) + ' ' + pad2(adjusted.getUTCHours()) + ':' + pad2(adjusted.getUTCMinutes()) + ':' + pad2(adjusted.getUTCSeconds());
+        }
+
+        function pad2(value) {
+            return (value < 10 ? '0' : '') + value;
+        }
+
+        function pad4(value) {
+            var text = String(value);
+            while (text.length < 4) {
+                text = '0' + text;
+            }
+            return text;
+        }
+    },
+
+
+
+
     type: 'TaskPriorityCalc'
-};]]></script>
+});]]></script>
         <sys_class_name>sys_script_include</sys_class_name>
         <sys_created_by>45432468@hsbc.com</sys_created_by>
         <sys_created_on>2025-05-23 07:50:22</sys_created_on>
         <sys_id>0dae4dff1b69a6d06ed00e1ad34bcb96</sys_id>
-        <sys_mod_count>255</sys_mod_count>
+        <sys_mod_count>263</sys_mod_count>
         <sys_name>TaskPriorityCalc</sys_name>
         <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
         <sys_policy>read</sys_policy>
         <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
         <sys_update_name>sys_script_include_0dae4dff1b69a6d06ed00e1ad34bcb96</sys_update_name>
-        <sys_updated_by>45405265@hsbc.com</sys_updated_by>
-        <sys_updated_on>2026-01-07 12:14:29</sys_updated_on>
+        <sys_updated_by>44002602@hsbc.com</sys_updated_by>
+        <sys_updated_on>2026-03-19 02:40:42</sys_updated_on>
     </sys_script_include>
 </record_update>
