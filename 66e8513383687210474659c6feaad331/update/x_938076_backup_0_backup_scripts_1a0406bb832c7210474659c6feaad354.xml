@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="x_938076_backup_0_backup_scripts">
+    <x_938076_backup_0_backup_scripts action="INSERT_OR_UPDATE">
+        <active>true</active>
+        <description/>
+        <name>Fix script to adapt to new risk scoring</name>
+        <order>100</order>
+        <script><![CDATA[try {
+	gs.info('VRM ADVANCE SCORING (Fix Script): START');
+	
+	var dt = new GlideDateTime();
+	
+	gs.info('VRM ADVANCE SCORING (Fix Script): Adding default value of 365 to assessment_results_valid_duration in asmt template');
+	var asmtTemplate = new GlideRecord('sn_vdr_risk_asmt_template');
+	asmtTemplate.addNullQuery('assessment_results_valid_duration');
+	asmtTemplate.setValue('assessment_results_valid_duration', 365);
+	asmtTemplate.setWorkflow(false);
+	asmtTemplate.updateMultiple();
+	
+	gs.info('VRM ADVANCE SCORING (Fix Script): Adding default value of 365 to assessment_results_valid_duration in repeating asmt template');
+	var repeatingAsmtTemplate = new GlideRecord('sn_vdr_risk_asmt_repeating_assessment');
+	repeatingAsmtTemplate.addNullQuery('assessment_results_valid_duration');
+	repeatingAsmtTemplate.setValue('assessment_results_valid_duration', 365);
+	repeatingAsmtTemplate.setWorkflow(false);
+	repeatingAsmtTemplate.updateMultiple();
+	
+	gs.info('VRM ADVANCE SCORING (Fix Script): Adding default risk area definition to questionnaire and document request templates');
+	var riskAreaDefinition = new GlideRecord('sn_vdr_risk_asmt_risk_area_definition');
+	if (!riskAreaDefinition.get('575c3f1873a300100d72a56a4cf6a74d'))
+		throw 'Default risk area definition not found';
+        
+    var metricTypesWithVRACategory = {};
+    var metricCategoriesWithVRA = new GlideRecord('asmt_metric_category');
+    metricCategoriesWithVRA.addNotNullQuery('vrm_category_risk_area');
+    metricCategoriesWithVRA.query();
+    while (metricCategoriesWithVRA.next()) {
+        metricTypesWithVRACategory[metricCategoriesWithVRA.getValue("metric_type")] = "";
+    }
+    metricTypesWithVRACategory = Object.keys(metricTypesWithVRACategory);
+	
+    var questionnaireTemplate = new GlideRecord('asmt_metric_type');
+	questionnaireTemplate.addNullQuery('risk_area_definition');
+    questionnaireTemplate.addQuery('evaluation_method', 'vdr_risk_asmt');
+    questionnaireTemplate.addEncodedQuery("sys_idNOT IN" + metricTypesWithVRACategory.join(','));
+    questionnaireTemplate
+        .addQuery('classification', 'questionnaire_template')
+        .addOrCondition('classification', 'document_request_template')
+        .addOrCondition('classification', 'sig_full')
+        .addOrCondition('classification', 'sig_lite');
+    questionnaireTemplate.setValue('risk_area_definition', riskAreaDefinition.getUniqueValue());
+    questionnaireTemplate.updateMultiple();
+	
+	gs.info('VRM ADVANCE SCORING (Fix Script): Adding default risk area definition to questionnaires');
+    var questionnaire = new GlideRecord('sn_vdr_risk_asmt_m2m_asmt_questionnaire_template');
+	questionnaire.addEncodedQuery('risk_rating_valid_toISEMPTY^ORrisk_area_definitionISEMPTY');
+	questionnaire.query();
+	while (questionnaire.next()) {	
+		if (gs.nil(questionnaire.risk_area_definition))
+			questionnaire.setValue('risk_area_definition', riskAreaDefinition.getUniqueValue());
+		if (gs.nil(questionnaire.risk_rating_valid_to)) {
+			dt = new GlideDateTime(questionnaire.vendor_risk_assessment.sys_created_on);
+			dt.addYearsLocalTime(5);
+			questionnaire.setValue('risk_rating_valid_to', dt);
+		}
+		questionnaire.setWorkflow(false);
+		questionnaire.update();
+	}
+
+	gs.info('VRM ADVANCE SCORING (Fix Script): Adding default risk area definition to document requests');
+    var documentRequest = new GlideRecord('sn_vdr_risk_asmt_m2m_asmt_doc_request');
+	documentRequest.addEncodedQuery('risk_rating_valid_toISEMPTY^ORrisk_area_definitionISEMPTY');
+	documentRequest.query();
+    while (documentRequest.next()) {
+		if (gs.nil(documentRequest.risk_area_definition))
+			documentRequest.setValue('risk_area_definition', riskAreaDefinition.getUniqueValue());
+		if (gs.nil(documentRequest.risk_rating_valid_to)) {
+			dt = new GlideDateTime(documentRequest.vendor_risk_assessment.sys_created_on);
+			dt.addYearsLocalTime(5);
+			documentRequest.setValue('risk_rating_valid_to', dt);
+		}
+		documentRequest.setWorkflow(false);
+		documentRequest.update();
+	}
+	
+	gs.info('VRM ADVANCE SCORING (Fix Script): Adding existing risk area rating as overridden risk rating in vendor risk asmt');
+	var asmt = new GlideRecord('sn_vdr_risk_asmt_assessment');
+	asmt.query();
+	while (asmt.next()) {
+		dt = new GlideDateTime(asmt.getValue('sys_created_on'));
+		dt.addYearsLocalTime(5);
+		
+		if (gs.nil(asmt.risk_rating_valid_to))
+			asmt.setValue('risk_rating_valid_to', dt);
+		
+		if (!gs.nil(asmt.risk_rating) && gs.nil(asmt.computed_risk_rating)) {
+			asmt.setValue('override_risk_rating', true);
+			asmt.setValue('overridden_risk_rating', asmt.getValue('risk_rating'));
+			asmt.setValue('justification', gs.getMessage('Risk rating has been overridden by previous value defined before upgrade.'));
+		}
+		asmt.setWorkflow(false);
+		asmt.update();
+	}
+	
+	gs.info('VRM ADVANCE SCORING (Fix Script): Adding current risk rating as overridden risk rating in vendor');
+	dt = new GlideDateTime();
+	
+	var vendor =  new GlideRecord('core_company');
+	vendor.addQuery('vendor', true);
+	vendor.addNotNullQuery('risk_rating');
+	vendor.addNullQuery('computed_risk_rating');
+	vendor.query();
+	while (vendor.next()) {
+		vendor.setValue('override_risk_rating', true);
+		vendor.setValue('overridden_on', dt);
+		vendor.setValue('overridden_risk_rating', vendor.getValue('risk_rating'));
+		vendor.setValue('justification', gs.getMessage('Risk rating has been overridden by previous value defined before upgrade.'));
+		vendor.update();
+	}
+	
+	gs.info('VRM ADVANCE SCORING (Fix Script): END');
+} catch (e) {
+    gs.error('VRM ADVANCE SCORING (Fix Script): ' + e);
+}]]></script>
+        <sys_class_name>x_938076_backup_0_backup_scripts</sys_class_name>
+        <sys_created_by>oauth.profile</sys_created_by>
+        <sys_created_on>2025-10-19 14:46:38</sys_created_on>
+        <sys_id>1a0406bb832c7210474659c6feaad354</sys_id>
+        <sys_mod_count>2</sys_mod_count>
+        <sys_name>100</sys_name>
+        <sys_package display_value="Backup Scripts" source="x_938076_backup_0">66e8513383687210474659c6feaad331</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Backup Scripts">66e8513383687210474659c6feaad331</sys_scope>
+        <sys_update_name>x_938076_backup_0_backup_scripts_1a0406bb832c7210474659c6feaad354</sys_update_name>
+        <sys_updated_by>oauth.profile</sys_updated_by>
+        <sys_updated_on>2025-10-19 15:14:45</sys_updated_on>
+    </x_938076_backup_0_backup_scripts>
+</record_update>
