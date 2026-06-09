@@ -686,7 +686,7 @@ OAuthTokenGenerator.prototype = Object.extendsObject(global.AbstractAjaxProcesso
 
     incidentSummary: function() {
 
-		var incSysID = this.getParameter('sysparm_incID');
+        var incSysID = this.getParameter('sysparm_incID');
 
         var inc = new GlideRecord("incident");
         if (inc.get(incSysID)) {
@@ -694,13 +694,13 @@ OAuthTokenGenerator.prototype = Object.extendsObject(global.AbstractAjaxProcesso
             // ✅ Build Timeline from Work Notes
             var timeline = "";
             var jrnl = new GlideRecord("sys_journal_field");
-            jrnl.addQuery("element_id", inc.sys_id);
-            jrnl.addQuery("element", "work_notes"); // only work notes
+            jrnl.addEncodedQuery("element_id=" + incSysID);
             jrnl.orderBy("sys_created_on");
             jrnl.query();
 
+
             while (jrnl.next()) {
-                timeline += jrnl.sys_created_on + " - " + jrnl.value + "\n";
+                timeline += jrnl.sys_created_on + "- " + jrnl.sys_created_by + " - " + jrnl.value + "\n";
             }
 
             // ✅ Build Prompt
@@ -711,9 +711,51 @@ OAuthTokenGenerator.prototype = Object.extendsObject(global.AbstractAjaxProcesso
                 "but DO NOT invent specific timestamps, dates, or factual events.\n" +
                 "If data is missing, summarize instead of inserting placeholders.\n\n" +
 
+                "If caller name, impact, or category are available, use them to make the summary more descriptive.\n\n" +
+
+                "For Suggestions by AI:\n" +
+                "- If relevant suggestions can be derived from general best practices or open-source knowledge, include them.\n" +
+                "- Otherwise, omit the 'Suggestions by AI' section entirely.\n\n" +
+
+                "For Actions Taken:\n" +
+                "- The input is a raw timeline in the format: timestamp - user - action.\n" +
+                "- DO NOT copy, repeat, or list the raw timeline entries.\n" +
+                "- DO NOT include timestamps in this section.\n" +
+                "- Convert the timeline into a clear, concise, human-readable narrative.\n" +
+                "- Combine related actions into meaningful sentences.\n" +
+                "- Clearly describe WHO performed the action and WHAT was done.\n" +
+                "- Distinguish between user-reported issues and agent/admin actions.\n" +
+                "- Rewrite questions or notes into proper descriptive statements.\n" +
+                "- Focus on enabling the next agent to quickly understand progress.\n\n" +
+
+
+                "For Resolutions:\n" +
+                "- Use the resolution use the timelines, actions, descrition and shortdesctions details as well to compose a detailed resolution.\n" +
+                "- Convert the timeline into a clear, concise, human-readable narrative.\n" +
+                "- Combine related actions into meaningful sentences.\n" +
+                "- Rewrite questions or notes into proper descriptive statements.\n" +
+                "- Focus on enabling the next agent to quickly understand progress.\n\n" +
+
+                "Example transformation:\n" +
+                "Input: 2025-12-15 04:38:43 - itil - User can't access SAP\n" +
+                "Output: The agent investigated a reported issue where the user was unable to access the SAP system.\n\n" +
+
+                "Another example:\n" +
+                "Input: Multiple timeline entries\n" +
+                "Output: The administrator analyzed the issue, performed initial troubleshooting steps, and later attached supporting information for further investigation.\n\n" +
+
+                "IMPORTANT:\n" +
+                "- Actions Taken MUST be written as descriptive sentences.\n" +
+                "- It MUST NOT contain raw logs, timestamps, or bullet-style entries.\n\n" +
+
                 "Date: " + inc.opened_at.getDisplayValue() + "\n" +
                 "Short Description: " + inc.short_description + "\n" +
-                "Actions Taken: " + timeline + "\n" +
+                "Raw Timeline Entries (for interpretation only, DO NOT copy): " + timeline + "\n" +
+                "Description: " + inc.description + "\n\n" +
+
+                "Caller: " + (inc.caller_id ? inc.caller_id.getDisplayValue() : " ") + "\n\n" +
+                "Category: " + (inc.category ? inc.category.getDisplayValue() : " ") + "\n\n" +
+
                 "Resolution: " + inc.close_notes + "\n\n" +
 
                 "Return format:\n\n" +
@@ -726,15 +768,16 @@ OAuthTokenGenerator.prototype = Object.extendsObject(global.AbstractAjaxProcesso
                 "* Resolution:\n\n" +
 
                 "Incident Timeline:\n" +
-                "- derive from inputs without guessing timestamps\n\n" +
+                "- Derive events from inputs without guessing timestamps\n\n" +
 
                 "Lessons Learned:\n" +
                 "- ...\n\n" +
 
                 "Post-Incident Review:\n" +
+                "- ...\n\n" +
+
+                "Suggestions by AI (include only if applicable):\n" +
                 "- ...";
-
-
             var body = {
                 model: "llama3",
                 prompt: prompt,
@@ -754,6 +797,7 @@ OAuthTokenGenerator.prototype = Object.extendsObject(global.AbstractAjaxProcesso
             r.setEccCorrelator(inc.sys_id);
 
             var response = r.execute();
+			return inc.sys_id;
             // response.waitForResponse(60);
 
             //gs.info("Request sent for Incident: " + inc.number);
@@ -763,19 +807,62 @@ OAuthTokenGenerator.prototype = Object.extendsObject(global.AbstractAjaxProcesso
     },
 
 
+    fetchECCResult: function() {
+
+        var jobId = this.getParameter('sysparm_jobId');
+
+        var gr = new GlideRecord('ecc_queue');
+        gr.addEncodedQuery('source=http://localhost:11434/api/generate^agent_correlator=' + jobId + '^queue=input');
+        gr.orderByDesc('sys_created_on');
+        gr.query();
+
+        if (gr.next()) {
+
+            try {
+                var xml = gr.payload;
+
+                var xmlDoc = new XMLDocument2();
+                xmlDoc.parseXML(xml);
+
+                var outputNode = xmlDoc.getNode("//output");
+                if (!outputNode) {
+                    return "Error: No output node";
+                }
+
+                var jsonString = outputNode.getTextContent();
+                var obj = JSON.parse(jsonString);
+                var aiText = obj.response;
+
+                var match = aiText.match(/Incident Summary[\s\S]*/);
+                if (match) {
+                    aiText = match[0];
+                }
+
+                aiText = aiText.replace(/\*\*/g, "").trim();
+
+                return aiText;
+            } catch (e) {
+                return "Error parsing response";
+            }
+        }
+
+        return "WAITING";
+    },
+
+
     type: 'OAuthTokenGenerator'
 });]]></script>
         <sys_class_name>sys_script_include</sys_class_name>
         <sys_created_by>admin</sys_created_by>
         <sys_created_on>2025-10-19 12:00:17</sys_created_on>
         <sys_id>75ad15b39720f2d0a78db62de053af55</sys_id>
-        <sys_mod_count>46</sys_mod_count>
+        <sys_mod_count>53</sys_mod_count>
         <sys_name>OAuthTokenGenerator</sys_name>
         <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
         <sys_policy>read</sys_policy>
         <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
         <sys_update_name>sys_script_include_75ad15b39720f2d0a78db62de053af55</sys_update_name>
         <sys_updated_by>admin</sys_updated_by>
-        <sys_updated_on>2026-06-09 09:24:41</sys_updated_on>
+        <sys_updated_on>2026-06-09 14:06:18</sys_updated_on>
     </sys_script_include>
 </record_update>
