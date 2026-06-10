@@ -714,8 +714,11 @@ OAuthTokenGenerator.prototype = Object.extendsObject(global.AbstractAjaxProcesso
                 "If caller name, impact, or category are available, use them to make the summary more descriptive.\n\n" +
 
                 "For Suggestions by AI:\n" +
-                "- If relevant suggestions can be derived from general best practices or open-source knowledge, include them.\n" +
-                "- Otherwise, omit the 'Suggestions by AI' section entirely.\n\n" +
+                "- MUST always provide at least 2–3 actionable troubleshooting or preventive suggestions.\n" +
+                "- DO NOT return 'None applicable', 'not specified', or leave this section empty.\n" +
+                "- Suggestions should be practical and directly relevant to the issue.\n" +
+                "- Focus on troubleshooting steps, validation checks, monitoring, and prevention strategies.\n" +
+                "- Each suggestion MUST be written as a separate bullet point using '-' and placed on a new line.\n\n" +
 
                 "For Actions Taken:\n" +
                 "- The input is a raw timeline in the format: timestamp - user - action.\n" +
@@ -728,13 +731,33 @@ OAuthTokenGenerator.prototype = Object.extendsObject(global.AbstractAjaxProcesso
                 "- Rewrite questions or notes into proper descriptive statements.\n" +
                 "- Focus on enabling the next agent to quickly understand progress.\n\n" +
 
-
                 "For Resolutions:\n" +
-                "- Use the resolution use the timelines, actions, descrition and shortdesctions details as well to compose a detailed resolution.\n" +
-                "- Convert the timeline into a clear, concise, human-readable narrative.\n" +
+                "- Use the resolution, timelines, actions, description, and short description details to compose a detailed resolution.\n" +
+                "- Convert inputs into a clear, concise, human-readable narrative.\n" +
                 "- Combine related actions into meaningful sentences.\n" +
                 "- Rewrite questions or notes into proper descriptive statements.\n" +
                 "- Focus on enabling the next agent to quickly understand progress.\n\n" +
+
+                "For Lessons Learned:\n" +
+                "- MUST provide at least 2–3 meaningful and actionable insights.\n" +
+                "- DO NOT return 'not specified', '...', or leave this section empty.\n" +
+                "- DO NOT combine multiple lessons into a single paragraph.\n" +
+                "- Each lesson MUST be written as a separate bullet point using '-' on a new line.\n" +
+                "- Add one blank line between each point for readability.\n" +
+                "- Focus on prevention, validation gaps, upgrade impacts, monitoring gaps, and process improvements.\n\n" +
+
+                "For Post-Incident Review:\n" +
+                "- MUST provide a structured analysis of what went well and what could be improved.\n" +
+                "- DO NOT return 'not specified', '...', or leave this section empty.\n" +
+                "- Each point MUST be written as a separate bullet point on a new line.\n" +
+                "- Add one blank line between each point for clarity.\n" +
+                "- Focus on improving testing, communication, monitoring, and incident response processes.\n\n" +
+
+                "Formatting Instructions:\n" +
+                "- All lists MUST use '-' bullet points (NOT numbered lists).\n" +
+                "- Each point MUST start on a new line.\n" +
+                "- Insert a blank line between each bullet point.\n" +
+                "- Do NOT merge multiple points into a single paragraph.\n\n" +
 
                 "Example transformation:\n" +
                 "Input: 2025-12-15 04:38:43 - itil - User can't access SAP\n" +
@@ -746,7 +769,11 @@ OAuthTokenGenerator.prototype = Object.extendsObject(global.AbstractAjaxProcesso
 
                 "IMPORTANT:\n" +
                 "- Actions Taken MUST be written as descriptive sentences.\n" +
-                "- It MUST NOT contain raw logs, timestamps, or bullet-style entries.\n\n" +
+                "- It MUST NOT contain raw logs, timestamps, or bullet-style entries.\n" +
+                "- Lessons Learned, Post-Incident Review, and Suggestions by AI MUST NEVER be empty.\n" +
+                "- DO NOT output placeholders like '...', 'not specified', or 'None applicable'.\n" +
+                "- Always generate meaningful and actionable insights even if data is limited.\n" +
+                "- Prioritize practical and realistic recommendations over generic statements.\n\n" +
 
                 "Date: " + inc.opened_at.getDisplayValue() + "\n" +
                 "Short Description: " + inc.short_description + "\n" +
@@ -771,13 +798,13 @@ OAuthTokenGenerator.prototype = Object.extendsObject(global.AbstractAjaxProcesso
                 "- Derive events from inputs without guessing timestamps\n\n" +
 
                 "Lessons Learned:\n" +
-                "- ...\n\n" +
+                "- (multiple bullet points with spacing)\n\n" +
 
                 "Post-Incident Review:\n" +
-                "- ...\n\n" +
+                "- (multiple bullet points with spacing)\n\n" +
 
-                "Suggestions by AI (include only if applicable):\n" +
-                "- ...";
+                "Suggestions by AI:\n" +
+                "- (multiple actionable bullet points with spacing)";
             var body = {
                 model: "llama3",
                 prompt: prompt,
@@ -797,7 +824,7 @@ OAuthTokenGenerator.prototype = Object.extendsObject(global.AbstractAjaxProcesso
             r.setEccCorrelator(inc.sys_id);
 
             var response = r.execute();
-			return inc.sys_id;
+            return inc.sys_id;
             // response.waitForResponse(60);
 
             //gs.info("Request sent for Incident: " + inc.number);
@@ -812,7 +839,12 @@ OAuthTokenGenerator.prototype = Object.extendsObject(global.AbstractAjaxProcesso
         var jobId = this.getParameter('sysparm_jobId');
 
         var gr = new GlideRecord('ecc_queue');
-        gr.addEncodedQuery('source=http://localhost:11434/api/generate^agent_correlator=' + jobId + '^queue=input');
+        gr.addEncodedQuery(
+            'source=http://localhost:11434/api/generate' +
+            '^agent_correlator=' + jobId +
+            '^queue=input' +
+            '^state=ready' // ✅ ONLY completed records
+        );
         gr.orderByDesc('sys_created_on');
         gr.query();
 
@@ -821,34 +853,59 @@ OAuthTokenGenerator.prototype = Object.extendsObject(global.AbstractAjaxProcesso
             try {
                 var xml = gr.payload;
 
+                // ✅ Ensure payload exists
+                if (!xml) {
+                    return "WAITING";
+                }
+
                 var xmlDoc = new XMLDocument2();
                 xmlDoc.parseXML(xml);
 
+                // ✅ YOUR WORKING NODE
                 var outputNode = xmlDoc.getNode("//output");
+
                 if (!outputNode) {
-                    return "Error: No output node";
+                    return "WAITING";
                 }
 
                 var jsonString = outputNode.getTextContent();
-                var obj = JSON.parse(jsonString);
+
+                if (!jsonString) {
+                    return "WAITING";
+                }
+
+                var obj;
+
+                try {
+                    obj = JSON.parse(jsonString);
+                } catch (e) {
+                    return "WAITING";
+                }
+
+                if (!obj || !obj.response) {
+                    return "WAITING";
+                }
+
                 var aiText = obj.response;
 
+                // ✅ Extract only Incident Summary section
                 var match = aiText.match(/Incident Summary[\s\S]*/);
                 if (match) {
                     aiText = match[0];
                 }
 
+                // ✅ Clean formatting
                 aiText = aiText.replace(/\*\*/g, "").trim();
 
                 return aiText;
+
             } catch (e) {
-                return "Error parsing response";
+                return "WAITING";
             }
         }
 
         return "WAITING";
     },
-
 
     type: 'OAuthTokenGenerator'
 });]]></script>
@@ -856,13 +913,13 @@ OAuthTokenGenerator.prototype = Object.extendsObject(global.AbstractAjaxProcesso
         <sys_created_by>admin</sys_created_by>
         <sys_created_on>2025-10-19 12:00:17</sys_created_on>
         <sys_id>75ad15b39720f2d0a78db62de053af55</sys_id>
-        <sys_mod_count>53</sys_mod_count>
+        <sys_mod_count>58</sys_mod_count>
         <sys_name>OAuthTokenGenerator</sys_name>
         <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
         <sys_policy>read</sys_policy>
         <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
         <sys_update_name>sys_script_include_75ad15b39720f2d0a78db62de053af55</sys_update_name>
         <sys_updated_by>admin</sys_updated_by>
-        <sys_updated_on>2026-06-09 14:06:18</sys_updated_on>
+        <sys_updated_on>2026-06-10 07:24:54</sys_updated_on>
     </sys_script_include>
 </record_update>
