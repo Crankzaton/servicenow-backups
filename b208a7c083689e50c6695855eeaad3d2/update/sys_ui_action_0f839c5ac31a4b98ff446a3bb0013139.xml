@@ -1,0 +1,364 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="sys_ui_action">
+    <sys_ui_action action="INSERT_OR_UPDATE">
+        <action_name/>
+        <active>false</active>
+        <client>true</client>
+        <client_script_v2><![CDATA[function onClick(g_form) {
+
+}]]></client_script_v2>
+        <comments/>
+        <condition>new sn_nowassist_admin.NowAssistSkillConfig().isSkillConfigurationActive('582050d6c3d64b98ff446a3bb0013123')</condition>
+        <form_action>true</form_action>
+        <form_button>true</form_button>
+        <form_button_v2>true</form_button_v2>
+        <form_context_menu>false</form_context_menu>
+        <form_link>false</form_link>
+        <form_menu_button_v2>false</form_menu_button_v2>
+        <form_style/>
+        <format_for_configurable_workspace>false</format_for_configurable_workspace>
+        <hint/>
+        <isolate_script>false</isolate_script>
+        <list_action>false</list_action>
+        <list_banner_button>false</list_banner_button>
+        <list_button>false</list_button>
+        <list_choice>false</list_choice>
+        <list_context_menu>false</list_context_menu>
+        <list_link>false</list_link>
+        <list_save_with_form_button>false</list_save_with_form_button>
+        <list_style/>
+        <messages/>
+        <name>Incident Quality Checker</name>
+        <onclick>qualityCheck()</onclick>
+        <order>100</order>
+        <script><![CDATA[function qualityCheck() {
+
+    g_form.clearMessages();
+    g_form.addInfoMessage("Generating Quality Check via Now Assist... please wait.");
+
+    var ga = new GlideAjax('sn_itsm_gen_ai.synergizeDemoUtils');
+    ga.addParam('sysparm_name', 'executeQualityCheck');
+    ga.addParam('sysparm_inc_id', g_form.getUniqueValue());
+
+    ga.getXMLAnswer(function(response) {
+
+        g_form.clearMessages();
+
+        if (!response) {
+            g_form.addErrorMessage("No response received from the server.");
+            return;
+        }
+
+        var finalPlainOutput = cleanQualityCheckOutput(response);
+
+        if (finalPlainOutput.indexOf("ERROR:") === 0) {
+            g_form.addErrorMessage(finalPlainOutput.replace("ERROR:", "").trim());
+            return;
+        }
+
+        /*
+         Optional:
+         Store plain text output in a field if needed.
+         Replace u_quality_check_output with your actual field name.
+        */
+        if (g_form.getControl('u_quality_check_output')) {
+            g_form.setValue('u_quality_check_output', finalPlainOutput);
+        }
+
+        /*
+         Display formatted output in the ServiceNow suggestion message banner.
+        */
+        var finalHtmlOutput = convertQualityCheckToHtml(finalPlainOutput);
+        g_form.addSuggestionMessage(finalHtmlOutput);
+    });
+}
+
+
+function cleanQualityCheckOutput(response) {
+
+    var output = response + '';
+
+    /*
+     1. Decode escaped characters.
+    */
+    output = output.replace(/\\r\\n/g, '\n');
+    output = output.replace(/\\n/g, '\n');
+    output = output.replace(/\\r/g, '\n');
+    output = output.replace(/\\t/g, ' ');
+    output = output.replace(/\\"/g, '"');
+
+    /*
+     2. Decode common HTML entities.
+     Keeping &lt; and &gt; as encoded because this is working
+     with addSuggestionMessage in your instance.
+    */
+    output = output.replace(/&lt;/g, '&lt;');
+    output = output.replace(/&gt;/g, '&gt;');
+    output = output.replace(/&amp;/g, '&');
+    output = output.replace(/&quot;/g, '"');
+    output = output.replace(/'/g, "'");
+
+    /*
+     3. Try JSON parse if the response is proper JSON.
+    */
+    try {
+        var parsed = JSON.parse(output);
+
+        if (parsed.error) {
+            return "ERROR: " + parsed.error;
+        }
+
+        if (parsed.model_output) {
+            output = parsed.model_output + '';
+        } else if (parsed.output) {
+            output = parsed.output + '';
+        } else if (parsed.result) {
+            output = parsed.result + '';
+        }
+
+    } catch (e) {
+        /*
+         Not valid JSON.
+         Continue with string cleanup.
+        */
+    }
+
+    output = output.trim();
+
+    /*
+     4. Remove model_output wrapper even if response is not valid JSON.
+     Handles:
+     "model_output": "&lt;br&gt;..."
+     {"model_output": "&lt;br&gt;..."}
+    */
+    output = output.replace(/^\s*\{?\s*"model_output"\s*:\s*/i, '');
+    output = output.replace(/^\s*\{?\s*model_output\s*:\s*/i, '');
+
+    output = output.trim();
+
+    /*
+     5. Remove only outer starting quote.
+    */
+    if (output.charAt(0) === '"') {
+        output = output.substring(1);
+    }
+
+    output = output.trim();
+
+    /*
+     6. Remove closing quote and brace at the end.
+     This removes trailing:
+     "}
+     "}
+     "
+     }
+    */
+    output = output.replace(/"\s*\}\s*$/g, '');
+    output = output.replace(/\}\s*$/g, '');
+    output = output.replace(/"\s*$/g, '');
+
+    output = output.trim();
+
+    /*
+     7. Remove markdown wrappers.
+    */
+    output = output.replace(/```markdown/gi, '');
+    output = output.replace(/```/g, '');
+
+    /*
+     8. Convert HTML line breaks into actual new lines.
+    */
+    output = output.replace(/&lt;br\s*\/?&gt;/gi, '\n');
+
+    /*
+     9. Remove original strong tags and all HTML tags.
+     This removes:
+     &lt;strong data-lexical-text="true"&gt;
+     &lt;/strong&gt;
+    */
+    output = output.replace(/&lt;strong[^&gt;]*&gt;/gi, '');
+    output = output.replace(/&lt;\/strong&gt;/gi, '');
+    output = output.replace(/&lt;[^&gt;]+&gt;/g, '');
+
+    /*
+     10. Remove markdown bold symbols.
+    */
+    output = output.replace(/\*\*/g, '');
+
+    /*
+     11. Remove remaining unnecessary backslashes.
+    */
+    output = output.replace(/\\/g, '');
+
+    /*
+     12. Remove model_output again in case it remained after tag cleaning.
+    */
+    output = output.replace(/^\s*\{?\s*"model_output"\s*:\s*/i, '');
+    output = output.replace(/^\s*\{?\s*model_output\s*:\s*/i, '');
+
+    output = output.trim();
+
+    /*
+     13. Remove remaining outer quotes/braces again.
+    */
+    if (output.charAt(0) === '"') {
+        output = output.substring(1);
+    }
+
+    output = output.replace(/"\s*\}\s*$/g, '');
+    output = output.replace(/\}\s*$/g, '');
+    output = output.replace(/"\s*$/g, '');
+
+    output = output.trim();
+
+    /*
+     14. Normalize Quality Check.
+    */
+    output = output.replace(/Quality Check:\s*(\d+)\s*%/i, 'Quality Check: $1%');
+
+    /*
+     15. Normalize Recommendations.
+     Creates a blank line between Quality Check and Recommendations.
+    */
+    output = output.replace(/\s*Recommendations:\s*/i, '\n\nRecommendations:\n\n');
+
+    /*
+     16. Put each recommendation point on a new line.
+     This avoids breaking values like Priority (5).
+    */
+    output = output.replace(/\s+([1-9]\d?\)\s+[A-Z])/g, '\n\n$1');
+
+    /*
+     17. Clean spacing.
+    */
+    output = output.replace(/[ \t]+/g, ' ');
+    output = output.replace(/\n[ \t]+/g, '\n');
+    output = output.replace(/\n{5,}/g, '\n\n');
+
+    /*
+     18. Ensure final desired spacing:
+     Quality Check: 35%
+
+     Recommendations:
+
+     1) ...
+    */
+    output = output.replace(/(Quality Check:\s*\d+%)\s*\n+\s*(Recommendations:)/i, '$1\n\n$2');
+    output = output.replace(/(Recommendations:)\s*\n+(\d+\))/i, '$1\n\n$2');
+
+    /*
+     19. Final cleanup for any leftover closing characters.
+    */
+    output = output.replace(/"\s*\}\s*$/g, '');
+    output = output.replace(/\}\s*$/g, '');
+    output = output.replace(/"\s*$/g, '');
+
+    return output.trim();
+}
+
+
+function convertQualityCheckToHtml(plainText) {
+
+    var html = plainText || '';
+
+    /*
+     1. Extract quality score.
+    */
+    var score = 0;
+    var scoreMatch = html.match(/Quality Check:\s*(\d+)%/i);
+
+    if (scoreMatch && scoreMatch.length > 1) {
+        score = parseInt(scoreMatch[1], 10);
+    }
+
+    /*
+     2. Continuous 3-color logic.
+     Every percentage from 0 to 100 is covered.
+
+     0  to 30  = Red
+     31 to 70  = Blue
+     71 to 100 = Dark Green
+    */
+    var scoreColor = '#000000';
+
+    if (score >= 0 && score <= 30) {
+        scoreColor = '#D71920'; // Red
+    } else if (score >= 31 && score <= 70) {
+        scoreColor = '#0070C0'; // Blue
+    } else if (score >= 71 && score <= 100) {
+        scoreColor = '#006100'; // Dark Green
+    }
+
+    /*
+     3. Use actual HTML tags here.
+     Do not use &lt;b&gt; or &lt;br/&gt; here.
+     addSuggestionMessage is rendering actual <b> correctly in your instance.
+    */
+
+    /*
+     4. Bold Quality Check and color-code percentage.
+    */
+    html = html.replace(
+        /Quality Check:\s*(\d+)%/i,
+        '<b>Quality Check:</b> <font color="' + scoreColor + '"><b>$1%</b></font>'
+    );
+
+    /*
+     5. Bold Recommendations heading.
+    */
+    html = html.replace(
+        /Recommendations:/i,
+        '<b>Recommendations:</b>'
+    );
+
+    /*
+     6. Bold only recommendation title before colon.
+     Example:
+     1) Short Description Formatting:
+     becomes:
+     1) <b>Short Description Formatting:</b>
+
+     The explanation after the colon remains normal.
+    */
+    html = html.replace(
+        /(^|\n+)([1-9]\d?\)\s+)([^:\n]{2,180}:)/g,
+        function(match, lineBreaks, numberPart, titlePart) {
+            return lineBreaks +
+                numberPart +
+                '<b>' +
+                titlePart +
+                '</b>';
+        }
+    );
+
+    /*
+     7. Convert line breaks to visible HTML breaks.
+     Use actual <br/> tags.
+    */
+    html = html.replace(/\n/g, '<br/>');
+
+    return html;
+}]]></script>
+        <show_insert>true</show_insert>
+        <show_multiple_update>false</show_multiple_update>
+        <show_query>false</show_query>
+        <show_update>true</show_update>
+        <sys_class_name>sys_ui_action</sys_class_name>
+        <sys_created_by>gokul.nath-varadarajan@capgemini.com</sys_created_by>
+        <sys_created_on>2026-07-27 10:45:18</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>0f839c5ac31a4b98ff446a3bb0013139</sys_id>
+        <sys_mod_count>20</sys_mod_count>
+        <sys_name>Incident Quality Checker</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_ui_action_0f839c5ac31a4b98ff446a3bb0013139</sys_update_name>
+        <sys_updated_by>gokul.nath-varadarajan@capgemini.com</sys_updated_by>
+        <sys_updated_on>2026-07-31 10:39:37</sys_updated_on>
+        <table>incident</table>
+        <ui11_compatible>true</ui11_compatible>
+        <ui16_compatible>false</ui16_compatible>
+    </sys_ui_action>
+</record_update>

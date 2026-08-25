@@ -1,0 +1,870 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>030d15a1f391021000baad941484caca</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_udc.CollectionItem&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;mobile_callable&gt;false&lt;/mobile_callable&gt;
+        &lt;name&gt;CollectionItem&lt;/name&gt;
+        &lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;
+        &lt;script&gt;&lt;![CDATA[class CollectionItem {
+    static type = 'CollectionItem';
+    static TABLE = 'sn_udc_collection_item';
+    static M2M_TABLE = 'sn_udc_collection_item_m2m';
+    static Column = {
+        SysId: 'sys_id',
+        User: 'user',
+        Collection: 'collection',
+        FileTable: 'file_table',
+        File: 'file',
+        Url: 'url',
+        Label: 'label',
+        TaxonomyType: 'taxonomy_type'
+    };
+    static M2MColumn = {
+        Collection: 'collection',
+        CollectionItem: 'collection_item'
+    };
+
+    static #FileType = {
+        Apps: 'apps',
+        Files: 'files',
+        Lists: 'lists'
+    };
+
+    static #LOG = new Logger(CollectionItem.type);
+
+    static getDuplicateCollectionItem(collectionItemDetails, userSysId, excludeSysId) {
+        CollectionItem.#validateCollectionItemDetails(collectionItemDetails);
+
+        if (gs.nil(userSysId)) {
+            throw 'User sys id is not specified.';
+        }
+
+        const {
+            file,
+            fileTable,
+            url
+        } = collectionItemDetails;
+
+        const isListBookmark = CollectionItem.#isListBookmark(fileTable, file, url);
+
+        var gr = new GlideRecordSecure(CollectionItem.TABLE);
+        gr.addQuery(CollectionItem.Column.User, userSysId);
+
+        if (isListBookmark) {
+            // List bookmarks are scoped by url — unique (user, url) index enforces one record per user per URL
+            gr.addQuery(CollectionItem.Column.Url, url);
+        } else {
+            gr.addQuery(CollectionItem.Column.FileTable, fileTable);
+            gr.addQuery(CollectionItem.Column.File, file);
+        }
+
+        if (excludeSysId) {
+            gr.addQuery(CollectionItem.Column.SysId, '!=', excludeSysId);
+        }
+
+        gr.setLimit(1);
+        gr.query();
+
+        return gr;
+    }
+
+    static doesCollectionItemExist(collectionItemDetails, userSysId, excludeSysId) {
+        const result = this.getDuplicateCollectionItem(collectionItemDetails, userSysId, excludeSysId);
+
+        if (result === false)
+            return false;
+
+        return result.hasNext();
+    }
+
+    static doesCurrentUserHaveCollectionItem(collectionItemDetails, excludeSysId) {
+        return CollectionItem.doesCollectionItemExist(collectionItemDetails, gs.getUserID(), excludeSysId);
+    }
+
+    static insertCollectionItemForCollection(collectionId, collectionItemDetails) {
+        if (gs.nil(collectionId)) {
+            throw 'Invalid collection item insertion. Collection sys id is not specified.';
+        }
+
+        CollectionItem.#validateCollectionItemDetails(collectionItemDetails);
+
+        if (!Collection.isCollectionOwnedByCurrentUser(collectionId)) {
+            throw 'Collection with sys_id: ' + collectionId + ' is invalid, does not exist, or you do not have access to it.';
+        }
+        const collectionItemSysId = CollectionItem.#getOrCreateCollectionItem(collectionItemDetails);
+
+        if (CollectionItem.#doesM2mRecordExist(collectionId, collectionItemSysId)) {
+            throw 'Collection item already exists in this collection.';
+        }
+
+        CollectionItem.#insertM2mRecord(collectionId, collectionItemSysId);
+
+        return collectionItemSysId;
+    }
+
+    static deleteCollectionItem(collectionItemSysId) {
+        if (gs.nil(collectionItemSysId)) {
+            throw `Invalid collection item deletion. Collection item sys id: ${collectionItemSysId} specified is invalid.`;
+        }
+
+        var gr = new GlideRecordSecure(CollectionItem.TABLE);
+
+        if (!gr.get(collectionItemSysId)) {
+            const message = `Collection item does not exists with sys id: ${collectionItemSysId}`
+            this.#LOG.info(message)
+            return
+        }
+
+        if (!gr.deleteRecord()) {
+            throw 'Failed to delete collection item.'
+        }
+
+        return true;
+    }
+
+    static getCollectionItemsForUser(collectionId, options = {}) {
+        return CollectionItem.getCollectionItemsByCollection(collectionId, {
+            ...options,
+            userSysId: gs.getUserID()
+        });
+    }
+
+    static getCollectionItemsByCollection(collectionId, options = {}) {
+        if (gs.nil(collectionId)) {
+            throw 'Invalid collection items retrieval. Collection sys id is not specified.';
+        }
+
+        const {
+            userSysId,
+            type
+        } = options;
+
+        const collectionItemsGr = new GlideRecordSecure(CollectionItem.TABLE);
+
+        const m2mJoin = collectionItemsGr.addJoinQuery(
+            CollectionItem.M2M_TABLE,
+            CollectionItem.Column.SysId,
+            CollectionItem.M2MColumn.CollectionItem
+        );
+        m2mJoin.addCondition(CollectionItem.M2MColumn.Collection, collectionId);
+
+        collectionItemsGr.addNotNullQuery(CollectionItem.Column.FileTable);
+
+        if (userSysId) {
+            collectionItemsGr.addQuery(CollectionItem.Column.User, userSysId);
+        }
+
+        if (type === CollectionItem.#FileType.Apps) {
+            collectionItemsGr.addNotNullQuery(CollectionItem.Column.File);
+            collectionItemsGr.addQuery(CollectionItem.Column.FileTable, 'IN', Object.keys(UDCConstants.APP_TABLES).join(','));
+        }
+
+        if (type === CollectionItem.#FileType.Files) {
+            collectionItemsGr.addNotNullQuery(CollectionItem.Column.File);
+            collectionItemsGr.addQuery(CollectionItem.Column.FileTable, '!=', Object.keys(UDCConstants.APP_TABLES).join(','));
+        }
+
+        if (type === CollectionItem.#FileType.Lists) {
+            collectionItemsGr.addNullQuery(CollectionItem.Column.File);
+            collectionItemsGr.addNotNullQuery(CollectionItem.Column.Url);
+        }
+
+        collectionItemsGr.query();
+
+        const processedResponse = CollectionItem.#processCollectionItems(collectionItemsGr);
+
+        switch (type) {
+            case CollectionItem.#FileType.Apps: {
+                return {
+                    apps: processedResponse.apps
+                };
+            }
+
+            case CollectionItem.#FileType.Files: {
+                return {
+                    files: processedResponse.files
+                };
+            }
+
+            case CollectionItem.#FileType.Lists: {
+                // Historical quirk: list items are returned under the "files" key, not "lists".
+                // Documented in current_sn_udc_collection_item_api_spec.json. Callers depend on
+                // this shape — do not change without a coordinated consumer update.
+                return {
+                    files: processedResponse.lists
+                };
+            }
+
+            default:
+                return processedResponse;
+        }
+    }
+
+    static getCollectionItemDetails(collectionItemSysId) {
+        const collectionItemsGr = new GlideRecordSecure(CollectionItem.TABLE);
+
+        if (!collectionItemsGr.get(collectionItemSysId)) {
+            throw `Collection item does not exists with sys id: ${collectionItemSysId}`;
+        }
+
+        // Get all taxonomy types grouped by table name
+        const taxonomyTypes = UDCUtil.groupBy(FileTaxonomy.getTaxonomyTypesDetails(), 'table');
+
+        return CollectionItem.#processCollectionItem(collectionItemsGr, taxonomyTypes);
+    }
+
+    static updateCollectionItem(collectionItemSysId, updatedCollectionItemDetails) {
+        if (gs.nil(collectionItemSysId)) {
+            throw new Error(`Invalid collection item. Collection item sys id: ${collectionItemSysId} specified is invalid.`);
+        }
+
+        var collectionItemGr = new GlideRecordSecure(CollectionItem.TABLE);
+
+        if (!collectionItemGr.get(collectionItemSysId)) {
+            const message = `Collection item does not exist with sys id: ${collectionItemSysId}`;
+            this.#LOG.info(message);
+            return;
+        }
+
+        const {
+            label
+        } = updatedCollectionItemDetails;
+        collectionItemGr.setValue(CollectionItem.Column.Label, label);
+
+        if (!collectionItemGr.update()) {
+            throw 'Failed to rename collection item.';
+        }
+
+        return CollectionItem.getCollectionItemDetails(collectionItemSysId);
+
+    }
+
+    static addFileToCollections(collectionItemDetails, collectionSysIds) {
+        CollectionItem.#validateCollectionItemDetails(collectionItemDetails);
+
+        if (!Array.isArray(collectionSysIds) || collectionSysIds.length === 0) {
+            throw 'collections must be a non-empty array.';
+        }
+
+        // Get all collections owned by current user
+        const userCollectionsMap = Collection.getUserCollectionsMap();
+        
+        const validationMap = {};
+        let hasValidCollection = false;
+
+        for (let i = 0; i &lt; collectionSysIds.length; i++) {
+            const collectionId = collectionSysIds[i];
+            
+            if (!validationMap.hasOwnProperty(collectionId)) {
+                // Check if it's default collection OR user owns the collection
+                const isDefaultCollection = Collection.isDefaultCollection(collectionId);
+                const isOwnedByUser = userCollectionsMap.hasOwnProperty(collectionId);
+                const isValid = isDefaultCollection || isOwnedByUser;
+                
+                validationMap[collectionId] = isValid;
+                if (isValid &amp;&amp; !hasValidCollection) {
+                    hasValidCollection = true;
+                }
+            }
+        }
+
+        if (!hasValidCollection) {
+            throw 'At least one valid collection is required.';
+        }
+
+        const collectionItemSysId = CollectionItem.#getOrCreateCollectionItem(collectionItemDetails);
+
+        const added = [];
+        const failures = [];
+        const uniqueCollectionIds = Object.keys(validationMap);
+
+        for (let i = 0; i &lt; uniqueCollectionIds.length; i++) {
+            const collectionId = uniqueCollectionIds[i];
+            const result = CollectionItem.#addItemToCollection(collectionId, collectionItemSysId, validationMap[collectionId]);
+            
+            if (result.success) {
+                added.push(collectionId);
+            } else {
+                failures.push({
+                    collectionSysId: collectionId,
+                    operation: 'add',
+                    message: result.error
+                });
+            }
+        }
+
+        if (failures.length &gt; 0) {
+            CollectionItem.#LOG.warn(`addFileToCollections: ${failures.length} collection(s) failed`);
+        } else if (added.length &gt; 0) {
+            CollectionItem.#LOG.info(`addFileToCollections completed: added to ${added.length} collection(s)`);
+        }
+
+        // Fetch details only if at least one collection was added; WS operation guards on file &amp;&amp; icon.
+        const collectionItemDetailsResult = added.length &gt; 0 
+            ? CollectionItem.getCollectionItemDetails(collectionItemSysId) 
+            : {};
+
+        return {
+            collectionItemSysId,
+            file: collectionItemDetailsResult.file,
+            icon: collectionItemDetailsResult.icon,
+            added,
+            failures
+        };
+    }
+
+    static updateFileCollections(collectionItemDetails, addCollectionIds, removeCollectionIds) {
+        CollectionItem.#validateCollectionItemDetails(collectionItemDetails);
+
+        // Step 1: Remove duplicates
+        const addSet = new Set(Array.isArray(addCollectionIds) ? addCollectionIds : []);
+        const removeSet = new Set(Array.isArray(removeCollectionIds) ? removeCollectionIds : []);
+
+        // Step 2: Remove common elements between add and remove
+        const invalidDuplicates = [];
+        const filteredAddArray = [];
+        
+        addSet.forEach(function(id) {
+            if (removeSet.has(id)) {
+                removeSet.delete(id);
+                invalidDuplicates.push({
+                    collectionSysId: id,
+                    operation: 'add',
+                    message: `Collection ${id} cannot be both added and removed.`
+                });
+            } else {
+                filteredAddArray.push(id);
+            }
+        });
+
+        // Validate at least one operation
+        if (filteredAddArray.length === 0 &amp;&amp; removeSet.size === 0) {
+            throw 'At least one of add or remove must be specified.';
+        }
+
+        // Find existing collection item
+        const existingItemSysId = CollectionItem.#findCollectionItemForUser(collectionItemDetails);
+
+        if (!existingItemSysId) {
+            throw 'File is not currently in any collection. Use POST to add file to collections.';
+        }
+
+        // Step 3: Remove unauthorized collections and build valid/invalid lists
+        const userCollectionsMap = Collection.getUserCollectionsMap();
+        
+        const validAdd = [];
+        const invalidAdd = [];
+        const validRemove = [];
+        const invalidRemove = [];
+
+        // Filter add collections
+        for (let i = 0; i &lt; filteredAddArray.length; i++) {
+            const collectionId = filteredAddArray[i];
+            const isDefaultCollection = Collection.isDefaultCollection(collectionId);
+            const isOwnedByUser = userCollectionsMap.hasOwnProperty(collectionId);
+            const isValid = isDefaultCollection || isOwnedByUser;
+
+            if (isValid) {
+                validAdd.push(collectionId);
+            } else {
+                invalidAdd.push({
+                    collectionSysId: collectionId,
+                    operation: 'add',
+                    message: `Collection with sys_id: ${collectionId} is invalid, does not exist, or you do not have access to it.`
+                });
+            }
+        }
+
+        // Filter remove collections
+        const removeArray = Array.from(removeSet);
+        for (let i = 0; i &lt; removeArray.length; i++) {
+            const collectionId = removeArray[i];
+            const isDefaultCollection = Collection.isDefaultCollection(collectionId);
+            const isOwnedByUser = userCollectionsMap.hasOwnProperty(collectionId);
+            const isValid = isDefaultCollection || isOwnedByUser;
+
+            if (isValid) {
+                validRemove.push(collectionId);
+            } else {
+                invalidRemove.push({
+                    collectionSysId: collectionId,
+                    operation: 'remove',
+                    message: `Collection with sys_id: ${collectionId} is invalid, does not exist, or you do not have access to it.`
+                });
+            }
+        }
+
+        const added = [];
+        const removed = [];
+        const failures = [].concat(invalidAdd, invalidRemove, invalidDuplicates);
+
+        // Step 4: Execute add operations
+        for (let i = 0; i &lt; validAdd.length; i++) {
+            const collectionId = validAdd[i];
+            try {
+                if (CollectionItem.#doesM2mRecordExist(collectionId, existingItemSysId)) {
+                    failures.push({
+                        collectionSysId: collectionId,
+                        operation: 'add',
+                        message: 'Collection item already exists in this collection.'
+                    });
+                    continue;
+                }
+
+                CollectionItem.#insertM2mRecord(collectionId, existingItemSysId);
+                added.push(collectionId);
+            } catch (error) {
+                failures.push({
+                    collectionSysId: collectionId,
+                    operation: 'add',
+                    message: error.toString()
+                });
+            }
+        }
+
+        // Step 5: Execute remove operations
+        for (let i = 0; i &lt; validRemove.length; i++) {
+            const collectionId = validRemove[i];
+            try {
+                // Skip silently if not in collection
+                if (!CollectionItem.#doesM2mRecordExist(collectionId, existingItemSysId)) {
+                    continue;
+                }
+
+                CollectionItem.#deleteM2mRecord(collectionId, existingItemSysId);
+                removed.push(collectionId);
+            } catch (error) {
+                failures.push({
+                    collectionSysId: collectionId,
+                    operation: 'remove',
+                    message: error.toString()
+                });
+            }
+        }
+
+        // Step 6: Cleanup orphaned collection items if at least one M2M record was deleted
+        if (removed.length &gt; 0) {
+            // Note: No transaction lock - concurrent add/remove races between M2M delete and this check are accepted as low-probability trade-off
+            if (!CollectionItem.#hasM2mRecords(existingItemSysId)) {
+                try {
+                    CollectionItem.deleteCollectionItem(existingItemSysId);
+                    CollectionItem.#LOG.info(`Deleted orphaned collection item: ${existingItemSysId}`);
+                } catch (error) {
+                    CollectionItem.#LOG.error(`Failed to delete orphaned collection item ${existingItemSysId}: ${error.toString()}`);
+                }
+            }
+        }
+
+        if (failures.length &gt; 0) {
+            CollectionItem.#LOG.warn(`updateFileCollections: ${failures.length} operation(s) failed`);
+        } else if (added.length &gt; 0 || removed.length &gt; 0) {
+            CollectionItem.#LOG.info(`updateFileCollections completed: ${added.length} added, ${removed.length} removed`);
+        }
+
+        return {
+            added,
+            removed,
+            failures
+        };
+    }
+
+    static #validateCollectionItemDetails(collectionItemDetails) {
+        const {
+            file,
+            fileTable,
+            label,
+            url
+        } = collectionItemDetails;
+
+        const isListBookmark = CollectionItem.#isListBookmark(fileTable, file, url);
+        if (isListBookmark) {
+            if (gs.nil(label) || gs.nil(url) || gs.nil(fileTable) || !UDCUtil.isValidTable(fileTable)) {
+                throw `Invalid collection item insertion. File table: ${fileTable}, url: ${url} or label: ${label} specified are missing or invalid`;
+            }
+        } else {
+            if (gs.nil(file) || gs.nil(fileTable) || !UDCUtil.isValidRecord(fileTable, file)) {
+                throw `Invalid collection item insertion. File table: ${fileTable} or file sys id: ${file} specified is invalid.`;
+            }
+        }
+    }
+
+    static #getAppCollectionItemDetails({
+        fileObject,
+        table,
+        sysId
+    }) {
+        const taxonomy = new FileTaxonomy(table, sysId);
+        return {
+            icon: taxonomy.getIcon(),
+            file: {
+                table,
+                sysId,
+                label: taxonomy.getFileLabel() || gs.getMessage('(empty)'),
+                name: taxonomy.getFileName(),
+                type: taxonomy.getType(),
+                typeSysId: taxonomy.getFileTaxonomySysId(),
+                scope: FileTaxonomy.getArtifactScopeDetails(table, fileObject)
+            }
+        };
+    }
+
+    static #getInvalidArtifactDetails({
+        fileObject,
+        table,
+        sysId
+    }) {
+        return FileTaxonomy.getFileDetails({
+            fileTable: table,
+            fileSysId: sysId
+        });
+    }
+
+    static #getFileCollectionItemDetails({
+        fileObject,
+        table,
+        sysId,
+        taxonomyTypes
+    }) {
+        let fileDetails = {};
+        const fileTableHandledTaxonomyTypes = taxonomyTypes[table];
+        if (fileTableHandledTaxonomyTypes) { // metadata table has registered taxonomy types
+            fileDetails = FileTaxonomy.getFileDetailsForRegisteredTaxonomyType(fileTableHandledTaxonomyTypes, sysId, table);
+        } else {
+            fileDetails = FileTaxonomy.getFileDetailsForUnRegisteredTaxonomyType(sysId, table);
+        }
+        // Add scope information to file objects
+        if (fileDetails &amp;&amp; fileDetails.file) {
+            fileDetails.file.scope = FileTaxonomy.getArtifactScopeDetails(table, fileObject);
+        }
+
+        return fileDetails;
+    }
+
+    static #getListCollectionItemDetails({
+        url,
+        label,
+        table,
+        sysId
+    }) {
+        return {
+            icon: 'list-outline',
+            file: {
+                url,
+                label,
+                table
+            }
+        };
+    }
+
+    static #processCollectionItem(collectionItemGr, taxonomyTypes) {
+        const collectionItemSysId = collectionItemGr.getValue(CollectionItem.Column.SysId);
+        const table = collectionItemGr.getValue(CollectionItem.Column.FileTable);
+        const sysId = collectionItemGr.getValue(CollectionItem.Column.File);
+        const label = collectionItemGr.getValue(CollectionItem.Column.Label);
+        const url = collectionItemGr.getValue(CollectionItem.Column.Url);
+
+        let fileDetails = null;
+        if (CollectionItem.#isListBookmark(table, sysId, url)) {
+            fileDetails = CollectionItem.#getListCollectionItemDetails({
+                url,
+                label,
+                table
+            });
+        } else {
+            const fileObject = FileTaxonomy.getFileObjectRecord(table, sysId);
+            if (!UDCUtil.isValidGlideRecord(fileObject)) {
+                fileDetails = CollectionItem.#getInvalidArtifactDetails({
+                    fileObject,
+                    table,
+                    sysId
+                });
+            } else if (UDCUtil.isAppRecord(table)) {
+                fileDetails = CollectionItem.#getAppCollectionItemDetails({
+                    fileObject,
+                    table,
+                    sysId
+                });
+            } else {
+                fileDetails = CollectionItem.#getFileCollectionItemDetails({
+                    fileObject,
+                    table,
+                    sysId,
+                    taxonomyTypes
+                })
+            }
+            if (label &amp;&amp; fileDetails.file)
+                fileDetails.file.label = label;
+        }
+
+        if (fileDetails.error) {
+            const {
+                code
+            } = fileDetails.error;
+
+            // Handle deleted bookmarked artifact
+            if (table &amp;&amp; sysId &amp;&amp; code === UDCConstants.ERROR_CODES.NOT_FOUND) {
+                return CollectionItem.#getJSONForDeletedArtifact(collectionItemGr, fileDetails);
+            }
+
+            // Log and skip errored record
+            const errorMessage = `Unable to fetch file taxonomy details for file table: ${table} with sys id: ${sysId}`;
+            this.#LOG.error(errorMessage, fileDetails.error);
+            return null;
+        }
+
+        const {
+            file,
+            icon
+        } = fileDetails;
+
+        return {
+            file,
+            icon,
+            collectionItemSysId
+        };
+    }
+
+    static #getJSONForDeletedArtifact(collectionItemGr, fileDetails) {
+        const collectionItemSysId = collectionItemGr.getValue(CollectionItem.Column.SysId);
+        const table = collectionItemGr.getValue(CollectionItem.Column.FileTable);
+        const sysId = collectionItemGr.getValue(CollectionItem.Column.File);
+        const label = collectionItemGr.getValue(CollectionItem.Column.Label);
+        const taxonomyGr = collectionItemGr[CollectionItem.Column.TaxonomyType].getRefRecord();
+
+        if (UDCUtil.isValidGlideRecord(taxonomyGr)) {
+            return {
+                file: {
+                    table,
+                    sysId,
+                    label,
+                    type: taxonomyGr.getDisplayValue(FileTaxonomy.Column.Label) || FileTaxonomy.getTableLabel(table),
+                    typeSysId: taxonomyGr.getUniqueValue()
+                },
+                icon: taxonomyGr.getDisplayValue(FileTaxonomy.Column.Icon) || FileTaxonomy.getFallBackIcon(table),
+                collectionItemSysId
+            }
+        }
+
+        return {
+            file: {
+                table,
+                sysId,
+                label,
+                type: fileDetails.type,
+                typeSysId: ''
+            },
+            icon: FileTaxonomy.getFallBackIcon(table),
+            collectionItemSysId
+        };
+    }
+
+    static #processCollectionItems(collectionItemsGr) {
+        // Get all taxonomy types grouped by table name
+        const taxonomyTypes = UDCUtil.groupBy(FileTaxonomy.getTaxonomyTypesDetails(), 'table');
+        const apps = [];
+        const files = [];
+        const lists = [];
+
+        while (collectionItemsGr.next()) {
+            const collectionItemDetails = CollectionItem.#processCollectionItem(collectionItemsGr, taxonomyTypes);
+
+            if (!collectionItemDetails) {
+                continue;
+            }
+
+            const {
+                file: {
+                    sysId,
+                    table,
+                    url
+                }
+            } = collectionItemDetails;
+            const targetToPushTo = CollectionItem.#isListBookmark(table, sysId, url) ? lists : UDCUtil.isAppRecord(table) ? apps : files;
+            targetToPushTo.push(collectionItemDetails);
+        }
+
+        return {
+            apps,
+            files,
+            lists
+        };
+    }
+
+    static #isListBookmark(fileTable, fileSysId, url) {
+        return gs.nil(fileSysId) &amp;&amp; fileTable &amp;&amp; url;
+    }
+
+    static #getTaxonomyRecordForArtifact(fileTable, fileSysId) {
+        const taxonomy = new FileTaxonomy(fileTable, fileSysId);
+        return taxonomy;
+    }
+
+    static #findCollectionItemForUser(collectionItemDetails) {
+        const gr = CollectionItem.getDuplicateCollectionItem(collectionItemDetails, gs.getUserID(), null);
+        return (gr !== false &amp;&amp; gr.next()) ? gr.getUniqueValue() : null;
+    }
+
+    static #getOrCreateCollectionItem(collectionItemDetails) {
+        const existingItemSysId = CollectionItem.#findCollectionItemForUser(collectionItemDetails);
+        
+        if (existingItemSysId) {
+            return existingItemSysId;
+        }
+        
+        return CollectionItem.#insertCollectionItemRecord(collectionItemDetails);
+    }
+
+    static #addItemToCollection(collectionId, collectionItemSysId, isValidCollection) {
+        try {
+            if (!isValidCollection) {
+                return {
+                    success: false,
+                    error: `Collection with sys_id: ${collectionId} is invalid, does not exist, or you do not have access to it.`
+                };
+            }
+
+            if (CollectionItem.#doesM2mRecordExist(collectionId, collectionItemSysId)) {
+                return {
+                    success: false,
+                    error: 'Collection item already exists in this collection.'
+                };
+            }
+
+            CollectionItem.#insertM2mRecord(collectionId, collectionItemSysId);
+            
+            return { success: true };
+        } catch (error) {
+            return {
+                success: false,
+                error: error.toString()
+            };
+        }
+    }
+
+    static #insertCollectionItemRecord(collectionItemDetails) {
+        const { file, fileTable, url, label } = collectionItemDetails;
+        const isListBookmark = CollectionItem.#isListBookmark(fileTable, file, url);
+
+        var gr = new GlideRecordSecure(CollectionItem.TABLE);
+        gr.initialize();
+        gr.setValue(CollectionItem.Column.FileTable, fileTable);
+        gr.setValue(CollectionItem.Column.Url, url || '');
+        gr.setValue(CollectionItem.Column.User, gs.getUserID());
+
+        if (isListBookmark) {
+            gr.setValue(CollectionItem.Column.Label, label);
+        } else {
+            const taxonomy = CollectionItem.#getTaxonomyRecordForArtifact(fileTable, file);
+            gr.setValue(CollectionItem.Column.File, file);
+            gr.setValue(CollectionItem.Column.TaxonomyType, taxonomy.getFileTaxonomySysId());
+            gr.setValue(CollectionItem.Column.Label, label || taxonomy.getFileLabel() || gs.getMessage('(empty)'));
+        }
+
+        const recordSysId = gr.insert();
+
+        if (!recordSysId) {
+            throw 'Invalid collection item insertion.';
+        }
+
+        return recordSysId;
+    }
+
+    static #doesM2mRecordExist(collectionSysId, collectionItemSysId) {
+        var gr = new GlideRecordSecure(CollectionItem.M2M_TABLE);
+        gr.addQuery(CollectionItem.M2MColumn.Collection, collectionSysId);
+        gr.addQuery(CollectionItem.M2MColumn.CollectionItem, collectionItemSysId);
+        gr.setLimit(1);
+        gr.query();
+        return gr.hasNext();
+    }
+
+    static #insertM2mRecord(collectionSysId, collectionItemSysId) {
+        var gr = new GlideRecordSecure(CollectionItem.M2M_TABLE);
+        gr.initialize();
+        gr.setValue(CollectionItem.M2MColumn.Collection, collectionSysId);
+        gr.setValue(CollectionItem.M2MColumn.CollectionItem, collectionItemSysId);
+        gr.setWorkflow(false);
+        
+        const sysId = gr.insert();
+
+        if (!sysId) {
+            throw `Failed to create collection membership for collection: ${collectionSysId}, item: ${collectionItemSysId}`;
+        }
+
+        return sysId;
+    }
+
+    static #deleteM2mRecord(collectionSysId, collectionItemSysId) {
+        var gr = new GlideRecordSecure(CollectionItem.M2M_TABLE);
+        gr.addQuery(CollectionItem.M2MColumn.Collection, collectionSysId);
+        gr.addQuery(CollectionItem.M2MColumn.CollectionItem, collectionItemSysId);
+        gr.setLimit(1);
+        gr.query();
+
+        if (gr.next()) {
+            if (!gr.deleteRecord()) {
+                throw `Failed to remove collection membership for collection: ${collectionSysId}, item: ${collectionItemSysId}`;
+            }
+            return true;
+        }
+
+        return false;
+    }
+
+    static #hasM2mRecords(collectionItemSysId) {
+        var gr = new GlideRecordSecure(CollectionItem.M2M_TABLE);
+        gr.addQuery(CollectionItem.M2MColumn.CollectionItem, collectionItemSysId);
+        gr.setLimit(1);
+        gr.query();
+        return gr.hasNext();
+    }
+}]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2024-04-01 06:24:11&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;030d15a1f391021000baad941484caca&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;118&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;CollectionItem&lt;/sys_name&gt;
+        &lt;sys_package display_value="Unified Developer Core" source="sn_udc"&gt;8a841f2bc42f457e8809ea71d35e821f&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Unified Developer Core"&gt;8a841f2bc42f457e8809ea71d35e821f&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_030d15a1f391021000baad941484caca&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2026-05-14 10:54:00&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+    &lt;sys_es_latest_script action="INSERT_OR_UPDATE"&gt;
+        &lt;id&gt;030d15a1f391021000baad941484caca&lt;/id&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2024-08-01 12:44:59&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;df46c7fcf373021000baad941484ca93&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-08-01 12:44:59&lt;/sys_updated_on&gt;
+        &lt;table&gt;sys_script_include&lt;/table&gt;
+        &lt;use_es_latest&gt;true&lt;/use_es_latest&gt;
+    &lt;/sys_es_latest_script&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-08-25 05:56:06</sys_created_on>
+        <sys_id>e977e8ef83368310a5875160ceaad33e</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>CollectionItem</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_e977e8ef83368310a5875160ceaad33e</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-08-25 05:56:06</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

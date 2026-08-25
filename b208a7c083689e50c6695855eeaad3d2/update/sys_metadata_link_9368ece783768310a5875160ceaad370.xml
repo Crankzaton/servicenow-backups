@@ -1,0 +1,539 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1b9e371677723010132628489a106131</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_pw.ProjectWorkspaceFetchApi&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;mobile_callable&gt;false&lt;/mobile_callable&gt;
+        &lt;name&gt;ProjectWorkspaceFetchApi&lt;/name&gt;
+        &lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;
+        &lt;script&gt;&lt;![CDATA[var ProjectWorkspaceFetchApi = Class.create();
+ProjectWorkspaceFetchApi.prototype = {
+    initialize: function() {
+        this.isSecure = ProjectWorkspaceUtil.getProperty('sn_pw.fetchData.isSecure', 'false');
+		this.createTaskFunc = this.createTask();
+		this.avatharApi = new Avathar();
+		this.hideTimeComponent = false;
+		this.resourceAssigneesMap = new Map();
+		this.taskWithNotifications = new Map();
+		this.shadowToOriginalTasks = new Map();
+		this.softProjectIndicator = {
+            type: 'icon',
+            icon: 'tree-view-short-fill',
+            tooltip: gs.getMessage('Soft Dependency')
+        };
+    },
+
+    getTasksData: function(topTaskId, table, columns, taskIds) {
+        if (!taskIds)
+            return [];
+        var query = 'sys_idIN' + taskIds;
+        return this.getTasks(topTaskId, columns, table, query);
+    },
+	
+	getSubProjectQueryAndDependencies: function(table, sysId, gr){
+		var query = "";
+		var outsideTasks = [], dependencies = [], gd;
+
+		if (!table)
+          table = 'planned_task';
+		
+		var topTaskId = gr.getValue("top_task");
+		if(sysId != topTaskId){
+			var wbs = gr.getValue("wbs");
+			var oLinkQuery = "child.ref_planned_task.top_task=" + topTaskId + "^parent.ref_planned_task.top_task="+ topTaskId 
+							+ "^child.ref_planned_task.wbs="+ wbs +"^ORchild.ref_planned_task.wbsSTARTSWITH"+ wbs
+							+ "^ORparent.ref_planned_task.wbs="+ wbs +"^ORparent.ref_planned_task.wbsSTARTSWITH" + wbs;
+			var grRel = new GlideRecord('planned_task_rel_planned_task');
+			grRel.addEncodedQuery(oLinkQuery, true);
+			grRel.query();
+			while(grRel.next()){
+				outsideTasks.push(grRel.getValue('parent'));
+				outsideTasks.push(grRel.getValue('child'));
+				
+				dependencies.push(this._getDependencey(grRel));
+			}
+			
+			query = "top_task="+topTaskId +"^wbsSTARTSWITH"+ wbs+".^ORwbs="+wbs + "^ORDERBYlevel^ORDERBYwbs_order^ORDERBYwbs^ORsys_idIN"+ outsideTasks.join();
+		}
+		
+		return {
+			query: query,
+			dependencies: dependencies
+		};
+	},
+	
+	// Returns array of parentProjects except top task
+	getParentProjects: function(subProjectId, ptasks, columns, baseTableStateUtil, beginingOfToday) {
+		var parentProject,
+			parentSubProjectGrs = [];
+		
+		parentSubProjectGrs = this._getParentProjectGr(subProjectId, parentSubProjectGrs);
+		for( var i =0; i &lt; parentSubProjectGrs.length; i++) {
+			parentProject = this.createTaskFunc(parentSubProjectGrs[i], columns, baseTableStateUtil, beginingOfToday, {});
+			if(parentProject.id == subProjectId)
+				parentProject.isSummary = true;//this filed is used to give the summary task record behaviour to the sub project record in sub project view
+			ptasks.push(parentProject);  // fetching all parent projects of subProjectId
+		}
+		return ptasks;
+	},
+	
+	_getParentProjectGr: function(subProjectId, parentProjects) {
+		var projectGr = new GlideRecord('pm_project');
+		projectGr.get(subProjectId);
+		if(projectGr.isValidRecord() &amp;&amp; projectGr.getValue('parent')){
+			parentProjects = this._getParentProjectGr(projectGr.getValue('parent'), parentProjects);
+			parentProjects.push(projectGr);
+		}
+		return parentProjects;
+	},
+	
+    getTasks: function(topTaskId, columns, table, query, firstRow, subProjectId) {
+
+        var ptasks = [],
+            indexTaskMap = {},
+			batchSize = ProjectWorkspaceUtil.getFetchTasksBachSize(),
+            childTable, childGr, temp;
+		
+		if(!columns) {
+			columns = gs.getSession().getClientData('project_workspace_columns');
+			columns = JSON.parse(columns);
+		}
+		
+		if(subProjectId &amp;&amp; !query)
+			query = gs.getSession().getClientData(subProjectId + '_query');
+		
+		var beginingOfToday = this._getBeginingOfToday();
+		var baseTableStateUtil = new global.PlannedTaskStateUtil(new GlideRecord(table));
+		this._fetchNotificationsInfo(topTaskId);
+
+        if (!table)
+            table = 'planned_task';
+		
+		
+		if (!firstRow) {
+            var topTaskGr = new GlideRecord(table);
+            topTaskGr.get(topTaskId);
+            if (topTaskGr.isValidRecord()) {
+				this.hideTimeComponent = topTaskGr.getValue('project_schedule_date_format') == 'date';
+				temp = this.createTaskFunc(topTaskGr, columns, baseTableStateUtil, beginingOfToday, {});
+				temp['execution_type'] = topTaskGr.getValue("execution_type");
+				ptasks.push(temp); // top project should be first always
+			} else
+                return ptasks;
+			
+			if(subProjectId)
+				ptasks = this.getParentProjects(subProjectId, ptasks, columns, baseTableStateUtil, beginingOfToday);
+        }
+		
+		var childSubProjects = this.getSubProjects(topTaskId, columns, table, baseTableStateUtil, beginingOfToday, subProjectId);
+
+        childTable = global.PTGlobalAPI.getProjectTaskTable(table);
+        var childTableStateUtil = new global.PlannedTaskStateUtil(new GlideRecord(childTable));
+
+        childGr = this._getGlideRecord(childTable, this.isSecure);
+        if (query) {
+			childGr.addEncodedQuery(query, true);
+			/**
+			 * chooseWindow is not working when encoded query has `sys_idIN`
+			 * this case observed when retriving the saved tasks and it's getting called from getTasksData function
+			 */
+			if(!query.startsWith('sys_idIN'))
+				childGr.chooseWindow(firstRow, firstRow + batchSize,true);
+		} else {
+            childGr.addQuery('top_task', topTaskId);
+			childGr.addQuery('sys_class_name','!=','pm_project_task_link');
+			childGr.orderBy('level');
+            childGr.orderBy('wbs_order');
+			childGr.orderBy('wbs');
+			childGr.chooseWindow(firstRow, firstRow + batchSize,true);
+        }
+        childGr.query();
+		
+		var subProjectIndex = 0, subProject, subProjectLevel, subProjectWbsOrder, taskLevel, taskWbsOrder;
+        while (childGr.next()) {
+            temp = this.createTaskFunc(childGr, columns, childTableStateUtil, beginingOfToday, {});
+			taskLevel = parseInt(temp.level.value);
+			taskWbsOrder = parseInt(temp.wbs_order.value);
+
+            subProject = childSubProjects[subProjectIndex];
+			if(subProject) {
+				subProjectLevel = parseInt(subProject.level.value);
+				subProjectWbsOrder = parseInt(subProject.wbs_order.value);
+			}
+			
+			while(subProject &amp;&amp; (subProjectLevel &lt; taskLevel || (subProjectLevel == taskLevel &amp;&amp; subProjectWbsOrder &lt; taskWbsOrder))) {
+				ptasks.push(subProject);
+				subProjectIndex++;
+				subProject = childSubProjects[subProjectIndex];
+				if(subProject) {
+					subProjectLevel = parseInt(subProject.level.value);
+					subProjectWbsOrder = parseInt(subProject.wbs_order.value);
+				}
+			}
+			
+            indexTaskMap[temp['wbs_order'].value] = ptasks.length; // finding the last index where a task of that wbs_order has been inserted
+            ptasks.push(temp);
+        }
+		
+		for( ; subProjectIndex &lt; childSubProjects.length; subProjectIndex++) {
+			ptasks.push(childSubProjects[subProjectIndex]);
+		}
+        return ptasks;
+    },
+
+    getSubProjects: function(topTaskId, columns, table, stateUtil, beginingOfToday, subProjectId ) {
+        var subProjects = [],
+            parentGr, temp;
+		
+		if(subProjectId) {
+			var subProjectGr = new GlideRecord(table);
+			subProjectGr.get(subProjectId);
+			var subProjectWBS = subProjectGr.getValue('wbs');
+		}
+        parentGr = this._getGlideRecord(table, this.isSecure);
+        parentGr.addQuery('top_task', topTaskId);
+        parentGr.addQuery('sys_id', '!=', topTaskId);
+		if(subProjectId){
+			parentGr.addQuery('sys_id', '!=', subProjectId);
+			parentGr.addQuery('wbs', 'STARTSWITH', subProjectWBS);
+		}
+		parentGr.orderBy('level');
+        parentGr.orderBy('wbs_order');
+		parentGr.orderBy('wbs');
+        parentGr.query();
+        while (parentGr.next()) {
+            temp = this.createTaskFunc(parentGr, columns, stateUtil, beginingOfToday, {});
+			temp['execution_type'] = parentGr.getValue("execution_type");
+            subProjects.push(temp);
+        }
+		return subProjects;
+    },
+	
+    getBaselinesInfo: function(topTaskId, tableName, selectedBaseline) {
+        var baselineList = [], selectedFlag = false, baselineId;
+        var userSelectedBaselineIds = ProjectWorkspaceUtil.getUserPreference(tableName+'_selected_baselines_'+topTaskId);
+		var baselineGr1 = this._getGlideRecord('planned_task_baseline', 'true');
+		baselineGr1.addQuery('top_task', topTaskId);
+		baselineGr1.addQuery('enable_task_baseline', true);
+		baselineGr1.orderByDesc("updated");
+		baselineGr1.query();
+		while (baselineGr1.next()) {
+			baselineId =  baselineGr1.getValue('sys_id');
+			selectedFlag = selectedBaseline ? (selectedBaseline == baselineId) : ((userSelectedBaselineIds &amp;&amp; userSelectedBaselineIds.indexOf(baselineId) != -1) ? true : false);
+			baselineList.push({
+				id: baselineId,
+				name: baselineGr1.getValue('name'),
+				description: baselineGr1.getValue('description'),
+				selected: selectedFlag
+			});
+		}
+        return baselineList;
+    },
+
+	createTask() {
+		const loadWithPermissions = ProjectWorkspaceUtil.getProperty('sn_pw.load_data_with_permissions', 'true');
+		return loadWithPermissions === 'true' ? this.createTaskObjectWithPermissions : this.createTaskObject;
+	},
+
+    createTaskObjectWithPermissions(gr, columns, stateUtil, beginingOfToday, taskObj) {
+		taskObj['canDelete'] = gr.canDelete();
+		taskObj['canWrite'] = gr.canWrite();
+
+		return this.createTaskObject(gr, columns, stateUtil, beginingOfToday, taskObj);
+	},
+
+    createTaskObject: function(gr, columns, stateUtil, beginingOfToday, taskObj) {
+        let gd, dateValue;
+		
+        taskObj['id'] = gr.getValue('sys_id');
+        taskObj['parent'] = gr.getValue('parent');
+        if (gr.getValue('key_milestone') == '1' || gr.getValue('milestone') == '1')
+            taskObj['type'] = 'milestone';
+        for (var i = 0; i &lt; columns.length; i++) {
+
+			if(!columns[i].internalColumnName) 
+				continue;
+			
+            if (columns[i].isExtendedColumn) {
+                taskObj[columns[i].name] = {
+                    value: gr.getElement(columns[i].internalColumnName).toString(),
+                    displayValue: gr.getDisplayValue(columns[i].internalColumnName)
+                };
+            } else if (columns[i].type == 'date') {
+                gd = new GlideDate();
+                dateValue = gr.getDisplayValue(columns[i].internalColumnName);
+                if (dateValue)
+                    gd.setDisplayValue(dateValue);
+                taskObj[columns[i].name] = {
+                    value: dateValue ? ProjectWorkspaceUtil.convertToStandardISOFormat(gd.getDisplayValueInternal() + ' 00:00:00') : '',
+                    displayValue: dateValue ? gd.getDisplayValue() : ''
+                };
+            } else if (columns[i].type == 'date_time') {
+                dateValue = gr.getDisplayValue(columns[i].internalColumnName);
+                if (dateValue) {
+                    gd = new GlideDateTime();
+                    gd.setDisplayValue(dateValue);
+                }
+                taskObj[columns[i].name] = {
+                    value: dateValue ? ProjectWorkspaceUtil.convertToStandardISOFormat(gd.getDisplayValueInternal()) : '',
+                    displayValue: dateValue ? gd.getDisplayValue() : ''
+                };
+				if (this.hideTimeComponent) {
+					const dateTimeVal = taskObj[columns[i].name].value;
+					if(dateTimeVal) {
+						const dateGd = new GlideDateTime(dateTimeVal).getDate();
+						taskObj[columns[i].name].displayValue = dateGd.getDisplayValue();
+					}
+				}
+            } else if (columns[i].internalColumnName == 'duration' || columns[i].internalColumnName == 'work_duration' || columns[i].internalColumnName == 'effort' || columns[i].internalColumnName == 'work_effort') {
+                gd = new GlideDuration();
+                gd.setValue(gr.getValue(columns[i].internalColumnName));
+				var durVal = gd.getDurationValue();
+				if(global.JSUtil.notNil(durVal)) {
+					durVal = durVal.substring(0, durVal.length - 3);
+					var dayPart = gd.getDayPart();
+					if(dayPart &lt;= 0)
+						durVal = '00 ' + durVal;
+				}
+				
+                taskObj[columns[i].name] = {
+                    value: durVal,
+                    displayValue: gd.getDisplayValue()
+                };
+            } else if (columns[i].name == 'assigned_to') {
+                var value = gr.getValue(columns[i].internalColumnName) || "";
+                taskObj[columns[i].name] = {
+                    value: value,
+                    displayValue: gr.getDisplayValue(columns[i].internalColumnName),
+					isChanged: false,
+                    imageSrc: this.avatharApi.get(value)
+                };
+            } else {
+                taskObj[columns[i].name] = {
+                    value: gr.getValue(columns[i].internalColumnName) || "",
+                    displayValue: gr.getDisplayValue(columns[i].internalColumnName)
+                };
+            }
+
+			if (columns[i].type == 'avatar_group') {
+                var listValue = gr.getValue(columns[i].internalColumnName) || "";
+                var disValue = gr.getDisplayValue(columns[i].internalColumnName);
+                disValue = disValue &amp;&amp; disValue.split(",");
+                listValue = listValue &amp;&amp; listValue.split(",");
+                var userObjList = [];
+                for (var k = 0; k &lt; listValue.length; k++) {
+                    var userObj = {
+                        value: (listValue[k]).trim(),
+                        displayValue: (disValue[k]).trim(),
+                        imageSrc: this.avatharApi.get(listValue[k])
+                    };
+                    userObjList.push(userObj);
+                }
+                taskObj[columns[i].name] = userObjList;
+            } else if (columns[i].internalColumnName == ProjectWorkspaceConstants.RESOURCE_ASSIGNEE_LIST) {
+                var resourceAssigneesObjList = [];
+                var userResourceIds = gr.getValue(ProjectWorkspaceConstants.RESOURCE_ASSIGNEE) ;
+				var groupResourceIds = gr.getValue(ProjectWorkspaceConstants.GROUP_RESOURCE_ASSIGNEE);
+				if(groupResourceIds &amp;&amp; groupResourceIds.length &gt; 0){
+					this._fetchResourceAssigneesObjList(groupResourceIds, 'sys_user_group',  gr.getValue('sys_id'), resourceAssigneesObjList);
+				}	
+				if(userResourceIds &amp;&amp; userResourceIds.length &gt; 0){
+					this._fetchResourceAssigneesObjList(userResourceIds, 'sys_user',  gr.getValue('sys_id'), resourceAssigneesObjList);
+				}	
+
+                taskObj[columns[i].name] = resourceAssigneesObjList;
+            }
+        }
+
+		var taskDecorator = new ProjectWorkspaceTaskDecorator();
+        taskDecorator.populateGanttStartAndEndDates(gr, taskObj, stateUtil);
+		taskDecorator.decorateTaskOverdue(gr, taskObj, beginingOfToday);
+		
+		taskObj['isExternal'] = gr.getValue('shadow') == '1' ? true : false;
+		if(taskObj['isExternal']) {
+			taskDecorator.populateExternalTaskProps(gr, taskObj);
+			const originalTaskId = gr.getValue('orig_sys_id');
+			this.shadowToOriginalTasks[gr.getValue('sys_id')] = originalTaskId;
+			if(this.taskWithNotifications[originalTaskId]) {
+				taskObj['isSoftDependentTask'] = true;
+				taskObj['indicator'] = this.softProjectIndicator;
+			}
+		}
+
+        return taskObj;
+    },
+
+	_fetchNotificationsInfo : function(topTaskId) {
+		const notificationGr = new GlideRecord('planned_task_notification');
+		notificationGr.addQuery('task_top_task', topTaskId);
+		notificationGr.addQuery('state', 'new');
+		notificationGr.query();
+		while(notificationGr.next()){
+			const key = notificationGr.getValue('source')+ '_' + notificationGr.getValue('task');
+			this.taskWithNotifications[key] = true;
+			this.taskWithNotifications[notificationGr.getValue('source')] = true;
+		}
+	},
+
+	_fetchResourceAssigneesObjList : function(resourceIds, resourceTableName, taskId, resourceAssigneesObjList) {
+		var resourceIdsArr = resourceIds.split(',');
+		resourceIdsArr = this._checkInResourceMap(resourceIdsArr, resourceAssigneesObjList);
+		const resourceObjList =  ProjectWorkspaceUtil.getUserOrGroupRecords(resourceIdsArr, resourceTableName, this.resourceAssigneesMap);
+		resourceAssigneesObjList.push(...resourceObjList);
+	},
+
+	_checkInResourceMap: function(resourceIdsArr, resourceAssigneesObjList) {
+		return resourceIdsArr.filter((resourceId) =&gt; {
+				if(this.resourceAssigneesMap.has(resourceId))
+					resourceAssigneesObjList.push(this.resourceAssigneesMap.get(resourceId));
+				else
+					return true;	
+		});
+	},
+
+
+    getDependencies: function(topTaskId) {
+        var dependencies = [],
+            gd;
+        var gr = new GlideRecord('planned_task_rel_planned_task');
+        gr.addQuery('child.ref_planned_task.top_task', topTaskId);
+        gr.addQuery('parent.ref_planned_task.top_task', topTaskId);
+        gr.query();
+        while (gr.next()) {
+            dependencies.push(this._getDependencey(gr));
+        }
+
+        return dependencies;
+    },
+	
+	_getDependencey: function(gr) {
+		var dependencey = {};
+		dependencey['id'] = gr.getValue('sys_id');
+		dependencey['source'] = gr.getValue('parent');
+		dependencey['target'] = gr.getValue('child');
+		dependencey['type'] = gr.getValue('sub_type');
+		const origSourceTask = this.shadowToOriginalTasks[gr.getValue('parent')];
+		dependencey['depType'] =  gr.getValue('process_flag') == false &amp;&amp; this.taskWithNotifications[origSourceTask+'_'+gr.getValue('child')] ? 'soft' : 'hard';
+
+		var gd = new GlideDuration();
+		gd.setValue(gr.getValue('lag'));
+		dependencey['lag'] = gd.getDayPart();
+		
+		var isExternal = gr.getValue('orig_sys_id') ? true : false;
+		dependencey['isExternal'] = isExternal;
+
+		return dependencey;
+	},
+	
+    getBaselineItems: function(baselineIds, topTaskId, table){
+		if(!baselineIds){
+			return [];
+		}
+		var hideTimeComponent = this._isTimeComponentHidden(topTaskId, table) || false;
+		var baselineItem = new GlideRecordSecure('planned_task_baseline_item');
+		baselineItem.addQuery('baseline', 'IN', baselineIds);
+		baselineItem.query();
+		var result = [];
+		while(baselineItem.next()){
+			result.push({
+				id: baselineItem.getValue('baseline'),   //Which is used to map with baselineInfo before rendering to get proper color
+				startDate: this._getBaselineDateInISOFormat(baselineItem.getDisplayValue('start'), hideTimeComponent),
+				endDate: this._getBaselineDateInISOFormat(baselineItem.getDisplayValue('end'), hideTimeComponent),
+				taskId: baselineItem.getValue('task')
+			});
+		}
+		return result;
+	},
+	
+	_isTimeComponentHidden: function(sysId, table) {
+		if(!table)
+			table = 'pm_project';
+		var gr = new GlideRecord(table);
+		gr.get(sysId);
+		if(gr.isValidRecord()){
+			return gr.getValue('project_schedule_date_format') == 'date';
+		}
+	},
+	
+	//Returns object with value and displayValue, where value is in StandardISOFormat
+	_getBaselineDateInISOFormat : function(dateValue, hideTimeComponent) {
+		if(dateValue) {
+			var gd = new GlideDateTime();
+			gd.setDisplayValue(dateValue);
+			return {
+				value: ProjectWorkspaceUtil.convertToStandardISOFormat(gd.getDisplayValueInternal()),
+				displayValue: hideTimeComponent ? gd.getDisplayValue().split(' ')[0] : gd.getDisplayValue()
+			};
+		}
+		return {
+			value: '',
+			displayValue: ''
+		};
+	},
+
+    _getGlideRecord: function(table, isSecure) {
+        var glideRecord;
+        if (isSecure == 'true')
+            glideRecord = new GlideRecordSecure(table);
+        else
+            glideRecord = new GlideRecord(table);
+        return glideRecord;
+    },
+	
+	_getBeginingOfToday: function() {
+		var currentDate = new GlideDate();
+		var beginingOfToday = new GlideDateTime();
+		beginingOfToday.setDisplayValueInternal(currentDate.getDisplayValueInternal() + " " + "00:00:00");
+		return beginingOfToday;
+	},
+
+    type: 'ProjectWorkspaceFetchApi'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2021-09-27 10:44:19&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1b9e371677723010132628489a106131&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;254&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ProjectWorkspaceFetchApi&lt;/sys_name&gt;
+        &lt;sys_package display_value="Project Workspace" source="sn_pw"&gt;47e2b69f533f201016f6ddeeff7b12fa&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Project Workspace"&gt;47e2b69f533f201016f6ddeeff7b12fa&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1b9e371677723010132628489a106131&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2025-01-12 14:07:04&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+    &lt;sys_es_latest_script action="INSERT_OR_UPDATE"&gt;
+        &lt;id&gt;1b9e371677723010132628489a106131&lt;/id&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2024-09-09 16:51:14&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;4fa4b8617fac52107f5eba9cbc866528&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-09-09 16:51:14&lt;/sys_updated_on&gt;
+        &lt;table&gt;sys_script_include&lt;/table&gt;
+        &lt;use_es_latest&gt;true&lt;/use_es_latest&gt;
+    &lt;/sys_es_latest_script&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-08-25 06:00:19</sys_created_on>
+        <sys_id>9368ece783768310a5875160ceaad370</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ProjectWorkspaceFetchApi</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_9368ece783768310a5875160ceaad370</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-08-25 06:00:19</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

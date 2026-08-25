@@ -1,0 +1,758 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>078d0838536500109e9eddeeff7b128b</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.ProminUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Contains utility methods for process mining&amp;#13;
+      /*  &amp;#13;
+      1. To validate all insert/update operation of child table definition&amp;#13;
+      2. To get workbench URL when clicked on "View in Workspace" &amp;#13;
+      3.  To get UI Action ID for showing a link with project ("Go to Analyst Workbench")&amp;#13;
+      4. To Show/Hide Global Context Menu "Launch Process Mining"&amp;#13;
+      */&amp;#13;
+    &lt;/description&gt;
+        &lt;mobile_callable&gt;false&lt;/mobile_callable&gt;
+        &lt;name&gt;ProminUtils&lt;/name&gt;
+        &lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;
+        &lt;script&gt;&lt;![CDATA[var ProminUtils = Class.create();
+ProminUtils.prototype = {
+    initialize: function() {
+        this.table = {
+            "activityDef": "promin_activity_def",
+            "breakdownDef": "promin_breakdown_field"
+        };
+
+        this.findingDefinitionTableAllowed = {
+            "automated": "promin_automated_finding",
+            "rule-based": "promin_finding_def",
+        };
+        
+        this._initializeConfig();
+    },
+    _initializeConfig: function() {
+        this.isMSPInstance = GlidePluginManager.isActive('com.glide.domain.msp_extensions.installer');
+        this.rowLimitForTableDef = {};
+        this.rowLimitForTableDef[this.table.activityDef] = {
+            "parentProperty": "promin.limit.total_activity",
+            "defaultParentsAllowed": 10,
+            "childProperty": "promin.limit.child_total_activity",
+            "defaultChildsAllowed": 5
+        };
+        this.rowLimitForTableDef[this.table.breakdownDef] = {
+            "parentProperty": "promin.limit.breakdown_def",
+            "defaultParentsAllowed": 10,
+            "childProperty": "promin.limit.child_breakdown_def",
+            "defaultChildsAllowed": 5
+        };
+        this.defaultActivityAllowed = {
+            "parentProperty": "promin.limit.default_activity",
+            "parentLimit": 5,
+            "childProperty": "promin.limit.child_default_activity",
+            "childLimit": 3
+        };
+    },
+    validateActivityDef: function(grActivityDef) {
+        try {
+            this._validateDefaultActivityLimit(grActivityDef);
+            this._validateTableDefinition(grActivityDef);
+            this._hasDuplicateDisplayName(grActivityDef);
+            this._validateDotWalkLevelsForActivityDef(grActivityDef);
+            this._validateAllowedField(grActivityDef);
+            this._validateNoAOIWithDotWalk(grActivityDef);
+            this._validateActivityOfInterest(grActivityDef);
+            this._validateFieldValues(grActivityDef);
+            this._validateDisplayOrder(grActivityDef);
+            this._validateCompoundActivity(grActivityDef);
+            if (grActivityDef.getValue("type") != "DEFAULT") {
+                this._validateAttachedEntityActivity(grActivityDef);
+            }
+            this._validateStringAndJournalFieldsAreGrouped(grActivityDef);
+        } catch (error) {
+            grActivityDef.setAbortAction(true);
+            gs.addErrorMessage(error);
+            gs.error(error);
+            action.setRedirectURL(current);
+        }
+    },
+    _validateStringAndJournalFieldsAreGrouped: function(grActivityDef) {
+        var source = grActivityDef.entity.source_type;
+        if (source == "EXTERNAL_DATA" || source == "AGENTIC_AI_DATA") {
+            return;
+        }
+        var tableName = grActivityDef.entity.table;
+        if (source == "ARCHIVED_DATA" &amp;&amp; tableName.startsWith("ar_")) {
+            tableName = tableName.substring(3);
+        }
+        if (grActivityDef.getValue("type") == "DEFAULT") {
+            var internalType = this.getInternalTypeOfSelectedField(tableName, grActivityDef.field);
+            if ((internalType == 'string' || internalType == 'journal_input') &amp;&amp; !grActivityDef.track_change) {
+                throw gs.getMessage("Textual or Journal fields can only be added as grouped activity");
+            }
+        }
+    },
+    _validateCompoundActivity: function(grActivityDef) {
+        var type = grActivityDef.type;
+        if (type == "COMPOUND") {
+            var fields = grActivityDef.field.split(",");
+            if (fields.length &lt; 2) {
+                throw gs.getMessage("Activity of type 'Compound' cannot be created on single field. Please choose atleast 2 or more fields");
+            }
+        }
+    },
+    _validateActivityOfInterest: function(grActivityDef) {
+        if (grActivityDef.activity_of_interest &amp;&amp; grActivityDef.track_change) {
+            throw gs.getMessage("Contextual activity cannot be grouped.");
+        }
+    },
+    _validateFieldValues: function(grActivityDef) {
+        if (grActivityDef.field_values_selection_type != "ALL" &amp;&amp; !grActivityDef.field_values) {
+            throw gs.getMessage("Please select the activity values or 'Choose activity values to' All before proceeding.");
+        }
+    },
+    _validateDisplayOrder: function(grActivityDef) {
+        if (gs.nil(grActivityDef.getValue("display_order")) || grActivityDef.activity_of_interest) {
+            grActivityDef.setValue("display_order", 50);
+        }
+        if (parseInt(grActivityDef.getValue("display_order")) &lt; -1000 || parseInt(grActivityDef.getValue("display_order")) &gt; 1000) {
+            throw gs.getMessage("Please select a valid display order between range -1000 to 1000");
+        }
+    },
+    _validateDefaultActivityLimit: function(grProminTable) {
+        if (grProminTable.getValue("type") == "DEFAULT" &amp;&amp;
+            grProminTable.getValue("activity_of_interest") == false) {
+            var limit;
+            if (this._isDefinitionForParent(grProminTable)) {
+                limit = gs.getProperty(this.defaultActivityAllowed.parentProperty, this.defaultActivityAllowed.parentLimit);
+            } else {
+                limit = gs.getProperty(this.defaultActivityAllowed.childProperty, this.defaultActivityAllowed.childLimit);
+            }
+            var gaTable = new GlideAggregate(grProminTable.getTableName());
+            gaTable.addQuery("entity", grProminTable.getValue("entity"));
+            gaTable.addQuery("type", "DEFAULT");
+            gaTable.addQuery("activity_of_interest", false);
+            if (grProminTable.operation() === "update") {
+                gaTable.addQuery("sys_id", "!=", grProminTable.getUniqueValue());
+            }
+            gaTable.addAggregate("COUNT");
+            gaTable.query();
+            if (gaTable.next()) {
+                var count = gaTable.getAggregate("COUNT");
+                if (parseInt(count) &gt;= parseInt(limit)) {
+                    throw gs.getMessage("You can enter up to {0} Field Values (Default) type {1}s for this table configuration.",
+                        [limit, grProminTable.getClassDisplayValue()]);
+                }
+            }
+        }
+    },
+    _validateDotWalkLevelsForActivityDef: function(grActivityDef) {
+        var activityValue = grActivityDef.field;
+        if (activityValue.contains(".")) {
+            var limit = gs.getProperty("promin.limit.max_activity_dot_walk_levels", 3);
+            var activity = activityValue.split(".");
+            var levels = activity.length;
+            if (levels &gt; parseInt(limit)) {
+                throw gs.getMessage("The limit for dot walking in activity field is {0} levels e.g. CI.BusinessService.assignment group", limit);
+            }
+        }
+    },
+    _validateAllowedField: function(grConfigTable) {
+        if (grConfigTable.getTableName() == "promin_activity_def" &amp;&amp; grConfigTable.type != "DEFAULT") {
+            return;
+        }
+        if (grConfigTable.getTableName() != "promin_activity_def" || grConfigTable.entity.source_type != "AGENTIC_AI_DATA") {
+            var isValidField = new ProminAllowedColumns().getAllowedColumnList(grConfigTable.getTableName(), grConfigTable.entity.table, grConfigTable.field, grConfigTable.entity);
+            if (!isValidField &amp;&amp; !this._validateAllowedFieldsMDMForExternalAndArchived(grConfigTable)) {
+                var internalType = this.getInternalTypeOfSelectedField(grConfigTable.entity.table, grConfigTable.field);
+                if (internalType == 'integer') {
+                    throw gs.getMessage("Numbers or Integer fields are not allowed. Please select another field.");
+                } else {
+                    throw gs.getMessage("Fields of type {0} are not allowed. Please select another field.", [internalType]);
+                }
+            }
+        }
+    },
+    getInternalTypeOfSelectedField: function(table, field) {
+        var selectedField = field.split('.');
+        var totalLength = selectedField.length - 1;
+        if (selectedField.length &gt;= 2) {
+            for (var i = 0; i &lt; totalLength; i++) {
+                var gr = new GlideRecord(table);
+                gr.query();
+                if (gr.next() &amp;&amp; gr[selectedField[i]].getRefRecord().getTableName() !== 'undefined') {
+                    table = gr[selectedField[i]].getRefRecord().getTableName();
+                    field = selectedField[i + 1];
+                }
+            }
+        }
+        var recObj = new GlideRecord(table);
+        var glideElement = recObj.getElement(field);
+        var descriptor = glideElement.getED();
+        var type = descriptor.getInternalType();
+		if((type == "string" || type == "integer") &amp;&amp; descriptor.isChoiceTable()) {
+			return "choice";
+		}
+		return type;
+    },
+
+    _validateAllowedFieldsMDMForExternalAndArchived: function(grConfigTable) {
+        if (grConfigTable.getTableName() == "promin_breakdown_field") {
+            return false;
+        }
+
+        var field = grConfigTable.field;
+        var grEntity = new GlideRecord("promin_project_entity");
+        grEntity.addQuery("parent_entity", grConfigTable.entity);
+        grEntity.addQuery("source_type", "IN", "ARCHIVED_DATA,EXTERNAL_DATA");
+        grEntity.query();
+        while (grEntity.next()) {
+            if (field == grEntity.target_field) {
+                return true;
+            }
+        }
+        return false;
+    },
+    _validateNoAOIWithDotWalk: function(grActivityDef) {
+        var activityValue = grActivityDef.field;
+        if (activityValue.contains(".") &amp;&amp; grActivityDef.activity_of_interest == true) {
+            throw gs.getMessage("The 'Contextual activity' cannot be selected with dot walk functionality. Please either uncheck 'Contextual activity' or select an activity definition 'Field' without dot walk.");
+        }
+    },
+    _validateAttachedEntityActivity: function(activityDefGr) {
+        var type = activityDefGr.type;
+        if (type == "CHILD_ATTACHED") {
+            var grEntity = new GlideRecord("promin_project_entity");
+            if (!grEntity.get(activityDefGr.attached_entity)) {
+                throw gs.getMessage("Invalid child attached '{0}'. Table Configuration not found.", activityDefGr.attached_entity);
+            } else if (grEntity.project != activityDefGr.entity.project || grEntity.parent_entity != activityDefGr.entity || grEntity.relation_type != "CHILD") {
+                throw gs.getMessage("Invalid child attached '{0}'. Please attach a table configuration of 'Child' relation type for '{1}' table configuration within this project.", [activityDefGr.attached_entity.getDisplayValue(), activityDefGr.entity.getDisplayValue()]);
+            }
+        } else if (type == "PARENT_ATTACHED") {
+            if (activityDefGr.entity.relation_type != "REFERENCE") {
+                throw gs.getMessage("Invalid parent attached '{0}'. Please attach a table configuration of 'Reference' relation type for '{1}' table configuration within this project.", [activityDefGr.attached_entity.getDisplayValue(), activityDefGr.entity.getDisplayValue()]);
+            } else if (activityDefGr.entity.parent_entity.getValue('sys_id') != activityDefGr.attached_entity) {
+                throw gs.getMessage("Invalid parent attached '{0}'.", activityDefGr.attached_entity.getDisplayValue());
+            }
+        }
+    },
+    _hasDuplicateDisplayName: function(grProminTable) {
+        if (grProminTable.getValue('display_name')) {
+            var gaProminTable = new GlideAggregate(grProminTable.getTableName());
+            var currentName = grProminTable.getValue('display_name');
+            gaProminTable.addQuery('entity', grProminTable.getValue('entity'));
+            gaProminTable.addQuery('display_name', currentName);
+            gaProminTable.addQuery('sys_id', '!=', grProminTable.getUniqueValue());
+            gaProminTable.addAggregate("COUNT");
+            gaProminTable.query();
+            if (gaProminTable.next()) {
+                if (gaProminTable.getAggregate('COUNT') &gt; 0) {
+                    throw gs.getMessage("Duplicate display name: '{0}' is already present in another {1}. Please try giving another display name",
+                        [currentName, grProminTable.getClassDisplayValue()]
+                    );
+                }
+            }
+        }
+    },
+    validateBreakdownDef: function(grBreakdown) {
+        try {
+            this._validateDotWalkLevels(grBreakdown);
+            this._validateTableDefinition(grBreakdown);
+            this._validateAllowedField(grBreakdown);
+            this._hasDuplicateDisplayName(grBreakdown);
+        } catch (error) {
+            grBreakdown.setAbortAction(true);
+            gs.addErrorMessage(error);
+            gs.error(error);
+            action.setRedirectURL(current);
+        }
+    },
+    validatePermission: function(grPermission) {
+        this._validateShareProject(grPermission);
+    },
+    _validateTableDefinition: function(grConfigTable) {
+        try {
+            if (!grConfigTable.isValid()) {
+                throw gs.getMessage("Can not validate definition change.");
+            }
+            var tableName = grConfigTable.getTableName();
+            this._canCreateChildTableDefinition(grConfigTable);
+            this._isExceedTableDefRowLimit(grConfigTable, this.rowLimitForTableDef[tableName]);
+            this._isDuplicateChildTableDefPresent(grConfigTable);
+
+
+        } catch (error) {
+            gs.error(error);
+            gs.addErrorMessage(error);
+            grConfigTable.setAbortAction(true);
+        }
+    },
+    _canCreateChildTableDefinition: function(grEntityConfigDef) {
+        if (grEntityConfigDef.operation() == "insert") {
+
+            /* used in insert BR of activity/breakdown */
+            var grProject = grEntityConfigDef.entity.project.getRefRecord();
+
+            if (gs.nil(grProject) || !grProject.isValidRecord())
+                throw gs.getMessage("Invalid project");
+
+            var canCreateNewRecord = new global.ProminACLUtil(grProject).canWriteInChildTableDef();
+
+            if (!canCreateNewRecord &amp;&amp; (grProject.getValue('sys_created_by') != gs.getUserName())) {
+                throw gs.getMessage('You do not have required permission to create a new {0}.', [
+                    grEntityConfigDef.getClassDisplayValue().toLowerCase()
+                ]);
+            }
+        }
+    },
+    _isExceedTableDefRowLimit: function(grProminTable, tableDefLimits) {
+        if (grProminTable.operation() === 'insert') {
+            var limit;
+            if (this._isDefinitionForParent(grProminTable)) {
+                limit = gs.getProperty(tableDefLimits.parentProperty, tableDefLimits.defaultParentsAllowed);
+            } else {
+                limit = gs.getProperty(tableDefLimits.childProperty, tableDefLimits.defaultChildsAllowed);
+            }
+            var gaTable = new GlideAggregate(grProminTable.getTableName());
+            gaTable.addQuery("entity", grProminTable.getValue("entity"));
+            gaTable.addAggregate("COUNT");
+            gaTable.query();
+            if (gaTable.next()) {
+                var count = gaTable.getAggregate("COUNT");
+                if (parseInt(count) &gt;= parseInt(limit)) {
+                    throw gs.getMessage("You can enter up to {0} {1}s for this table configuration.",
+                        [limit, grProminTable.getClassDisplayValue()]);
+                }
+            }
+        }
+    },
+    _isDefinitionForParent: function(grConfigTable) {
+        return gs.nil(grConfigTable.entity.parent_entity);
+    },
+    /** Check for duplicate child table definition starts **/
+    _isDuplicateChildTableDefPresent: function(grProminTable) {
+        var gaProminTable = new GlideAggregate(grProminTable.getTableName());
+        gaProminTable.addEncodedQuery(this._getQueryForDuplicateRecordCheck(grProminTable), true);
+        gaProminTable.addAggregate("COUNT");
+        gaProminTable.query();
+        if (gaProminTable.next()) {
+            if (gaProminTable.getAggregate('COUNT') &gt; 0) {
+                throw gs.getMessage("Duplicate Record: {0} is already present as {1} ",
+                    [this._getDuplicateFieldLabel(grProminTable), grProminTable.getClassDisplayValue()]
+                );
+            }
+        }
+    },
+    _getQueryForDuplicateRecordCheck: function(grProminTable) {
+        var query = '';
+        var uniqueFieldsByTable = {};
+        uniqueFieldsByTable[this.table.activityDef] = ["entity", "field", "attached_entity"];
+        uniqueFieldsByTable[this.table.breakdownDef] = ["entity", "field"];
+
+        var uniqueFields = uniqueFieldsByTable[grProminTable.getTableName()];
+        if (uniqueFields) {
+            uniqueFields.forEach(function(field) {
+                if (grProminTable.getValue(field)) {
+                    query += field + '=' + grProminTable.getValue(field) + '^';
+                }
+            });
+            if (grProminTable.operation() === 'update') {
+                query += 'sys_id!=' + grProminTable.getUniqueValue();
+            }
+            if (grProminTable.getTableName() == this.table.activityDef) {
+                if (grProminTable.getValue('type') != 'DEFAULT' &amp;&amp; grProminTable.getValue('type') != 'COMPOUND' &amp;&amp; grProminTable.getValue('type') != 'DATE_TIME') {
+                    query += 'type=' + grProminTable.getValue('type') + '^';
+                }
+            }
+        }
+        return query;
+    },
+    _getDuplicateFieldLabel: function(grProminTable) {
+        var tableName = grProminTable.entity.table;
+        var fieldName = grProminTable.getValue("field");
+        if (grProminTable.getTableName() == "promin_activity_def" &amp;&amp; !fieldName) {
+            return "The attached entity '" + grProminTable.getDisplayValue("attached_entity") + "'";
+        }
+        var tables = '';
+        tables += new TableUtils(tableName).getTables().toString();
+        if (tables) {
+            var grDictionary = new GlideRecord('sys_dictionary');
+            grDictionary.addQuery('name', 'IN', tables.replace(/[\][]/g, '').replace(/ +?/g, ''));
+            grDictionary.addQuery('element', fieldName);
+            grDictionary.query();
+            if (grDictionary.next()) {
+                return "'" + grDictionary.getValue('column_label') + "'";
+            }
+        }
+        return '';
+
+    },
+    _validateShareProject: function(grPermission) {
+        try {
+            if (gs.nil(grPermission)) {
+                throw gs.getMessage("Invalid record");
+            }
+            var canShare = new global.ProminACLUtil(grPermission.project).canShareProject();
+            if (!canShare) {
+                throw gs.getMessage('You do not have required permissions to share this project.');
+            }
+            this._checkDomainOfUserAndGroup(grPermission);
+
+        } catch (error) {
+            gs.error(error);
+            gs.addErrorMessage(error);
+            grPermission.setAbortAction(true);
+        }
+    },
+    /** Check for duplicate child table definition ends **/
+    canOpenAnalystWorkbench: function(projectId) { // UI Action 'View in Workspace'
+        if (gs.nil(projectId)) {
+            return;
+        }
+        var grProminTable = new GlideRecord("promin_model_def_version");
+        grProminTable.addQuery('project', projectId);
+        grProminTable.orderByDesc('sys_created_on');
+        grProminTable.setLimit(1);
+        grProminTable.query();
+        return grProminTable.next() &amp;&amp; grProminTable.getValue('state') == 'AVAILABLE';
+    },
+    getUIActionId: function(projectId) { // Used in promin_project table -&gt; Go To Workbench field (calculated)
+        if (gs.nil(projectId)) {
+            return;
+        }
+        var grProminTable = new GlideRecord("promin_model_def_version");
+        grProminTable.addQuery('project', projectId);
+        grProminTable.orderByDesc('sys_created_on');
+        grProminTable.setLimit(1);
+        grProminTable.query();
+        if (grProminTable.next() &amp;&amp; grProminTable.getValue('state') == 'AVAILABLE' &amp;&amp; new global.ProminACLUtil(grProminTable.project).canAccessRestrictedProject())
+            return new global.ProminUIAction().getWorkbenchUIactionSysIdForModelDef(); //SysId of UI Action
+        return;
+    },
+    getDynamicQueryForDataSource: function(grProject) {
+        if (gs.nil(grProject.sys_updated_by)) { // new model def
+            return "tableIN" + this._getAllowedDataSourceTableList();
+        } else {
+            return "table=" + grProject.table;
+        }
+    },
+    getReferenceQualForSharing: function(grPermission) {
+        var refQual = "active=true";
+        var projectDomain = grPermission.project.sys_domain;
+        if (!gs.nil(projectDomain)) {
+            refQual += '^sys_domainINglobal,' + grPermission.project.sys_domain;
+        }
+        return refQual;
+    },
+    /*
+    	Used in context menu "Launch Process Mining"
+    */
+    canLaunchPOfromContextMenu: function(table) {
+        var isAllowedTable = new ProminAllowedTableList().getAllowedTableList([table]);
+        return gs.hasRole("sn_process_optimization_analyst") &amp;&amp; !gs.nil(isAllowedTable);
+    },
+    _getAllowedDataSourceTableList: function() {
+        var dataSourceTables = [];
+        var gaDataSource = new GlideAggregate("sys_report_source");
+        gaDataSource.groupBy("table");
+        gaDataSource.query();
+        while (gaDataSource.next()) {
+            dataSourceTables.push(gaDataSource.getValue("table"));
+        }
+
+        if (dataSourceTables.length &gt; 0) {
+            return new ProminAllowedTableList().getAllowedTableList(dataSourceTables).toString();
+        }
+        return "";
+    },
+    _validateDotWalkLevels: function(grBreakdown) {
+        var breakdownValue = grBreakdown.field;
+        if (breakdownValue.contains(".")) {
+            var limit = gs.getProperty("promin.limit.breakdown_dot_walk", 3);
+            var breakdowns = breakdownValue.split(".");
+            var levels = breakdowns.length;
+            if (levels &gt; parseInt(limit)) {
+                throw gs.getMessage("The limit for dot walking in breakdown field is {0} levels", limit);
+            }
+        }
+    },
+    _checkDomainOfUserAndGroup: function(grPermission) {
+        if (!this.isMSPInstance) {
+            return;
+        }
+        var queryData = {};
+        var projectDomain = grPermission.project.sys_domain;
+
+        if (!gs.nil(projectDomain)) {
+            queryData["sys_user"] = grPermission.getValue("user");
+            queryData["sys_user_group"] = grPermission.getValue("group");
+
+            for (var table in queryData) {
+                if (!gs.nil(queryData[table]) &amp;&amp; queryData[table].length &gt; 0) {
+                    var gr = new GlideRecord(table);
+                    gr.addQuery("sys_id", "IN", queryData[table]);
+                    gr.addQuery("sys_domain", "!=", "global");
+                    gr.addQuery("sys_domain", "!=", projectDomain);
+                    gr.setLimit(1);
+                    gr.query();
+
+                    if (gr.hasNext()) {
+                        throw gs.getMessage("Project can be shared with the user/group of global domain or the domain of Project Definition");
+                    }
+                }
+            }
+        }
+    },
+    isLeProgressTypeFieldPresent: function(table) {
+        var allQueryTables = "";
+        allQueryTables += new TableUtils(table).getTables().toString();
+        allQueryTables = allQueryTables.replace(/[\][]/g, '').replace(/ +?/g, '');
+
+        var aggr = new GlideAggregate("sys_dictionary");
+        aggr.addQuery("name", "IN", allQueryTables);
+        aggr.addQuery("internal_type", "le_progress");
+        aggr.addAggregate('COUNT');
+        aggr.query();
+        if (aggr.next()) {
+            return (aggr.getAggregate('COUNT') &gt; 0);
+        }
+        return false;
+    },
+
+    getTableColumns: function(table, types) {
+        try {
+            var tableName = table;
+            var gr = new GlideRecord(tableName);
+            gr.initialize();
+            var columns = gr.getFields();
+            var columnNames = [];
+            var typesLength = types.length;
+
+            for (var i = 0; i &lt; columns.size(); i++) {
+                for (var j = 0; j &lt; typesLength; j++) {
+                    if (gr.getElement(columns.get(i).getName()).getED().getInternalType() == types[j]) {
+                        columnNames.push({
+                            id: columns.get(i).getName(),
+                            label: gr[columns.get(i).getName()].getLabel()
+                        });
+                    }
+                }
+                if (typesLength == 0) {
+                    columnNames.push({
+                        id: columns.get(i).getName(),
+                        label: gr[columns.get(i).getName()].getLabel()
+                    });
+                }
+            }
+            return columnNames;
+        } catch (err) {
+            return [];
+        }
+    },
+
+    deleteChildTableConfig: function(childConfigId) {
+        try {
+            var gr = new GlideRecordSecure('promin_child_table_config');
+            if (gr.get(childConfigId)) {
+                gr.deleteRecord();
+            }
+
+            return {
+                success: true,
+                error: '',
+            };
+        } catch (err) {
+            return {
+                success: false,
+                error: gs.getMessage('Error occurred when deleting child table config.'),
+            };
+        }
+    },
+
+    deleteFindingDef: function(findingIds, table) {
+        try {
+            var findingsArray = findingIds.split(",");
+            if (this.findingDefinitionTableAllowed[table] &amp;&amp; findingIds &amp;&amp; findingsArray.length &gt; 0) {
+                var gr = new GlideRecord(this.findingDefinitionTableAllowed[table]);
+                var deleteFailedrecordCount = 0;
+                for (var i = 0; i &lt; findingsArray.length; i++) {
+                    if (gr.get(findingsArray[i])) {
+                        if (gr.canDelete()) {
+                            var res = gr.deleteRecord();
+                            if (!res) {
+                                deleteFailedrecordCount++;
+                            }
+                        }
+                    } else {
+                        deleteFailedrecordCount++;
+                    }
+                }
+                if (deleteFailedrecordCount === findingsArray.length) {
+                    return {
+                        success: false,
+                        error: gs.getMessage('Failed to delete {0} finding definition record(s)', deleteFailedrecordCount),
+                    };
+                }
+
+                return {
+                    success: true,
+                    error: '',
+                };
+            } else {
+                gs.error(gs.getMessage('Error occurred when deleting finding definitions'));
+                return {
+                    success: false,
+                    error: gs.getMessage('Error occurred when deleting finding definitions'),
+                };
+            }
+        } catch (err) {
+            return {
+                success: false,
+                error: gs.getMessage('Error occurred when deleting finding definitions'),
+            };
+        }
+    },
+
+    deleteProcessConfig: function(processId) {
+        try {
+            var gr = new GlideRecordSecure('promin_process_def');
+            if (gr.get(processId)) {
+                return gr.deleteRecord();
+            }
+
+            return false;
+        } catch (err) {
+            return false;
+        }
+    },
+
+    deleteProminPlaybook: function (sysId) {
+        try {
+            var gr = new GlideRecord('promin_playbook');
+            if (gr.get(sysId)) {
+                if (gr.project.getRefRecord().canWrite()) {
+                    return gr.deleteRecord();
+                }
+            }
+            return false;
+        } catch (err) {
+            return false;
+        }
+    },
+
+    validateIdleTimeConfigForEntity: function(entityId) {
+        var entityGr = new GlideRecord("promin_project_entity");
+        if (entityGr.get(entityId) &amp;&amp; entityGr.getValue("enable_idle_time") == true) {
+            var idleTimeFields = {};
+            var fieldAndLabel = {};
+            var table = entityGr.getValue("table");
+            var tableGr = new GlideRecord(table);
+            var viewFieldGr = new GlideRecord('promin_view_field_config');
+            viewFieldGr.addQuery("process_def.table", table);
+            viewFieldGr.addQuery("process_def.content_pack", false);
+            viewFieldGr.addQuery("view", "IN", "CONTROL_FLOW,RESOURCE_USER,RESOURCE_GROUP");
+            viewFieldGr.query();
+            while (viewFieldGr.next()) {
+                var field = viewFieldGr.getValue("field");
+                if (!gs.nil(field)) {
+                    idleTimeFields[viewFieldGr.getValue("view")] = field;
+					//get label for the field from tableGR
+                    if (tableGr.getElement(field) != null &amp;&amp; tableGr.getElement(field).getED() != null &amp;&amp;
+                        !gs.nil(tableGr.getElement(field).getED().getLabel())) {
+                        fieldAndLabel[field] = tableGr.getElement(field).getED().getLabel();
+                    } else {
+                        fieldAndLabel[field] = field;
+                    }
+                }
+            }
+            var activityGr = new GlideRecord("promin_activity_def");
+            activityGr.addQuery("entity", entityId);
+            activityGr.addQuery("track_change", false);
+            activityGr.addQuery("type", "DEFAULT");
+            activityGr.query();
+            var isControlFlowFieldPresent = false;
+            var isUserFieldPresent = false;
+            var isGroupFieldPresent = false;
+            while (activityGr.next()) {
+                var field = activityGr.getValue("field");
+                if (idleTimeFields["CONTROL_FLOW"] == field) {
+                    isControlFlowFieldPresent = true;
+                } else if (idleTimeFields["RESOURCE_USER"] == field) {
+                    isUserFieldPresent = true;
+                } else if (idleTimeFields["RESOURCE_GROUP"] == field) {
+                    isGroupFieldPresent = true;
+                }
+            }
+            var isConfigValid = true;
+            var errorTemplate = "Activity '{0}' is mandatory for {1} metric as a default, non-grouped activity. {1} metric is now disabled. To enable, go to the project setup on process mining workspace.";
+            if (!isControlFlowFieldPresent) {
+                isConfigValid = false;
+                gs.addErrorMessage(gs.getMessage(errorTemplate, [fieldAndLabel[idleTimeFields["CONTROL_FLOW"]],
+                    "Idle time"
+                ]));
+            }
+            if (!isUserFieldPresent) {
+                isConfigValid = false;
+                gs.addErrorMessage(gs.getMessage(errorTemplate, [fieldAndLabel[idleTimeFields["RESOURCE_USER"]],
+                    "Idle time"
+                ]));
+            }
+            if (!isGroupFieldPresent) {
+                isConfigValid = false;
+                gs.addErrorMessage(gs.getMessage(errorTemplate, [fieldAndLabel[idleTimeFields["RESOURCE_GROUP"]],
+                    "Idle time"
+                ]));
+            }
+            if (!isConfigValid) {
+                entityGr.setValue("enable_idle_time", false);
+                entityGr.update();
+            }
+        }
+    },
+    type: 'ProminUtils'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2019-12-03 10:52:08&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;078d0838536500109e9eddeeff7b128b&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;248&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ProminUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Process Mining Core" source="com.sn_process_optimization"&gt;4f7ba100a5ad03108bb220b7a4d212b2&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_078d0838536500109e9eddeeff7b128b&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2025-07-30 12:37:11&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+    &lt;sys_es_latest_script action="INSERT_OR_UPDATE"&gt;
+        &lt;id&gt;078d0838536500109e9eddeeff7b128b&lt;/id&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2024-07-31 08:19:29&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;f8ff3ca0437b0210a829bf5ff7b8f297&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-07-31 08:19:29&lt;/sys_updated_on&gt;
+        &lt;table&gt;sys_script_include&lt;/table&gt;
+        &lt;use_es_latest&gt;false&lt;/use_es_latest&gt;
+    &lt;/sys_es_latest_script&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-08-25 05:56:51</sys_created_on>
+        <sys_id>e4a76c2383768310a5875160ceaad3ab</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ProminUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_e4a76c2383768310a5875160ceaad3ab</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-08-25 05:56:51</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

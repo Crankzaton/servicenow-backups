@@ -1,0 +1,249 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>090e2c85b7a90210ad650481de11a9d0</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_entitlement.SubscriptionApplicationUsersDao&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;mobile_callable&gt;false&lt;/mobile_callable&gt;
+        &lt;name&gt;SubscriptionApplicationUsersDao&lt;/name&gt;
+        &lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;
+        &lt;script&gt;&lt;![CDATA[var SubscriptionApplicationUsersDao = Class.create();
+SubscriptionApplicationUsersDao.prototype = {
+
+    initialize: function() {
+        this._licenseRoleTypes = this._getLicenseRoleTypes();
+        this._licenseRoleTypeIds = this._licenseRoleTypes.map(licenseRoleTypes =&gt; licenseRoleTypes.id);
+        this._grHelper = new sn_entitlement.LicensingEngineGlideRecordHelper();
+        // params to _userDao.getUserIdsByValidAndHasRole(roleIds) may not be repeated. Not using pass-through cache
+        this._userDao = new sn_entitlement.UserDao();
+
+        // with pass-through cache
+        this._userRoleDao = new sn_entitlement.PassThroughCache(new sn_entitlement.UserRoleDao());
+        this._userHasSubscriptionDao = new sn_entitlement.PassThroughCache(new sn_entitlement.UserHasSubscriptionDao());
+    },
+
+    _getLicenseRoleTypes: function() {
+        const gr = new GlideRecord('license_role_type');
+        gr.addActiveQuery();
+        gr.query();
+
+        let licenseRoleTypes = [];
+        while (gr.next()) {
+            licenseRoleTypes.push({
+                id: String(gr.id),
+                name: String(gr.name),
+                order: parseInt(gr.order)
+            });
+        }
+        return licenseRoleTypes;
+    },
+
+    _getMaxRoleLevelByLicenseRoleType: function(licenseRoleTypes, roleNames) {
+        const gr = new GlideRecord('license_role');
+        gr.addQuery('sys_user_role', 'IN', roleNames);
+        this._grHelper.addExtraField(gr, "license_role_type.id");
+        gr.query();
+
+        let roleTypeIds = [];
+        while (gr.next())
+            roleTypeIds.push(String(gr.license_role_type.id));
+
+        const lowestOrderVal = licenseRoleTypes
+            .filter(licenseRoleType =&gt; roleTypeIds.indexOf(licenseRoleType.id) &gt; -1)
+            .map(licenseRoleType =&gt; licenseRoleType.order)
+            .reduce((a, b) =&gt; Math.min(a, b), Number.MAX_SAFE_INTEGER);
+
+        const maxLicenseRoleType = licenseRoleTypes
+            .find(licenseRoleType =&gt; licenseRoleType.order == lowestOrderVal);
+
+        return maxLicenseRoleType ? maxLicenseRoleType.name : '';
+    },
+
+    _filterRoleNamesByRoleTypeName: function(roleNames, licenseRoleTypeName) {
+        const gr = new GlideRecord('license_role');
+        gr.addActiveQuery();
+        gr.addQuery('name', 'IN', roleNames);
+        gr.addQuery('license_role_type.name', licenseRoleTypeName);
+        gr.query();
+
+        let result = [];
+        while (gr.next())
+            result.push(String(gr.name));
+        return result;
+    },
+
+    _getRoleNamesByRoleIds: function(roleIds) {
+        const gr = new GlideRecord('sys_user_role');
+        gr.addQuery('sys_id', 'IN', roleIds);
+        gr.query();
+
+        let names = [];
+        while (gr.next())
+            names.push(String(gr.name));
+        return names;
+    },
+
+    getUsers: function(subscriptionId, licenseFamilyId) {
+        return this._getDataInternal(subscriptionId, licenseFamilyId, false);
+    },
+
+    getUsersCount: function(subscriptionId, licenseFamilyId) {
+        return this._getDataInternal(subscriptionId, licenseFamilyId, true);
+    },
+
+    getUsersCountForSubscriptionAndFamilies: function(subscriptionId, licenseFamilyIds) {
+        return this._getDataInternalBatch(subscriptionId, licenseFamilyIds, true);
+    },
+
+    _noResults: function(returnJustTheCount) {
+        return returnJustTheCount ? 0 : [];
+    },
+
+    _noResultsForFamIds: function(returnJustTheCount, licenseFamilyIds) {
+        const resultMap = new Map();
+        licenseFamilyIds.forEach(id =&gt; {
+            resultMap.set(id, this._noResults(returnJustTheCount));
+        });
+        return resultMap;
+    },
+
+    _getDataInternal: function(subscriptionId, licenseFamilyId, returnJustTheCount) {
+        if (!subscriptionId || !licenseFamilyId)
+            return this._noResults(returnJustTheCount);
+
+        return this._getDataInternalBatch(subscriptionId, [licenseFamilyId], returnJustTheCount).get(licenseFamilyId);
+    },
+
+    _getDataInternalBatch: function(subscriptionId, licenseFamilyIds, returnJustTheCount) {
+        if (!subscriptionId) {
+            return this._noResultsForFamIds(returnJustTheCount, licenseFamilyIds);
+        }
+
+        // initialized in the initialize()
+        const licenseRoleTypes = this._licenseRoleTypes;
+        const licenseRoleTypeIds = this._licenseRoleTypeIds;
+
+        const userIdsSubscribed = [...this._userHasSubscriptionDao.getUserIdsBySubscriptionId(subscriptionId)];
+        const roleIdsCoveredBySubscription = this._userRoleDao.getRoleIdsBySubscriptionId(subscriptionId, false);
+        if ((licenseRoleTypes.length === 0) ||
+            (licenseRoleTypeIds.length === 0) ||
+            (userIdsSubscribed.length === 0) ||
+            (roleIdsCoveredBySubscription.length === 0)) {
+
+            return this._noResultsForFamIds(returnJustTheCount, licenseFamilyIds);
+        }
+
+
+        const licFamToLicUserRoleNames = this._userRoleDao.getLicensableUserRoleNamesByLicenseRoleTypeNamesForLicenseFamilyIds(licenseFamilyIds, licenseRoleTypeIds, false);
+        const allRoleNames = new Set();
+        licFamToLicUserRoleNames.forEach((roleNames, key) =&gt; {
+            roleNames.forEach(r =&gt; allRoleNames.add(r));
+        });
+        const roleNameToRoleIdMap = this._userRoleDao.getUserRoleIdsForRoleNames(Array.from(allRoleNames));
+        const resultMap = new Map();
+        licenseFamilyIds.forEach(licenseFamilyId =&gt; {
+            resultMap.set(licenseFamilyId, this._getResultForFamilyId(licenseFamilyId, returnJustTheCount, licFamToLicUserRoleNames, roleNameToRoleIdMap, roleIdsCoveredBySubscription, userIdsSubscribed, subscriptionId, licenseRoleTypes, licenseRoleTypeIds));
+        });
+
+        return resultMap;
+    },
+
+    _getResultForFamilyId: function(licenseFamilyId, returnJustTheCount, licFamToLicUserRoleNames, roleNameToRoleIdMap, roleIdsCoveredBySubscription, userIdsSubscribed, subscriptionId, licenseRoleTypes, licenseRoleTypeIds) {
+        const licRoleNames = licFamToLicUserRoleNames.get(licenseFamilyId);
+        if ((!licRoleNames) || (licRoleNames.length === 0)) {
+            return this._noResults(returnJustTheCount);
+        }
+
+
+        const roleIdsForApplication = [];
+        licRoleNames.forEach(roleName =&gt; {
+            if (roleNameToRoleIdMap.has(roleName))
+                roleIdsForApplication.push(roleNameToRoleIdMap.get(roleName));
+        });
+
+        if ((!roleIdsForApplication) || (roleIdsForApplication.length === 0))
+            return this._noResults(returnJustTheCount);
+
+        const roleIdsRelevant = roleIdsCoveredBySubscription.filter(roleId =&gt; roleIdsForApplication.indexOf(roleId) &gt; -1);
+        if (roleIdsRelevant.length === 0)
+            return this._noResults(returnJustTheCount);
+
+        const userIdsRelevant = this._userDao.getUserIdsByValidAndHasRole(roleIdsRelevant)
+            .filter(userId =&gt; userIdsSubscribed.indexOf(userId) &gt; -1);
+        if (userIdsRelevant.length === 0)
+            return this._noResults(returnJustTheCount);
+
+        if (returnJustTheCount) {
+            const ga = new GlideAggregate('sys_user');
+            ga.addQuery('sys_id', 'IN', userIdsRelevant);
+            return ga.getCount();
+        }
+
+        const gr = new GlideRecord('sys_user');
+        gr.addQuery('sys_id', 'IN', userIdsRelevant);
+        gr.query();
+
+        const rows = [];
+
+        while (gr.next()) {
+            const userId = gr.getUniqueValue();
+            const roleIds = this._userRoleDao.getUserRoleIdsByUserId(userId)
+                .filter(roleId =&gt; roleIdsRelevant.indexOf(roleId) &gt; -1);
+            const userRoles = this._getRoleNamesByRoleIds(roleIds);
+            const maxRoleLevelName = this._getMaxRoleLevelByLicenseRoleType(licenseRoleTypes, userRoles);
+            const userRolesWithMaxRoleLevel = [...new Set(this._filterRoleNamesByRoleTypeName(userRoles, maxRoleLevelName))]
+                .join(',');
+            const row = {
+                sys_id: userId,
+                user_name: String(gr.getValue('user_name')),
+                name: String(gr.getValue('name')),
+                user_roles: userRolesWithMaxRoleLevel,
+                cost_center_name: String(gr.cost_center.name),
+                access_level: maxRoleLevelName,
+                subscription: subscriptionId,
+                license_family: licenseFamilyId
+            };
+            rows.push(row);
+        }
+
+        return rows;
+
+    },
+    type: 'SubscriptionApplicationUsersDao'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;maint&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2024-04-11 23:57:30&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;090e2c85b7a90210ad650481de11a9d0&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;81&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;SubscriptionApplicationUsersDao&lt;/sys_name&gt;
+        &lt;sys_package display_value="Licensing Engine" source="sn_entitlement"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Licensing Engine"&gt;bcadabf277f311109c62f5f3cb5a992a&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_090e2c85b7a90210ad650481de11a9d0&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;maint&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-05-03 23:15:25&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-08-25 05:57:06</sys_created_on>
+        <sys_id>0cb7246383768310a5875160ceaad39c</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>SubscriptionApplicationUsersDao</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_0cb7246383768310a5875160ceaad39c</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-08-25 05:57:06</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

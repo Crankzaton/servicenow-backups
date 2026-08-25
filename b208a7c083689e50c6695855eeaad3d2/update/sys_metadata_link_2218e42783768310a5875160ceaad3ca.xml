@@ -1,0 +1,215 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>143ac75aa330211009e9966446fcda79</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.PlatformDocRuleUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;mobile_callable&gt;false&lt;/mobile_callable&gt;
+        &lt;name&gt;PlatformDocRuleUtils&lt;/name&gt;
+        &lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;
+        &lt;script&gt;&lt;![CDATA[var PlatformDocRuleUtils = Class.create();
+var DS_DOCUMENT_TABLE = "ds_document";
+var DS_APPROVAL_REVISION_RULE_TABLE = "ds_approval_revision_rule";
+var DS_APPROVAL_REVISION_RULE_REVIEWER_TABLE= "ds_approval_revision_rule_reviewer";
+var DS_APPROVAL_REVISION_RULE_APPROVER_TABLE = "ds_approval_revision_rule_approver";
+var DS_DOCUMENT_APPROVER_TABLE = "ds_document_approver";
+var DS_DOCUMENT_REVIEWER_TABLE = "ds_document_reviewer";
+var APPROVER_ATTRIBUTES = ["approver","sequence"];
+var REVIEWER_ATTRIBUTES = ["reviewer"];
+
+PlatformDocRuleUtils.prototype = {
+
+    initialize: function(documentSysId) {
+		this.platformDocMgmt = new PlatformDocMgmt();
+		this.platformDocMgmtDB = new PlatformDocMgmtDB();
+		this.documentRecord = new GlideRecord(DS_DOCUMENT_TABLE);
+		this.approvalRevisionRules = new GlideRecord(DS_APPROVAL_REVISION_RULE_TABLE);
+		this.approvalRevisionRules.query();
+
+		this.documentSysId = documentSysId;
+		this.documentRecord.get(documentSysId);
+		this.matchingApprovalRevisionRules = new Array();
+		this._initMatchingApprovalRevisionRulesSysId();
+	},
+
+	_initMatchingApprovalRevisionRulesSysId: function() {
+		var filter = GlideFilter;
+		while (this.approvalRevisionRules.next()) {
+			var approvalRevisionRule = this.approvalRevisionRules;
+			var match = filter.checkRecord(this.documentRecord, approvalRevisionRule.condition);
+			if (match &amp;&amp; approvalRevisionRule.active == "1") {
+				this.matchingApprovalRevisionRules.push(approvalRevisionRule.getValue("sys_id"));
+			}
+		}
+	},
+
+	_isInArray: function(newUser, userList, attributesToCheck) {
+		for (var i = 0; i &lt; userList.length; i++) {
+			var existingUser = userList[i];
+			if (this.platformDocMgmt.areObjectAttributesEqual(newUser, existingUser, attributesToCheck)) {
+				return true;
+			}
+		}
+		return false;
+	},
+	
+	getApproverUsers: function() {
+		var matchingUserApprovers = new Array();
+
+		if (this.matchingApprovalRevisionRules.length == 0) {
+			return matchingUserApprovers;
+		}
+		var approverUsers = new GlideRecord(DS_APPROVAL_REVISION_RULE_APPROVER_TABLE);
+		approverUsers.addQuery("approval_review_ruleIN" + this.matchingApprovalRevisionRules.toString());
+		approverUsers.query();
+
+		while (approverUsers.next()) {
+			var newApprover = this.platformDocMgmt.createObject(approverUsers);
+			if (!this._isInArray(newApprover, matchingUserApprovers, APPROVER_ATTRIBUTES)) { 
+				matchingUserApprovers.push(newApprover);
+			}
+		}
+		
+		return matchingUserApprovers;
+	},
+
+	getReviewerUsers: function() {
+		var matchingUserReviewers = new Array();
+
+		if(this.matchingApprovalRevisionRules.length == 0) {
+			return matchingUserReviewers;
+		}
+		var reviewerUsers = new GlideRecord(DS_APPROVAL_REVISION_RULE_REVIEWER_TABLE);
+		reviewerUsers.addQuery("approval_review_ruleIN" + this.matchingApprovalRevisionRules.toString());
+		reviewerUsers.query();
+
+		while (reviewerUsers.next()) {
+			var newReviewer = this.platformDocMgmt.createObject(reviewerUsers);
+			if (!this._isInArray(newReviewer, matchingUserReviewers, REVIEWER_ATTRIBUTES)) { 
+				matchingUserReviewers.push(newReviewer);
+			}
+		}
+		
+		return matchingUserReviewers;
+	},
+
+	getSequenceForApproval: function() {
+		var arrayUtil = new ArrayUtil();
+		var approverSequence = [];
+		
+		var approverGR = new GlideRecord(DS_DOCUMENT_APPROVER_TABLE);
+		approverGR.addQuery('document', this.documentSysId);
+		approverGR.query();
+		
+		while (approverGR.next()) {
+			var sequence = approverGR.getValue("sequence");
+			approverSequence.push(sequence);
+		}
+		
+		approverSequence = arrayUtil.unique(approverSequence);
+		return approverSequence.sort();
+	},
+
+	getApproversAtSequence: function(sequence) {
+		var approverUser = new GlideRecord(DS_DOCUMENT_APPROVER_TABLE);
+		approverUser.addQuery("document", this.documentSysId);
+		approverUser.addQuery("sequence", sequence);
+		approverUser.query();
+
+		var approversSysID = "";
+		while (approverUser.next()) {
+			var approverID = approverUser.getValue('approver');
+			approversSysID += approverID + ",";
+		}
+		return approversSysID.slice(0,-1);
+	},
+
+	addApproversAndReviewers: function() {
+		this._addReviewersFromRules();
+		this._addApproversFromRules();
+	},
+
+	refreshApproversAndReviewers: function() {
+		this._deleteSystemGeneratedApprovers();
+		this._deleteSystemGeneratedReviewers();
+		this._addReviewersFromRules();
+		this._addApproversFromRules();
+	},
+
+	_addApproversFromRules: function() {
+		var approverUsers = this.getApproverUsers();
+		for (var i = 0; i &lt; approverUsers.length; i++) {
+			var userApprover = new Object();
+			userApprover.document= this.documentSysId;
+			userApprover.approver = approverUsers[i].approver;
+			userApprover.sequence = approverUsers[i].sequence;
+			userApprover.generated_by = "system";
+			this.platformDocMgmtDB.insert(userApprover, DS_DOCUMENT_APPROVER_TABLE);
+		}
+	},
+
+	_addReviewersFromRules: function() {
+		var reviewerUsers = this.getReviewerUsers();
+		for (var i = 0; i &lt; reviewerUsers.length; i++) {
+			var userReviewer = new Object();
+			userReviewer.document= this.documentSysId;
+			userReviewer.reviewer = reviewerUsers[i].reviewer;
+			userReviewer.generated_by = "system";
+			this.platformDocMgmtDB.insert(userReviewer, DS_DOCUMENT_REVIEWER_TABLE);
+		}
+	},
+
+	_deleteSystemGeneratedApprovers: function() {
+		var approverUser = new GlideRecord(DS_DOCUMENT_APPROVER_TABLE);
+		approverUser.addQuery("document", this.documentSysId);
+		approverUser.addQuery("generated_by", "system");
+		approverUser.query();
+		approverUser.deleteMultiple();
+    },
+
+	_deleteSystemGeneratedReviewers: function() {
+		var reviewerUser = new GlideRecord(DS_DOCUMENT_REVIEWER_TABLE);
+		reviewerUser.addQuery("document", this.documentSysId);
+		reviewerUser.addQuery("generated_by", "system");
+		reviewerUser.query();
+		reviewerUser.deleteMultiple();
+    },
+	
+    type: 'PlatformDocRuleUtils'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-02-06 09:22:36&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;143ac75aa330211009e9966446fcda79&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;55&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;PlatformDocRuleUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Document Management" source="com.snc.platform_document_management"&gt;e2066988a56903108bb220b7a4d21241&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_143ac75aa330211009e9966446fcda79&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2023-09-22 07:52:30&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-08-25 05:58:55</sys_created_on>
+        <sys_id>2218e42783768310a5875160ceaad3ca</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>PlatformDocRuleUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_2218e42783768310a5875160ceaad3ca</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-08-25 05:58:55</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,297 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>11d2cbeba0871110fa9befeaa3d50ddf</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_plng_att_core.PlanningAttributesServiceSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;* Service layer for PlanningAttributes Repo&lt;/description&gt;
+        &lt;mobile_callable&gt;false&lt;/mobile_callable&gt;
+        &lt;name&gt;PlanningAttributesServiceSNC&lt;/name&gt;
+        &lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;
+        &lt;script&gt;&lt;![CDATA[var PlanningAttributesServiceSNC = Class.create();
+PlanningAttributesServiceSNC.prototype = {
+    initialize() {
+        this.planningAttributes = new PlanningAttributes();
+    },
+
+    _getAttributeFieldDetails: function({
+        tableName,
+        columnName
+    }) {
+        if (!gs.nil(tableName) &amp;&amp; !gs.nil(columnName)) {
+            const attributeDetails = {};
+            const gr = new GlideRecord(tableName);
+            if (gr.isValidField(columnName) &amp;&amp; gr.getElement(columnName) != null) {
+                const elementDescriptor = gr.getElement(columnName).getED();
+                let referenceTable;
+                let internalType = elementDescriptor.getInternalType();
+                attributeDetails['attributeDataType'] = internalType;
+
+                if (elementDescriptor.isChoiceTable()) {
+                    const choiceList = PlanningAttributesUtil.getChoiceListForTableAndField(tableName, columnName);
+                    attributeDetails['attributeChoiceList'] = choiceList;
+                }
+                if (internalType === 'reference') {
+                    referenceTable = elementDescriptor.reference;
+                    attributeDetails['attributeReference'] = referenceTable;
+                }
+
+                return {
+                    ...attributeDetails
+                };
+            } else {
+                // the columnName is not present in the table, check for one level of dot walking
+                const dotWalkColumnInfo = columnName.split('.');
+                if (dotWalkColumnInfo.length === 2) {
+                    // only handle case of single dotwalk, for instance user.department
+
+                    const referenceColumnNameInResourceTable = dotWalkColumnInfo[0]; // this is columnName in the resource table for instance user column in the emp profile
+
+                    const fieldInReferenceTable = dotWalkColumnInfo[1]; // this is the column name in the reference table which is referenced by the above field department in user table
+
+                    if (gr.isValidField(referenceColumnNameInResourceTable) &amp;&amp; gr.getElement(referenceColumnNameInResourceTable) != null) {
+                        const elementDescriptor = gr.getElement(referenceColumnNameInResourceTable).getED();
+                        const referenceTable = elementDescriptor.reference; // this is the table that is referenced by the field in the resource table for instance, user field in emp profile is referring to sys_user table
+
+                        // Now we need to get the field type for 'fieldInReferenceTable' in the reference table, for instance get the field type of department in user table 
+                        const referenceTableGr = new GlideRecord(referenceTable);
+
+                        const referenceTableElementDescriptor = referenceTableGr.getElement(fieldInReferenceTable).getED();
+
+                        const internalType = referenceTableElementDescriptor.getInternalType();
+
+						attributeDetails['attributeDataType'] = internalType; // for instance, this is the type of department field in the sys_user table
+
+                        if (referenceTableElementDescriptor.isChoiceTable()) {
+                            const choiceList = PlanningAttributesUtil.getChoiceListForTableAndField(referenceTable, fieldInReferenceTable);
+                            attributeDetails['attributeChoiceList'] = choiceList;
+                        }
+                        if (internalType === 'reference') {
+                            dotWalkFieldReferenceTable = referenceTableElementDescriptor.reference;
+                            attributeDetails['attributeReference'] = dotWalkFieldReferenceTable;
+                        }
+						return {
+							...attributeDetails
+						};
+                    }
+                } // else we return empty since we do not support more than one layer of referencing
+            }
+        }
+        return {};
+    },
+
+    _getColsForLookupTables(planningAttributeId) {
+        /**
+         * For now, we are fetching all lookup tables info whether they are required or not
+         */
+        const colsForLookupTables = {};
+        const planningAttrsConfigGr = this.planningAttributes.getColumnsForLookupTablesFromConfig(planningAttributeId);
+        if (planningAttrsConfigGr === -1)
+            return colsForLookupTables;
+        while (planningAttrsConfigGr.next()) {
+            colsForLookupTables[planningAttrsConfigGr.getValue('lookup_table')] = planningAttrsConfigGr.getValue('field');
+        }
+        return colsForLookupTables;
+    },
+
+    _getAttributesForModule(moduleId, canBeResourceType = false, canBeTaskType = false) {
+        let resourceAttrs = {};
+        var planningAttrsGr = new PlanningAttributes().getPlanningAttributesForModule(moduleId, canBeResourceType, canBeTaskType);
+
+        while (planningAttrsGr.next()) {
+            let attributeType = planningAttrsGr.getValue('attribute_type');
+            let attributeName = planningAttrsGr.getValue('attribute_name');
+            attributeName = attributeName.toLowerCase().split(' ').join('_');
+            resourceAttrs[attributeType] = gs.nil(resourceAttrs[attributeType]) ? {} : resourceAttrs[attributeType];
+            resourceAttrs[attributeType][attributeName] = {
+                attributeType,
+                attributeName
+            };
+            if (canBeResourceType &amp;&amp; attributeType == 'resource') {
+                resourceAttrs[attributeType][attributeName] = {
+                    ...resourceAttrs[attributeType][attributeName],
+                    'resourceTable': planningAttrsGr.getValue('attribute_table'),
+                    'fieldInResourceTable': planningAttrsGr.getValue('attribute_field'),
+                    'resourceReferenceField': planningAttrsGr.getValue('resource_reference_field'),
+					'attributeDisplayName' : planningAttrsGr.getDisplayValue('attribute_name'),
+					'attributeFieldDetails': {
+                        ...this._getAttributeFieldDetails({
+                            tableName: planningAttrsGr.getValue('attribute_table'),
+                            columnName: planningAttrsGr.getValue('attribute_field')
+                        })
+                    }
+                };
+            } else if (canBeTaskType &amp;&amp; attributeType == 'task') {
+                const taskTableAndFields = planningAttrsGr.getValue('task_attribute_table_and_field');
+                let attributeTableAndFields = [];
+                for (const [attributeTable, attributeField] of Object.entries(JSON.parse(taskTableAndFields))) {
+                    attributeTableAndFields.push({ attributeTable, attributeField });
+                }
+                resourceAttrs[attributeType][attributeName] = {
+				    'attributeDisplayName' : planningAttrsGr.getDisplayValue('attribute_name'),
+                    ...resourceAttrs[attributeType][attributeName],
+                    attributeTableAndFields
+                };
+            }
+
+            const planningAttributeId = planningAttrsGr.getValue('sys_id');
+            resourceAttrs[attributeType][attributeName]['fieldOnLookupTables'] = this._getColsForLookupTables(planningAttributeId);
+
+        }
+        return resourceAttrs;
+    },
+
+    getPlanningAttributesForCP() {
+        const canBeResourceType = true;
+        let cpAttributes = this._getAttributesForModule(PlanningAttributeConstants.CAPACITY_PLANNING, canBeResourceType);
+        return cpAttributes['resource'];
+    },
+
+	getAttributeIdFromAttributes(lookupField, lookupTable, attributes, lookupRecord) {
+		let attributeId = '';
+		Object.keys(attributes).forEach((attribute) =&gt; {
+		const attributeObj = attributes[attribute];
+		
+		const allocLookupField = attributeObj?.fieldOnLookupTables[lookupTable];
+		if(!gs.nil(allocLookupField) &amp;&amp; allocLookupField === lookupField)
+			attributeId = lookupRecord.getValue(allocLookupField);
+		});
+		return attributeId;
+	},
+
+    getPlanningAttributesForRM() {
+        const canBeResourceType = true;
+        let rmAttributes = this._getAttributesForModule(PlanningAttributeConstants.RESOURCE_MANAGEMENT, canBeResourceType);
+        return rmAttributes['resource'] ? rmAttributes['resource'] : {};
+    },
+
+    getPlanningAttributesForFinancials(canBeResourceType=true, canBeTaskType=true) {
+        let fmAttributes = this._getAttributesForModule(PlanningAttributeConstants.FINANCIALS, canBeResourceType, canBeTaskType);
+        return { ...fmAttributes['resource'], ...fmAttributes['task'] };
+    },
+
+	getLookupTablesForModules({
+		isRPEnabled,
+		isCPEnabled,
+		isFinEnabled
+	}) {
+		return [...new Set([
+			...(isRPEnabled === "1" ? PlanningAttributeConstants.LOOKUP_TABLES_PER_MODULE.RESOURCE_MANAGEMENT : []),
+			...(isCPEnabled === "1" ? PlanningAttributeConstants.LOOKUP_TABLES_PER_MODULE.CAPACITY_PLANNING : []),
+			...(isFinEnabled === "1" ? PlanningAttributeConstants.LOOKUP_TABLES_PER_MODULE.FINANCIALS : []),
+		])];
+	},
+
+    createColConfigsForAttribute(planningAttrGr=null) {
+		if(gs.nil(planningAttrGr))
+			return null;
+			
+		const lookupTables = this.getLookupTablesForModules({
+			isRPEnabled: planningAttrGr.getValue('enable_for_rm'),
+			isCPEnabled: planningAttrGr.getValue('enable_for_cp'),
+			isFinEnabled: planningAttrGr.getValue('enable_for_fin')
+		});
+		const attributeId = planningAttrGr.getValue('sys_id');
+		lookupTables.forEach((lookupTable) =&gt; this.planningAttributes.createPlanningAttributeColConfig({
+			attributeId,
+			lookupTable,
+			isRequired: true
+		}));
+		return attributeId;
+    },
+
+	refreshRequiredColConfigsForAttr(prevPlngAttrGr, currentPlngAttrGr) {
+		if(gs.nil(prevPlngAttrGr) || gs.nil(currentPlngAttrGr))
+			return null;
+		
+		const prevLookupTables = this.getLookupTablesForModules({
+			isRPEnabled: prevPlngAttrGr.getValue('enable_for_rm'),
+			isCPEnabled: prevPlngAttrGr.getValue('enable_for_cp'),
+			isFinEnabled: prevPlngAttrGr.getValue('enable_for_fin')
+		});
+		const currentLookupTables = this.getLookupTablesForModules({
+			isRPEnabled: currentPlngAttrGr.getValue('enable_for_rm'),
+			isCPEnabled: currentPlngAttrGr.getValue('enable_for_cp'),
+			isFinEnabled: currentPlngAttrGr.getValue('enable_for_fin')
+		});
+		const arrayUtil = new global.ArrayUtil();
+		const lookupTablesNeedsToBeDisabled = arrayUtil.diff(prevLookupTables, currentLookupTables);
+		const lookupTablesNeedsToBeEnabled = arrayUtil.diff(currentLookupTables, prevLookupTables);
+		const attributeId = currentPlngAttrGr.getValue('sys_id');
+		
+		if(lookupTablesNeedsToBeDisabled.length &gt; 0) {
+			this.planningAttributes.disablePlanningAttrColConfig({
+				attributeId,
+				lookupTables: lookupTablesNeedsToBeDisabled
+			});
+		}
+		if(lookupTablesNeedsToBeEnabled.length &gt; 0) {
+			this.planningAttributes.enablePlanningAttrColConfig({
+				attributeId,
+				lookupTables: lookupTablesNeedsToBeEnabled
+			});
+		}
+		return attributeId;
+	},
+
+	getEnabledModules(planningAttrRec) {
+		var enabledModules = [];
+		if(planningAttrRec != null) {
+			if(planningAttrRec.getValue('enable_for_rm') == true)
+				enabledModules.push(gs.getMessage('Resource Management'));
+			if(planningAttrRec.getValue('enable_for_cp') == true)
+				enabledModules.push(gs.getMessage('Capacity Planning'))
+			if(planningAttrRec.getValue('enable_for_fin') == true)
+				enabledModules.push(gs.getMessage('Financials'));
+		}
+		return enabledModules;
+	},
+
+	getActiveCPAttributesInfo() {
+		const activeCPPlanningAttributesData = this.getPlanningAttributesForCP();
+		const attributeInfo = {};
+		for(var attr in activeCPPlanningAttributesData) {
+			attributeInfo[activeCPPlanningAttributesData[attr]["fieldOnLookupTables"]["sn_plng_att_core_cpaam_combination"]] = {
+				attributeFieldDetails: activeCPPlanningAttributesData[attr]["attributeFieldDetails"]
+			};
+		}
+		return attributeInfo;
+	},
+
+    type: 'PlanningAttributesServiceSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2022-11-15 06:14:14&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;11d2cbeba0871110fa9befeaa3d50ddf&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;61&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;PlanningAttributesServiceSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="SPM Planning Attributes Core" source="sn_plng_att_core"&gt;b3a48e8058031110fa9b000bb9ea5f5f&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="SPM Planning Attributes Core"&gt;b3a48e8058031110fa9b000bb9ea5f5f&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_11d2cbeba0871110fa9befeaa3d50ddf&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-05-29 09:33:31&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-08-25 05:58:33</sys_created_on>
+        <sys_id>9908e8e383768310a5875160ceaad3c6</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>PlanningAttributesServiceSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_9908e8e383768310a5875160ceaad3c6</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-08-25 05:58:33</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

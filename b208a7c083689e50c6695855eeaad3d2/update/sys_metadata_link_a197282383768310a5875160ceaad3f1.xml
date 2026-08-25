@@ -1,0 +1,534 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0624dc3affe4b210a3aeffffffffffe8</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.GenAIProviderUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;mobile_callable&gt;false&lt;/mobile_callable&gt;
+        &lt;name&gt;GenAIProviderUtil&lt;/name&gt;
+        &lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;
+        &lt;script&gt;&lt;![CDATA[var GenAIProviderUtil = Class.create();
+GenAIProviderUtil.prototype = {
+    initialize: function() {
+        this.LINKED_GROUP_IDS = ['3f3266d1ff0622105ce2ffffffffffd4', '2e46d94c7ff31210e98d0b583d8665b1'];
+        this.VIRTUAL_GROUP_ID = 'AI_AGENTS';
+        this.groupMap = {};
+        this.groupIdMap = {};
+        this._built = false;
+        this.currentDomainId = gs.getSession().getCurrentDomainID() || 'global';
+    },
+
+    _ensureBuilt: function() {
+        if (!this._built) {
+            this.buildGroups();
+            this._built = true;
+        }
+    },
+
+    buildGroups: function() {
+        var gr = new GlideRecord('sn_ns_provider_configuration');
+        if (!gr.isValid()) return;
+
+        var evaluator = new GlideScopedEvaluator();
+        gr.query();
+
+        while (gr.next()) {
+            var ids = [];
+            try {
+                var script = gr.getValue('advanced_script');
+                var result = script &amp;&amp; evaluator.evaluateScript(gr, 'advanced_script', null);
+                if (result &amp;&amp; result.capability_list &amp;&amp; result.capability_list.length) {
+                    ids = result.capability_list;
+                }
+            } catch (e) {}
+
+            if (!ids.length) {
+                var raw = gr.getValue('capability_list');
+                ids = raw ? raw.split(',').map(function(x) {
+                    return x.trim();
+                }) : [];
+            }
+
+            var groupId = gr.getUniqueValue();
+            if (this.LINKED_GROUP_IDS.indexOf(groupId) !== -1) {
+                groupId = this.VIRTUAL_GROUP_ID;
+            }
+
+            for (var i = 0; i &lt; ids.length; i++) {
+                this.groupMap[ids[i]] = groupId;
+            }
+
+            if (!this.groupIdMap[groupId]) {
+                this.groupIdMap[groupId] = [];
+            }
+            this.groupIdMap[groupId] = this.groupIdMap[groupId].concat(ids);
+        }
+
+        if (!this.groupIdMap[this.VIRTUAL_GROUP_ID]) {
+            this.groupIdMap[this.VIRTUAL_GROUP_ID] = [];
+        }
+
+        for (var j = 0; j &lt; this.LINKED_GROUP_IDS.length; j++) {
+            var lid = this.LINKED_GROUP_IDS[j];
+            var caps = this.groupIdMap[lid] || [];
+            this.groupIdMap[this.VIRTUAL_GROUP_ID] = this.groupIdMap[this.VIRTUAL_GROUP_ID].concat(caps);
+            delete this.groupIdMap[lid];
+        }
+    },
+
+    getGroupIdForCapability: function(capabilityId) {
+        this._ensureBuilt();
+        return this.groupMap[capabilityId] || null;
+    },
+
+    getCapabilitiesForGroup: function(groupId) {
+        this._ensureBuilt();
+        var resolvedGroupId = this.LINKED_GROUP_IDS.indexOf(groupId) !== -1 ? this.VIRTUAL_GROUP_ID : groupId;
+        return this.groupIdMap[resolvedGroupId] || [];
+    },
+
+    processAuditTable: function(fromTimestamp) {
+        var history = new GlideRecord('sn_ns_manage_llm_change_history');
+        if (!history.isValid()) return;
+
+        history.addQuery('activity_type', 'skill');
+        history.addQuery('sys_domain', this.currentDomainId);
+
+        if (!gs.nil(fromTimestamp))
+            history.addQuery('sys_created_on', '&gt;=', fromTimestamp);
+
+        history.orderByDesc('sys_created_on');
+        history.query();
+
+        var self = this;
+
+        // first store in memry and resolve conflicts later
+        var effectivePrefs = {};
+
+
+        var processedCapabilities = {};
+        var processedGroups = {};
+
+        while (history.next()) {
+
+            var scope = history.getValue('scope');
+            if (!scope) continue;
+
+            var provider = history.getValue('model_provider');
+            if (!provider) continue;
+
+            var skillConfigId = history.getValue('skill_config');
+            if (gs.nil(skillConfigId) || this.getTypeOfSkillConfig(skillConfigId) !== 'oob')
+                continue;
+
+            var capabilityId = String(history.skill_config.skill_id).trim();
+            if (gs.nil(capabilityId))
+                continue;
+
+            if (scope === 'instance') {
+                effectivePrefs['OOB'] = {
+                    scope: 'instance',
+                    scope_id: 'OOB',
+                    provider: provider
+                };
+                break; // Ignore everything older after instance, they are overriden anway
+            }
+
+            if (scope === 'skill_group') {
+                var groupId = self.getGroupIdForCapability(capabilityId);
+                if (!groupId || processedGroups[groupId])
+                    continue;
+
+                var groupCaps = self.getCapabilitiesForGroup(groupId);
+
+                effectivePrefs[groupId] = {
+                    scope: 'capability_group',
+                    scope_id: groupId,
+                    provider: provider
+                };
+
+                processedGroups[groupId] = true;
+
+                for (var i = 0; i &lt; groupCaps.length; i++) {
+                    processedCapabilities[groupCaps[i]] = true;
+                }
+
+                continue;
+            }
+
+            if (scope === 'skill') {
+                if (processedCapabilities[capabilityId])
+                    continue;
+
+                effectivePrefs[capabilityId] = {
+                    scope: 'capability',
+                    scope_id: capabilityId,
+                    provider: provider
+                };
+
+                processedCapabilities[capabilityId] = true;
+            }
+        }
+
+
+        // now resolve conflicts from in memory object(effectivePrefs) with database
+        for (var key in effectivePrefs) {
+            var pref = effectivePrefs[key];
+
+            var gr = new GlideRecord('sys_gen_ai_provider_preference');
+            gr.addQuery('scope_id', pref.scope_id);
+            gr.addQuery('sys_domain', this.currentDomainId);
+            gr.query();
+
+            if (gr.next()) {
+                if (gr.provider != pref.provider || gr.scope != pref.scope) {
+                    gr.scope = pref.scope;
+                    gr.provider = pref.provider;
+                    gr.update();
+                }
+            } else {
+                gr.initialize();
+                gr.scope = pref.scope;
+                gr.scope_id = pref.scope_id;
+                gr.provider = pref.provider;
+                gr.insert();
+            }
+        }
+    },
+
+    getTypeOfSkillConfig: function(skillConfigId) {
+        var skillConfigGr = new GlideRecord('sn_nowassist_skill_config');
+        if (skillConfigGr.get(skillConfigId)) {
+            var skillFamily = skillConfigGr.getValue('skill_family');
+            if ((!gs.nil(skillFamily) &amp;&amp; skillFamily === 'a5efaf1c93764210aa5730f16489186d') || (!gs.nil(skillConfigGr.skill_family.category) &amp;&amp; skillConfigGr.skill_family.category.toString() === 'custom'))
+                return 'custom';
+            else
+                return 'oob';
+        }
+        return '';
+    },
+
+    getAllCapabilities: function() {
+        var capabilityIds = {};
+
+        var gr1 = new GlideRecord('sn_ns_config_m2m_skill');
+        if (!gr1.isValid()) return [];
+        gr1.addQuery('skill_table', 'sys_one_extend_capability');
+        gr1.query();
+        while (gr1.next()) {
+            var skillConfigId = gr1.getValue('skill_config');
+            if (this.getTypeOfSkillConfig(skillConfigId) === 'oob') {
+                capabilityIds[gr1.getValue('skill_id')] = true;
+            }
+        }
+
+        var gr2 = new GlideRecord('sn_nowassist_skill_config');
+        if (!gr2.isValid()) return [];
+        gr2.addQuery('skill_table', 'sys_one_extend_capability');
+        gr2.query();
+        while (gr2.next()) {
+            var skillConfigId2 = gr2.getUniqueValue();
+            if (this.getTypeOfSkillConfig(skillConfigId2) === 'oob') {
+                capabilityIds[gr2.getValue('skill_id')] = true;
+            }
+        }
+        var resultArray = [];
+        var groupGR = new GlideRecord('sn_ns_provider_configuration');
+        if (!groupGR.isValid()) return resultArray;
+        groupGR.query();
+        while (groupGR.next()) {
+            var groupId = groupGR.getUniqueValue();
+            var capabilities = this.getCapabilitiesForGroup(groupId);
+
+            if (Array.isArray(capabilities)) {
+                for (var m = 0; m &lt; capabilities.length; m++) {
+                    capabilityIds[capabilities[m]] = true;
+                }
+            }
+        }
+
+        for (var key in capabilityIds) {
+            if (capabilityIds.hasOwnProperty(key)) {
+                resultArray.push(key);
+            }
+        }
+        return resultArray;
+    },
+
+    getMimirProvider: function() {
+        var serviceUrl = sn_one_extend.GenerativeAIUtility.getServiceRecordURL('36415f1193cb261061e727dbd7373cf1');
+        var defaultProvider = null;
+        if (!gs.nil(serviceUrl)) {
+            var response = JSON.parse(serviceUrl);
+            if (!gs.nil(response.default_in_country_provider)) {
+                let geoRoutingDetails = {};
+                try {
+                    geoRoutingDetails = sn_one_extend.GenerativeAIUtility.getGeoRoutingDetails();
+                    if (typeof geoRoutingDetails === 'string')
+                        geoRoutingDetails = JSON.parse(geoRoutingDetails);
+                    if (geoRoutingDetails.geoRoutingEnabled)
+                        return response.default_in_country_provider.sys_id;
+                } catch (e) {
+                    gs.error('[GenAIProviderRouting]: Error parsing geoRoutingDetails: ' + e.message);
+                }
+            }
+            defaultProvider = !gs.nil(response.default_provider) ? response.default_provider.sys_id : null;
+        }
+        return defaultProvider;
+    },
+
+    getCustomizedSettings: function() {
+        var preferences = new GlideRecord('sys_gen_ai_provider_preference');
+        preferences.addQuery('sys_domain', this.currentDomainId);
+        var prefList = [];
+
+        preferences.query();
+        while (preferences.next()) {
+            prefList.push({
+                scope: preferences.getValue('scope'),
+                scopeId: preferences.getValue('scope_id'),
+                provider: preferences.getValue('provider')
+            });
+        }
+
+        var scopeOrder = {
+            capability: 1,
+            capability_group: 2,
+            instance: 3
+        };
+        prefList.sort(function(a, b) {
+            return scopeOrder[a.scope] - scopeOrder[b.scope];
+        });
+
+        var capabilityProviders = {};
+        var hasInstanceLevel = false;
+
+        for (var i = 0; i &lt; prefList.length; i++) {
+            var pref = prefList[i];
+            if (pref.scope === 'capability') {
+                if (!capabilityProviders[pref.scopeId]) {
+                    capabilityProviders[pref.scopeId] = {
+                        provider: pref.provider,
+                        source: 'CAPABILITY'
+                    };
+                }
+            } else if (pref.scope === 'capability_group') {
+                var caps = this.getCapabilitiesForGroup(pref.scopeId);
+                if (Array.isArray(caps)) {
+                    for (var j = 0; j &lt; caps.length; j++) {
+                        var capId = caps[j];
+                        if (!capabilityProviders[capId]) {
+                            capabilityProviders[capId] = {
+                                provider: pref.provider,
+                                source: 'CAPABILITY GROUP'
+                            };
+                        }
+                    }
+                }
+            } else if (pref.scope === 'instance') {
+                var allCaps = this.getAllCapabilities();
+                if (Array.isArray(allCaps)) {
+                    for (var n = 0; n &lt; allCaps.length; n++) {
+                        var cap = allCaps[n];
+                        if (!capabilityProviders[cap]) {
+                            capabilityProviders[cap] = {
+                                provider: pref.provider,
+                                source: 'INSTANCE'
+                            };
+                        }
+                    }
+                }
+                hasInstanceLevel = true;
+            }
+        }
+
+        if (!hasInstanceLevel) {
+            var mimirProvider = this.getMimirProvider();
+            if (mimirProvider) {
+                var allCapabilities = this.getAllCapabilities();
+                if (Array.isArray(allCapabilities)) {
+                    for (var p = 0; p &lt; allCapabilities.length; p++) {
+                        var cap3 = allCapabilities[p];
+                        if (!capabilityProviders[cap3]) {
+                            capabilityProviders[cap3] = {
+                                provider: mimirProvider,
+                                source: 'SERVICE PROVIDER'
+                            };
+                        }
+                    }
+                }
+            }
+        }
+
+        return capabilityProviders;
+    },
+
+    fetchTimeStamp: function() {
+        var gr = new GlideRecord('sys_gen_ai_provider_preference');
+        gr.addQuery('sys_domain', this.currentDomainId);
+        gr.orderByDesc('sys_updated_on');
+        gr.setLimit(1);
+        gr.query();
+
+        var latestUpdated = null;
+        if (gr.next()) {
+            latestUpdated = gr.getValue('sys_updated_on');
+        }
+        return latestUpdated;
+    },
+
+    processCustomizedSettings: function(trigger) {
+        //existence of property indicates customer is on supported GAIC version and the scheduled job doesn't need to refresh data manually.
+        if (gs.nil(gs.getProperty('sn_generative_ai.provider_preference_data_refresh'))) {
+            var tms = this.fetchTimeStamp();
+            this.processAuditTable(tms); //refresh provider preference table from audit
+        }
+
+        var customizedSettings = this.getCustomizedSettings();
+        for (var capabilityId in customizedSettings) {
+            if (!customizedSettings.hasOwnProperty(capabilityId)) continue;
+
+            var providerId = customizedSettings[capabilityId].provider;
+            var source = customizedSettings[capabilityId].source;
+
+            var providerImplementations = [];
+            var mappingGr = new GlideRecord('sys_generative_ai_provider_mapping');
+            mappingGr.addQuery('gen_ai_provider', providerId);
+            mappingGr.addQuery('active', true);
+            mappingGr.query();
+            while (mappingGr.next()) {
+                providerImplementations.push(mappingGr.getValue('provider_implementation'));
+            }
+            if (providerImplementations.length === 0) {
+                gs.info('[GenAIProviderUtil] No active provider mapping found for provider ' + providerId);
+                continue;
+            }
+
+            var definitionIds = [];
+            var definitionGr = new GlideRecord('sys_one_extend_capability_definition');
+            definitionGr.addQuery('capability', capabilityId);
+            if (providerImplementations.length === 1) {
+                definitionGr.addQuery('api', providerImplementations[0]);
+            } else {
+                definitionGr.addQuery('api', 'IN', providerImplementations.join(','));
+            }
+            definitionGr.query();
+            while (definitionGr.next()) {
+                definitionIds.push(definitionGr.getValue('sys_id'));
+            }
+
+            if (definitionIds.length === 0) {
+                gs.info('[GenAIProviderUtil] No capability definition found for capability ' + capabilityId + ' and provider ' + providerId);
+                continue;
+            }
+
+            var configGr = new GlideRecord('sys_one_extend_definition_config');
+            configGr.addQuery('capability', capabilityId);
+            configGr.addQuery('definition', 'IN', definitionIds.join(','));
+            configGr.addQuery('active', true);
+            configGr.query();
+
+            var activeRecords = [];
+            while (configGr.next()) {
+                activeRecords.push(configGr.getUniqueValue());
+            }
+
+            if (activeRecords.length &gt; 1) {
+                continue;
+            }
+
+            if (activeRecords.length === 0) {
+                continue;
+            }
+
+            var recordId = activeRecords[0];
+            var recordGrSingle = new GlideRecord('sys_one_extend_definition_config');
+
+            if (recordGrSingle.get(recordId)) {
+                var updated = null;
+                var isTargetDefault = recordGrSingle.getValue('default') == 1;
+
+                var otherDefaultsGr = new GlideRecord('sys_one_extend_definition_config');
+                otherDefaultsGr.addQuery('capability', capabilityId);
+                otherDefaultsGr.addQuery('sys_id', '!=', recordId);
+                otherDefaultsGr.addQuery('default', 1);
+                otherDefaultsGr.query();
+
+                while (otherDefaultsGr.next()) {
+                    otherDefaultsGr.setValue('default', 0);
+                    updated = otherDefaultsGr.update();
+                    if (!gs.nil(updated)) {
+                        this.insertAudit(updated, trigger, source, 'S002');
+                    }
+                }
+
+                if (!isTargetDefault) {
+                    recordGrSingle.setValue('default', 1);
+                    updated = recordGrSingle.update();
+                    if (!gs.nil(updated)) {
+                        this.insertAudit(updated, trigger, source, 'S001');
+                    }
+                }
+            }
+        }
+    },
+
+    insertAudit: function(sys_id, trigger, source, status) {
+        var auditGr = new GlideRecord('sys_gen_ai_provider_preference_audit');
+        auditGr.initialize();
+        auditGr.definition_config = sys_id;
+        auditGr.trigger = trigger;
+        auditGr.source = source;
+        auditGr.status = status;
+        auditGr.insert();
+    },
+
+    type: 'GenAIProviderUtil'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2025-10-16 04:18:02&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0624dc3affe4b210a3aeffffffffffe8&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;67&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;GenAIProviderUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Glide OneExtend" source="com.glide.one_extend"&gt;dc0e5100a56103108bb220b7a4d212de&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0624dc3affe4b210a3aeffffffffffe8&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2026-01-28 06:53:22&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+    &lt;sys_es_latest_script action="INSERT_OR_UPDATE"&gt;
+        &lt;id&gt;0624dc3affe4b210a3aeffffffffffe8&lt;/id&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2025-10-16 04:18:01&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1167503effe4b210a3aeffffffffff4a&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2025-10-16 04:18:01&lt;/sys_updated_on&gt;
+        &lt;table&gt;sys_script_include&lt;/table&gt;
+        &lt;use_es_latest&gt;true&lt;/use_es_latest&gt;
+    &lt;/sys_es_latest_script&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-08-25 05:56:39</sys_created_on>
+        <sys_id>a197282383768310a5875160ceaad3f1</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>GenAIProviderUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_a197282383768310a5875160ceaad3f1</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-08-25 05:56:39</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

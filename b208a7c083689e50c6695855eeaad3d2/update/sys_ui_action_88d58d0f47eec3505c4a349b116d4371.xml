@@ -1,0 +1,534 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update sys_domain="global" table="sys_ui_action">
+    <sys_ui_action action="INSERT_OR_UPDATE">
+        <action_name>ai_review_update</action_name>
+        <active>true</active>
+        <client>true</client>
+        <client_script_v2><![CDATA[function onClick(g_form) {
+
+}]]></client_script_v2>
+        <comments/>
+        <condition>current.canWrite()</condition>
+        <form_action>true</form_action>
+        <form_button>true</form_button>
+        <form_button_v2>false</form_button_v2>
+        <form_context_menu>false</form_context_menu>
+        <form_link>false</form_link>
+        <form_menu_button_v2>false</form_menu_button_v2>
+        <form_style/>
+        <format_for_configurable_workspace>false</format_for_configurable_workspace>
+        <hint/>
+        <isolate_script>true</isolate_script>
+        <list_action>false</list_action>
+        <list_banner_button>false</list_banner_button>
+        <list_button>false</list_button>
+        <list_choice>false</list_choice>
+        <list_context_menu>false</list_context_menu>
+        <list_link>false</list_link>
+        <list_save_with_form_button>false</list_save_with_form_button>
+        <list_style/>
+        <messages/>
+        <name>AI Review &amp; Update</name>
+        <onclick>showAIUpdatePreview()</onclick>
+        <order>100</order>
+        <script><![CDATA[function showAIUpdatePreview() {
+    g_form.clearMessages();
+    g_form.addInfoMessage('NOW ASSIST UI ACTION - VERSION 8 - STRUCTURED DISPLAY');
+
+    var cachedResponse = g_form.getValue('ai_resolution_plan') || '';
+
+    if (cachedResponse.trim()) {
+        var cachedResult = parseAIResponse(cachedResponse, true);
+
+        if (cachedResult && hasCurrentResponseFormat(cachedResult)) {
+
+            console.warn(
+                'Existing ai_resolution_plan is empty, invalid, or uses an older format. Executing the skill.'
+            );
+            openAIUpdatePreview(cachedResponse);
+            return;
+        }
+
+        console.warn(
+            'Existing ai_resolution_plan is empty, invalid, or uses an older format. Executing the skill.'
+        );
+    }
+
+    g_form.addSuggestionMessage('Analysing the data.....');
+
+    var inputs = {};
+    inputs.incidentsysid = g_form.getUniqueValue();
+
+    GlideFlow.startSubflow(
+        'sn_sow_inc.generate_incident_update_preview__ai_agent',
+        inputs
+    ).then(function(execution) {
+        return execution.awaitCompletion();
+    }).then(function(completion) {
+        if (!completion || completion.status !== 'COMPLETE') {
+            g_form.addErrorMessage(
+                'The Now Assist preview did not complete successfully.'
+            );
+            return;
+        }
+
+        var outputs = completion.outputs || {};
+        var skillResponse = outputs.skillresponse || '';
+
+        if (!skillResponse) {
+            g_form.addErrorMessage(
+                'Now Assist did not return any recommendations.'
+            );
+            return;
+        }
+
+        skillResponse = cleanJSONResponse(skillResponse);
+
+        if (!parseAIResponse(skillResponse, false)) {
+            return;
+        }
+
+        openAIUpdatePreview(skillResponse);
+    }).catch(function(error) {
+        console.error('AI Review and Update failed:', error);
+        g_form.addErrorMessage(
+            'Unable to generate the Now Assist recommendations.'
+        );
+    });
+}
+
+function cleanJSONResponse(value) {
+    var response = String(value || '').trim();
+
+    response = response.replace(/^Skill Response\s*/i, '');
+    response = response.replace(/^```json\s*/i, '');
+    response = response.replace(/^```\s*/i, '');
+    response = response.replace(/\s*```$/i, '');
+    response = response.replace(/<br\s*\/?\s*>/gi, '\n');
+    response = response.replace(/&quot;/gi, '"');
+    response = response.replace(/&#34;/gi, '"');
+    response = response.replace(/&amp;/gi, '&');
+    response = response.replace(/&lt;/gi, '<');
+    response = response.replace(/&gt;/gi, '>');
+
+    var firstBrace = response.indexOf('{');
+    var lastBrace = response.lastIndexOf('}');
+
+    if (firstBrace > -1 && lastBrace > firstBrace) {
+        response = response.substring(firstBrace, lastBrace + 1);
+    }
+
+    return normalizeRawLineBreaks(response.trim());
+}
+
+function normalizeRawLineBreaks(value) {
+    var normalized = '';
+    var insideString = false;
+    var escapedCharacter = false;
+    var index;
+
+    for (index = 0; index < value.length; index++) {
+        var character = value.charAt(index);
+
+        if (escapedCharacter) {
+            normalized += character;
+            escapedCharacter = false;
+            continue;
+        }
+
+        if (character === '\\' && insideString) {
+            normalized += character;
+            escapedCharacter = true;
+            continue;
+        }
+
+        if (character === '"') {
+            insideString = !insideString;
+            normalized += character;
+            continue;
+        }
+
+        if (insideString && (character === '\n' || character === '\r')) {
+            normalized += '\\n';
+
+            if (character === '\r' && value.charAt(index + 1) === '\n') {
+                index++;
+            }
+
+            continue;
+        }
+
+        normalized += character;
+    }
+
+    return normalized;
+}
+
+function parseAIResponse(skillResponse, suppressErrors) {
+    var result;
+
+    try {
+        result = JSON.parse(cleanJSONResponse(skillResponse));
+
+        if (typeof result === 'string') {
+            result = JSON.parse(result);
+        }
+    } catch (error) {
+        console.error('Invalid Now Assist JSON response:', skillResponse, error);
+
+        if (!suppressErrors) {
+
+            g_form.addErrorMessage('Now Assist response : ' + skillResponse);
+            g_form.addErrorMessage(
+                'Now Assist returned invalid JSON. Regenerate the AI Resolution Plan.'
+            );
+        }
+
+        return null;
+    }
+
+    var requiredTextFields = [
+        'shortDescription',
+        'description',
+        'category',
+        'channel',
+        'closeCode',
+        'closeNote',
+        'reassignmentReason',
+        'workNotes'
+    ];
+
+    for (var index = 0; index < requiredTextFields.length; index++) {
+        var fieldName = requiredTextFields[index];
+
+        if (typeof result[fieldName] !== 'string' || !result[fieldName].trim()) {
+            console.error('Missing Now Assist property:', fieldName, result);
+
+            if (!suppressErrors) {
+                g_form.addErrorMessage(
+                    'Now Assist did not return all required values.'
+                );
+            }
+
+            return null;
+        }
+    }
+
+    result.priority = Number(result.priority);
+    result.qualityScore = Number(result.qualityScore);
+
+    if (isNaN(result.priority) || isNaN(result.qualityScore)) {
+        console.error('Invalid numeric values in Now Assist response:', result);
+
+        if (!suppressErrors) {
+            g_form.addErrorMessage(
+                'Now Assist returned an invalid Priority or Quality Score.'
+            );
+        }
+
+        return null;
+    }
+
+    return result;
+}
+
+function hasCurrentResponseFormat(result) {
+    if (!result) {
+        return false;
+    }
+
+    var description = String(result.description || '');
+    var closeNote = String(result.closeNote || '');
+
+    return (
+        description.indexOf('Additional Details:') > -1 &&
+        closeNote.indexOf('Additional Details:') > -1
+    );
+}
+
+function openAIUpdatePreview(skillResponse) {
+    var result = parseAIResponse(skillResponse, false);
+
+    if (!result) {
+        return;
+    }
+
+    var suffix = new Date().getTime();
+    var acceptButtonId = 'ai_accept_' + suffix;
+    var cancelButtonId = 'ai_cancel_' + suffix;
+
+    function escapeHtml(value) {
+        return String(value === null || value === undefined ? '' : value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#039;');
+    }
+
+    function normalizeDisplayNewlines(value) {
+        return String(value === null || value === undefined ? '' : value)
+            .replace(/\\r\\n/g, '\n')
+            .replace(/\\n/g, '\n')
+            .replace(/\r\n/g, '\n')
+            .replace(/\r/g, '\n');
+    }
+
+    function formatStructuredText(value) {
+        var text = normalizeDisplayNewlines(value).trim();
+        var lines = text.split('\n');
+        var html = '';
+        var index;
+
+        for (index = 0; index < lines.length; index++) {
+            var line = String(lines[index] || '').trim();
+
+            if (!line) {
+                html += '<div style="height:8px;"></div>';
+                continue;
+            }
+
+            if (line === 'Additional Details:') {
+                html +=
+                    '<div style="margin-top:10px;margin-bottom:6px;font-weight:700;color:#1f5132;">' +
+                    'Additional Details:' +
+                    '</div>';
+                continue;
+            }
+
+            if (/^\d+\.\s*/.test(line)) {
+                html +=
+                    '<div style="display:flex;align-items:flex-start;margin:4px 0;">' +
+                    '<span style="min-width:24px;font-weight:700;color:#285b3c;">' +
+                    escapeHtml(line.match(/^\d+\./)[0]) +
+                    '</span>' +
+                    '<span style="flex:1;">' +
+                    escapeHtml(line.replace(/^\d+\.\s*/, '')) +
+                    '</span>' +
+                    '</div>';
+                continue;
+            }
+
+            html +=
+                '<div style="margin-bottom:5px;line-height:1.55;">' +
+                escapeHtml(line) +
+                '</div>';
+        }
+
+        return html;
+    }
+
+    function createRow(label, value, alternate, structured) {
+        var displayedValue = structured ?
+            formatStructuredText(value) : escapeHtml(value);
+
+        return '<tr' +
+            (alternate ? ' style="background:rgba(239,250,243,0.85);"' : '') +
+            '>' +
+            '<td style="padding:10px;width:165px;vertical-align:top;border-bottom:1px solid #b7d8c4;">' +
+            '<strong>' + escapeHtml(label) + '</strong>' +
+            '</td>' +
+            '<td style="padding:10px;vertical-align:top;border-bottom:1px solid #b7d8c4;line-height:1.55;white-space:normal;word-break:break-word;">' +
+            displayedValue +
+            '</td>' +
+            '</tr>';
+    }
+
+    var content =
+        '<div style="padding:20px;background:linear-gradient(120deg,#d8ffe3 0%,#c8fff0 50%,#c9f4ff 100%);border:1px solid #35a968;border-radius:12px;">' +
+        '<div style="display:flex;align-items:center;margin-bottom:18px;">' +
+        '<span style="font-size:21px;line-height:1;margin-right:9px;">&#10024;</span>' +
+        '<strong style="font-size:18px;color:#101010;">Now Assist Suggestions</strong>' +
+        '</div>' +
+        '<p style="margin-top:0;"><strong>The below are the suggestions provided by Now Assist:</strong></p>' +
+        '<table style="width:100%;border-collapse:collapse;border:1px solid #92d3ae;background:rgba(255,255,255,0.78);">' +
+        createRow('Short Description', result.shortDescription, false, false) +
+        createRow('Description', result.description, true, true) +
+        createRow('Category', result.category, false, false) +
+        createRow('Priority', result.priority, true, false) +
+        createRow('Channel', result.channel, false, false) +
+        createRow('Close Code', result.closeCode, true, false) +
+        createRow('Close Note', result.closeNote, false, true) +
+        createRow('Reassignment Reason', result.reassignmentReason, true, true) +
+        createRow('Work Notes', result.workNotes, false, true) +
+        createRow('Quality Score', result.qualityScore + ' / 100', true, false) +
+        '</table>' +
+        '<div style="margin-top:18px;padding:12px;background:#fff4ce;border-left:4px solid #ffb900;">' +
+        '<strong>Note:</strong> Clicking Accept will modify the fields listed above based on the Now Assist suggestions. These changes cannot be automatically reverted.<br>' +
+        '<span style="color: red; font-weight: bold;">Accepting these suggestions will improve your compliance score to ' + result.qualityScore + '</span>' +
+        '</div>' +
+        '<div style="margin-top:20px;text-align:right;">' +
+        '<button type="button" id="' + cancelButtonId + '" class="btn btn-default" style="margin-right:10px;border:1px solid #0068d9;color:#004dcc;font-weight:600;border-radius:7px;padding:7px 20px;">Cancel</button>' +
+        '<button type="button" id="' + acceptButtonId + '" class="btn" style="background:#159447;border:1px solid #087a36;color:#ffffff;font-weight:600;border-radius:7px;padding:7px 22px;">Accept</button>' +
+        '</div>' +
+        '</div>';
+
+    var gm = new GlideModal('ai_update_preview');
+    //gm.setTitle('AI Proposed Incident Updates');
+    gm.setWidth(850);
+    gm.renderWithContent(content);
+
+    bindModalButtons(
+        gm,
+        acceptButtonId,
+        cancelButtonId,
+        result,
+        cleanJSONResponse(skillResponse)
+    );
+}
+
+function bindModalButtons(
+    gm,
+    acceptButtonId,
+    cancelButtonId,
+    result,
+    skillResponse
+) {
+    var attempts = 0;
+    var maximumAttempts = 30;
+
+    function findButton(buttonId) {
+        var pageDocument = null;
+
+        if (typeof top !== 'undefined' && top.document) {
+            pageDocument = top.document;
+        } else if (typeof document !== 'undefined' && document) {
+            pageDocument = document;
+        }
+
+        if (!pageDocument) {
+            return null;
+        }
+
+        return pageDocument.getElementById(buttonId);
+    }
+
+    function attachHandlers() {
+        attempts++;
+
+        var acceptButton = findButton(acceptButtonId);
+        var cancelButton = findButton(cancelButtonId);
+
+        if ((!acceptButton || !cancelButton) && attempts < maximumAttempts) {
+            setTimeout(attachHandlers, 200);
+            return;
+        }
+
+        if (!acceptButton || !cancelButton) {
+            console.error(
+                'Modal buttons were not found.',
+                acceptButtonId,
+                cancelButtonId
+            );
+            g_form.addErrorMessage(
+                'Unable to initialize the confirmation buttons.'
+            );
+            return;
+        }
+
+        cancelButton.onclick = function() {
+            gm.destroy();
+            g_form.addInfoMessage(
+                'The Now Assist suggestions were ignored.'
+            );
+            return false;
+        };
+
+        acceptButton.onclick = function() {
+            acceptButton.disabled = true;
+            acceptButton.innerHTML = 'Applying...';
+
+            applyAIUpdates(
+                result,
+                skillResponse,
+                function(success) {
+                    if (!success) {
+                        acceptButton.disabled = false;
+                        acceptButton.innerHTML = 'Accept';
+                        return;
+                    }
+
+                    gm.destroy();
+                }
+            );
+
+            return false;
+        };
+    }
+
+    setTimeout(attachHandlers, 200);
+}
+
+function applyAIUpdates(result, skillResponse, callback) {
+    var ga = new GlideAjax('sn_itsm_gen_ai.synergizeDemoUtils');
+
+    ga.addParam('sysparm_name', 'applyUpdates');
+    ga.addParam('sysparm_incident_sys_id', g_form.getUniqueValue());
+    ga.addParam('sysparm_short_description', result.shortDescription);
+    ga.addParam('sysparm_description', result.description);
+    ga.addParam('sysparm_category', result.category);
+    ga.addParam('sysparm_priority', String(result.priority));
+    ga.addParam('sysparm_channel', result.channel);
+    ga.addParam('sysparm_close_code', result.closeCode);
+    ga.addParam('sysparm_close_note', result.closeNote);
+    ga.addParam('sysparm_reassignment_reason', result.reassignmentReason);
+    ga.addParam('sysparm_work_notes', result.workNotes);
+    ga.addParam('sysparm_quality_score', String(result.qualityScore));
+    ga.addParam('sysparm_ai_resolution_plan', skillResponse);
+
+    ga.getXMLAnswer(function(answer) {
+        var response;
+
+        try {
+            response = JSON.parse(answer || '{}');
+        } catch (error) {
+            console.error('Invalid Script Include response:', answer, error);
+            g_form.addErrorMessage(
+                'Invalid response from the Incident update service.'
+            );
+            callback(false);
+            return;
+        }
+
+        if (!response.success) {
+            g_form.addErrorMessage(
+                response.message || 'The Incident could not be updated.'
+            );
+            callback(false);
+            return;
+        }
+
+        g_form.clearMessages();
+        g_form.addSuggestionMessage(
+            'Check fields generated by Now Assist for accuracy.'
+        );
+        callback(true);
+
+        setTimeout(function() {
+            window.location.reload();
+        }, 600);
+    });
+}]]></script>
+        <show_insert>true</show_insert>
+        <show_multiple_update>false</show_multiple_update>
+        <show_query>false</show_query>
+        <show_update>true</show_update>
+        <sys_class_name>sys_ui_action</sys_class_name>
+        <sys_created_by>gokul.nath-varadarajan@capgemini.com</sys_created_by>
+        <sys_created_on>2026-08-11 08:46:29</sys_created_on>
+        <sys_domain>global</sys_domain>
+        <sys_domain_path>/</sys_domain_path>
+        <sys_id>88d58d0f47eec3505c4a349b116d4371</sys_id>
+        <sys_mod_count>38</sys_mod_count>
+        <sys_name>AI Review &amp; Update</sys_name>
+        <sys_overrides/>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_ui_action_88d58d0f47eec3505c4a349b116d4371</sys_update_name>
+        <sys_updated_by>gokul.nath-varadarajan@capgemini.com</sys_updated_by>
+        <sys_updated_on>2026-08-24 06:40:16</sys_updated_on>
+        <table>incident</table>
+        <ui11_compatible>true</ui11_compatible>
+        <ui16_compatible>false</ui16_compatible>
+    </sys_ui_action>
+</record_update>

@@ -1,0 +1,185 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0f086cf953d8421066e3ddeeff7b12b9</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_sd.SDSelfServiceAnalyticsUtils&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Contains helper functions to get configuration/data of Self Service Analytics&lt;/description&gt;
+        &lt;mobile_callable&gt;false&lt;/mobile_callable&gt;
+        &lt;name&gt;SDSelfServiceAnalyticsUtils&lt;/name&gt;
+        &lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;
+        &lt;script&gt;&lt;![CDATA[var SDSelfServiceAnalyticsUtils = Class.create();
+SDSelfServiceAnalyticsUtils.prototype = {
+    initialize: function() {},
+
+    getVACategory: function(scopeIDs) {
+        var topicCategory = [];
+        var grCategory = new GlideRecord('sys_cb_topic_category');
+        grCategory.addQuery('sys_scope', 'IN', scopeIDs);
+        grCategory.query();
+        while (grCategory.next())
+            topicCategory.push(grCategory.getUniqueValue());
+        return topicCategory.join(',');
+    },
+
+    getVaCountByCategory: function(topicCategory) {
+        var gaTopic = new GlideAggregate('sys_cb_topic');
+        gaTopic.addAggregate('COUNT');
+        gaTopic.addQuery('category', 'IN', topicCategory);
+        gaTopic.query();
+        if (gaTopic.next())
+            return parseInt(gaTopic.getAggregate('COUNT'));
+        return 0;
+    },
+
+    getVACountByDeflection: function(deflectionPatternIDs) {
+        var queryList = [];
+        deflectionPatternIDs.split(',').forEach(function(k) {
+            queryList.push('graphLIKE' + k);
+        });
+        var gaCBTopic = new GlideAggregate('sys_cb_topic');
+        gaCBTopic.addAggregate('COUNT');
+        gaCBTopic.addEncodedQuery(queryList.join('^OR'), true);
+        gaCBTopic.query();
+        if (gaCBTopic.next()) return parseInt(gaCBTopic.getAggregate('COUNT'));
+        return 0;
+    },
+
+    getDeflectionPatternIDs: function(encQuery) {
+        var ids = [];
+        var grDefPattern = new GlideRecord('ssa_deflection_pattern');
+        grDefPattern.addEncodedQuery(encQuery);
+        grDefPattern.query();
+        while (grDefPattern.next())
+            ids.push(grDefPattern.getUniqueValue());
+        return ids.join(',');
+    },
+
+    getSourceEncQuery: function(encQuery, sourceTable, sourceRefColumn) {
+        var defPatternQuery = this.parseQueryFromEncodedQuery('ssa_deflection_metric', encQuery, 'deflection_pattern');
+        var activityMetaData = this.getActivityMetaData(defPatternQuery);
+        var encQueryList = [];
+        for (var i in activityMetaData) {
+            var queryList = [];
+            Object.keys(activityMetaData[i]).forEach(function(key) {
+                if (key == 'activity_type' || key == 'activity_context')
+                    queryList.push(key + 'IN' + activityMetaData[i][key]);
+            });
+            if (sourceTable) queryList.push('source_table=' + sourceTable);
+            encQueryList.push(queryList.join('^'));
+        }
+        var activityContextEncQuery = encQueryList.join('^NQ');
+        return this.getSimilarActivityContextType(activityContextEncQuery, sourceRefColumn);
+    },
+
+
+    getSimilarActivityContextType: function(encQuery, refColumn) {
+        var encQueryList = [];
+        var grActContextType = new GlideRecord('sn_actsub_source_context_mapping');
+        if (!encQuery || !grActContextType.isValidEncodedQuery(encQuery))
+            return '';
+        grActContextType.addEncodedQuery(encQuery);
+        grActContextType.query();
+        while (grActContextType.next()) {
+            if (!gs.nil(grActContextType.getValue('mapping_criteria')))
+                encQueryList.push(this.parseQueryFromEncodedQuery(grActContextType.getValue('source_table'), grActContextType.getValue('mapping_criteria'), refColumn));
+        }
+        return encQueryList.join('^NQ');
+    },
+
+    //Get Self Service Analytics configuration from the deflection configuration
+    getActivityMetaData: function(encQuery) {
+        var activities = [];
+        var grDefPattern = new GlideRecord('ssa_deflection_pattern');
+        if (!encQuery || !grDefPattern.isValidEncodedQuery(encQuery))
+            return activities;
+        grDefPattern.addEncodedQuery(encQuery);
+        grDefPattern.query();
+        while (grDefPattern.next()) {
+            var activityType = [],
+                primaryActivity = [],
+                activity = [];
+            var activityContext = grDefPattern.deflection_configuration.activity_context.sys_id.toString();
+            var activityPattern = grDefPattern.activity_pattern;
+            if (activityPattern.primary_activity)
+                primaryActivity.push(activityPattern.primary_activity.sys_id.toString());
+
+            var grPatternElement = new GlideRecord('ssa_pattern_m2m_element');
+            grPatternElement.addQuery('pattern', activityPattern.sys_id);
+            grPatternElement.query();
+            while (grPatternElement.next())
+                activity.push(grPatternElement.element.activity_type);
+
+            activities.push({
+                "activity_context": activityContext,
+                "primary_activity": primaryActivity.join(','),
+                "activity": activity.join(','),
+                "activity_type": primaryActivity.concat(activity).join(',')
+            });
+        }
+        return activities;
+    },
+    // Used for parsing the query which is present for the reference column
+    parseQueryFromEncodedQuery: function(table, encQuery, refColumn) {
+        var gr = new GlideRecord(table);
+        if (!gr.isValidEncodedQuery(encQuery) || !gr.isValidField(refColumn)) return '';
+        // Split the query by '^NQ'
+        var orGroups = encQuery.split('^NQ');
+        var modifiedOrGroups = [];
+        orGroups.forEach(function(orGroup) {
+            // Split the query by both '^' and '^OR' operators
+            var fields = orGroup.split(/(\^OR|\^)/);
+            var modifiedFields = [];
+            for (var i = 0; i &lt; fields.length; i++) {
+                var field = fields[i].trim();
+                if (field.includes(refColumn)) {
+                    // Check if the field contains the dot operator. If it does, remove the reference table prefix. If it doesn't, replace reference table with 'sys_id'
+                    field = field.includes(".") ? field.replace(refColumn + ".", "") : field.replace(refColumn, "sys_id");
+                    if (i &gt; 0 &amp;&amp; modifiedFields.length &gt; 0 &amp;&amp; (fields[i - 1].trim() == '^' || fields[i - 1].trim() == '^OR')) {
+                        modifiedFields.push(fields[i - 1].trim() + field);
+                    } else {
+                        modifiedFields.push(field);
+                    }
+                }
+            }
+            modifiedOrGroups.push(modifiedFields.join(''));
+        });
+        return modifiedOrGroups.join('^NQ');
+    },
+    type: 'SDSelfServiceAnalyticsUtils'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2024-02-12 04:09:45&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0f086cf953d8421066e3ddeeff7b12b9&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;1&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;SDSelfServiceAnalyticsUtils&lt;/sys_name&gt;
+        &lt;sys_package display_value="Success Dashboard Core" source="sn_sd"&gt;3cc85c0107303010c7d559bf1ad30022&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Success Dashboard Core"&gt;3cc85c0107303010c7d559bf1ad30022&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0f086cf953d8421066e3ddeeff7b12b9&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-08-26 09:27:25&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-08-25 05:58:03</sys_created_on>
+        <sys_id>8ae7eca383768310a5875160ceaad394</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>SDSelfServiceAnalyticsUtils</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_8ae7eca383768310a5875160ceaad394</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-08-25 05:58:03</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

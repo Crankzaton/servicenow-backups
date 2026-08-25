@@ -1,0 +1,1359 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>16e983e902454ed89cba1b5d85caf6a9</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.BuildAgentUpdateSetBackOut&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Build Agent - Update Set Back Out (bypasses BackOutAPI for scoped app compatibility)&lt;/description&gt;
+        &lt;mobile_callable&gt;false&lt;/mobile_callable&gt;
+        &lt;name&gt;BuildAgentUpdateSetBackOut&lt;/name&gt;
+        &lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;
+        &lt;script&gt;&lt;![CDATA[/**
+ * Build Agent update set backout that bypasses SNC.BackOutAPI for scoped app compatibility.
+ *
+ * The standard BackOutAPI fails for scoped apps due to:
+ *   1. SystemFieldPurgingChecker.isSystemName() uses session scope prefix instead of app prefix
+ *   2. RecordPurger.isSystemMetadata() blocks purge for non-sys_app/sys_scope packages
+ *   3. Business rule cascade failures on tables with M2M relationships
+ *
+ * This class uses GlideappUpdateVersion.revert() for existing records and direct
+ * record deletion for new records, bypassing all three issues.
+ *
+ * Handles hierarchical update sets: when the target update set has children
+ * (as created by the checkpoint system), all descendants are discovered and
+ * processed in reverse order (deepest children first, then parent).
+ *
+ * Atomicity features:
+ *   - Pre-backout manifest persisted to sys_properties for recoverability
+ *   - Fail-fast mode (default): stops processing on first error
+ *   - Guarded deletion: update set metadata preserved when errors occur
+ *   - Baseline version fallback: checks sys_upgrade_history before purging
+ *   - Superseded version detection: blocks revert of non-latest versions
+ *   - Invalid field change detection: blocks reverts that would change field types
+ *     or reduce field lengths when the field contains data
+ *   - Data-loss guards: blocks purging tables that contain data
+ *   - Progress reporting via optional GlideExecutionTracker
+ */
+class BuildAgentUpdateSetBackOut {
+    static TABLES = {
+        UPDATE_SET: 'sys_update_set',
+        UPDATE_VERSION: 'sys_update_version',
+        UPDATE_XML: 'sys_update_xml',
+        SYS_METADATA: 'sys_metadata'
+    };
+
+    static STATES = {
+        CURRENT: 'current',
+        PREVIOUS: 'previous',
+        BACKED_OUT: 'backed_out'
+    };
+
+    static LOG_PREFIX = '[BuildAgentUpdateSetBackOut]';
+
+    static MANIFEST_PROPERTY_PREFIX = 'build_agent.backout.manifest.';
+
+    constructor(updateSetId, options) {
+        if (!updateSetId) {
+            throw new Error(BuildAgentUpdateSetBackOut.LOG_PREFIX + ': updateSetId is required');
+        }
+
+        this._updateSetId = updateSetId;
+        this._options = {
+            dryRun: false,
+            verbose: false,
+            deleteUpdateSet: true,
+            useWorkspaceSet: true,
+            failFast: true,
+            tracker: null
+        };
+        if (options) {
+            for (var key in options) {
+                if (options.hasOwnProperty(key)) {
+                    this._options[key] = options[key];
+                }
+            }
+        }
+
+        this._stats = {
+            reverted: 0,
+            purged: 0,
+            skipped: 0,
+            errors: 0,
+            deduplicatedMarked: 0,
+            errorDetails: []
+        };
+        this._originalUpdateSetId = null;
+        this._workspaceUpdateSetId = null;
+        this._updateSetHierarchy = [updateSetId];
+        this._manifest = null;
+    }
+
+    /**
+     * Main orchestration: validate, discover hierarchy, build manifest, process, cleanup.
+     * Processes child update sets before the parent (reverse hierarchy order).
+     * @returns {Object} stats - { reverted, purged, skipped, errors, deduplicatedMarked, errorDetails }
+     */
+    backOut() {
+        this._log('Starting backout for update set: ' + this._updateSetId);
+        this._reportProgress('Starting backout for update set: ' + this._updateSetId);
+
+        this._validateUpdateSet();
+
+        // Discover hierarchy: children first, root last
+        this._updateSetHierarchy = this._getUpdateSetHierarchy(this._updateSetId);
+        this._log('Update set hierarchy (' + this._updateSetHierarchy.length + ' update sets): ' +
+            this._updateSetHierarchy.join(', '));
+
+        // Build and persist manifest before any mutations
+        this._manifest = this._buildManifest();
+        this._persistManifest(this._manifest);
+        this._reportProgress('Built manifest with ' + this._manifest.totalVersions + ' operations');
+
+        // Pre-validation: scan the manifest for blocking issues across ALL
+        // update sets in the hierarchy before any mutations begin. This prevents
+        // partial backouts where early update sets succeed but a later one has
+        // a superseded or unsafe version, leaving the app in an inconsistent state.
+        var blockedOps = [];
+        for (var m = 0; m &lt; this._manifest.operations.length; m++) {
+            var op = this._manifest.operations[m];
+            if (op.action === 'blocked_superseded' || op.action === 'blocked_unsafe' || op.action === 'blocked_data_loss') {
+                blockedOps.push(op);
+            }
+        }
+        if (blockedOps.length &gt; 0) {
+            for (var b = 0; b &lt; blockedOps.length; b++) {
+                var blockMsg = 'Pre-validation: ' + blockedOps[b].name + ' — ' +
+                    (blockedOps[b].reason || blockedOps[b].action);
+                gs.error(BuildAgentUpdateSetBackOut.LOG_PREFIX + ': ' + blockMsg);
+                this._stats.errors++;
+                this._stats.errorDetails.push(blockMsg);
+            }
+            this._log('Pre-validation failed: ' + blockedOps.length +
+                ' blocking issue(s) found across all update sets. No mutations performed.');
+            this._reportProgress('Pre-validation failed: ' + blockedOps.length + ' blocking issue(s)');
+            return this._stats;
+        }
+
+        if (this._options.useWorkspaceSet) {
+            this._switchToWorkspaceUpdateSet();
+        }
+
+        // NOTE: Ideally we would set UpdateController.setLoading(true) here so
+        // that business rules checking isLoading() skip execution during our
+        // reverts/deletes. However, Packages.com.glide.update is blocked by
+        // the script security manager. Instead we rely on:
+        //   1. Workspace update set isolation (changes tracked there, then deleted)
+        //   2. setWorkflow(false) on version state updates and delete fallbacks
+
+        // Shared across all update sets so cross-update-set dedup works correctly
+        var processedNames = {};
+
+        try {
+            for (var h = 0; h &lt; this._updateSetHierarchy.length; h++) {
+                var currentUpdateSetId = this._updateSetHierarchy[h];
+                this._log('Processing update set ' + (h + 1) + '/' +
+                    this._updateSetHierarchy.length + ': ' + currentUpdateSetId);
+                this._reportProgress('Processing update set ' + (h + 1) + '/' +
+                    this._updateSetHierarchy.length);
+
+                var orderedVersions = this._getOrderedVersions(currentUpdateSetId);
+                this._logVerbose('Found ' + orderedVersions.length + ' versions in update set ' + currentUpdateSetId);
+
+                for (var i = 0; i &lt; orderedVersions.length; i++) {
+                    // Fail-fast: stop on first error
+                    if (this._options.failFast &amp;&amp; this._stats.errors &gt; 0) {
+                        this._log('Fail-fast: stopping after ' + this._stats.errors + ' error(s)');
+                        break;
+                    }
+
+                    var versionGr = new GlideRecord(BuildAgentUpdateSetBackOut.TABLES.UPDATE_VERSION);
+                    if (!versionGr.get(orderedVersions[i])) {
+                        this._logVerbose('Version not found, skipping: ' + orderedVersions[i]);
+                        this._stats.skipped++;
+                        continue;
+                    }
+                    this._processVersion(versionGr, processedNames);
+                }
+
+                // Fail-fast: stop processing remaining update sets
+                if (this._options.failFast &amp;&amp; this._stats.errors &gt; 0) {
+                    break;
+                }
+            }
+
+            // Guard deletion: skip when errors occurred to preserve recovery info
+            if (this._stats.errors &gt; 0) {
+                this._log('Skipping update set deletion due to ' + this._stats.errors +
+                    ' error(s). Update set metadata preserved for recovery.');
+                this._reportProgress('Backout completed with errors. Update set preserved.');
+            } else if (this._options.deleteUpdateSet) {
+                // Delete in same order (children first) to avoid FK issues
+                for (var d = 0; d &lt; this._updateSetHierarchy.length; d++) {
+                    this._deleteUpdateXmlEntries(this._updateSetHierarchy[d]);
+                    this._deleteUpdateSet(this._updateSetHierarchy[d]);
+                }
+            }
+
+            // Manifest cleanup: clear on success, preserve on failure
+            if (this._stats.errors === 0) {
+                this._clearManifest();
+            } else {
+                this._log('Manifest preserved for recovery: ' +
+                    BuildAgentUpdateSetBackOut.MANIFEST_PROPERTY_PREFIX + this._updateSetId);
+            }
+
+            this._log('Backout complete. Stats: reverted=' + this._stats.reverted +
+                ', purged=' + this._stats.purged +
+                ', skipped=' + this._stats.skipped +
+                ', errors=' + this._stats.errors +
+                ', deduplicatedMarked=' + this._stats.deduplicatedMarked);
+            this._reportProgress('Backout complete: ' + this._stats.reverted + ' reverted, ' +
+                this._stats.purged + ' purged, ' + this._stats.errors + ' errors');
+
+            return this._stats;
+        } finally {
+            if (this._options.useWorkspaceSet) {
+                this._restoreOriginalUpdateSet();
+            }
+        }
+    }
+
+    /**
+     * Report progress to the optional execution tracker.
+     * No-op when tracker is null.
+     * @param {string} message - progress message
+     */
+    _reportProgress(message) {
+        if (this._options.tracker) {
+            this._options.tracker.updateDetailMessage(message);
+        }
+    }
+
+    /**
+     * Classify a version as dedup, revert, or purge.
+     * Shared by _buildManifest (planning) and _processVersion (execution) to
+     * ensure the manifest always matches actual behavior.
+     * @param {string} name - version name
+     * @param {string} recordedAt - sys_recorded_at of the version
+     * @param {Object} processedNames - map of already-processed version names
+     * @returns {Object} { action: 'dedup'|'revert'|'purge', previousVersion: {sysId,payload}|null }
+     */
+    _classifyVersion(name, recordedAt, processedNames) {
+        if (processedNames[name]) {
+            return { action: 'dedup', previousVersion: null };
+        }
+
+        var previousVersion = this._findPreviousVersion(name, recordedAt);
+        if (!previousVersion) {
+            previousVersion = this._findBaselineVersion(name);
+        }
+
+        if (previousVersion) {
+            return { action: 'revert', previousVersion: previousVersion };
+        }
+        return { action: 'purge', previousVersion: null };
+    }
+
+    /**
+     * Build a pre-backout manifest describing all planned operations.
+     * This is a read-only planning phase — no mutations occur.
+     * Flags invalid field changes and superseded versions so dry runs
+     * reveal blocking issues before any mutations.
+     * @returns {Object} manifest with updateSetId, hierarchy, createdAt, totalVersions, operations[]
+     */
+    _buildManifest() {
+        var operations = [];
+        var processedNames = {};
+
+        for (var h = 0; h &lt; this._updateSetHierarchy.length; h++) {
+            var currentUpdateSetId = this._updateSetHierarchy[h];
+            var orderedVersions = this._getOrderedVersions(currentUpdateSetId);
+
+            for (var i = 0; i &lt; orderedVersions.length; i++) {
+                var versionGr = new GlideRecord(BuildAgentUpdateSetBackOut.TABLES.UPDATE_VERSION);
+                if (!versionGr.get(orderedVersions[i])) {
+                    continue;
+                }
+
+                var versionState = versionGr.getValue('state');
+                if (versionState === BuildAgentUpdateSetBackOut.STATES.BACKED_OUT) {
+                    continue;
+                }
+
+                var name = versionGr.getValue('name');
+                var recordedAt = versionGr.getValue('sys_recorded_at');
+                var classification = this._classifyVersion(
+                    name,
+                    recordedAt,
+                    processedNames
+                );
+
+                if (classification.action !== 'dedup') {
+                    processedNames[name] = true;
+                }
+
+                // Determine the effective action after safety checks
+                var effectiveAction = classification.action;
+                var reason = null;
+
+                if (classification.action !== 'dedup') {
+                    // Superseded check takes priority
+                    if (this._isSuperseded(name, recordedAt)) {
+                        effectiveAction = 'blocked_superseded';
+                        reason = 'Superseded by a newer version from another update set';
+                    }
+                    // Invalid field change check (only for reverts)
+                    else if (classification.action === 'revert' &amp;&amp; classification.previousVersion) {
+                        var fieldCheck = this._isInvalidFieldChange(name, classification.previousVersion.payload);
+                        if (fieldCheck.isInvalid) {
+                            effectiveAction = 'blocked_unsafe';
+                            reason = fieldCheck.reason;
+                        }
+                    }
+                    // Table data-loss check (only for purges of sys_db_object records)
+                    else if (classification.action === 'purge') {
+                        var recordInfo = this._extractRecordInfo(name);
+                        if (recordInfo &amp;&amp; recordInfo.table === 'sys_db_object') {
+                            var objGr = new GlideRecord('sys_db_object');
+                            if (objGr.get(recordInfo.sysId)) {
+                                var tableCheck = this._isTablePurgeWithData(objGr.getValue('name'));
+                                if (tableCheck.hasData) {
+                                    effectiveAction = 'blocked_data_loss';
+                                    reason = tableCheck.reason;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                operations.push({
+                    versionId: orderedVersions[i],
+                    name: name,
+                    action: effectiveAction,
+                    reason: reason,
+                    previousVersionId: classification.previousVersion ? classification.previousVersion.sysId : null,
+                    updateSetId: currentUpdateSetId
+                });
+            }
+        }
+
+        var now = new GlideDateTime();
+        return {
+            updateSetId: this._updateSetId,
+            hierarchy: this._updateSetHierarchy,
+            createdAt: now.getDisplayValue(),
+            totalVersions: operations.length,
+            operations: operations
+        };
+    }
+
+    /**
+     * Persist the manifest to a sys_property for recovery.
+     * If the manifest exceeds 60KB, strips verbose fields to fit.
+     * @param {Object} manifest - the manifest to persist
+     */
+    _persistManifest(manifest) {
+        var propertyName = BuildAgentUpdateSetBackOut.MANIFEST_PROPERTY_PREFIX + this._updateSetId;
+        var json = JSON.stringify(manifest);
+
+        // Size guard: sys_properties has practical limits
+        if (json.length &gt; 60000) {
+            this._log('Manifest exceeds 60KB (' + json.length + ' chars). Stripping verbose fields.');
+            var trimmed = {
+                updateSetId: manifest.updateSetId,
+                hierarchy: manifest.hierarchy,
+                createdAt: manifest.createdAt,
+                totalVersions: manifest.totalVersions,
+                operations: []
+            };
+            for (var i = 0; i &lt; manifest.operations.length; i++) {
+                trimmed.operations.push({
+                    versionId: manifest.operations[i].versionId,
+                    action: manifest.operations[i].action
+                });
+            }
+            json = JSON.stringify(trimmed);
+        }
+
+        gs.setProperty(propertyName, json);
+        this._logVerbose('Persisted manifest to property: ' + propertyName);
+    }
+
+    /**
+     * Delete the manifest property record after successful backout.
+     */
+    _clearManifest() {
+        var propertyName = BuildAgentUpdateSetBackOut.MANIFEST_PROPERTY_PREFIX + this._updateSetId;
+        var gr = new GlideRecord('sys_properties');
+        gr.addQuery('name', propertyName);
+        gr.query();
+        if (gr.next()) {
+            gr.deleteRecord();
+            this._logVerbose('Deleted manifest property record: ' + propertyName);
+        } else {
+            this._logVerbose('Manifest property record not found (already deleted): ' + propertyName);
+        }
+    }
+
+    /**
+     * Discover the full hierarchy of update sets rooted at the given ID.
+     * Uses BFS to find all descendants via the parent field.
+     * Returns them in reverse order: deepest children first, root last.
+     * This ensures child update set changes are backed out before parent changes.
+     * @param {string} rootUpdateSetId - the root update set sys_id
+     * @returns {string[]} ordered update set sys_ids (children first, root last)
+     */
+    _getUpdateSetHierarchy(rootUpdateSetId) {
+        // BFS to collect all descendants in breadth-first order
+        var queue = [rootUpdateSetId];
+        var ordered = [rootUpdateSetId];
+        var visited = {};
+        visited[rootUpdateSetId] = true;
+
+        while (queue.length &gt; 0) {
+            var currentId = queue.shift();
+
+            var childGr = new GlideRecord(BuildAgentUpdateSetBackOut.TABLES.UPDATE_SET);
+            childGr.addQuery('parent', currentId);
+            childGr.query();
+
+            while (childGr.next()) {
+                var childId = childGr.getUniqueValue();
+                if (!visited[childId]) {
+                    visited[childId] = true;
+                    ordered.push(childId);
+                    queue.push(childId);
+                }
+            }
+        }
+
+        // Reverse: deepest children first, root last
+        ordered.reverse();
+        return ordered;
+    }
+
+    /**
+     * Confirm update set exists and is in complete state.
+     */
+    _validateUpdateSet() {
+        var gr = new GlideRecord(BuildAgentUpdateSetBackOut.TABLES.UPDATE_SET);
+        if (!gr.get(this._updateSetId)) {
+            throw new Error(BuildAgentUpdateSetBackOut.LOG_PREFIX + ': Update set not found: ' + this._updateSetId);
+        }
+
+        var state = gr.getValue('state');
+        if (state !== 'complete') {
+            throw new Error(BuildAgentUpdateSetBackOut.LOG_PREFIX + ': Update set must be complete. Current state: ' + state);
+        }
+    }
+
+    /**
+     * Query versions in 7 dependency-safe groups ordered for safe reversal.
+     * Within each group: name ASC, sys_recorded_at ASC.
+     * Retrieves all versions from the update set in any state except backed_out.
+     * Non-current versions (e.g. previous) are included so that _buildManifest
+     * can detect superseded entries during pre-validation.
+     * @param {string} updateSetId - the update set to query versions for
+     * @returns {string[]} ordered array of sys_update_version sys_ids
+     */
+    _getOrderedVersions(updateSetId) {
+        var allVersionSysIds = [];
+        var allProcessedIds = {};
+        var self = this;
+
+        function queryGroup(encodedQueryPart, label) {
+            var gr = new GlideRecord(BuildAgentUpdateSetBackOut.TABLES.UPDATE_VERSION);
+            gr.addQuery('source', updateSetId);
+            gr.addQuery('state', '!=', BuildAgentUpdateSetBackOut.STATES.BACKED_OUT);
+            if (encodedQueryPart) {
+                gr.addEncodedQuery(encodedQueryPart);
+            }
+            gr.orderBy('name');
+            gr.orderBy('sys_recorded_at');
+            gr.query();
+
+            var ids = [];
+            while (gr.next()) {
+                var id = gr.getUniqueValue();
+                if (!allProcessedIds[id]) {
+                    ids.push(id);
+                    allProcessedIds[id] = true;
+                }
+            }
+            self._logVerbose('Group "' + label + '": ' + ids.length + ' versions');
+            return ids;
+        }
+
+        // Group 1: UI Views
+        allVersionSysIds = allVersionSysIds.concat(
+            queryGroup('nameSTARTSWITHsys_ui_view_', 'UI Views')
+        );
+
+        // Group 2: Documentation
+        allVersionSysIds = allVersionSysIds.concat(
+            queryGroup('nameSTARTSWITHsys_documentation_', 'Documentation')
+        );
+
+        // Groups 3 &amp; 4: Dictionary (split collections vs fields in JS)
+        var dictGr = new GlideRecord(BuildAgentUpdateSetBackOut.TABLES.UPDATE_VERSION);
+        dictGr.addQuery('source', updateSetId);
+        dictGr.addQuery('state', '!=', BuildAgentUpdateSetBackOut.STATES.BACKED_OUT);
+        dictGr.addEncodedQuery('nameSTARTSWITHsys_dictionary_^nameNOT LIKEsys_dictionary_override');
+        dictGr.orderBy('name');
+        dictGr.orderBy('sys_recorded_at');
+        dictGr.query();
+
+        var dictCollections = [];
+        var dictFields = [];
+        while (dictGr.next()) {
+            var dictId = dictGr.getUniqueValue();
+            if (allProcessedIds[dictId]) {
+                continue;
+            }
+            allProcessedIds[dictId] = true;
+
+            var dictName = dictGr.getValue('name');
+            if (dictName.match(/_null$/)) {
+                dictCollections.push(dictId);
+            } else {
+                dictFields.push(dictId);
+            }
+        }
+        this._logVerbose('Group "Dictionary collections": ' + dictCollections.length + ' versions');
+        this._logVerbose('Group "Dictionary fields": ' + dictFields.length + ' versions');
+        allVersionSysIds = allVersionSysIds.concat(dictCollections);
+        allVersionSysIds = allVersionSysIds.concat(dictFields);
+
+        // Group 5: Table records
+        allVersionSysIds = allVersionSysIds.concat(
+            queryGroup('nameSTARTSWITHsys_db_object_', 'Table records')
+        );
+
+        // Group 6: App records
+        allVersionSysIds = allVersionSysIds.concat(
+            queryGroup('nameSTARTSWITHsys_app_', 'App records')
+        );
+
+        // Group 7: Everything else
+        var processedIdList = Object.keys(allProcessedIds);
+
+        if (processedIdList.length &gt; 0) {
+            var catchAllGr = new GlideRecord(BuildAgentUpdateSetBackOut.TABLES.UPDATE_VERSION);
+            catchAllGr.addQuery('source', updateSetId);
+            catchAllGr.addQuery('state', '!=', BuildAgentUpdateSetBackOut.STATES.BACKED_OUT);
+            catchAllGr.addQuery('sys_id', 'NOT IN', processedIdList.join(','));
+            catchAllGr.orderBy('name');
+            catchAllGr.orderBy('sys_recorded_at');
+            catchAllGr.query();
+
+            var catchAllIds = [];
+            while (catchAllGr.next()) {
+                catchAllIds.push(catchAllGr.getUniqueValue());
+            }
+            this._logVerbose('Group "Everything else": ' + catchAllIds.length + ' versions');
+            allVersionSysIds = allVersionSysIds.concat(catchAllIds);
+        } else {
+            // No versions matched prior groups - query all
+            allVersionSysIds = allVersionSysIds.concat(
+                queryGroup('', 'Everything (no prior groups)')
+            );
+        }
+
+        return allVersionSysIds;
+    }
+
+    /**
+     * Process a single version: decide revert vs purge, execute, mark backed out.
+     * Uses errorsBefore pattern to avoid double-counting errors from _deleteRecord.
+     * @param {GlideRecord} versionGr - sys_update_version record
+     * @param {Object} processedNames - map of already-processed version names
+     */
+    _processVersion(versionGr, processedNames) {
+        var versionState = versionGr.getValue('state');
+
+        // Idempotency: skip already backed-out versions
+        if (versionState === BuildAgentUpdateSetBackOut.STATES.BACKED_OUT) {
+            this._logVerbose('Skipping already backed-out version: ' + versionGr.getUniqueValue());
+            this._stats.skipped++;
+            return;
+        }
+
+        var name = versionGr.getValue('name');
+        var recordedAt = versionGr.getValue('sys_recorded_at');
+        var classification = this._classifyVersion(
+            name,
+            recordedAt,
+            processedNames
+        );
+
+        // Deduplication: oldest version per name gets the actual revert
+        if (classification.action === 'dedup') {
+            if (!this._options.dryRun) {
+                this._markVersionBackedOut(versionGr);
+            }
+            this._stats.deduplicatedMarked++;
+            this._logVerbose('Dedup: marked version ' + versionGr.getUniqueValue() + ' for name: ' + name);
+            return;
+        }
+
+        processedNames[name] = true;
+
+        try {
+            var errorsBefore = this._stats.errors;
+
+            if (classification.action === 'revert') {
+                if (!this._options.dryRun) {
+                    var revertOk = this._revertVersion(classification.previousVersion.sysId, versionGr);
+                    if (!revertOk) {
+                        var revertErrMsg = 'Revert returned false for version ' +
+                            versionGr.getUniqueValue() + ' (name: ' + name + ')';
+                        gs.error(BuildAgentUpdateSetBackOut.LOG_PREFIX + ': ' + revertErrMsg);
+                        this._stats.errors++;
+                        this._stats.errorDetails.push(revertErrMsg);
+                    }
+                }
+                if (this._stats.errors === errorsBefore) {
+                    this._stats.reverted++;
+                    this._logVerbose('Reverted: ' + name);
+                }
+            } else {
+                if (!this._options.dryRun) {
+                    this._purgeNewRecord(name, versionGr.getValue('payload'));
+                }
+                if (this._stats.errors === errorsBefore) {
+                    this._stats.purged++;
+                    this._logVerbose('Purged: ' + name);
+                }
+            }
+
+            // Only mark backed out if no new errors occurred
+            if (!this._options.dryRun &amp;&amp; this._stats.errors === errorsBefore) {
+                this._markVersionBackedOut(versionGr);
+            }
+        } catch (e) {
+            var errorMsg = 'Error processing version ' +
+                versionGr.getUniqueValue() + ' (name: ' + name + '): ' + e.message;
+            gs.error(BuildAgentUpdateSetBackOut.LOG_PREFIX + ': ' + errorMsg);
+            this._stats.errors++;
+            this._stats.errorDetails.push(errorMsg);
+        }
+    }
+
+    /**
+     * Find the previous version of a record from before this update set hierarchy.
+     * Excludes all update sets in the hierarchy (not just the root) to avoid
+     * finding versions from sibling/child update sets.
+     * @param {string} name - version name (table_sysId format)
+     * @param {string} beforeTimestamp - sys_recorded_at of the current version
+     * @returns {Object|null} { sysId, payload } or null if record is new
+     */
+    _findPreviousVersion(name, beforeTimestamp) {
+        var gr = new GlideRecord(BuildAgentUpdateSetBackOut.TABLES.UPDATE_VERSION);
+        gr.addQuery('name', name);
+        gr.addQuery('state', 'previous');
+        gr.addQuery('source', 'NOT IN', this._updateSetHierarchy.join(','));
+        gr.addQuery('sys_recorded_at', '&lt;', beforeTimestamp);
+        gr.orderByDesc('sys_recorded_at');
+        gr.setLimit(1);
+        gr.query();
+
+        if (gr.next()) {
+            return {
+                sysId: gr.getUniqueValue(),
+                payload: gr.getValue('payload')
+            };
+        }
+        return null;
+    }
+
+    /**
+     * Find a baseline version from plugin/system upgrades (sys_upgrade_history).
+     * This is the fallback when _findPreviousVersion returns null — the record
+     * may have been delivered by a plugin and modified by the app. Reverting to
+     * the baseline preserves the plugin record instead of purging it.
+     * @param {string} name - version name (table_sysId format)
+     * @returns {Object|null} { sysId, payload } or null if no baseline exists
+     */
+    _findBaselineVersion(name) {
+        var gr = new GlideRecord(BuildAgentUpdateSetBackOut.TABLES.UPDATE_VERSION);
+        gr.addQuery('name', name);
+        gr.addQuery('state', 'previous');
+        gr.addQuery('source_table', 'sys_upgrade_history');
+        gr.orderByDesc('sys_recorded_at');
+        gr.setLimit(1);
+        gr.query();
+
+        if (gr.next()) {
+            return {
+                sysId: gr.getUniqueValue(),
+                payload: gr.getValue('payload')
+            };
+        }
+        return null;
+    }
+
+    /**
+     * Check if a version has been superseded by a later version from
+     * outside this update set hierarchy. Query criteria:
+     *   - Same name
+     *   - State is current or previous (not just current)
+     *   - Source is outside the hierarchy being backed out
+     *   - Recorded at the same time or later than the version being checked
+     *   - Not itself a reverted version
+     *
+     * @param {string} name - version name
+     * @param {string} recordedAt - sys_recorded_at of the version being backed out
+     * @returns {boolean} true if a later version exists outside hierarchy
+     */
+    _isSuperseded(name, recordedAt) {
+        var gr = new GlideRecord(BuildAgentUpdateSetBackOut.TABLES.UPDATE_VERSION);
+        gr.addQuery('name', name);
+        gr.addEncodedQuery('stateINcurrent,previous');
+        gr.addQuery('source', 'NOT IN', this._updateSetHierarchy.join(','));
+        gr.addQuery('sys_recorded_at', '&gt;=', recordedAt);
+        gr.addNullQuery('reverted_from');
+        gr.setLimit(1);
+        gr.query();
+
+        if (gr.next()) {
+            this._logVerbose('Superseded: ' + name + ' has a later version (state=' +
+                gr.getValue('state') + ') from source ' + gr.getValue('source') +
+                ' (recorded at ' + gr.getValue('sys_recorded_at') + ')');
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Check if reverting a sys_dictionary version would cause data loss.
+     * Guards against unsafe schema mutations:
+     *   - Only applies to sys_dictionary versions being reverted (not purged)
+     *   - Detects field type changes that would alter the storage format
+     *   - Detects field length reductions that would truncate existing data
+     *   - Only flags when the field actually contains data
+     *
+     * @param {string} name - version name (e.g., "sys_dictionary_x_app_table_field")
+     * @param {string} targetPayload - XML payload of the version we'd revert TO
+     * @returns {Object} { isInvalid: boolean, reason: string }
+     */
+    _isInvalidFieldChange(name, targetPayload) {
+        var SAFE = { isInvalid: false, reason: '' };
+
+        // Only check sys_dictionary versions
+        if (!name || name.indexOf('sys_dictionary_') !== 0) {
+            return SAFE;
+        }
+
+        // Must have a target payload to compare against
+        if (!targetPayload) {
+            return SAFE;
+        }
+
+        var targetDoc = new XMLDocument2();
+        targetDoc.parseXML(targetPayload);
+
+        // Check if the target action is a delete — deletion is always safe
+        var actionAttr = targetDoc.getNodeText('//sys_dictionary/@action');
+        if (actionAttr === 'DELETE' || actionAttr === 'delete' ||
+            actionAttr === 'DELETE_MULTIPLE' || actionAttr === 'delete_multiple') {
+            return SAFE;
+        }
+
+        // Extract element name and table name from target payload
+        var targetElement = targetDoc.getNodeText('//element');
+        var targetTable = targetDoc.getNodeText('//name');
+
+        if (!targetElement || !targetTable) {
+            this._logVerbose('InvalidFieldChange: Could not extract element/table from payload for ' + name);
+            return SAFE;
+        }
+
+        // Check if the table and field exist in the live schema
+        if (!GlideTableDescriptor.isValid(targetTable)) {
+            return SAFE;
+        }
+        if (!GlideTableDescriptor.fieldExists(targetTable, targetElement)) {
+            return SAFE;
+        }
+
+        // Check if the field currently exists in sys_dictionary (live metadata)
+        var dictGr = new GlideRecord('sys_dictionary');
+        dictGr.addQuery('name', targetTable);
+        dictGr.addQuery('element', targetElement);
+        dictGr.setLimit(1);
+        dictGr.query();
+
+        if (!dictGr.next()) {
+            return SAFE;
+        }
+
+        // Check if the field has data before flagging type/length changes
+        try {
+            var agg = new GlideAggregate(targetTable);
+            agg.addNotNullQuery(targetElement);
+            agg.addAggregate('COUNT');
+            agg.query();
+            var hasData = false;
+            if (agg.next()) {
+                hasData = parseInt(agg.getAggregate('COUNT'), 10) &gt; 0;
+            }
+
+            if (!hasData) {
+                return SAFE;
+            }
+        } catch (e) {
+            // If we can't verify the field is empty, block the revert. An
+            // automated agent has no human to review skipped versions, so
+            // the safe default is to assume data exists.
+            return {
+                isInvalid: true,
+                reason: 'Field ' + targetTable + '.' + targetElement +
+                    ' data check failed (' + e.message +
+                    '). Blocking revert because data presence could not be confirmed.'
+            };
+        }
+
+        // Compare field type: current live type vs. target payload type
+        var currentType = dictGr.getValue('internal_type');
+        var targetType = targetDoc.getNodeText('//internal_type');
+
+        if (targetType &amp;&amp; currentType &amp;&amp; targetType !== currentType) {
+            return {
+                isInvalid: true,
+                reason: 'Field ' + targetTable + '.' + targetElement +
+                    ' type change (' + currentType + ' -&gt; ' + targetType +
+                    ') would be applied by revert, but field contains data. ' +
+                    'Blocking revert to prevent data loss.'
+            };
+        }
+
+        // Compare field length: check if target is shorter than current
+        var currentLength = parseInt(dictGr.getValue('max_length'), 10);
+        var targetLengthStr = targetDoc.getNodeText('//max_length');
+
+        if (targetLengthStr) {
+            var targetLength = parseInt(targetLengthStr, 10);
+
+            if (!isNaN(targetLength) &amp;&amp; targetLength &gt;= 0 &amp;&amp;
+                !isNaN(currentLength) &amp;&amp; currentLength &gt;= 0 &amp;&amp;
+                targetLength &lt; currentLength) {
+                return {
+                    isInvalid: true,
+                    reason: 'Field ' + targetTable + '.' + targetElement +
+                        ' length reduction (' + currentLength + ' -&gt; ' + targetLength +
+                        ') would be applied by revert, but field contains data. ' +
+                        'Blocking revert to prevent data loss.'
+                };
+            }
+        }
+
+        return SAFE;
+    }
+
+    /**
+     * Check if a table contains data rows. Used to block purges that would
+     * drop tables with existing data.
+     *
+     * @param {string} tableName - the table name to check
+     * @returns {Object} { hasData: boolean, reason: string }
+     */
+    _isTablePurgeWithData(tableName) {
+        var SAFE = { hasData: false, reason: '' };
+
+        if (!tableName) {
+            return SAFE;
+        }
+
+        try {
+            var dataGr = new GlideRecord(tableName);
+            dataGr.setLimit(1);
+            dataGr.query();
+            if (dataGr.next()) {
+                return {
+                    hasData: true,
+                    reason: 'Table ' + tableName +
+                        ' contains data. Blocking purge to prevent data loss.'
+                };
+            }
+        } catch (e) {
+            // Can't confirm table is empty — block to be safe
+            return {
+                hasData: true,
+                reason: 'Table ' + tableName +
+                    ' data check failed (' + e.message +
+                    '). Blocking purge because data presence could not be confirmed.'
+            };
+        }
+
+        return SAFE;
+    }
+
+    /**
+     * Revert a record to its previous version.
+     * Primary: GlideappUpdateVersion().revert(versionSysId) — no-arg constructor,
+     *   revert() takes the sys_id of the sys_update_version record.
+     * Fallback: GlideUpdateManager2.loadXML() with previous version's payload.
+     *
+     * @param {string} previousVersionId - sys_id of previous sys_update_version record
+     * @param {GlideRecord} currentVersionGr - current version record (used for logging)
+     * @returns {boolean} true if revert succeeded, false if it silently failed
+     */
+    _revertVersion(previousVersionId, currentVersionGr) {
+        var name = currentVersionGr.getValue('name');
+
+        // Primary approach: GlideappUpdateVersion (no-arg constructor)
+        try {
+            var updateVersion = new GlideappUpdateVersion();
+            var result = updateVersion.revert(previousVersionId);
+            if (result === false) {
+                this._log('GlideappUpdateVersion.revert() returned false for ' + name +
+                    '. Falling back to GlideUpdateManager2.loadXML()');
+            } else {
+                return true;
+            }
+        } catch (e) {
+            this._log('GlideappUpdateVersion.revert() failed for ' + name +
+                ': ' + e.message + '. Falling back to GlideUpdateManager2.loadXML()');
+        }
+
+        // Fallback: load previous version's payload directly
+        var previousGr = new GlideRecord(BuildAgentUpdateSetBackOut.TABLES.UPDATE_VERSION);
+        if (!previousGr.get(previousVersionId)) {
+            throw new Error('Previous version record not found: ' + previousVersionId);
+        }
+
+        var payload = previousGr.getValue('payload');
+        if (!payload) {
+            throw new Error('Previous version has no payload: ' + previousVersionId);
+        }
+
+        var updateManager = new GlideUpdateManager2();
+        updateManager.loadXML(payload);
+
+        // Verify the revert applied by re-querying the version record.
+        // If loadXML succeeded, the platform marks the previous version as
+        // 'current'. We check this instead of gs.getLastErrorMessage() which
+        // is a global singleton and unreliable (prior errors or business rule
+        // side-effects can produce false positives).
+        var verifyGr = new GlideRecord(BuildAgentUpdateSetBackOut.TABLES.UPDATE_VERSION);
+        if (verifyGr.get(previousVersionId)) {
+            var newState = verifyGr.getValue('state');
+            if (newState === BuildAgentUpdateSetBackOut.STATES.CURRENT) {
+                return true;
+            }
+            this._log('loadXML() did not promote previous version to current for ' +
+                name + '. State is: ' + newState);
+            return false;
+        }
+
+        // If we can't re-query the version, assume success — loadXML didn't throw
+        this._log('Could not re-query previous version ' + previousVersionId +
+            ' after loadXML for ' + name + '. Assuming success.');
+        return true;
+    }
+
+    /**
+     * Purge a record that was new in this update set (no prior version exists).
+     * Always deletes from the concrete table (not sys_metadata) so that
+     * table-specific business rules fire — e.g., sys_db_object rules that
+     * drop physical database tables, sys_dictionary rules that drop columns.
+     *
+     * Three resolution paths:
+     *   Standard:  "table_name_&lt;32-hex-sysid&gt;" — delete directly.
+     *   Composite: parsed table is an artificial wrapper (e.g. sys_ui_form_sections)
+     *              that carries multiple inner records — delegate to _purgeCompositePayload.
+     *   Dictionary: "sys_dictionary_&lt;table&gt;_&lt;element&gt;" — sys_metadata.sys_update_name lookup.
+     *
+     * @param {string} name - version name
+     * @param {string} [payload] - update XML payload; required for composite wrapper records
+     * @returns {boolean} true if purge succeeded, false if deletion failed
+     */
+    _purgeNewRecord(name, payload) {
+        var recordInfo = this._extractRecordInfo(name);
+
+        if (recordInfo) {
+            if (recordInfo.table === 'sys_db_object') {
+                return this._purgeTable(recordInfo.sysId, name);
+            }
+            if (!GlideTableDescriptor.isValid(recordInfo.table)) {
+                return this._purgeCompositePayload(name, payload);
+            }
+            return this._deleteRecord(recordInfo.table, recordInfo.sysId, name);
+        }
+
+        // Fallback for non-standard version names (e.g. sys_dictionary_&lt;table&gt;_&lt;element&gt;).
+        // Look up the actual record via sys_metadata.sys_update_name to get the
+        // concrete table and sys_id.
+        var metaGr = new GlideRecord(BuildAgentUpdateSetBackOut.TABLES.SYS_METADATA);
+        metaGr.addQuery('sys_update_name', name);
+        metaGr.setLimit(1);
+        metaGr.query();
+
+        if (metaGr.next()) {
+            var concreteTable = metaGr.getValue('sys_class_name');
+            var sysId = metaGr.getUniqueValue();
+            this._logVerbose('Resolved via sys_metadata lookup: ' + name +
+                ' -&gt; ' + concreteTable + '/' + sysId);
+            if (concreteTable === 'sys_db_object') {
+                return this._purgeTable(sysId, name);
+            } else {
+                return this._deleteRecord(concreteTable, sysId, name);
+            }
+        } else {
+            this._logVerbose('Record not found in sys_metadata for: ' + name +
+                '. May already be deleted.');
+            return true;
+        }
+    }
+
+    /**
+     * Purge a table (sys_db_object) record and its dependencies.
+     *
+     * When a table is created, the platform auto-generates records that
+     * don't have sys_update_version entries and can block sys_db_object deletion:
+     *   - sys_dictionary: system columns (sys_id, sys_created_on, etc.)
+     *
+     * Note: ua_table_licensing_config entries are intentionally NOT removed.
+     * Subscription licensing records are managed by the platform and should
+     * not be deleted during backout.
+     *
+     * Blocks deletion when the table contains data rows.
+     * Cleans up dictionary dependencies first, then deletes the sys_db_object
+     * record which triggers the physical table drop.
+     *
+     * @param {string} sysId - sys_id of the sys_db_object record
+     * @param {string} name - version name for logging
+     * @returns {boolean} true if purge succeeded, false if deletion failed
+     */
+    _purgeTable(sysId, name) {
+        var objGr = new GlideRecord('sys_db_object');
+        if (!objGr.get(sysId)) {
+            this._logVerbose('Table record not found (may already be deleted): ' + sysId);
+            return true;
+        }
+        var tableName = objGr.getValue('name');
+
+        // Data-loss guard (defensive): pre-validation in _buildManifest blocks
+        // data-loss purges before execution starts, so this should not match.
+        // Retained as a safety net in case execution-time state diverges.
+        var tableCheck = this._isTablePurgeWithData(tableName);
+        if (tableCheck.hasData) {
+            gs.error(BuildAgentUpdateSetBackOut.LOG_PREFIX + ': ' + tableCheck.reason);
+            this._stats.errors++;
+            this._stats.errorDetails.push(tableCheck.reason);
+            return false;
+        }
+
+        // Remove all sys_dictionary entries for this table.
+        // This includes both version-tracked entries (already handled but
+        // harmless to re-delete) and system-generated entries (no version
+        // tracking, would otherwise block the sys_db_object delete).
+        var dictGr = new GlideRecord('sys_dictionary');
+        dictGr.addQuery('name', tableName);
+        dictGr.query();
+        this._logVerbose('Removing dictionary entries for table: ' + tableName);
+        dictGr.deleteMultiple();
+
+        // Now delete the sys_db_object record — should trigger physical table drop
+        return this._deleteRecord('sys_db_object', sysId, name);
+    }
+
+    /**
+     * Purge inner records carried by a composite wrapper payload. Inner records are
+     * matched by the `action` attribute (which wrappers don't carry) and each inner
+     * record's tag name + &lt;sys_id&gt; child give the real table and id.
+     *
+     * @param {string} name - version name (wrapper-style, e.g. sys_ui_form_sections_&lt;id&gt;)
+     * @param {string} payload - update XML payload
+     * @returns {boolean} true on success, false if payload missing or unparseable
+     */
+    _purgeCompositePayload(name, payload) {
+        if (!payload) {
+            var missingMsg = 'Composite wrapper record has no payload; cannot determine inner records to purge: ' + name;
+            gs.error(BuildAgentUpdateSetBackOut.LOG_PREFIX + ': ' + missingMsg);
+            this._stats.errors++;
+            this._stats.errorDetails.push(missingMsg);
+            return false;
+        }
+
+        var xmlDoc = new XMLDocument2();
+        if (!xmlDoc.parseXML(payload)) {
+            var parseErrMsg = 'Composite payload XML failed to parse: ' + name;
+            gs.error(BuildAgentUpdateSetBackOut.LOG_PREFIX + ': ' + parseErrMsg);
+            this._stats.errors++;
+            this._stats.errorDetails.push(parseErrMsg);
+            return false;
+        }
+
+        var node = xmlDoc.getFirstNode('//*[@action]');
+        var attempted = 0;
+        var succeeded = 0;
+        // Attempt every inner child even if a sibling fails: composites are one logical
+        // unit. fail-fast still halts at the next version via _processVersion.
+        while (node) {
+            var tableName = node.getNodeName();
+            // Guard against a future wrapper variant carrying its own `action` attribute.
+            if (!GlideTableDescriptor.isValid(tableName)) {
+                this._logVerbose('Composite skip: not a real table ' + tableName + ' (' + name + ')');
+                node = xmlDoc.getNextNode(node);
+                continue;
+            }
+            var sysIdText = this._findChildText(node, 'sys_id');
+            if (sysIdText) {
+                attempted++;
+                if (this._deleteRecord(tableName, sysIdText, name)) {
+                    succeeded++;
+                }
+            } else {
+                this._logVerbose('Composite child has no sys_id, skipping: ' + tableName + ' (' + name + ')');
+            }
+            node = xmlDoc.getNextNode(node);
+        }
+
+        if (attempted === 0) {
+            var emptyMsg = 'Composite wrapper payload had no deletable inner records: ' + name;
+            gs.error(BuildAgentUpdateSetBackOut.LOG_PREFIX + ': ' + emptyMsg);
+            this._stats.errors++;
+            this._stats.errorDetails.push(emptyMsg);
+            return false;
+        }
+
+        this._logVerbose('Composite purge: ' + succeeded + '/' + attempted + ' inner record(s) deleted for ' + name);
+        return succeeded === attempted;
+    }
+
+    /**
+     * Text content of the first direct child element with the given tag name, or null.
+     * Walks children directly so we don't depend on XMLDocument2's read-side XPath context.
+     */
+    _findChildText(parentNode, childTagName) {
+        var iter = parentNode.getChildNodeIterator();
+        while (iter.hasNext()) {
+            var child = iter.next();
+            if (child.getNodeName() === childTagName) {
+                return child.getTextContent();
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Delete a record. Tries with workflow enabled first; on failure,
+     * retries with workflow disabled to bypass cascade failures.
+     * @param {string} table - table name
+     * @param {string} sysId - record sys_id
+     * @param {string} name - version name for logging
+     * @returns {boolean} true if record was deleted or not found, false if both attempts failed
+     */
+    _deleteRecord(table, sysId, name) {
+        var gr = new GlideRecord(table);
+        if (!gr.get(sysId)) {
+            this._logVerbose('Record not found for purge (may already be deleted): ' +
+                table + '/' + sysId + ' (' + name + ')');
+            return true;
+        }
+
+        // Try with workflow enabled (allows business rules for schema changes)
+        try {
+            gr.setWorkflow(true);
+            if (gr.deleteRecord()) {
+                this._logVerbose('Purged with workflow: ' + table + '/' + sysId);
+                return true;
+            }
+            this._log('deleteRecord() returned false for ' + table + '/' + sysId +
+                ' (' + name + '). ' + (gs.getLastErrorMessage() || 'No error details available.') +
+                ' Retrying with workflow(false).');
+        } catch (e) {
+            this._log('Delete with workflow(true) failed for ' + table + '/' + sysId +
+                ': ' + e.message + '. Retrying with workflow(false).');
+        }
+
+        // Fallback: disable workflow to bypass cascade failures
+        var gr2 = new GlideRecord(table);
+        if (gr2.get(sysId)) {
+            gr2.setWorkflow(false);
+            if (!gr2.deleteRecord()) {
+                var deleteErrorMsg = 'deleteRecord() failed for ' +
+                    table + '/' + sysId + ' (' + name + '). ' + (gs.getLastErrorMessage() || 'No error details available.');
+                this._log(deleteErrorMsg);
+                this._stats.errors++;
+                this._stats.errorDetails.push(deleteErrorMsg);
+                return false;
+            }
+            this._logVerbose('Purged with workflow(false): ' + table + '/' + sysId);
+        }
+        return true;
+    }
+
+    /**
+     * Parse version name to extract table and sys_id.
+     * Format: "table_name_&lt;32-char-hex-sys-id&gt;"
+     * @param {string} name - version name
+     * @returns {Object|null} { table, sysId } or null
+     */
+    _extractRecordInfo(name) {
+        if (!name) {
+            return null;
+        }
+
+        var match = name.match(/^(.+)_([0-9a-f]{32})$/);
+        if (!match) {
+            return null;
+        }
+
+        return {
+            table: match[1],
+            sysId: match[2]
+        };
+    }
+
+    /**
+     * Mark a version as backed out.
+     * @param {GlideRecord} versionGr - sys_update_version record
+     */
+    _markVersionBackedOut(versionGr) {
+        versionGr.setWorkflow(false);
+        versionGr.setValue('state', BuildAgentUpdateSetBackOut.STATES.BACKED_OUT);
+        versionGr.update();
+    }
+
+    /**
+     * Delete all sys_update_xml entries for the update set.
+     * @param {string} updateSetId - update set sys_id
+     */
+    _deleteUpdateXmlEntries(updateSetId) {
+        if (this._options.dryRun) {
+            return;
+        }
+
+        var gr = new GlideRecord(BuildAgentUpdateSetBackOut.TABLES.UPDATE_XML);
+        gr.addQuery('update_set', updateSetId);
+        gr.query();
+        gr.deleteMultiple();
+        this._log('Deleted sys_update_xml entries for update set: ' + updateSetId);
+    }
+
+    /**
+     * Delete the update set record.
+     * @param {string} updateSetId - update set sys_id
+     */
+    _deleteUpdateSet(updateSetId) {
+        if (this._options.dryRun) {
+            return;
+        }
+
+        var gr = new GlideRecord(BuildAgentUpdateSetBackOut.TABLES.UPDATE_SET);
+        if (gr.get(updateSetId)) {
+            gr.deleteRecord();
+            this._log('Deleted update set: ' + updateSetId);
+        }
+    }
+
+    /**
+     * Create a temporary workspace update set so revert operations
+     * don't pollute the user's current update set.
+     */
+    _switchToWorkspaceUpdateSet() {
+        var gus = new GlideUpdateSet();
+        this._originalUpdateSetId = gus.get();
+
+        var gr = new GlideRecord(BuildAgentUpdateSetBackOut.TABLES.UPDATE_SET);
+        gr.initialize();
+        gr.setValue('name', 'Backout workspace - ' + this._updateSetId);
+        gr.setValue('state', 'in progress');
+        var tempId = gr.insert();
+
+        if (tempId) {
+            gus.set(tempId);
+            this._workspaceUpdateSetId = tempId;
+            this._logVerbose('Switched to workspace update set: ' + tempId);
+        } else {
+            gs.warn(BuildAgentUpdateSetBackOut.LOG_PREFIX + ': Failed to create workspace update set. Proceeding without isolation.');
+        }
+    }
+
+    /**
+     * Restore the original update set and clean up the workspace.
+     * Called in finally block to guarantee cleanup.
+     */
+    _restoreOriginalUpdateSet() {
+        if (this._originalUpdateSetId) {
+            var gus = new GlideUpdateSet();
+            gus.set(this._originalUpdateSetId);
+            this._logVerbose('Restored original update set: ' + this._originalUpdateSetId);
+        }
+
+        if (this._workspaceUpdateSetId) {
+            try {
+                var xmlGr = new GlideRecord(BuildAgentUpdateSetBackOut.TABLES.UPDATE_XML);
+                xmlGr.addQuery('update_set', this._workspaceUpdateSetId);
+                xmlGr.query();
+                xmlGr.deleteMultiple();
+
+                var usGr = new GlideRecord(BuildAgentUpdateSetBackOut.TABLES.UPDATE_SET);
+                if (usGr.get(this._workspaceUpdateSetId)) {
+                    usGr.deleteRecord();
+                }
+                this._logVerbose('Cleaned up workspace update set: ' + this._workspaceUpdateSetId);
+            } catch (e) {
+                gs.warn(BuildAgentUpdateSetBackOut.LOG_PREFIX + ': Failed to clean up workspace update set: ' + e.message);
+            }
+        }
+    }
+
+    _log(message) {
+        gs.info(BuildAgentUpdateSetBackOut.LOG_PREFIX + ': ' + message);
+    }
+
+    _logVerbose(message) {
+        if (this._options.verbose) {
+            gs.info(BuildAgentUpdateSetBackOut.LOG_PREFIX + ' [verbose]: ' + message);
+        }
+    }
+}]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2026-02-18 00:00:00&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;16e983e902454ed89cba1b5d85caf6a9&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;BuildAgentUpdateSetBackOut&lt;/sys_name&gt;
+        &lt;sys_package display_value="Build Agent Core - Global" source="com.glide.app_build_agent_core.global"&gt;5460cb4e838a0310a5875160ceaad3b2&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_16e983e902454ed89cba1b5d85caf6a9&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2026-02-18 00:00:00&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+    &lt;sys_es_latest_script action="INSERT_OR_UPDATE"&gt;
+        &lt;id&gt;16e983e902454ed89cba1b5d85caf6a9&lt;/id&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2026-02-18 00:00:00&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;16e983e902454ed89cba1b5d85caf6aa&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2026-02-18 00:00:00&lt;/sys_updated_on&gt;
+        &lt;table&gt;sys_script_include&lt;/table&gt;
+        &lt;use_es_latest&gt;true&lt;/use_es_latest&gt;
+    &lt;/sys_es_latest_script&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-08-25 05:59:22</sys_created_on>
+        <sys_id>5938646783768310a5875160ceaad370</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>BuildAgentUpdateSetBackOut</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_5938646783768310a5875160ceaad370</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-08-25 05:59:22</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

@@ -1,0 +1,211 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>15994eb837ea0210d1e067ae64924b8a</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.MlClusterDetailPurgeUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;This util script is used to purge stale records and records from deleted solutions in ml_cluster_detail table &lt;/description&gt;
+        &lt;mobile_callable&gt;false&lt;/mobile_callable&gt;
+        &lt;name&gt;MlClusterDetailPurgeUtil&lt;/name&gt;
+        &lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;
+        &lt;script&gt;&lt;![CDATA[var MlClusterDetailPurgeUtil = Class.create();
+
+(function() {
+    var tables = {
+        ML_SOLUTION: 'ml_solution',
+        ML_CLUSTER_DETAIL: 'ml_cluster_detail',
+        ML_CLUSTER_DETAIL_PURGE_AUDIT: 'ml_cluster_detail_purge_audit'
+    };
+
+    var column_names = {
+        SYS_ID: 'sys_id',
+        REC_SYS_ID: 'rec_sys_id',
+        REC_TABLE: 'rec_table',
+        ACTIVE: 'active',
+        SYS_CREATED_ON: 'sys_created_on',
+        SOLUTION: 'solution',
+        LAST_PROCESSED_RECORD_TIME: 'last_processed_record_time',
+        TABLE: 'table',
+        NUM_SCANS_COMPLETE: 'num_scans_complete'
+    };
+
+    var MAX_ML_CLUSTER_DETAIL_PURGE_COUNT = 500000;
+    var MAX_BATCH_SIZE = 100000;
+
+    MlClusterDetailPurgeUtil.prototype = {
+        initialize: function() {},
+
+        purgeDeletedSolutionRecords: function() {
+            var mlClusterDetailGa = new GlideAggregate(tables.ML_CLUSTER_DETAIL);
+            mlClusterDetailGa.groupBy(column_names.SOLUTION);
+            mlClusterDetailGa.addAggregate('COUNT', column_names.SOLUTION);
+            mlClusterDetailGa.query();
+
+            var mlClusterDetailPurgedCount = 0;
+            var totalTimeTaken = 0;
+
+            while (mlClusterDetailGa.next()) {
+                var solution_id = mlClusterDetailGa.getValue(column_names.SOLUTION);
+                var mlSolutiongGr = new GlideRecord(tables.ML_SOLUTION);
+                mlSolutiongGr.addQuery(column_names.SYS_ID, solution_id);
+                mlSolutiongGr.query();
+                if (!mlSolutiongGr.next()) {
+                    var start = new Date().getTime();
+                    var mlClusterDetailPurgedCountPerSolution = 0;
+
+                    var mlClusterDetailGr = new GlideRecord(tables.ML_CLUSTER_DETAIL);
+                    mlClusterDetailGr.addQuery(column_names.SOLUTION, solution_id);
+                    mlClusterDetailGr.addQuery(column_names.ACTIVE, true);
+                    mlClusterDetailGr.setLimit(MAX_BATCH_SIZE);
+                    mlClusterDetailGr.query();
+                    while (mlClusterDetailGr.next()) {
+                        mlClusterDetailGr.setValue(column_names.ACTIVE, false);
+                        mlClusterDetailGr.update();
+                        mlClusterDetailPurgedCountPerSolution++;
+                    }
+                    var end = new Date().getTime();
+                    var time = end - start;
+                    totalTimeTaken += time;
+                    gs.log('Total number of purged records for deleted solution ' + solution_id + ': ' + mlClusterDetailPurgedCountPerSolution);
+                    gs.log('Time taken to purge ML Cluster Detail records related to ' + solution_id + ' : ' + time + 'ms');
+                    mlClusterDetailPurgedCount += mlClusterDetailPurgedCountPerSolution;
+                }
+            }
+            gs.log('Total number of purged records for all deleted solutions: ' + mlClusterDetailPurgedCount);
+            gs.log('Total time taken to purge ML Cluster Detail records for all deleted solutions: ' + totalTimeTaken + "ms");
+        },
+
+        executePurge: function() {
+
+            var totalMlClusterDetailPurgedCount = 0;
+            var totalTimeTaken = 0;
+            var mlSolutionGa = new GlideAggregate(tables.ML_SOLUTION);
+            mlSolutionGa.addEncodedQuery('capability=clustering_trainer^ORcapability=workflow_clustering_trainer');
+            mlSolutionGa.orderBy(column_names.SYS_CREATED_ON);
+            mlSolutionGa.groupBy(column_names.SYS_ID);
+            mlSolutionGa.query();
+            while (mlSolutionGa.next() &amp;&amp; totalMlClusterDetailPurgedCount &lt; MAX_ML_CLUSTER_DETAIL_PURGE_COUNT) {
+                var start = new Date().getTime();
+                var mlClusterDetailPurgedCount = 0;
+                var mlClusterDetailRetainedCount = 0;
+                var solutionSysId = mlSolutionGa.getUniqueValue();
+                var solutionSysCreatedOn = mlSolutionGa.getValue(column_names.SYS_CREATED_ON);
+
+                // Fetch Last processed record time from Ml Cluster Detail Audit table
+                var lastProcessedRecordTime = mlSolutionGa.getValue(column_names.SYS_CREATED_ON);
+                var mlClusterDetailPurgeAuditGr = new GlideRecord(tables.ML_CLUSTER_DETAIL_PURGE_AUDIT);
+                mlClusterDetailPurgeAuditGr.addQuery(column_names.SOLUTION, solutionSysId);
+                mlClusterDetailPurgeAuditGr.query();
+                if (mlClusterDetailPurgeAuditGr.next()) {
+                    lastProcessedRecordTime = mlClusterDetailPurgeAuditGr.getValue(column_names.LAST_PROCESSED_RECORD_TIME);
+                    gs.log('ML Cluster Detail Purge audit record for solution id: ' + solutionSysId + ' found with last processed time: ' + lastProcessedRecordTime);
+                } else {
+                    var mlClusterDetailPurgeAuditGrNewEntry = new GlideRecord(tables.ML_CLUSTER_DETAIL_PURGE_AUDIT);
+                    mlClusterDetailPurgeAuditGrNewEntry.setValue(column_names.SOLUTION, solutionSysId);
+                    mlClusterDetailPurgeAuditGrNewEntry.setValue(column_names.LAST_PROCESSED_RECORD_TIME, lastProcessedRecordTime);
+                    mlClusterDetailPurgeAuditGrNewEntry.insert();
+                    gs.log('New record in ML Cluster Detail Purge audit for solution id: ' + solutionSysId + ' has been created');
+                }
+
+                // For this record look for ml_cluster_detail records
+                // and then check if those ml_cluster_detail records have a valid reference
+                var performedPurging = false;
+                var mlClusterDetailGr = new GlideRecord(tables.ML_CLUSTER_DETAIL);
+                mlClusterDetailGr.addEncodedQuery('solution=' + solutionSysId + '^active=true^sys_created_on&gt;' + lastProcessedRecordTime);
+                // mlClusterDetailGr.orderBy(column_names.SYS_CREATED_ON);
+                mlClusterDetailGr.setLimit(MAX_BATCH_SIZE);
+                mlClusterDetailGr.query();
+                while (mlClusterDetailGr.next() &amp;&amp; totalMlClusterDetailPurgedCount &lt; MAX_ML_CLUSTER_DETAIL_PURGE_COUNT) {
+                    performedPurging = true;
+                    var targetTableGr = new GlideRecord(mlClusterDetailGr.getValue(column_names.REC_TABLE));
+                    targetTableGr.addQuery(column_names.SYS_ID, mlClusterDetailGr.getValue(column_names.REC_SYS_ID));
+                    targetTableGr.query();
+
+                    // If the record doesn't exist in the target table then we set active to false.
+                    if (!targetTableGr.next()) {
+                        mlClusterDetailGr.setValue(column_names.ACTIVE, false);
+                        mlClusterDetailGr.update();
+                        mlClusterDetailPurgedCount++;
+                        totalMlClusterDetailPurgedCount++;
+                    } else {
+                        mlClusterDetailRetainedCount++;
+                    }
+                    lastProcessedRecordTime = mlClusterDetailGr.getValue(column_names.SYS_CREATED_ON);
+                }
+                mlClusterDetailPurgeAuditGr = new GlideRecord(tables.ML_CLUSTER_DETAIL_PURGE_AUDIT);
+                mlClusterDetailPurgeAuditGr.addQuery(column_names.SOLUTION, solutionSysId);
+                mlClusterDetailPurgeAuditGr.query();
+                if (mlClusterDetailPurgeAuditGr.next()) {
+                    if (performedPurging) {
+                        // Purging is done
+                        // Update the last Processed Record time for the solution in Ml Cluster Detail Purge Audit table.
+                        mlClusterDetailPurgeAuditGr.setValue(column_names.LAST_PROCESSED_RECORD_TIME, lastProcessedRecordTime);
+                        mlClusterDetailPurgeAuditGr.update();
+                        gs.log('ML Cluster Detail Purge audit last processed record time for solution id: ' + solutionSysId + ' has been updated to ' + lastProcessedRecordTime);
+                    } else {
+                        // Purging is not done
+                        if (totalMlClusterDetailPurgedCount &lt; MAX_ML_CLUSTER_DETAIL_PURGE_COUNT) {
+                            if (mlClusterDetailRetainedCount == 0) {
+                                gs.info("No ML Cluster Detail records found for solution id: " + solutionSysId);
+                            }
+                            // Reset the purge job only when we exhausted searching ML Cluster Detail table.
+                            // This avoids reset when we dont purge based on Max Cluster Detail Purge count.
+                            mlClusterDetailPurgeAuditGr.setValue(column_names.LAST_PROCESSED_RECORD_TIME, solutionSysCreatedOn);
+                            var numberOfScansComplete = mlClusterDetailPurgeAuditGr.getValue(column_names.NUM_SCANS_COMPLETE);
+                            numberOfScansComplete = parseInt(numberOfScansComplete) + 1;
+                            mlClusterDetailPurgeAuditGr.setValue(column_names.NUM_SCANS_COMPLETE, numberOfScansComplete);
+                            mlClusterDetailPurgeAuditGr.update();
+                            gs.log('ML Cluster Detail Purge job reset for solution id: ' + solutionSysId);
+                        }
+                    }
+                }
+
+                gs.log('ML Cluster Detail records purged for ' + solutionSysId + ' : ' + mlClusterDetailPurgedCount + '\n' + 'ML Cluster Detail records retained for ' + solutionSysId + ' : ' + mlClusterDetailRetainedCount);
+                var end = new Date().getTime();
+                var time = end - start;
+                totalTimeTaken += time;
+                gs.log('Time taken to purge ML Cluster Detail records related to ' + solutionSysId + ' : ' + time + 'ms');
+                gs.sleep(1000);
+            }
+            gs.log('Total ML Cluster Detail records purged: ' + totalMlClusterDetailPurgedCount);
+            gs.log('Total time taken to purge ML Cluster Detail records: ' + totalTimeTaken + "ms");
+        },
+
+        type: 'MlClusterDetailPurgeUtil'
+    };
+})();]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2024-05-31 05:03:41&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;15994eb837ea0210d1e067ae64924b8a&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;46&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;MlClusterDetailPurgeUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Predictive Intelligence" source="com.glide.platform_ml"&gt;1d8e1988a56103108bb220b7a4d212fb&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_15994eb837ea0210d1e067ae64924b8a&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2025-02-07 10:46:23&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-08-25 05:59:09</sys_created_on>
+        <sys_id>8e28206783768310a5875160ceaad38c</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>MlClusterDetailPurgeUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_8e28206783768310a5875160ceaad38c</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-08-25 05:59:09</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

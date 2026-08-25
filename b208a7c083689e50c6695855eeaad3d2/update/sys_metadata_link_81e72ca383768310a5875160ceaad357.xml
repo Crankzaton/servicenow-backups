@@ -1,0 +1,490 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0ecdabab37a112109a013343d1924ba0</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_uibtk_api.VersionsHandler&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;This is the common library that deals with versions(sys_update_version) related to different artefacts.&lt;/description&gt;
+        &lt;mobile_callable&gt;false&lt;/mobile_callable&gt;
+        &lt;name&gt;VersionsHandler&lt;/name&gt;
+        &lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;
+        &lt;script&gt;&lt;![CDATA[const VersionsHandler = Class.create();
+VersionsHandler.prototype = Object.extendsObject(BuilderToolkitAPIBase, {
+    TABLE: 'sys_update_version',
+    FIELDS: ['name', 'payload', 'sys_created_on', 'sys_created_by'],
+
+    initialize: function() {
+        BuilderToolkitAPIBase.prototype.initialize.call(this, this.TABLE, this.FIELDS);
+        this.TIMESTAMPS = [];
+        this.SCRIPT_IDS = [];
+        this.EVENT_IDS = [];
+    },
+
+    getPageVersionSnapshots: function(screenSysId, macroponentSysId) {
+        const versionSnapshots = [];
+        const { mcpVersions, screenVersions } = this.getMacroponetAndScreenVersions(macroponentSysId, screenSysId);
+
+        // Extract client script sysIds from all the macroponent versions
+        mcpVersions.forEach((v) =&gt; this.processMcpVersion(v));
+
+        const clientScriptsVersions = this.getClientScriptsVersions(macroponentSysId);
+
+        const eventsVersions = this.getEventsVersions();
+
+        // Sort all the timestamps in ascending order
+        this.TIMESTAMPS = this.TIMESTAMPS.map(
+          (ts) =&gt; new GlideDateTime(ts)
+        ).sort((t1, t2) =&gt; {
+          return t1.getNumericValue() - t2.getNumericValue();
+        });
+
+        this.TIMESTAMPS = this.collapseDateTimeJitter(this.TIMESTAMPS);
+
+        for (const ts of this.TIMESTAMPS) {
+            const pageModelVersion = {
+                macroponent: null,
+                screen: null,
+                clientScripts: {},
+                events: {},
+                timestamp: ts.getValue()
+            };
+
+            const snapshotVersions = [];
+
+            const mcp = this.findLast(mcpVersions, (v) =&gt;
+                v &amp;&amp; v.timestamp.onOrBefore(ts)
+            );
+            pageModelVersion.macroponent = !mcp || mcp.action === 'DELETE' ? null : mcp.versionId;
+            mcp &amp;&amp; snapshotVersions.push(mcp);
+
+            const screen = this.findLast(screenVersions, (v) =&gt;
+                v &amp;&amp; v.timestamp.onOrBefore(ts)
+            );
+            pageModelVersion.screen = !screen || screen.action === 'DELETE' ? null : screen.versionId;
+            screen &amp;&amp; snapshotVersions.push(screen);
+
+            pageModelVersion.clientScripts = Object.entries(
+                clientScriptsVersions
+            ).reduce((acc, [k, vs]) =&gt; {
+                const cs = this.findLast(vs, (v) =&gt; v &amp;&amp; v.timestamp.onOrBefore(ts));
+                cs &amp;&amp; snapshotVersions.push(cs);
+                return !cs || cs.action === 'DELETE' ?
+                    acc : {
+                        ...acc,
+                        [k]: cs.versionId
+                    };
+            }, {});
+
+            pageModelVersion.events = Object.entries(
+                eventsVersions
+            ).reduce((acc, [k, vs]) =&gt; {
+                const ev = this.findLast(vs, (v) =&gt; v &amp;&amp; v.timestamp.onOrBefore(ts));
+                ev &amp;&amp; snapshotVersions.push(ev);
+                return !ev || ev.action === 'DELETE' ?
+                    acc : {
+                        ...acc,
+                        [k]: ev.versionId
+                    };
+            }, {});
+
+            // get the latest version from all the available versions in a given snapshot
+            const latestVersion = this.findLatestVersion(snapshotVersions);
+            pageModelVersion.createdBy = latestVersion?.createdBy || 'system';
+            versionSnapshots.push(pageModelVersion);
+        }
+
+        return versionSnapshots.reverse();
+    },
+
+    getComponentVersionSnapshots: function() {
+        /* placeholder */
+    },
+
+    getControllerVersionSnapshots: function() {
+        /* placeholder */
+    },
+
+    getPresetVersionSnapshots: function() {
+        /* placeholder */
+    },
+
+    getRecordVersionSnapshots: function() {
+        /* placeholder */
+    },
+
+    parseVersions: function(versionIds) {
+        if (!versionIds) {
+            return {};
+        }
+        const encodedQuery = `sys_idIN${versionIds}`;
+        const versions = this.getVersions(encodedQuery);
+
+        return versions.reduce((acc, v) =&gt; {
+            acc[v.versionId] = v.payload;
+            return acc;
+        }, {});
+    },
+
+    getClientScriptsVersions: function(macroponentSysId) {
+        // Get all the client scripts related to the current macroponent
+        const scriptsGr = this.getRecords('sys_ux_client_script', `macroponent=${macroponentSysId}`);
+
+        // Store the current macroponent's active client script ids to the SCRIPT_IDS
+        while (scriptsGr.next()) {
+            this.addScriptSysId(scriptsGr.getUniqueValue());
+        }
+
+        let scriptsVersions = [];
+        if (this.SCRIPT_IDS.length &gt; 0) {
+            // Get the versions for all the clients across all the given macroponent versions
+            scriptsVersions = this.getVersions(
+                `nameIN${this.SCRIPT_IDS.map((id) =&gt; `sys_ux_client_script_${id}`).join(',')}`
+            );
+        }
+
+        return this.groupScriptVersionsById(scriptsVersions);
+    },
+
+    getEventsVersions: function() {
+        let eventsVersions = [];
+        if (this.EVENT_IDS.length &gt; 0) {
+            // Get the versions for all the events across all the given macroponent versions
+            eventsVersions = this.getVersions(
+                `nameIN${this.EVENT_IDS.map((id) =&gt; `sys_ux_event_${id}`).join(',')}`
+            );
+        }
+
+        return this.groupEventVersionsById(eventsVersions);
+    },
+
+    groupEventVersionsById: function(versions) {
+        const grouped = {};
+        for (let v of versions) {
+            if (!grouped[v.payload.sysId]) {
+                grouped[v.payload.sysId] = [];
+            }
+            grouped[v.payload.sysId].push(v);
+        }
+        return grouped;
+    },
+
+    getMacroponetAndScreenVersions: function(macroponentSysId, screenSysId) {
+        const query = `nameINsys_ux_macroponent_${macroponentSysId},sys_ux_screen_${screenSysId}`;
+        const allVersions = this.getVersions(query);
+        return allVersions.reduce((acc, version) =&gt; {
+            if (version?.name?.startsWith('sys_ux_macroponent')) {
+                acc.mcpVersions.push(version);
+            } else if (version?.name?.startsWith('sys_ux_screen')) {
+                acc.screenVersions.push(version);
+            }
+            return acc;
+        }, {mcpVersions: [], screenVersions: []});
+    },
+
+    getVersions: function(encodedQuery) {
+        const versions = [];
+        const versionsGr = this.getRecords(this.table, encodedQuery);
+
+        while (versionsGr.next()) {
+            const createdOn = versionsGr.getDisplayValue('sys_created_on');
+            const createdBy = versionsGr.getDisplayValue('sys_created_by');
+            const versionPayload = versionsGr.getValue('payload');
+            const versionName = versionsGr.getValue('name');
+
+            const {
+                action,
+                payload
+            } = this.getPayloadAsUIBJson(versionPayload);
+
+            versions.push(
+                this.createVersion(
+                    versionName,
+                    versionsGr.getUniqueValue(),
+                    payload,
+                    new GlideDateTime(createdOn),
+                    createdBy,
+                    action
+                )
+            );
+
+            this.addTimestamp(createdOn);
+        }
+
+        return versions;
+    },
+
+    createVersion: function(name, versionId, payload, timestamp, createdBy, action) {
+        return {
+            name,
+            versionId,
+            payload,
+            timestamp,
+            createdBy,
+            action
+        };
+    },
+
+    getPayloadAsUIBJson: function(versionPayload) {
+        const jsonPayload = gs.xmlToJSON(versionPayload);
+        const tableName = jsonPayload.record_update?.table;
+
+        if (!tableName) {
+            this._log(`Did not find the record for table ${table} in the payload:\n${versionPayload}`);
+            return null;
+        }
+
+        const {
+            action,
+            ...recordInfo
+        } = jsonPayload.record_update[tableName];
+
+        const fakeGR = new GlideRecord(tableName);
+        for (const field in recordInfo) {
+            if (field === 'sys_id' || field === 'sys_scope' || field === 'sys_mod_count') {
+                continue;
+            }
+
+            if (typeof recordInfo[field] === 'object' &amp;&amp; 'display_value' in recordInfo[field]) {
+                fakeGR[field] = recordInfo[field].content;
+            } else {
+                fakeGR[field] = recordInfo[field];
+            }
+        }
+
+        const values = new BuilderToolkitAPIBase(tableName).getValuesFromGlideRecord(
+            fakeGR
+        );
+
+        return {
+            action: action,
+            payload: {
+                ...values,
+                sysId: recordInfo.sys_id
+            }
+        };
+    },
+
+    addTimestamp: function(ts) {
+        if (this.TIMESTAMPS.includes(ts)) {
+            return;
+        }
+        this.TIMESTAMPS.push(ts);
+    },
+
+    addScriptSysId: function(sysId) {
+        if (!sysId || this.SCRIPT_IDS.includes(sysId)) {
+            return;
+        }
+        this.SCRIPT_IDS.push(sysId);
+    },
+
+    addEventSysId: function(sysId) {
+        if (!sysId || this.EVENT_IDS.includes(sysId)) {
+            return;
+        }
+        this.EVENT_IDS.push(sysId);
+    },
+
+    processComposition(composition) {
+        composition.forEach((el) =&gt; {
+            this.processElementProps(el);
+            this.processElementEventMappings(el);
+            if (el.overrides?.composition) {
+                this.processComposition(el.overrides.composition);
+            }
+            if (el.conditionals) {
+                const conditionalsComposition = el.conditionals.map((conditional) =&gt; conditional.item);
+                this.processComposition(conditionalsComposition);
+            }
+        });
+    },
+
+    processElementProps: function(el) {
+        // Find all CTS in UxValues in composition elements
+        for (let value of Object.values(el.propertyValues ?? {})) {
+            if (value?.type === 'CLIENT_TRANSFORM_SCRIPT') {
+                this.addScriptSysId(value.script.scriptSysId);
+            }
+        }
+    },
+
+    processElementEventMappings: function(el) {
+        // Find all scriptSysId fields in element event mapping targets
+        for (let mapping of el.eventMappings ?? []) {
+            for (let target of mapping.targets ?? []) {
+                if (target.clientScript) {
+                    this.addScriptSysId(target.clientScript.sysId);
+                }
+            }
+        }
+    },
+
+    processDataResource: function(dr) {
+        for (let mapping of dr.eventMappings ?? []) {
+            for (let target of mapping.targets ?? []) {
+                if (target.clientScript) {
+                    this.addScriptSysId(target.clientScript.sysId);
+                }
+            }
+        }
+    },
+
+    processPageEventMapping: function(em) {
+        if (em.clientScript) {
+            this.addScriptSysId(em.clientScript.sysId);
+        }
+    },
+
+    processMcpVersion: function(mcpVersion) {
+        const mcp = mcpVersion.payload;
+        const mcpComposition = mcp.composition || [];
+        const mcpData = mcp.data || [];
+        const mcpEventMappings = mcp.internalEventMappings ?? {};
+        const handledEvents = mcp.handledEvents?.split(',') || [];
+        const dispatchedEvents = mcp.dispatchedEvents?.split(',') || [];
+        [...handledEvents, ...dispatchedEvents].forEach((eventId) =&gt; this.addEventSysId(eventId));
+
+        this.processComposition(mcpComposition);
+        // Find all scriptSysId fields in data resource event mapping targets
+        for (let dr of mcpData) {
+            this.processDataResource(dr);
+        }
+        // Find all scriptSysId fields in page level event mapping targets
+        for (let mapping of Object.values(mcpEventMappings).flat()) {
+            this.processPageEventMapping(mapping);
+        }
+    },
+
+    groupScriptVersionsById: function(versions) {
+        const grouped = {};
+        for (let v of versions) {
+            if (!grouped[v.payload.sysId]) {
+                grouped[v.payload.sysId] = [];
+            }
+            grouped[v.payload.sysId].push(v);
+        }
+        return grouped;
+    },
+
+    collapseJitter: function(values, comparisonFn) {
+        let i = 0;
+        let begining = null;
+        let top = null;
+        let jitterFree = [];
+        while (i &lt; values.length) {
+            if (!begining) {
+                begining = values[i];
+            }
+            if (comparisonFn(begining, values[i])) {
+                top = values[i];
+                i++;
+            } else {
+                if (top == null) {
+                    top = begining;
+                }
+                values.splice(0, i);
+                jitterFree.push(top);
+                begining = null;
+                top = null;
+                i = 0;
+            }
+            if (i &gt;= values.length &amp;&amp; values.length == 1) {
+                jitterFree.push(values[0]);
+                break;
+            } else if (i &gt;= values.length) {
+                jitterFree.push(top);
+                break;
+            }
+        }
+        return jitterFree;
+    },
+
+    collapseDateTimeJitter: function(dateTimes) {
+        return this.collapseJitter(dateTimes, this.compareDateTimes);
+    },
+
+    compareDateTimes: function(lower, dt) {
+        let gdt = new GlideDateTime(lower);
+        gdt.add(5000);
+        if (dt === null) {
+            return false;
+        }
+        return gdt.onOrAfter(dt);
+    },
+
+    findLast: function(arr, pred) {
+        let last = undefined;
+        for (let el of arr) {
+            if (pred(el)) {
+                last = el;
+            } else {
+                return last;
+            }
+        }
+        return last;
+    },
+
+    findLatestVersion: function(versions) {
+        versions.sort((v1, v2) =&gt; {
+            return v1.timestamp.getNumericValue() - v2.timestamp.getNumericValue();
+        })
+
+        return versions.pop();
+    },
+
+    getRecords: function(table, encodedQuery, orderBy) {
+        return this.get(table, encodedQuery, orderBy || 'sys_created_on');
+    },
+
+    _log: function(message) {
+        gs.info("[VersionsHandler][{0}]: {1}", [new GlideDateTime().getNumericValue(), message]);
+    },
+
+    type: 'VersionsHandler'
+});]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2024-11-05 04:34:03&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0ecdabab37a112109a013343d1924ba0&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;10&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;VersionsHandler&lt;/sys_name&gt;
+        &lt;sys_package display_value="@devsnc/uibtk-api" source="sn_uibtk_api"&gt;cdfd3bed43321110e70583020cb8f28e&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="@devsnc/uibtk-api"&gt;cdfd3bed43321110e70583020cb8f28e&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0ecdabab37a112109a013343d1924ba0&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-11-21 12:24:16&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+    &lt;sys_es_latest_script action="INSERT_OR_UPDATE"&gt;
+        &lt;id&gt;0ecdabab37a112109a013343d1924ba0&lt;/id&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2024-11-05 04:34:02&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;378eabab37a112109a013343d1924ba7&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-11-05 04:34:02&lt;/sys_updated_on&gt;
+        &lt;table&gt;sys_script_include&lt;/table&gt;
+        &lt;use_es_latest&gt;true&lt;/use_es_latest&gt;
+    &lt;/sys_es_latest_script&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-08-25 05:57:59</sys_created_on>
+        <sys_id>81e72ca383768310a5875160ceaad357</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>VersionsHandler</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_81e72ca383768310a5875160ceaad357</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-08-25 05:57:59</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

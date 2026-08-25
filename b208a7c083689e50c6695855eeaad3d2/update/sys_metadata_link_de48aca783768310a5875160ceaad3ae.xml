@@ -1,0 +1,584 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>1913d20943935210629e734e3bb8f26b</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;global.MIDProfileManagement&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;mobile_callable&gt;false&lt;/mobile_callable&gt;
+        &lt;name&gt;MIDProfileManagement&lt;/name&gt;
+        &lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;
+        &lt;script&gt;&lt;![CDATA[var MIDProfileManagement = Class.create();
+
+MIDProfileManagement.prototype = {
+
+	initialize: function() {
+		this.profile_table_name = "mid_server_profile";
+
+		this.sys_id_field_name = "sys_id";
+
+		this.missing_on_mid_msg = "Missing on MID.";
+		this.difference_from_profile_msg = "Difference.";
+		this.not_defined_in_profile_msg = "Not Defined In Profile.";
+		this.m2mTables = {
+			"Cluster": {profileM2M: "mid_profile_cluster_m2m", agentM2M: "ecc_agent_cluster_member_m2m", profileFilterField: "profile", agentFilterField: "agent", gather_field_name: "cluster", target_table: "ecc_agent_cluster"},
+			"Application": {profileM2M: "mid_profile_application_m2m", agentM2M: "ecc_agent_application_m2m", profileFilterField: "profile", agentFilterField: "agent", gather_field_name: "application", target_table: "ecc_agent_application"},
+			"IP Range": {profileM2M: "mid_profile_ip_range_m2m", agentM2M: "ecc_agent_ip_range_m2m", profileFilterField: "profile", agentFilterField: "agent", gather_field_name: "ip_range", target_table: "ecc_agent_ip_range"},
+			"Capability" : {profileM2M: "mid_profile_capability_m2m", agentM2M: "ecc_agent_capability_m2m", profileFilterField: "profile", agentFilterField: "agent", gather_field_name: "capability", target_table: "ecc_agent_capability"}
+		};
+	},
+
+	/**
+	 * verifies the profile specified config matches with the list of MID's provided.
+	 *
+	 * @param profile_number 	a string variable represnting the profile number to be validated against.
+	 * @param mid_sys_ids 		a list containing the sys ids of all the mids to be validated. If the list is null, undefined or
+	 *       					empty, all the mids associated with profile number will be validated.
+	 * @param trigger_profile_validation_requests 	a boolean value to indicate if the profile validation ecc requests need to be triggered
+	 *
+	 * @returns an JSON string containing all the data found as part of validation.
+	 */
+    verifyProfile: function(profile_number, mid_sys_ids, trigger_profile_validation_requests) {
+
+		var result_obj = {};
+
+		result_obj.mids = [];
+		result_obj.profile = profile_number;
+		result_obj.mid_mismatch_data = [];
+		result_obj.errors = [];
+		result_obj.mismatch_count = 0;
+
+		var mid_list = mid_sys_ids;
+
+		// scan all mids associated with the profile if no mid has been specified
+		if (!mid_list?.length)
+			mid_list = this.getMIDSysIDList(profile_number);
+
+		this.generateVerificationResults(mid_list, profile_number, result_obj);
+
+		if (trigger_profile_validation_requests) {
+			result_obj.wrapper_request_data = new MIDWrapperConfigOperations().createVerifyWrapperECCRequests(mid_list, false);
+		}
+		return result_obj;
+	},
+
+	/**
+	 * returns list of all sys_ids associated with a profile
+	 *
+	 * @param profile_number a string value denoting a profile number
+	 *
+	 * @returns a list of sys_ids of mid servers
+	 */
+	getMIDSysIDList: function(profile_number) {
+
+		var profile_gr = this.getGlideRecord(this.profile_table_name, "number", profile_number);
+
+		if (profile_gr == null) {
+			return new Array();
+		}
+
+		var profile_sys_id = profile_gr.getValue(this.sys_id_field_name);
+		return this.filterRecordsGetColumnValue("ecc_agent", "profile_id", profile_sys_id, this.sys_id_field_name);
+	},
+
+	/**
+	 * Performs verification and fills the result in result_obj
+	 *
+	 * @param mid_sys_id_list 	list of mid sys ids to be verified
+	 * @param profile_number 	string value of profile number to be verified
+	 * @param result_object 	object into which the data needs to be filled
+	 */
+	generateVerificationResults: function(mid_sys_id_list, profile_number, result_obj) {
+
+		var profile_gr = this.getGlideRecord(this.profile_table_name, "number", profile_number);
+
+		if (profile_gr == null) {
+			result_obj.errors.push("Invalid profile number: " + profile_number);
+			return;
+		}
+
+		if (mid_sys_id_list.length == 0) {
+			result_obj.errors.push("No MID Server found for validation of profile: " + profile_number);
+			return;
+		}
+
+		var profile_sys_id = profile_gr.getValue(this.sys_id_field_name);
+
+		mid_sys_id_list.forEach(mid_sys_id =&gt; {
+
+			result_obj.mids.push(mid_sys_id);
+
+			var mid_gr = this.getGlideRecord("ecc_agent", this.sys_id_field_name, mid_sys_id);
+
+			var mid_result_data = {};
+			mid_result_data.sys_id = mid_sys_id;
+			mid_result_data.status = "";
+			mid_result_data.mismatch_count = 0;
+			mid_result_data.name = "";
+			mid_result_data.errors = [];
+			mid_result_data.mismatches = [];
+
+			if(mid_gr == null){
+				mid_result_data.errors.push("MID record not found. Might have been deleted. Mid ID:" + mid_sys_id);
+				mid_result_data.name = "";
+				mid_result_data.status = "Invalid";
+				result_obj.mid_mismatch_data.push(mid_result_data);
+				return;
+			}
+
+			mid_result_data.name = mid_gr.getValue("name");
+			mid_result_data.status = mid_gr.getValue("status");
+
+			this.performComponentVerification(mid_sys_id, profile_sys_id, mid_result_data);
+
+			result_obj.mid_mismatch_data.push(mid_result_data);
+			result_obj.mismatch_count += parseInt(mid_result_data.mismatch_count);
+		});
+	},
+
+	/**
+	 * function to perform profile validation on a single mid
+	 *
+	 * @param mid_sys_id 		the sys id of mid
+	 * @param profile_sys_id 	the sys id of profile
+	 * @param mid_result_data 	the data structure in which the result will be added
+	 */
+	performComponentVerification: function(mid_sys_id, profile_sys_id, mid_result_data) {
+		for (var type in this.m2mTables)
+			this.performDataMatch(type, mid_sys_id, profile_sys_id, mid_result_data);
+		this.matchMidProfileConfigs(mid_sys_id, profile_sys_id, mid_result_data);
+		this.matchMidProperties(mid_sys_id, profile_sys_id, mid_result_data);
+	},
+
+	/**
+	 * Perfroms the match of mid configuration against the profile configurations
+	 *
+	 * @param type				type of match
+	 * @param mid_sys_id		Sys ID of the mid
+	 * @param profile_sys_id	Sys ID of the profile
+	 * @param mid_result_data	The object in which the result needs to be added
+	 */
+	performDataMatch: function(type, mid_sys_id, profile_sys_id, mid_result_data) {
+		var matchMap = this.m2mTables[type];
+		const in_profile = this.filterRecordsGetColumnValue(matchMap.profileM2M, matchMap.profileFilterField, profile_sys_id, matchMap.gather_field_name);
+		const in_mid = this.filterRecordsGetColumnValue(matchMap.agentM2M, matchMap.agentFilterField, mid_sys_id, matchMap.gather_field_name);
+
+		const [profile_unique, common_clusters, mid_unique] = this.compareArrayValues(in_profile, in_mid);
+
+		const cluster_table = matchMap.target_table;
+		var data = this.createComponentIssue(type);
+
+		profile_unique.forEach (id =&gt; {
+			var gr = this.getGlideRecord(cluster_table, this.sys_id_field_name, id);
+
+			if(gr != null)
+				data.data.push(this.createMismatchRecordByType(type, id, gr, this.missing_on_mid_msg));
+		});
+
+		mid_unique.forEach (id =&gt; {
+			var gr = this.getGlideRecord(cluster_table, this.sys_id_field_name, id);
+
+			if(gr != null)
+				data.data.push(this.createMismatchRecordByType(type, id, gr, this.not_defined_in_profile_msg));
+		});
+
+		if (data.data.length &gt; 0) {
+			data.mismatch_count = parseInt(data.data.length);
+			mid_result_data.mismatches.push(data);
+			mid_result_data.mismatch_count += parseInt(data.mismatch_count);
+		}
+	},
+
+	/**
+	 * verifies the mid properties against profile capability properties
+	 *
+	 * @params	mid_sys_id		sys of mid
+	 * @params	profile_sys_id 	sys id of profile
+	 * @param	mid_result_data	the data structure in which the result will be added
+	 */
+	matchMidProperties: function (mid_sys_id, profile_sys_id, mid_result_data) {
+
+		const profile_property_map = this.fetchDataMap("mid_profile_property", "profile", profile_sys_id, "name", "value");
+		const mid_property_map = this.fetchDataMap("ecc_agent_property", "ecc_agent", mid_sys_id, "name", "value");
+		this.processMapMatch(profile_property_map, mid_property_map, "Property", mid_result_data);
+	},
+
+	/**
+	 * verifies the mid configurations-params against profile configurations-params properties
+	 *
+	 * @params	mid_sys_id		sys of mid
+	 * @params	profile_sys_id 	sys id of profile
+	 * @param	mid_result_data	the data structure in which the result will be added
+	 */
+	matchMidProfileConfigs: function(mid_sys_id, profile_sys_id, mid_result_data) {
+
+		const map_on_profile_specific_keys = this.sanitizeConfigs(this.fetchDataMap("mid_profile_config", "profile", profile_sys_id, "name", "value"));
+		const map_on_mid_specific_keys = this.sanitizeConfigs(this.fetchDataMap("ecc_agent_config", "ecc_agent", mid_sys_id, "param_name", "value"));
+		this.processMapMatch(map_on_profile_specific_keys, map_on_mid_specific_keys, "Config", mid_result_data);
+	},
+
+	/**
+	 * creates and returns an filled mismatch object
+	 *
+	 * @param type			Type of mismatch object
+	 * @param sys_id		Sys Id of mismatch object
+	 * @param glide_record	The record using which the mismatch needs to be created
+	 * @param description	Descrition text for the mismatch record.
+	 *
+	 * @returns a object containing values for the mismatch
+	 */
+	createMismatchRecordByType: function(type, sys_id, glide_record, description) {
+		switch(type) {
+			case "Cluster":
+				return this.createClusterIssue(sys_id, glide_record, description);
+			case "Application":
+				return this.createApplicationIssue(sys_id, glide_record, description);
+			case "IP Range":
+				return this.createIPRangeIssue(sys_id, glide_record, description);
+			case "Capability":
+				return this.createCapabilityIssue(sys_id, glide_record, description);
+		}
+	},
+
+	/**
+	 * Creates the structure to store all mismatches related to a mid configuration comonent
+	 *
+	 * @param	component_type	string value denoting the type of mid configuration
+	 *
+	 * @returns an object to sore the mismatches related to the component
+	 */
+	createComponentIssue: function(component_type) {
+		var data = {};
+		data.type = component_type;
+		data.data = [];
+		data.mismatch_count = 0;
+		return data;
+	},
+
+	/**
+	 * creates the object to store the cluste analysis results
+	 *
+	 * @param	cluster_sys_id			Sys ID of cluster
+	 * @param 	glide_record			The record using which the issue needs to be created
+	 * @param	mismatch_description  	An string detail of nature of mismatch
+	 *
+	 * @returns an object of Cluster Issue
+	 */
+	createClusterIssue: function(cluster_sys_id, glide_record, mismatch_description){
+
+		var clusterIssue = {};
+		clusterIssue.cluster_sys_id = cluster_sys_id;
+		clusterIssue.name = glide_record.getValue("name");
+		clusterIssue.type = glide_record.getValue("type");
+		clusterIssue.description = mismatch_description;
+		return clusterIssue;
+	},
+
+	/**
+	 * creates the object to store the application analysis results
+	 *
+	 * @param	application_sys_id		Sys ID of application
+	 * @param	glide_record			The record using which the issue needs to be created
+	 * @param	mismatch_description  	An string detail of nature of mismatch
+	 *
+	 * @returns an object of Application Issue
+	 */
+	createApplicationIssue(application_sys_id, glide_record, mismatch_description) {
+		var application_mismatch = {};
+		application_mismatch.application_sys_id = application_sys_id;
+		application_mismatch.name = glide_record.getValue("name");
+		application_mismatch.description = mismatch_description;
+		return application_mismatch;
+	},
+
+	/**
+	 * creates the object to store the IP Range analysis results
+	 *
+	 * @param	ip_range_sys_id			Sys ID of IP Range
+	 * @param	glide_record			The record using which the issue needs to be created
+	 * @param	mismatch_description  	An string detail of nature of mismatch
+	 *
+	 * @returns an object of IP Range Issue
+	 */
+	createIPRangeIssue: function(ip_range_sys_id, glide_record, mismatch_description) {
+		var ip_range_mismatch = {};
+		ip_range_mismatch.ip_range_sys_id = ip_range_sys_id;
+		ip_range_mismatch.name = glide_record.getValue("name");
+		ip_range_mismatch.range = glide_record.getValue("range");
+		ip_range_mismatch.description = mismatch_description;
+		return ip_range_mismatch;
+	},
+
+	/**
+	 * creates the object to store the Capability analysis results
+	 *
+	 * @param	capability_sys_id		Sys ID of Capability
+	 * @param	glide_record			The record using which the issue needs to be created
+	 * @param	mismatch_description  	An string detail of nature of mismatch
+	 *
+	 * @returns an object of IP Range Issue
+	 */
+	createCapabilityIssue: function(capability_sys_id, glide_record, mismatch_description) {
+		var capability_mismatch = {};
+		capability_mismatch.capability_sys_id = capability_sys_id;
+		capability_mismatch.name = glide_record.getValue("capability");
+		capability_mismatch.value = glide_record.getValue("capability_value");
+		capability_mismatch.description = mismatch_description;
+		return capability_mismatch;
+	},
+
+	/**
+	 * Compares arrays and returns the unique and common value list
+	 *
+	 * @param comparision_array_1	a list
+	 * @param comparision_array_2	a list
+	 *
+	 * @returns an array with three values, where
+	 * 		first element:  contains list of all unique values in array1
+	 * 		second element: contains list of common values in array1 and array2
+	 * 		third element:	contains list of all unique values in array2
+	 */
+	compareArrayValues: function (comparision_array_1, comparision_array_2) {
+
+		const unique_in_array_1 = comparision_array_1.filter(x =&gt; !comparision_array_2.includes(x)).sort();
+		const unique_in_array_2 = comparision_array_2.filter(x =&gt; !comparision_array_1.includes(x)).sort();
+		const common = comparision_array_1.filter(x =&gt; comparision_array_2.includes(x)).sort();
+
+		return [unique_in_array_1, common, unique_in_array_2];
+	},
+
+	/**
+	 * Create a key based mismatch object based on parameter
+	 *
+	 * @param key					The key that has mismatch
+	 * @param profile_value			The value of key on profile
+	 * @param mid_value				The value of key on mid server
+	 * @param mismatch_description		An string detail of nature of mismatch
+	 *
+	 * @returns	The mismatch object
+	 */
+	createIssue: function(key, profile_value, mid_value, mismatch_description) {
+		var mismatch = {};
+		mismatch.key = key;
+		mismatch.profile_value = profile_value;
+		mismatch.mid_value = mid_value;
+		mismatch.description = mismatch_description;
+		return mismatch;
+	},
+
+	/**
+	 * process match for maps of properties obtained from profile and mid
+	 *
+	 * @param map_profile_keys		a map of key values as obtained from profile
+	 * @param map_mid_keys			a map of key values as obtained from MID
+	 * @param type					the type of config/properties being considered
+	 * @param mid_result_data		the data structure in which the result will be added
+	 */
+	processMapMatch: function(map_profile_keys, map_mid_keys, type, mid_result_data) {
+		const [profile_unique_config, common_config, mid_unique_config] = this.segregateKeys(map_profile_keys, map_mid_keys);
+
+		var data = this.createComponentIssue(type);
+
+		common_config.forEach(key =&gt; {
+			if(map_profile_keys.get(key) != map_mid_keys.get(key))
+				data.data.push(this.createIssue(key, map_profile_keys.get(key), map_mid_keys.get(key), this.difference_from_profile_msg));
+		});
+
+		profile_unique_config.forEach(key =&gt; {
+			data.data.push(this.createIssue(key, map_profile_keys.get(key), "-", this.missing_on_mid_msg));
+		});
+
+		// remove parameter that mid adds to config with default values
+		this.getMIDConfigDefaults().forEach((value,key) =&gt; {
+
+			const index = mid_unique_config.indexOf(key);
+			if (index &gt; -1 &amp;&amp; value == map_mid_keys.get(key))
+				mid_unique_config.splice(index, 1);
+		});
+
+		mid_unique_config.forEach(key =&gt; {
+			data.data.push(this.createIssue(key, "-", map_mid_keys.get(key), this.not_defined_in_profile_msg));
+		});
+
+		if (data.data.length &gt; 0) {
+			data.mismatch_count = parseInt(data.data.length);
+			mid_result_data.mismatch_count += parseInt(data.mismatch_count);
+			mid_result_data.mismatches.push(data);
+		}
+	},
+
+
+	/**
+	 * Compares keys in the maps and returns the unique and common value list
+	 * 
+	 * @param comparision_map_1		a map
+	 * @param comparision_map_2		a map
+	 * 
+	 * @returns an array with three values, where
+	 * 		first element:  contains list of all unique keys to map 1
+	 * 		second element: contains list of common keys in map 1 and map 2
+	 * 		third element:	contains list of all unique keys in array2
+	 */
+	segregateKeys: function(comparision_map_1, comparision_map_2) {
+		const map_1_keys = Array.from(comparision_map_1.keys());
+		const map_2_keys = Array.from(comparision_map_2.keys());
+
+		const map1_unique_keys = map_1_keys.filter(x =&gt; !map_2_keys.includes(x)).sort();
+		const map2_unique_keys = map_2_keys.filter(x =&gt; !map_1_keys.includes(x)).sort();
+
+		const common_keys = map_1_keys.filter(x =&gt; map_2_keys.includes(x)).sort();
+		
+		return [map1_unique_keys, common_keys, map2_unique_keys];
+	},
+
+	/**
+	 * Function to clean up config map and remove entries that should be ignored
+	 * 
+	 * @param config_map	the map to be snatized
+	 * 
+	 * @returns updated config map
+	 */
+	sanitizeConfigs(config_map) {
+		var IGNORED_PARAMS = ["mid.buildstamp", "mid_sys_id", "keypairs.mid_id", "home_dir", "mid_profile_id","name"];
+		IGNORED_PARAMS.forEach(key =&gt; {config_map.delete(key);});
+
+		var keys = new Array();
+		config_map.forEach((value, key) =&gt; { keys.push(key); });
+
+		keys.forEach(key =&gt; {
+			var mcp = SncMIDConfigParameter.byName(key);
+			if (mcp.isHidden() || !mcp.isListed())
+				config_map.delete(key);
+			
+		});
+
+		return config_map;
+	},
+
+	/**
+	 * function to return the list of properties that are created by mid as default and need to be ignored
+	 */
+	getMIDConfigDefaults: function(){
+		var ret = new Map();
+		ret.set("mid.ssl.use.instance.security.policy", "false");
+		ret.set("mid.cloud.provider", "none");
+		return ret;
+	},
+
+	/**
+	 * filters all key value pairs against a filter on table
+	 * 
+	 * @param table_name		table from which the vales needs to be searched
+	 * @param filter_field		column of table that is to be used as filter
+	 * @param filter_val		query filter that is to be applied to column
+	 * @param name_field		field in table entry that stores key
+	 * @param value_field		field in table entry that stores values
+	 * 
+	 * @returns a map with all filtered key values
+	 */
+	fetchDataMap: function(table_name, filter_field, filter_val, name_field, value_field) {
+		var result = new Map();
+
+		var gr = new GlideRecord(table_name);
+		gr.addQuery(filter_field, filter_val);
+		gr.query();
+
+		while(gr.next()) {
+			result.set(gr.getValue(name_field), gr.getValue(value_field));
+		}
+
+		return result;
+	},
+
+	/**
+	 * Gathers all the column values after filtering records as per specified filter value
+	 * 
+	 * @param	table_name			name of the target table
+	 * @param	filter_field		name of column to used to filter
+	 * @param	filter_val			value of filter to be used in query
+	 * @param	gather_field_name	name of field whose values will be gathered
+	 * 
+	 * @returns a list of values
+	 */
+	filterRecordsGetColumnValue: function(table_name, filter_field, filter_val, gather_field_name) {
+		var return_array = new Array();
+		
+		var gr = new GlideRecord(table_name);
+		gr.addQuery(filter_field, filter_val);
+		gr.query();
+		
+		while(gr.next())
+			return_array.push(gr.getValue(gather_field_name));
+		
+		return return_array;
+	},
+
+	/**
+	 * returns the first record that matches the filter on table
+	 * 
+	 * @param	table_name		name of table
+	 * @param	filter_field	name of field to filter on
+	 * @param	filter_value	value of filter field
+	 */
+	getGlideRecord: function(table_name, filter_field, filter_value) {
+		if(!filter_value || !filter_field || !table_name)
+			return null;
+		
+		var profile_gr = new GlideRecord(table_name);
+		profile_gr.addQuery(filter_field, filter_value);
+		profile_gr.query();
+		
+		if (!profile_gr.next())
+			return null;
+
+		return profile_gr;
+	},
+
+    type: 'MIDProfileManagement'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2025-01-23 03:19:52&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;1913d20943935210629e734e3bb8f26b&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;MIDProfileManagement&lt;/sys_name&gt;
+        &lt;sys_package display_value="MID Server" source="com.glideapp.agent"&gt;62b2a1cca56503108bb220b7a4d212dc&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Global"&gt;global&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_1913d20943935210629e734e3bb8f26b&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;now.midserver&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2025-01-01 00:00:00&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+    &lt;sys_es_latest_script action="INSERT_OR_UPDATE"&gt;
+        &lt;id&gt;1913d20943935210629e734e3bb8f26b&lt;/id&gt;
+        &lt;sys_created_by&gt;now.midserver&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2025-01-01 00:00:00&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;af23520943935210629e734e3bb8f2f4&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_updated_by&gt;now.midserver&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2025-01-01 00:00:00&lt;/sys_updated_on&gt;
+        &lt;table&gt;sys_script_include&lt;/table&gt;
+        &lt;use_es_latest&gt;true&lt;/use_es_latest&gt;
+    &lt;/sys_es_latest_script&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-08-25 05:59:43</sys_created_on>
+        <sys_id>de48aca783768310a5875160ceaad3ae</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>MIDProfileManagement</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_de48aca783768310a5875160ceaad3ae</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-08-25 05:59:43</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

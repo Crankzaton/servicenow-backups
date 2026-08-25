@@ -1,0 +1,273 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0d32cd9beb3002107626211f1a52286c</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_ads_setup.SNHelpSetupMigrationUtil&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;mobile_callable&gt;false&lt;/mobile_callable&gt;
+        &lt;name&gt;SNHelpSetupMigrationUtil&lt;/name&gt;
+        &lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;
+        &lt;script&gt;&lt;![CDATA[var SNHelpSetupMigrationUtil = Class.create();
+
+SNHelpSetupMigrationUtil.prototype = {
+
+    initialize: function() {
+        this.constants = new sn_ads_setup.SNHelpSetupConstantProvider();
+        this.setupController = new sn_ads_setup.SNHelpSetupController();
+        this.snHelpService = new global.SNHelpService();
+        this.stepMap = {};
+    },
+
+    getActivityDefAndInput: function(task, activityId) {
+        var activityDefId = this.constants.activityDefId.INSTRUCTION;
+        var input = {};
+        var taskType = task.configuration_types;
+        var dependencies = task.dependenciesObj &amp;&amp; task.dependenciesObj.filter(function(dependency) {
+            return dependency.parent == task.parent;
+        }).map(function(dependency) {
+            return this.stepMap[dependency.id];
+        }, this);
+
+        switch (taskType) {
+            case this.constants.gsTaskType.EXTERNAL_LINK:
+                var relatedContent = task.content.related_content;
+                if (relatedContent &amp;&amp; relatedContent.length) {
+                    activityDefId = this.constants.activityDefId.EXTERNAL_LINK;
+                    input = {
+                        "variables": [{
+                            "variableValue": JSON.stringify(relatedContent),
+                            "variableMapping": "",
+                            "variableName": "external_links"
+                        }]
+                    };
+                }
+                break;
+            case this.constants.gsTaskType.IFRAME:
+                var url = task.content.url;
+                if (url) {
+                    activityDefId = this.constants.activityDefId.IFRAME;
+                    input = {
+                        "variables": [{
+                            "variableValue": url,
+                            "variableMapping": "",
+                            "variableName": "url"
+                        }]
+                    };
+                }
+                break;
+            case this.constants.gsTaskType.TABLE:
+                var tableName = task.content.table_name;
+                var view = task.content.view;
+                if (tableName &amp;&amp; view) {
+                    activityDefId = this.constants.activityDefId.TABLE;
+                    input = {
+                        "variables": [{
+                                "variableValue": tableName,
+                                "variableMapping": "",
+                                "variableName": "table"
+                            },
+                            {
+                                "variableValue": view,
+                                "variableMapping": "",
+                                "variableName": "form_view"
+                            }
+                        ]
+                    };
+                }
+                break;
+            case this.constants.gsTaskType.PLUGINS:
+                var records = task.content.records;
+                if (records) {
+                    activityDefId = this.constants.activityDefId.PLUGINS;
+                    var pluginIds = records.split(',');
+                    var pluginQuery = "idLIKE" + pluginIds.join("^ORidLIKE");
+                    input = {
+                        "variables": [{
+                            "variableValue": pluginQuery,
+                            "variableMapping": "",
+                            "variableName": "plugin_query"
+                        }]
+                    };
+                }
+                break;
+        }
+
+        return {
+            activityDefId: activityDefId,
+            input: input,
+            dependencies: dependencies
+        };
+    },
+
+
+
+    getActivities: function(tasks, processId) {
+        return tasks.map(function(task) {
+            var activityId = gs.generateGUID().toString();
+            this.stepMap[task.id] = activityId;
+            var taskInfo = this.getActivityDefAndInput(task, activityId);
+            var dep = taskInfo.dependencies;
+            return {
+                "label": task.name,
+                "description": task.description,
+                "lane": this.stepMap[task.parent],
+                "processDefinition": processId,
+                "activityDefinition": taskInfo.activityDefId,
+                "startRule": {
+                    "definition": (dep &amp;&amp; dep.length) ? this.constants.activityStartRule.AFTER_ACTIVITY : this.constants.activityStartRule.IMMEDIATE,
+                    "vars": {
+                        "activities": dep
+                    }
+                },
+                "restartRule": {
+                    "value": "RUN_ALWAYS",
+                    "displayValue": "Run always"
+                },
+                "inputs": taskInfo.input,
+                "order": task.order,
+                "sysId": activityId
+            };
+        }, this);
+    },
+
+    getDescription: function(step) {
+        var related_content = step.content &amp;&amp; step.content.related_content;
+        if (!related_content)
+            return step.description;
+
+        var htmlDescription = '&lt;div&gt;';
+        htmlDescription += '&lt;div&gt;' + step.description + '&lt;/div&gt;';
+        htmlDescription += '&lt;/br&gt;';
+        htmlDescription += '&lt;div&gt;' + gs.getMessage('Related Links') + '&lt;/div&gt;';
+        related_content.forEach(function(link) {
+            htmlDescription += '&lt;a href="' + link.url + '" target="_blank"&gt;' + link.title + '&lt;/a&gt;&lt;br&gt;';
+        });
+        htmlDescription += '&lt;/div&gt;';
+        return htmlDescription;
+    },
+
+    getLanes: function(steps, processId) {
+        var lanes = steps.map(function(step) {
+            var stepId = gs.generateGUID().toString();
+            this.stepMap[step.id] = stepId;
+            var currentLaneObj = {
+                "label": step.name,
+                "description": this.getDescription(step),
+                "processDefinition": processId,
+                "startRule": {
+                    "definition": this.constants.laneStartRule.IMMEDIATE,
+                    "vars": {}
+                },
+                "restartRule": {
+                    "value": "RUN_ALWAYS",
+                    "displayValue": "Run always"
+                },
+                "order": step.order,
+                "sysId": stepId
+            };
+            return currentLaneObj;
+        }, this);
+        return lanes;
+    },
+
+    getProcessDetails: function(setupDetail, processId) {
+        return ({
+            "sysId": processId,
+            "label": setupDetail.setupName,
+            "description": setupDetail.description,
+            "sysScope": setupDetail.sysScope,
+            "triggerRecordData": {
+                "triggerType": {
+                    "value": this.constants.triggerType.CREATE_OR_UPDATE
+                },
+                "triggerInstanceId": this.snHelpService.insertTriggerRecord(setupDetail.setupName, processId),
+                "inputs": {
+                    "variables": [{
+                            "variableName": "table",
+                            "variableValue": this.constants.tables.user_interaction,
+                            "variableMapping": null
+                        },
+                        {
+                            "variableName": "condition",
+                            "variableValue": "guidance.process_definition=" + processId,
+                            "variableMapping": null
+                        },
+                        {
+                            "variableName": "run_on_extended",
+                            "variableValue": "false",
+                            "variableMapping": null
+                        }
+                    ]
+                }
+            }
+        });
+    },
+
+    getProcessMetaData: function(guidanceRecord, processId) {
+        this.stepMap = {};
+        var setupDetail = this.setupController.getGuidanceSummary(guidanceRecord.getUniqueValue());
+        return ({
+            "process": this.getProcessDetails(setupDetail, processId),
+            "lanes": this.getLanes(setupDetail.steps, processId),
+            "activities": this.getActivities(setupDetail.tasks, processId)
+        });
+    },
+
+    deleteInteractionRecords: function(guidanceId) {
+        var hui = new GlideRecord('help_user_interaction');
+        hui.addQuery('guidance', guidanceId);
+        hui.query();
+        while (hui.next()) {
+            hui.deleteRecord();
+        }
+    },
+
+    type: 'SNHelpSetupMigrationUtil'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2024-03-12 18:27:10&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0d32cd9beb3002107626211f1a52286c&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;25&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;SNHelpSetupMigrationUtil&lt;/sys_name&gt;
+        &lt;sys_package display_value="Guided Setup" source="sn_ads_setup"&gt;1cb77a801b9af01039c155f3604bcb9e&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Guided Setup"&gt;1cb77a801b9af01039c155f3604bcb9e&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0d32cd9beb3002107626211f1a52286c&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2025-01-23 06:26:56&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+    &lt;sys_es_latest_script action="INSERT_OR_UPDATE"&gt;
+        &lt;id&gt;0d32cd9beb3002107626211f1a52286c&lt;/id&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2024-09-30 10:43:55&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0ff9e7804345121050286548b9b8f29a&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-09-30 10:43:55&lt;/sys_updated_on&gt;
+        &lt;table&gt;sys_script_include&lt;/table&gt;
+        &lt;use_es_latest&gt;false&lt;/use_es_latest&gt;
+    &lt;/sys_es_latest_script&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-08-25 05:57:45</sys_created_on>
+        <sys_id>e9d768a383768310a5875160ceaad39e</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>SNHelpSetupMigrationUtil</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_e9d768a383768310a5875160ceaad39e</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-08-25 05:57:45</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

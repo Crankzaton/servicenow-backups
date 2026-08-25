@@ -1,0 +1,196 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0719e87943902110ea95511ae9b8f23a</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_pw.ProjectWorkspaceResourceEditorData&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;mobile_callable&gt;false&lt;/mobile_callable&gt;
+        &lt;name&gt;ProjectWorkspaceResourceEditorData&lt;/name&gt;
+        &lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;
+        &lt;script&gt;&lt;![CDATA[var ProjectWorkspaceResourceEditorData = Class.create();
+ProjectWorkspaceResourceEditorData.prototype = {
+    initialize: function() {
+		this.resAsmtTable = 'sn_plng_att_core_resource_assignment';
+		this.planningAttributeHelper = new sn_plng_att_core.PlanningAttributeHelper();
+		this.userIds = [];
+	},
+
+	_populateCapacityAndAvailabilty(userList, workingDaysOfUsers, availableHoursOfUsers, avgDailyFteOfUsers) {
+		userList.forEach(user =&gt; {
+			user['averageDailyFte'] = avgDailyFteOfUsers[user.id];
+			user['workingDays'] = workingDaysOfUsers[user.id];
+			const availability = availableHoursOfUsers[user.id];
+			if(availability &lt; 0)
+				user['sublabel'] = gs.getMessage('over allocated');
+			else
+				user['sublabel'] = gs.getMessage('{0} hours available', (availability + ''));
+		});
+
+		return userList;
+	},
+
+    getData: function(search_keywords, limit, startDate, endDate, assignmentType, attributes) {
+        let result = [];
+		startDate = this._validateDate(startDate);
+		endDate = this._validateDate(endDate);
+        if (!assignmentType || assignmentType == 'user') {
+            let userList = this._getData(search_keywords, 'sys_user', limit, {...attributes});
+			if(startDate &amp;&amp; endDate) {
+				const resourceEffortDataApi = new sn_plng_att_core.ResourceEffortDataApi(this.userIds, startDate, endDate);
+				const avgDailyFteOfUsers = resourceEffortDataApi.getAverageDailyFTEOfUsers();
+				const resourceEfforts = resourceEffortDataApi.getAvailabileHoursAndWorkingDaysOfUsers();
+				userList = this._populateCapacityAndAvailabilty(userList, resourceEfforts.usersWorkingDays, resourceEfforts.availabileHoursOfUsers, avgDailyFteOfUsers);
+			}
+            result.push(...userList);
+        }
+        if ((!assignmentType &amp;&amp; !Object.keys(attributes || {}).length) || assignmentType == 'group') {
+            let userGroupList = this._getData(search_keywords, 'sys_user_group', limit);
+            result.push(...userGroupList);
+        }
+        result.sort((a, b) =&gt; {
+            const labelA = a.label?.toUpperCase();
+            const labelB = b.label?.toUpperCase();
+            if (labelA &lt; labelB) {
+                return -1;
+            }
+            if (labelA &gt; labelB) {
+                return 1;
+            }
+            return 0;
+        });
+        return {
+            status: 'success',
+            statusCode: '200',
+            items: result.slice(0, limit),
+        };
+    },
+
+	_validateDate: function(dateVal){
+		const date = new GlideDate();
+		date.setValue(dateVal);
+		
+		if(dateVal != date.getValue()){
+			date.setDisplayValue(dateVal);
+			return date.getValue();
+		}
+		return dateVal;
+	},
+
+    _getData: function(search_keywords, table, limit, attributes) {
+        let result = {};
+		const resourceProfile = new sn_plng_att_core.ResourceProfile();
+        let gr = new GlideRecord(table);
+        if (attributes &amp;&amp; Object.keys(attributes).length) {
+			const query = resourceProfile.getResourceUserConditionForGivenAttributeValues(attributes);
+            gr.addEncodedQuery(query,true);
+        }
+        if (search_keywords) {
+            gr.addQuery('name', 'CONTAINS', search_keywords);
+        }
+        gr.addQuery('roles', 'pps_resource');
+        gr.orderBy('name');
+        gr.setLimit(limit);
+        gr.query();
+
+		let groupIds = [];
+        while (gr.next()) {
+			let sysId = gr.getUniqueValue();
+            if (table == 'sys_user') {
+				this.userIds.push(sysId);
+                result[sysId] = this._createUserObj(gr);
+            } else {
+				groupIds.push(sysId);
+                result[sysId] = this._createUserGroupObj(gr);
+            }
+        }
+
+		const planningAttributeHelper = new sn_plng_att_core.PlanningAttributeHelper(this.userIds);
+		const resourcesCount = resourceProfile.getUserCountForAttributeValues("primary_resource_group", groupIds, "sn_employee_profile", "user");
+		for (let [key, value] of Object.entries(result)) {
+			if (value.type == 'user') {
+				const attributes = planningAttributeHelper.getResourceAssignementAttributeValueMap(table, key, true);
+				value['attributes'] = attributes;
+			} else {
+				value['primaryUserCount'] = resourcesCount[key] ? resourcesCount[key] : 0;
+			}
+		}
+
+        return Object.values(result);
+    },
+    _createUserGroupObj: function(groupGR) {
+        const id = groupGR.getValue("sys_id");
+        return {
+            id: id,
+            value: id,
+            label: groupGR.getValue("name"),
+            displayValue: groupGR.getValue("name"),
+            table: 'sys_user_group',
+            type: 'group'
+        };
+    },
+
+    _createUserObj: function(userGR) {
+        const resource = userGR.getValue("sys_id");
+        const imageSource = userGR.getValue('avatar') ? (userGR.getValue('avatar') + '.iix?t=small') : '';
+		let sublabel = userGR.getValue("email");
+        return {
+            id: resource,
+            value: resource,
+            label: userGR.getValue("name") || userGR.getValue('user_name'),
+			displayValue: userGR.getValue("name"),
+            sublabel: sublabel,
+            imageSource: imageSource,
+            table: 'sys_user',
+            type: 'user'
+        };
+    },
+
+    type: 'ProjectWorkspaceResourceEditorData'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-01-10 11:51:35&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0719e87943902110ea95511ae9b8f23a&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;128&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;ProjectWorkspaceResourceEditorData&lt;/sys_name&gt;
+        &lt;sys_package display_value="Project Workspace" source="sn_pw"&gt;47e2b69f533f201016f6ddeeff7b12fa&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Project Workspace"&gt;47e2b69f533f201016f6ddeeff7b12fa&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0719e87943902110ea95511ae9b8f23a&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2025-04-07 13:06:51&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+    &lt;sys_es_latest_script action="INSERT_OR_UPDATE"&gt;
+        &lt;id&gt;0719e87943902110ea95511ae9b8f23a&lt;/id&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2025-04-07 12:21:20&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;b0c41149ffbcea5075e2ffffffffff4a&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2025-04-07 12:21:20&lt;/sys_updated_on&gt;
+        &lt;table&gt;sys_script_include&lt;/table&gt;
+        &lt;use_es_latest&gt;true&lt;/use_es_latest&gt;
+    &lt;/sys_es_latest_script&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-08-25 05:56:47</sys_created_on>
+        <sys_id>6f972c2383768310a5875160ceaad3f0</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>ProjectWorkspaceResourceEditorData</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_6f972c2383768310a5875160ceaad3f0</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-08-25 05:56:47</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

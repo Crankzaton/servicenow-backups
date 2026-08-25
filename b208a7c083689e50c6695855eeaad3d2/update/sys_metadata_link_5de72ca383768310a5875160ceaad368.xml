@@ -1,0 +1,500 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>0ed2c7c77f9d12100911658f6d86653b</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_mab_api.FullTransformerRecordScreenService&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Service for transforming simple mobile metadata for a record screen into a full mobile metadata&lt;/description&gt;
+        &lt;mobile_callable&gt;false&lt;/mobile_callable&gt;
+        &lt;name&gt;FullTransformerRecordScreenService&lt;/name&gt;
+        &lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;
+        &lt;script&gt;&lt;![CDATA[/**
+ * Service for transforming simple mobile record screen metadata into full mobile metadata.
+ * This service also utilizes GenAI Service to generate the metadata for Cards.
+ */
+class FullTransformerRecordScreenService {
+    constructor() {
+        this.customErrorHandler = new CustomErrorHandler(this.constructor.name);
+        this.maib = new sn_mab_api.MobileComponentGenAiComposer();
+        this.SOURCE_ID = "MAB W2M";
+    }
+
+    /**
+     * Transforms simple mobile metadata for a record screen into full mobile metadata
+     * by constructing individual components such as record screen, details screen and card components,
+     * and aggregating them into a complete record screen structure.
+     *
+     * @param {Object} simpleMobileMetadata - The simple mobile metadata to transform.
+     * @param {Array&lt;Object&gt;} simpleMobileMetadata.fields - An array of field objects, each representing a field of the record screen.
+     * @param {string} simpleMobileMetadata.table - The name of the table associated with the record screen.
+     * @param {Object} simpleMobileMetadata.references - An object containing references including view configuration.
+     * @param {Object|null} simpleMobileMetadata.references.viewConfig - Optional view configuration for the components.
+     * @param {string} simpleMobileMetadata.viewValue - view config sys id.
+     * @returns {Object} The transformed full mobile record screen component.
+     * @returns {string} return.rootTable - The root table of the record screen component.
+     * @returns {string} return.rootSysId - The system identifier for the root of the record screen component.
+     * @returns {Array&lt;Object&gt;} return.components - An array of components comprising the full record screen, including details and card components.
+
+     * @example
+     *  const simpleMobileMetadata = {
+     *   componentType: "RECORD_SCREEN",
+     *   viewValue: "3ed6e2b77f1012100911658f6d866584",
+     *   table: "incident",
+     *   fields: [
+     *     {
+     *       label: "Short description",
+     *       prefix: "string",
+     *       name: "short_description",
+     *       value: "",
+     *       type: "string",
+     *       active: true,
+     *       scalarType: "string",
+     *       displayValue: "",
+     *       tableLabel: "Task",
+     *       display: false,
+     *       display_type: "string_wide",
+     *       display_type_label: "String",
+     *       is_function_field: false
+     *     },
+     *   ],
+     *   viewConfigMode: 'default',
+     *   references: {
+     *     viewConfig: null
+     *   }
+     * };
+     *
+     */
+    transform(simpleMobileMetadata) {
+        const { table, fields, viewConfigMode, references, viewValue } = simpleMobileMetadata;
+
+        const detailsScreenComponent = this._buildDetailsScreenComponent({
+            table,
+            fields
+        });
+
+        const cardComponent = this._buildCardComponent({
+            table,
+            fields,
+            viewConfigMode,
+            viewConfig: references?.viewConfig,
+            componentName: this._getUiViewTitle(viewValue)
+        });
+
+        const recordScreenComponent = this._buildRecordScreenComponent({
+            table,
+            viewValue,
+            references: {
+                detailsScreenComponent,
+                cardComponent
+            }
+        });
+
+        return {
+            rootTable: recordScreenComponent.rootTable,
+            rootSysId: recordScreenComponent.rootSysId,
+            components: [
+                recordScreenComponent,
+                detailsScreenComponent,
+                cardComponent
+            ]
+        };
+    }
+
+    /**
+     * Handles the GEN_AI view config regeneration.
+     *
+     * @param {Object} log - The LLM conversation history provided by the MobileComponentGenAiComposer.
+     * @returns {Object} The card component regenerated by the LLM.
+     */
+    regenerateCard(log) {
+        const cardRecords = this.maib.regenerateCard(log);
+        const { tableName, sysId } = cardRecords.sysSgViewConfig || {};
+
+        return {
+            rootTable: tableName,
+            rootSysId: sysId,
+            data: { ...cardRecords }
+        };
+    }
+
+    /**
+     * Builds the record screen component.
+     **
+     * @param {Object} params - Parameters for building the record screen component.
+     * @param {string} params.table - The name of the table associated with the record screen.
+     * @param {string} params.viewValue - A unique identifier for the view.
+     * @param {Object} params.references - References to other components used in the record screen.
+     * @param {Object} params.references.cardComponent - The card component reference.
+     * @param {Object} params.references.detailsScreenComponent - The details screen component reference.
+     * @returns {Object} The constructed record screen component.
+     * @private
+     */
+    _buildRecordScreenComponent({table,viewValue, references}) {
+        const { cardComponent, detailsScreenComponent } = references;
+
+        const tableLabel = this._getTableLabel(table);
+        const uiViewTitle = this._getUiViewTitle(viewValue);
+
+        const sysSgFormScreen = this._createRecord('sys_sg_form_screen', {
+            name: uiViewTitle ? `${tableLabel} - ${uiViewTitle}` : tableLabel,
+            use_view_config: 'true',
+            view_config: cardComponent.rootSysId || WebToMobileUtils.DEFAULT_EMPTY_VIEW_CONFIG
+        });
+
+        const sysSgFormSegment = this._createRecord('sys_sg_form_segment', {
+            form: sysSgFormScreen.sysId,
+            embedded_screen: detailsScreenComponent.rootSysId
+        });
+
+        return {
+            rootTable: sysSgFormScreen.tableName,
+            rootSysId: sysSgFormScreen.sysId,
+            data: {
+                sysSgFormScreen,
+                sysSgFormSegment,
+            }
+        }
+    }
+
+    /**
+     * Builds the details screen component.
+     *
+     * @param {Object} params - Parameters for constructing the details screen component.
+     * @param {string} params.table - The name of the table associated with the details screen.
+     * @param {Array&lt;Object&gt;} params.fields - An array of field objects representing the fields of the details screen.
+     * @returns {Object} The constructed details screen component.
+     * @private
+     */
+
+    _buildDetailsScreenComponent({table, fields}) {
+        const sysSgDetailsScreen = this._createRecord('sys_sg_details_screen', {
+            name: 'Details Screen - Details',
+            table,
+        });
+
+        const sysSgScreenField = this._createScreenFields({
+            fields,
+            table,
+            detailsScreenSysId: sysSgDetailsScreen.sysId,
+        });
+
+        return {
+            rootTable: sysSgDetailsScreen.tableName,
+            rootSysId: sysSgDetailsScreen.sysId,
+            data: {
+                sysSgDetailsScreen,
+                sysSgScreenField
+            }
+        };
+    }
+
+    /**
+     * Builds the card component using the provided table, fields, and view configuration.
+     *
+     * It handles different view configuration modes, such as GEN_AI, MANUAL, and DEFAULT, to create or retrieve
+     * the appropriate card records.
+     *
+     * @param {Object} params - Parameters for building the card component.
+     * @param {string} params.table - The name of the table associated with the card component.
+     * @param {Array&lt;Object&gt;} params.fields - An array of field objects, each representing a field of the card component.
+     * @param {string} params.viewConfigMode - The mode of view configuration used to create the card component.
+     * @param {string} [params.viewConfig] - Optional view configuration identifier, required if viewConfigMode is MANUAL.
+     * @param {string} [params.componentName] - Name of the component to build a card for.
+     * @returns {Object} The constructed card component.
+     * @private
+     */
+    _buildCardComponent({table, fields, viewConfigMode, viewConfig, componentName} ) {
+        if(!viewConfigMode) {
+            this.customErrorHandler.throwBadRequestError(
+                'MISSING_VIEW_CONFIG_MODE',
+                `The 'viewConfigMode' field is required. Please provide a valid view configuration mode.`,
+            );
+        }
+
+        switch (viewConfigMode.toLowerCase()) {
+            case WebToMobileUtils.viewConfigCreationModes.GEN_AI:
+                return this._handleViewConfigGenAiMode(table, componentName, fields);
+            case WebToMobileUtils.viewConfigCreationModes.MANUAL:
+                return this._handleViewConfigManualMode(viewConfig);
+            case WebToMobileUtils.viewConfigCreationModes.DEFAULT:
+                return this._handleViewConfigDefaultMode(table, fields);
+            default:
+                this.customErrorHandler.throwBadRequestError(
+                    'INVALID_VIEW_CONFIG_MODE',
+                    `The view configuration mode '${viewConfigMode}' is not valid. Valid modes are: ${WebToMobileUtils.getValidViewConfigModesString()}`,
+                );
+        }
+    }
+
+    /**
+     * Handles the MANUAL view configuration mode.
+     *
+     * @param {Object|null} viewConfig - The view configuration.
+     * @returns {Object} An object containing the table and sys_id of the selected existing card component.
+     */
+    _handleViewConfigManualMode(viewConfig) {
+        if (!viewConfig) {
+            this.customErrorHandler.throwBadRequestError(
+                'MISSING_VIEW_CONFIG',
+                "The 'viewConfig' field is required. Please provide a valid view configuration."
+            );
+        }
+
+        const tableName = 'sys_sg_view_config';
+        const sysId = viewConfig;
+        const grs = new GlideRecordSecure(tableName);
+
+        if (!grs.get(sysId)) {
+            this.customErrorHandler.throwNotFoundError(
+                'VIEW_CONFIG_NOT_FOUND',
+                `The sys_sg_view_config record with sys_id of '${sysId}' does not exist. Please check the 'viewConfig' parameter and try again.`
+            );
+        }
+
+        return {
+            rootTable: tableName,
+            rootSysId: sysId,
+            data: {}
+        };
+    }
+
+    /**
+     * Handles the DEFAULT view configuration mode.
+     *
+     * @param {string} table - The name of the table.
+     * @param {Array&lt;Object&gt;} fields - The fields for the card component.
+     * @returns {Object} The card component generated by script.
+     */
+    _handleViewConfigDefaultMode(table, fields) {
+        const cardRecords = this._createCardByScript(table, fields);
+        const { tableName, sysId } = cardRecords.sysSgViewConfig || {};
+
+        return {
+            rootTable: tableName,
+            rootSysId: sysId,
+            data: { ...cardRecords }
+        };
+    }
+
+    /**
+     * Handles the GEN_AI view configuration mode.
+     *
+     * @param {string} table - The name of the table.
+     * @param {string} componentName - The name of the component.
+     * @param {Array&lt;Object&gt;} fields - The fields for the card component.
+     * @returns {Object} The card component generated by the LLM.
+     */
+    _handleViewConfigGenAiMode(table, componentName, fields = []) {
+        const fieldNames = fields.map((field) =&gt; field.name);
+        const cardRecords = this.maib.generateCard(table, componentName, fieldNames);
+        const { tableName, sysId } = cardRecords.sysSgViewConfig || {};
+
+        return {
+            rootTable: tableName,
+            rootSysId: sysId,
+            data: { ...cardRecords }
+        };
+    }
+
+    /**
+     * Creates screen fields from the provided fields metadata.
+     **
+     * @param {Object} params - Destructured object containing fields, details screen system ID, and table name.
+     * @param {Object[]} params.fields - An array of field objects, each representing a field for the screen.
+     * @param {string} params.detailsScreenSysId - The system ID of the details screen to which the fields belong.
+     * @param {string} params.table - The name of the table associated with the screen fields.
+     * @returns {Array&lt;Object&gt;} An array of created screen field records.
+     * @private
+     */
+    _createScreenFields(params) {
+        const { fields, detailsScreenSysId, table } = params;
+        return fields.map((field, index) =&gt; {
+            let type = 'auto';
+            if (field.type === 'audio' || field.type === 'file_attachment') {
+                type = 'file';
+            }
+
+            return this._createRecord('sys_sg_screen_field', {
+                screen: detailsScreenSysId,
+                data_item_field_name: field.name,
+                type,
+                screen_data_item_table: table,
+                order: WebToMobileUtils.getOrderString(index)
+            });
+        });
+    }
+
+    /**
+     * Creates a card by script using the W2M default view template.
+     *
+     * @param {string} table - The name of the table for which the card is created.
+     * @param {Array&lt;Object&gt;} columns - An array of column objects representing the fields for the card.
+     * @returns {Object} The card records containing view configuration, elements, and attributes.
+     * @private
+     */
+    _createCardByScript(table, columns) {
+        const MAB_W2M_DEFAULT_VIEW_TEMPLATE = '0c0b9242bd559e90f877dac13f131058';
+        const cardElementAttributeMap = WebToMobileUtils.getMapFromTable(
+            'sys_sg_view_element_attribute_name',
+            'name',
+            'sys_id'
+        );
+
+        const sysSgViewTemplateSlots = WebToMobileUtils.getRecords(
+            'sys_sg_view_template_slot',
+            ['name', 'sys_id'],
+            { view_template: MAB_W2M_DEFAULT_VIEW_TEMPLATE }
+        );
+
+        const sortedSysSgViewTemplateSlots = sysSgViewTemplateSlots.sort(
+            (slot1, slot2) =&gt;  slot1.name.localeCompare(slot2.name)
+        );
+
+        const sysSgViewConfig = WebToMobileUtils.createRecord('sys_sg_view_config', {
+            name: `${this._getTableLabel(table)} - Record Screen Card`,
+            table,
+            template: MAB_W2M_DEFAULT_VIEW_TEMPLATE,
+            creation_method: this.SOURCE_ID
+        });
+
+        const sysSgViewConfigElement = sortedSysSgViewTemplateSlots.map((cardTemplateElement, index) =&gt; {
+            return WebToMobileUtils.createRecord('sys_sg_view_config_element', {
+                name: `${cardTemplateElement.name}_element`,
+                view_config: sysSgViewConfig.sysId,
+                view_template_slot: cardTemplateElement.sys_id,
+                creation_method: this.SOURCE_ID
+            });
+        });
+
+        const sysSgViewConfigElementAttribute = sysSgViewConfigElement.reduce((attributes, cardElement, index) =&gt; {
+            const columnIndex = Math.floor(index / 2);
+            if (columnIndex &lt; columns.length) {
+                const column = columns[columnIndex];
+                const cardElementAttributeType = (index % 2 === 0) ? 'FieldLabel' : 'FieldValue';
+
+                const sysSgViewConfigElementAttribute = WebToMobileUtils.createRecord(
+                    'sys_sg_view_config_element_attribute',
+                    {
+                        name: cardElementAttributeMap[cardElementAttributeType],
+                        view_config_element: cardElement.sysId,
+                        value: column.name,
+                        description: `${cardElement.fields.name}_${cardElementAttributeType}`,
+                        creation_method: this.SOURCE_ID
+                    });
+
+                attributes.push(sysSgViewConfigElementAttribute);
+            }
+            return attributes;
+        }, []);
+
+        return {
+            sysSgViewConfig,
+            sysSgViewConfigElement,
+            sysSgViewConfigElementAttribute
+        };
+    }
+
+    /**
+     * Creates a record in the specified table with given data.
+     *
+     * @param {string} table - The table where the record will be created.
+     * @param {Object} data - The data for the record.
+     * @returns {Object} The created record.
+     * @private
+     */
+    _createRecord(table, data) {
+        return WebToMobileUtils.createRecord(table, data);
+    }
+
+
+    /**
+     * Retrieves the label of a table by its name.
+     *
+     * @param {string} tableName - The name of the table.
+     * @returns {string|null} The label of the table, or null if not found.
+     */
+    _getTableLabel(tableName) {
+        const records = WebToMobileUtils.getRecords(
+            'sys_db_object',
+            ['label'],
+            { name: tableName }
+        );
+        const dbViews = WebToMobileUtils.getRecords(
+			'sys_db_view',
+			['label'],
+			{ name: tableName }
+		);
+
+		if(records.length &gt; 0) {
+			return records[0].label;
+		} else if (dbViews.length &gt; 0) {
+			return dbViews[0].label || tableName;
+		} else {
+			return null;
+		}
+    }
+
+    /**
+     * Retrieves the name of a UI view by its sys_id.
+     *
+     * @param {string} viewSysId - The sys_id of the UI view.
+     * @returns {string|null} The name of the UI view, or null if not found.
+     */
+    _getUiViewTitle(viewSysId) {
+        const records = WebToMobileUtils.getRecords(
+            'sys_ui_view',
+            ['title'],
+            { sys_id: viewSysId }
+        );
+        return records.length &gt; 0 ? records[0].title : null;
+    }
+}
+
+module.exports = FullTransformerRecordScreenService;
+]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2024-10-22 01:50:32&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;0ed2c7c77f9d12100911658f6d86653b&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;50&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;FullTransformerRecordScreenService&lt;/sys_name&gt;
+        &lt;sys_package display_value="Mobile App Builder API" source="sn_mab_api"&gt;3c64259bc7812010100f2f3bf4c2609a&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Mobile App Builder API"&gt;3c64259bc7812010100f2f3bf4c2609a&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_0ed2c7c77f9d12100911658f6d86653b&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-11-12 17:15:34&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+    &lt;sys_es_latest_script action="INSERT_OR_UPDATE"&gt;
+        &lt;id&gt;0ed2c7c77f9d12100911658f6d86653b&lt;/id&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2024-10-22 01:50:32&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;d8e2c7c77f9d12100911658f6d8665cd&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-10-22 01:50:32&lt;/sys_updated_on&gt;
+        &lt;table&gt;sys_script_include&lt;/table&gt;
+        &lt;use_es_latest&gt;true&lt;/use_es_latest&gt;
+    &lt;/sys_es_latest_script&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-08-25 05:58:00</sys_created_on>
+        <sys_id>5de72ca383768310a5875160ceaad368</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>FullTransformerRecordScreenService</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_5de72ca383768310a5875160ceaad368</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-08-25 05:58:00</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

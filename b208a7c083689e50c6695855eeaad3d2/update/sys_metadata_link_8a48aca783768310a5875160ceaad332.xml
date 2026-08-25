@@ -1,0 +1,860 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>18fb342c435431101326810d0bb8f235</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_rm_ws.RMWorkspaceDataFetchSNC&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;this is responsible to fetch the top and bottom grid data&lt;/description&gt;
+        &lt;mobile_callable&gt;false&lt;/mobile_callable&gt;
+        &lt;name&gt;RMWorkspaceDataFetchSNC&lt;/name&gt;
+        &lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;
+        &lt;script&gt;&lt;![CDATA[var RMWorkspaceDataFetchSNC = Class.create();
+RMWorkspaceDataFetchSNC.prototype = {
+    initialize: function(timeSpan, effortType) {
+        this.ALLOCATION = 'allocation';
+        this.OPERATIONAL_WORK = 'operational_work';
+        this.RESOURCE_PLAN = 'resource_plan';
+        this.PENDING_STATE = 'pending';
+        this.APPROVED_STATE = 'approved';
+        this.UNAPPROVED_STATE = 'unapproved';
+        this.DISPLAY_PENDING_STATE = gs.getMessage('Pending');
+        this.RESOURCE_ASSIGNMENT = 'sn_plng_att_core_resource_assignment';
+        this.timeSpan = timeSpan || RMWorkspaceConstants.WEEKLY_TIMESPAN;
+        this.effortType = effortType || 'hours';
+        this.topTaskMap = {};
+        this.resAllocEffortFieldMap = {
+            hours: 'allocated_hours',
+            fte: 'requested_fte',
+            man_days: 'requested_man_days'
+        };
+        this.effortSuffixMap = {
+            hours: gs.getMessage('Hours'),
+            allocated_hours: gs.getMessage('Hours'),
+            requested_hours: gs.getMessage('Hours'),
+            requested_fte: gs.getMessage('FTE'),
+            fte: gs.getMessage('FTE'),
+            requested_man_days: gs.getMessage('Person days'),
+            man_days: gs.getMessage('Person days')
+        };
+
+        this.addTrendFirstDayOfWeek = gs.getProperty('glide.ui.date_format.first_day_of_week', RMWorkspaceConstants.DEFAULT_UI_DATE_FORMAT_FIRST_DAY_OF_WEEK);
+        this.resourceMap = {};
+        this.userCapacityAggregateObj = {};
+        this.resourcePlanDateMap = {};
+        this.decimalSeparator = GlideLocale.get().getDecimalSeparator();
+        this.excludedWorkTypes = gs.getProperty("com.snc.resource_management.exclude_events_from_schedule");
+        this.avatharSrc = {};
+        this.readAccessCheckEnabled = new sn_plng_att_core.PlanningAttributeHelper().isReadAccessCheckEnabled() || false;
+    },
+
+    /**
+     * this should return the array of row objects for grid
+     */
+    getData(columns, startDate, endDate, userList, isTopGrid = true, firstRow, filterCriteria = '', filterTable, filterType) {
+        const empIds = this.createResourceRow(userList);
+		if(filterType == 'report_view'){
+			filterCriteria = this._alterCriteriaBasedOnAsmtIds(filterTable, filterCriteria);
+		}
+        const asgnmtData = this.getAssignmentData(columns, startDate, endDate, empIds, isTopGrid, firstRow, filterCriteria);
+        const resBoardStatusMap = this._getResBoardStatusMap(columns);
+        const asmts = asgnmtData.asmts;
+        const resourceBoardStatus = (asgnmtData.resourceBoardStatus === this.DISPLAY_PENDING_STATE) ? resBoardStatusMap.pending.displayValue : asgnmtData.resourceBoardStatus;
+        const allocs = (isTopGrid) ? this.getClassicResourcePlanAllocations(columns, startDate, endDate, empIds) : [];
+        const resRows = this._getResourceRows();
+        const gridRowData = resRows.concat(asmts, allocs);
+        return {
+            gridRowData,
+            resourceBoardStatus,
+            resBoardStatusMap
+        };
+    },
+
+	_alterCriteriaBasedOnAsmtIds(filterTable, filterCriteria) {
+		var asmtIds = [];
+		const columnName = new sn_plng_att_core.RMDashboardHelper().getAsmtFieldFromTable(filterTable);
+		if(!columnName)
+			return null;
+		var gr = new GlideAggregate(filterTable);
+		gr.addEncodedQuery(filterCriteria);
+		gr.groupBy(columnName);
+		gr.query();
+		while(gr.next()){
+			asmtIds.push(gr.getValue(columnName));
+		}
+
+		return 'sys_idIN'+asmtIds.join(',');
+	},
+
+    _getResBoardStatusMap(columns) {
+        let statusValues = {};
+        for (const col of columns) {
+            if (col.name == "resource_status") {
+                statusValues = col.meta_data.status_value_map;
+                break;
+            }
+        }
+        return statusValues;
+    },
+    _getUserCapacityAggregateData(table, dateCol, dates, empIds) {
+        const resourceAggregateGr = new GlideAggregate(table);
+        resourceAggregateGr.addQuery('category', 'IN', 'capacity');
+        resourceAggregateGr.addQuery('user', 'IN', empIds.join(','));
+        resourceAggregateGr.addQuery(dateCol, "&gt;=", dates.startDate);
+        resourceAggregateGr.addQuery(dateCol, "&lt;=", dates.endDate);
+        resourceAggregateGr.addQuery('hours', '&gt;', 0);
+        resourceAggregateGr.query();
+        while (resourceAggregateGr.next()) {
+            const userId = resourceAggregateGr.getValue('user');
+            const date = resourceAggregateGr.getValue(dateCol);
+            const hours = resourceAggregateGr.getValue('hours');
+            if (!(userId in this.userCapacityAggregateObj))
+                this.userCapacityAggregateObj[userId] = {};
+            if (!(date in this.userCapacityAggregateObj[userId]))
+                this.userCapacityAggregateObj[userId][date] = 0;
+            this.userCapacityAggregateObj[userId][date] += hours;
+        }
+    },
+
+    createResourceRow(userList,filterType) {
+        const empIds = [], userRows = [];
+        for (const user in userList) {
+            const id = userList[user].id;
+            resRowObj = {
+                id: id,
+                task: {
+                    value: userList[user].id,
+                    displayValue: userList[user].userName,
+                    indicator: {
+                        icon: "circle-check-outline",
+                        "color": "--now-color_alert--positive-2",
+                        "tooltip": gs.getMessage("Resource is properly allocated based on their schedule through this specific time period.")
+                    },
+                    group_resource: userList[user].primary_resource_group,
+                    role: userList[user].primary_resource_role,
+                    skill: userList[user].primary_resource_skill
+                },
+                _metadata: {
+                    disableRowReorder: true,
+                    disableRowContextMenu: true,
+                    disableEditing: true,
+                }
+            };
+			userRows.push(resRowObj);
+            empIds.push(id);
+            this.resourceMap[id] = resRowObj;
+        }
+         return (filterType!='task')?empIds: userRows;
+    },
+
+    getEmpProfilesForFilter(filterCriteria, limit, filterType, filterTable) {
+        return this._getEmpProfiles(filterCriteria, limit, filterType, filterTable);
+    },
+
+    getAssignmentData(columns, startDate, endDate, empIds, isTopGrid = true, firstRow, filterCriteria) {
+	this.getAttributesColumnsOnResourceAssignment();
+        const asmts = [];
+        const asmtGr = new GlideRecord('sn_plng_att_core_resource_assignment');
+        asmtGr.addQuery('start_date', '&lt;=', endDate);
+        asmtGr.addQuery('end_date', '&gt;=', startDate);
+        if (filterCriteria)
+            asmtGr.addEncodedQuery(filterCriteria);
+        if (isTopGrid) {
+            asmtGr.addNotNullQuery('user_resource');
+            asmtGr.addQuery('user_resource', 'IN', empIds);
+        } else {
+            asmtGr.addNullQuery('user_resource');
+            asmtGr.addQuery('assignment_type', 'user');
+            const assignmentBatchSize = RMWorkspaceUtil.getResourceAssignmentBatchSize();
+            asmtGr.chooseWindow(firstRow, firstRow + assignmentBatchSize, true);
+        }
+		if(!gs.nil(this.excludedWorkTypes))
+			asmtGr.addEncodedQuery('operational_work_type=^ORoperational_work_typeNOT IN' + this.excludedWorkTypes);
+		else
+			asmtGr.addEncodedQuery('operational_work_type=^ORoperational_work_typeISNOTEMPTY');
+        asmtGr.query();
+
+        let resourceBoardStatus;
+
+        while (asmtGr.next()) {
+            if (this.readAccessCheckEnabled &amp;&amp; !asmtGr.canRead())
+                continue;
+			let raActionHelper = new sn_plng_att_core.ResourceAssignmentActionHelper(asmtGr);
+            const taskOrPlanningItemGr = this._getTaskOrPlanningItem(asmtGr, false);
+            const row = this.createRowObject(columns, asmtGr, taskOrPlanningItemGr);
+            const type = asmtGr.plan_type;
+            let isParentnotNil = global.JSUtil.notNil(asmtGr.getValue('parent'));
+			const canWrite = raActionHelper.getCanWrite();
+            const disableEdit = isTopGrid &amp;&amp; !canWrite;
+            row._metadata = {
+                disableRowReorder: !isTopGrid || (isParentnotNil || disableEdit),
+                canReplaceUser: !isParentnotNil,
+                disableRowContextMenu: false,
+                disableEditing: disableEdit,
+                canSplitWork: ((asmtGr.getValue('start_date') != asmtGr.getValue('end_date')) &amp;&amp; !(isParentnotNil)),
+				canOpenRecord: true,
+				canOpenParentRecord: isParentnotNil,
+				canExtend: raActionHelper.canExtend(),
+				tableName: 'sn_plng_att_core_resource_assignment'
+            };
+            if (isParentnotNil) {
+                row.task.indicator = {
+                    icon: "circle-info-outline",
+                    "color": "--now-color_text--primary",
+                    "tooltip": gs.getMessage("Work is allocated for a team.")
+                };
+            }
+            if (row.resource_status &amp;&amp; asmtGr.assignment_modified) {
+                row.resource_status.indicator = {
+                    icon: "bell-outline",
+                    "color": "--now-color_text--primary",
+                    "tooltip": gs.getMessage("Assignment details were updated resulting the status change to Pending.")
+                };
+            }
+            this._updateEffort(row, asmtGr);
+            if (isTopGrid) {
+                this._buildResourceRow(row, true);
+                const resourceStatus = asmtGr.getDisplayValue('resource_status');
+                if (!resourceBoardStatus) {
+                    resourceBoardStatus = resourceStatus;
+                } else if (resourceStatus &amp;&amp; resourceBoardStatus != this.PENDING_STATE &amp;&amp; resourceBoardStatus != resourceStatus) {
+                    resourceBoardStatus = this.DISPLAY_PENDING_STATE;
+                }
+            }
+            asmts.push(row);
+        }
+
+        return {
+            asmts,
+            resourceBoardStatus
+        };
+    },
+
+    getClassicResourcePlanAllocations(columns, startDate, endDate, empIds) {
+    	this.getAttributesColumnsOnResourceAssignment();
+        const resAllocs = this.getAllocations('resource_allocation', columns, startDate, endDate, empIds);
+        const reqAllocs = this.getRequestedAllocations(columns, startDate, endDate, empIds);
+        return resAllocs.concat(reqAllocs);
+    },
+
+    getRequestedAllocations(columns, startDate, endDate, empIds) {
+        let reqAllocsOfOperationalPlan = [];
+        const excludeOperationalRPs = this.effortType != 'hours' ? true : false;
+        const reqAllocs = this.getAllocations('requested_allocation', columns, startDate, endDate, empIds, excludeOperationalRPs);
+        if (excludeOperationalRPs) {
+            reqAllocsOfOperationalPlan = this.getOperationalPlanRequestAllocations(columns, startDate, endDate, empIds);
+        }
+        return reqAllocs.concat(reqAllocsOfOperationalPlan);
+    },
+
+    getAllocations(table, columns, startDate, endDate, empIds, excludeOperationalRPs = false) {
+        const isReqAlloc = (table == 'requested_allocation') ? true : false;
+        const effortField = this._getEffortField(isReqAlloc);
+        const allocGr = new GlideAggregate(table);
+        allocGr.addQuery('start_date', '&lt;=', endDate);
+        allocGr.addQuery('end_date', '&gt;=', startDate);
+        allocGr.groupBy('resource_plan');
+        if (isReqAlloc) {
+            allocGr.addQuery('resource_plan.resource_type', '=', 'user');
+            allocGr.addQuery('resource_plan.state', '2');
+            allocGr.addQuery('resource_plan.user_resource', 'IN', empIds);
+            allocGr.groupBy('resource_plan.user_resource');
+            allocGr.groupBy('resource_plan.task');
+            if (excludeOperationalRPs)
+                allocGr.addQuery('resource_plan.plan_type', '!=', this.OPERATIONAL_WORK);
+            else {
+				if(!gs.nil(this.excludedWorkTypes))
+					allocGr.addNullQuery('resource_plan.operational_work_type').addOrCondition('resource_plan.operational_work_type', 'NOT IN', this.excludedWorkTypes);
+				else
+					allocGr.addEncodedQuery('resource_plan.operational_work_type=^ORresource_plan.operational_work_typeISNOTEMPTY');
+			}
+        } else {
+            allocGr.addQuery('resource_plan.resource_type', 'IN', 'user,group,role');
+            allocGr.addQuery('resource_plan.state', '=', '3');
+            allocGr.addQuery('user', 'IN', empIds);
+			if(!gs.nil(this.excludedWorkTypes))
+				allocGr.addNullQuery('resource_plan.operational_work_type').addOrCondition('resource_plan.operational_work_type', 'NOT IN', this.excludedWorkTypes);
+			else
+				allocGr.addEncodedQuery('resource_plan.operational_work_type=^ORresource_plan.operational_work_typeISNOTEMPTY');
+            allocGr.groupBy('user');
+            allocGr.groupBy('task');
+        }
+        allocGr.addAggregate('SUM', effortField);
+        allocGr.query();
+
+        return this._buildAllocationRow(allocGr, columns, effortField, this.ALLOCATION, isReqAlloc);
+    },
+
+    getOperationalPlanRequestAllocations(columns, startDate, endDate, empIds) {
+        const allocGr = new GlideAggregate('requested_allocation');
+        allocGr.addQuery('start_date', '&lt;=', endDate);
+        allocGr.addQuery('end_date', '&gt;=', startDate);
+        allocGr.groupBy('resource_plan');
+        allocGr.addQuery('resource_plan.plan_type', this.OPERATIONAL_WORK);
+        allocGr.addQuery('resource_plan.resource_type', '=', 'user');
+        allocGr.addQuery('resource_plan.state', '2');
+        allocGr.addQuery('resource_plan.user_resource', 'IN', empIds);
+        allocGr.groupBy('resource_plan.user_resource');
+		if(!gs.nil(this.excludedWorkTypes))
+			allocGr.addNullQuery('resource_plan.operational_work_type').addOrCondition('resource_plan.operational_work_type', 'NOT IN', this.excludedWorkTypes);
+		else
+			allocGr.addEncodedQuery('resource_plan.operational_work_type=^ORresource_plan.operational_work_typeISNOTEMPTY');
+        allocGr.addAggregate('SUM', 'requested_hours');
+        allocGr.query();
+
+        return this._buildAllocationRow(allocGr, columns, this.effortType, this.OPERATIONAL_WORK, true);
+    },
+
+    _buildAllocationRow(gr, columns, effortField, invokedFlow, isReqAlloc) {
+        const rowObjs = [];
+        let taskOrPlanningItemGr = null;
+        while (gr.next()) {
+            if (invokedFlow != this.OPERATIONAL_WORK) {
+                taskOrPlanningItemGr = this._getTaskOrPlanningItem(gr, isReqAlloc);
+                if (this.readAccessCheckEnabled &amp;&amp; !taskOrPlanningItemGr.canRead())
+                    continue;
+            }
+            const row = this.createRowObject(columns, gr, taskOrPlanningItemGr);
+            row._metadata = {
+                disableRowReorder: true,
+                canReplaceUser: true,
+                disableRowContextMenu: true,
+                disableEditing: true,
+				canOpenRecord: false
+            };
+            row.task.indicator = {
+                icon: "user-transfer-outline",
+                "color": "--now-color_text--primary",
+                "tooltip": gs.getMessage("Allocation from Classic Workspace")
+            };
+            this._populateReferenceValues(row, gr, isReqAlloc);
+            this._updateEffort(row, gr, invokedFlow, effortField);
+            this._buildResourceRow(row);
+            rowObjs.push(row);
+
+            const resId = row.parent;
+            let resRowObj = this.resourceMap[resId];
+            if (global.JSUtil.notNil(resRowObj)) {
+                if (!resRowObj.childTasks)
+                    resRowObj.childTasks = [];
+                resRowObj['childTasks'].push(row.id);
+                this.resourceMap[resId] = resRowObj;
+            }
+        }
+
+        return rowObjs;
+    },
+
+    _buildResourceRow(taskRow, isResourceAssignment) {
+        const resId = taskRow.user_resource.value;
+        let status = taskRow?.resource_status?.value;
+        let resRowObj = this.resourceMap[resId];
+        if (resRowObj) {
+            if (!resRowObj.resource_status) {
+                resRowObj['resource_status'] = {
+                    value: taskRow.resource_status.value,
+                    displayValue: taskRow.resource_status.displayValue
+                };
+            } else if (status &amp;&amp; resRowObj.resource_status.value != status) {
+                resRowObj['resource_status'] = {
+                    value: this.PENDING_STATE,
+                    displayValue: this.DISPLAY_PENDING_STATE
+                };
+            }
+        } else {
+            resRowObj = {
+                id: resId,
+                task: {
+                    ...taskRow.user_resource
+                }
+            };
+            resRowObj['resource_status'] = {
+                value: taskRow.resource_status.value,
+                displayValue: taskRow.resource_status.displayValue
+            };
+        }
+
+        if (isResourceAssignment) {
+            if (!resRowObj.childTasks)
+                resRowObj.childTasks = [];
+            resRowObj['childTasks'].push(taskRow.id);
+        }
+        this.resourceMap[resId] = resRowObj;
+    },
+
+    _updateEffort(row, gr, invokedFlow, effortMappingField) {
+        let value, displayValue, requestedHours;
+        const isFteType = this.effortType == 'fte';
+        switch (invokedFlow) {
+            case this.ALLOCATION:
+                value = gr.getAggregate('SUM', effortMappingField) || '';
+                value = !isFteType ? Number(value) : this._getFTEOrManDays(gr, value, row.user_resource.value);
+                break;
+            case this.OPERATIONAL_WORK:
+                requestedHours = gr.getAggregate('SUM', 'requested_hours');
+                value = this._getFTEOrManDays(gr, requestedHours, row.user_resource.value);
+                break;
+            default:
+                effortMappingField = this.resAllocEffortFieldMap[this.effortType];
+                value = gr.resource_allocation[effortMappingField].toString();
+        }
+        displayValue = this._formatNumber(global.ResourceManagementUtils.roundOff(value)) + ' ' + this.effortSuffixMap[isFteType ? 'fte' : effortMappingField];
+        row['effort'] = {
+            value,
+            displayValue
+        };
+
+        if (row?.user_resource?.value)
+            row['parent'] = row.user_resource.value;
+    },
+
+    _populateReferenceValues(rowObj, allocGr, isReqAlloc) {
+        const isOperationalPlan = rowObj.task.recordSysClassName == this.OPERATIONAL_WORK;
+        if (isReqAlloc) {
+            rowObj['user_resource'] = {
+                value: allocGr.resource_plan.user_resource.toString(),
+                displayValue: allocGr.resource_plan.user_resource.getDisplayValue()
+            };
+            rowObj['task'] = {
+                ...rowObj['task'],
+                value: allocGr.resource_plan.task.toString(),
+                displayValue: allocGr.resource_plan.task.short_description.getDisplayValue(),
+                topTask: rowObj?.task?.topTask ? rowObj.task.topTask : allocGr.resource_plan.task.toString()
+            };
+        } else {
+            rowObj['user_resource'] = {
+                value: allocGr.getValue('user'),
+                displayValue: allocGr.getDisplayValue('user')
+            };
+        }
+        if (isOperationalPlan) {
+            rowObj['task'] = {
+                ...rowObj['task'],
+                value: allocGr.resource_plan.toString(),
+                displayValue: allocGr.resource_plan.short_description.getDisplayValue(),
+                topTask: allocGr.resource_plan.toString(),
+                recordSysClassName: this.RESOURCE_PLAN
+            };
+        }
+
+        /**
+         * For resource allocations id will be userId_asmtId/task/RP id
+         * And for operational resource plans we are going to consider row id for mapping
+         */
+        const taskOrResourcePlanId = rowObj['task'].value || allocGr.getValue('resource_plan');
+        rowObj['id'] = rowObj['user_resource'].value + '_' + taskOrResourcePlanId;
+
+    },
+
+    getAttributesColumnsOnResourceAssignment() {
+        if(!this.attributeCols)
+	   this.attributeCols = new sn_plng_att_core.ResourceAssignmentService().getAttributesColumnsOnResourceAssignment();
+    },
+
+    _getDatesFromResourcePlan(aggregateGr) {
+        const resourcePlanId = aggregateGr.getValue('resource_plan');
+        let dates = this.resourcePlanDateMap[resourcePlanId];
+        if (!dates) {
+            const startDate = aggregateGr.resource_plan.start_date.toString();
+            const endDate = aggregateGr.resource_plan.end_date.toString();
+            dates = {
+                startDate,
+                endDate
+            };
+            this.resourcePlanDateMap[resourcePlanId] = dates;
+        }
+        return dates;
+    },
+
+    _getFTEOrManDays(gr, hours, userId, date) {
+        let fteOrManDays = 0;
+        if (hours) {
+            const avgDailyFte = global.RMUtil.averageDailyFteForUser(userId);
+            let queryStartDate;
+            let queryEndDate;
+            if (date) {
+                const {
+                    startDate,
+                    endDate
+                } = this.getResettedDateValue(date);
+                queryStartDate = startDate;
+                queryEndDate = endDate;
+            } else {
+                const {
+                    startDate,
+                    endDate
+                } = this._getDatesFromResourcePlan(gr);
+                queryEndDate = endDate;
+                queryStartDate = startDate;
+            }
+
+            var workingDays = new sn_plng_att_core.AttributeTypeResourcePlanService().getWorkingDays(userId, queryStartDate, queryEndDate);
+            const hoursAsPerInterval = global.ResourceManagementUtils.roundOffBasedOnCalendarEventProperty(hours); //rounding off hours based on calendar event duration property
+            fteOrManDays = this.effortType == 'fte' ? global.ResourceManagementUtils.hoursToFte(hoursAsPerInterval, avgDailyFte, workingDays, true) : global.ResourceManagementUtils.hoursToManDays(hoursAsPerInterval, avgDailyFte);
+        }
+
+        return fteOrManDays;
+    },
+
+    createRowObject(columns, gr, taskOrPlanningItemGr) {
+        let value = '',
+            displayValue = '',
+            isProject = false,
+            classType = this.OPERATIONAL_WORK;
+
+        if (taskOrPlanningItemGr != null) {
+            classType = taskOrPlanningItemGr.getValue('sys_class_name');
+            isProject = global.PTGlobalAPI.isProject(classType) || global.PTGlobalAPI.isProjectTask(classType);
+        }
+
+        const rowObj = {};
+        rowObj['id'] = gr.getValue('sys_id');
+        const userId = gr.getValue('user_resource') || gr.getValue('user');
+        if (userId) {
+            rowObj['user_resource'] = {
+                value: userId,
+                displayValue: gr.getDisplayValue('user_resource') || gr.getDisplayValue('user')
+            };
+        }
+	
+        for (let i = 0; i &lt; columns.length; i++) {
+            const columnName = columns[i].name;
+            if (columnName == 'resource_status' &amp;&amp; gr.getValue('resource_status'))
+                rowObj['can_edit_resource_status'] = true;
+			if(columnName == 'effort')
+				rowObj['can_edit_effort'] = true;
+            if (columnName == 'type') {
+                value = classType;
+                displayValue = taskOrPlanningItemGr == null ? gs.getMessage("Operational work") : taskOrPlanningItemGr.getDisplayValue('sys_class_name');
+            } else if (columnName == 'parent_item' &amp;&amp; isProject) {
+                const topTaskGr = this._getProject(taskOrPlanningItemGr);
+                value = taskOrPlanningItemGr.getValue('top_task');
+                displayValue = topTaskGr.getDisplayValue('short_description');
+            } else if (columnName == 'owner' &amp;&amp; taskOrPlanningItemGr != null) {
+                if (isProject) {
+                    const prjGr = this._getProject(taskOrPlanningItemGr);
+                    value = prjGr.getValue('project_manager');
+                    displayValue = prjGr.getDisplayValue('project_manager');
+                } else {
+                    const field = RMWorkspaceConstants.DEMAND_TABLES.includes(classType) ? 'demand_manager' : 'assigned_to';
+                    value = taskOrPlanningItemGr.getValue(field);
+                    displayValue = taskOrPlanningItemGr.getDisplayValue(field);
+                }
+            } else {
+                value = gr.getValue(columnName);
+                if (columnName == 'start_date' &amp;&amp; global.JSUtil.nil(value)) {
+                    value = gr.resource_plan.start_date.toString();
+                    displayValue = gr.resource_plan.start_date.getDisplayValue();
+                } else if (columnName == 'end_date' &amp;&amp; global.JSUtil.nil(value)) {
+                    value = gr.resource_plan.end_date.toString();
+                    displayValue = gr.resource_plan.end_date.getDisplayValue();
+                } else {
+                    value = (columnName == 'task' &amp;&amp; global.JSUtil.nil(value)) ? gr.getValue('planning_item') : value;
+                    displayValue = (columnName == 'task' &amp;&amp; taskOrPlanningItemGr != null) ? taskOrPlanningItemGr.getDisplayValue('short_description') : gr.getDisplayValue(columnName);
+                    if (global.JSUtil.nil(value) &amp;&amp; gr.getValue('plan_type') === this.OPERATIONAL_WORK)
+                        [value, displayValue] = this.getTaskValueAndDisplayValue(gr, columnName);
+                }
+            }
+
+            rowObj[columnName] = {
+                value,
+                displayValue
+            };
+
+            if (columnName == 'task') {
+                if (taskOrPlanningItemGr != null &amp;&amp; isProject) {
+                    rowObj[columnName].recordSysClassName = this._getProject(taskOrPlanningItemGr).getValue('sys_class_name');
+                } else {
+                    rowObj[columnName].recordSysClassName = gr.getValue('plan_type') == this.OPERATIONAL_WORK ? this.RESOURCE_ASSIGNMENT : classType;
+                }
+                rowObj[columnName].isClickable = true;
+                rowObj[columnName].isProject = isProject;
+                rowObj[columnName].isPWSInstalled = GlidePluginManager.isActive('sn_pw');
+                rowObj[columnName].topTask = taskOrPlanningItemGr != null &amp;&amp; isProject ? taskOrPlanningItemGr.getValue('top_task') : value;
+				if(isProject) {
+					rowObj[columnName].startDate = {
+						value: taskOrPlanningItemGr.getValue("start_date"),
+						displayValue: taskOrPlanningItemGr.getDisplayValue("start_date")
+					};
+					rowObj[columnName].endDate = {
+						value: taskOrPlanningItemGr.getValue("end_date"),
+						displayValue: taskOrPlanningItemGr.getDisplayValue("end_date")
+					};
+				}
+                if (isProject &amp;&amp; rowObj[columnName].isPWSInstalled) {
+                    rowObj[columnName].pwsUrl = new sn_pw.BannerContent().getUrlForCheckout('', rowObj[columnName].topTask, rowObj[columnName].recordSysClassName);
+                }
+            } else if (columnName == 'owner') {
+                const {
+                    imageSrc,
+                    email
+                } = this._getUserDetails(value);
+                rowObj[columnName]['imageSrc'] = imageSrc;
+                rowObj[columnName]['email'] = email;
+            } else if (columnName === "ready_for_review" &amp;&amp; global.JSUtil.notNil(gr.getValue("ready_for_review"))) {
+				rowObj['can_edit_ready_for_review'] = !global.JSUtil.notNil(gr.getValue("parent")); // allow editing only if parent is empty for resource assignments
+			} else if(['end_date', 'start_date', ...this.attributeCols].includes(columnName)) {
+				rowObj[columnName]['can_edit'] = global.JSUtil.nil(gr.getValue("parent"));
+			}
+        }
+
+        if (gr.isValidField('resource_allocation')) {
+            rowObj['resource_allocation'] = {
+                value: gr.getValue('resource_allocation'),
+                displayValue: gr.getDisplayValue('resource_allocation')
+            };
+        }
+
+		//passing parent reference for opening parent assignment from Workspace
+		rowObj['parent_assignment'] = {
+			value: gr.getValue('parent'),
+			displayValue: gr.getDisplayValue('parent')
+		};
+
+        return rowObj;
+    },
+
+    getTaskValueAndDisplayValue(gr, columnName) {
+        let value, displayValue;
+        if (columnName === 'task') {
+            value = gr.getValue('sys_id');
+            displayValue = gr.getValue('number');
+        }
+        return [value, displayValue];
+    },
+
+    _getUserDetails(id) {
+        if (!id)
+            return {};
+
+        if (this.avatharSrc[id])
+            return this.avatharSrc[id];
+
+        const userGr = new GlideRecord('sys_user');
+        if (userGr.get('sys_id', id)) {
+            this.avatharSrc[id] = {
+                imageSrc: userGr.getValue('avatar') ? userGr.getValue('avatar') + '.iix?t=small' : '',
+                email: userGr.getValue('email')
+            };
+        } else
+            return {};
+        return this.avatharSrc[id];
+    },
+
+    _getEffortField(isReqAlloc = false) {
+        let effortField = this.effortType;
+        if (isReqAlloc)
+            effortField = this.effortType == 'hours' || this.effortType == 'fte' ? 'requested_hours' : effortField;
+        else
+            effortField = this.effortType == 'fte' ? this.resAllocEffortFieldMap["hours"] : this.resAllocEffortFieldMap[this.effortType];
+
+        return effortField;
+    },
+
+    _getTaskOrPlanningItem(gr, isTaskOnRP) {
+        const tempGr = isTaskOnRP ? gr.resource_plan.getRefRecord() : gr;
+        const task = tempGr.getValue('task');
+
+        let taskOrPlanningItemGr = null;
+        if (global.JSUtil.notNil(task))
+            taskOrPlanningItemGr = tempGr.task.getRefRecord();
+        else {
+            const planning_item = tempGr.getValue('planning_item');
+            if (global.JSUtil.notNil(planning_item))
+                taskOrPlanningItemGr = tempGr.planning_item.getRefRecord();
+        }
+
+        return taskOrPlanningItemGr;
+    },
+
+    _getProject(taskGr) {
+        const topTaskId = taskGr.getValue('top_task');
+        let topTaskGr = this.topTaskMap[topTaskId];
+        if (!topTaskGr) {
+            topTaskGr = taskGr.top_task.getRefRecord();
+            this.topTaskMap[topTaskId] = topTaskGr;
+        }
+        return topTaskGr;
+    },
+
+    _getEmpProfiles(filerCriteria = '', limit, filterType, filterTable) {
+        const emps = [];
+        const empGr = RMWorkspaceUtil.getEmpProfilesWithPPSResource(filerCriteria, limit, filterType, filterTable);
+        while (empGr.next()) {
+            const users = {};
+            users['id'] = empGr.getValue('user');
+            users['userName'] = empGr.getDisplayValue('user');
+            users['primary_resource_group'] = {
+                value: empGr.getValue('primary_resource_group'),
+                displayValue: empGr.getDisplayValue('primary_resource_group')
+            };
+            users['primary_resource_role'] = {
+                value: empGr.getValue('primary_resource_role'),
+                displayValue: empGr.getDisplayValue('primary_resource_role')
+            };
+            users['primary_resource_skill'] = {
+                value: empGr.getValue('primary_resource_skill'),
+                displayValue: empGr.getDisplayValue('primary_resource_skill')
+            };
+            emps.push(users);
+        }
+        return emps;
+    },
+
+    _getResourceRows() {
+        return Object.values(this.resourceMap) || [];
+    },
+
+    getResettedDateValue(date) {
+        const startDate = new GlideDate();
+        const endDate = new GlideDate();
+        startDate.setValue(date);
+        endDate.setValue(date);
+        if (this.timeSpan == RMWorkspaceConstants.MONTHLY_TIMEPSAN)
+            sn_plng_att_core.PlanningAttributesUtil.resetToMonthStartAndEnd(startDate, endDate);
+        else
+            sn_plng_att_core.PlanningAttributesUtil.resetToWeekStartAndEnd(startDate, endDate);
+        return {
+            startDate: startDate.getValue(),
+            endDate: endDate.getValue()
+        };
+    },
+
+    _getDateFromTrendFormat: function(trendDate) {
+        let date = new GlideDate();
+        let dateDetails = trendDate.split("/");
+        if (this.timeSpan == RMWorkspaceConstants.MONTHLY_TIMEPSAN) {
+            date.setDayOfMonthUTC(1);
+            date.setMonthUTC(dateDetails[0]);
+            date.setYearUTC(dateDetails[1]);
+        } else {
+            date.setMonthUTC(dateDetails[0]);
+            date.setDayOfMonthUTC(dateDetails[1]);
+            date.setYearUTC(dateDetails[2]);
+        }
+        return date.getValue();
+    },
+
+    _formatNumber: function(num) {
+        if (num % 1 != 0) {
+            numString = sn_plng_att_core.PlanningAttributesUtil.formatClean(num.toString(), '.');
+            return numString.replace('.', this.decimalSeparator);
+        }
+        return num;
+    },
+
+	getChildAndParentAssignmentData(columns, parentId) {
+		const asmts = [];
+		const asmtIds = [];
+		let groupName = '',
+			startDate, endDate;
+			resourceAsmt = new sn_plng_att_core.ResourceAssignment();
+
+		const assignmentRecords = resourceAsmt.getResourceAssignmentRecords("sys_id=" + parentId + "^ORparent=" + parentId);
+
+		while (assignmentRecords.next()) {
+			if (this.readAccessCheckEnabled &amp;&amp; !assignmentRecords.canRead()) continue;
+
+			const rowObj = {};
+			const id = assignmentRecords.getValue('sys_id');
+			asmtIds.push(id);
+			rowObj['id'] = id;
+
+			const parent = assignmentRecords.getValue('parent');
+			const disableEdit = !parent || !assignmentRecords.canWrite();
+
+			rowObj['_metadata'] = {
+				disableEditing: disableEdit,
+				disableRowContextMenu: true,
+				disableRowReorder: false
+			};
+
+			if (parent) rowObj['parent'] = parent;
+
+			for (const { name: columnName } of [...columns, { name: 'resource_allocation' }]) {
+				let value = assignmentRecords.getValue(columnName) || '';
+				let displayValue = assignmentRecords.getDisplayValue(columnName) || '';
+
+				if (columnName === 'user_resource' &amp;&amp; !parent) {
+					value = assignmentRecords.getValue('group_resource');
+					displayValue = assignmentRecords.getDisplayValue('group_resource');
+					groupName = displayValue;
+					startDate = assignmentRecords.start_date;
+					endDate = assignmentRecords.end_date;
+					operationalWorkType = assignmentRecords.getValue('operational_work_type');
+				}
+
+				if (columnName == 'resource_status' &amp;&amp; assignmentRecords.getValue('resource_status'))
+					rowObj['can_edit_resource_status'] = assignmentRecords.resource_status.canWrite();
+
+				rowObj[columnName] = {
+					value,
+					displayValue
+				};
+			}
+
+			rowObj['parent_assignment'] = {
+				'value' : assignmentRecords.getValue('parent'),
+				'displayValue' : assignmentRecords.getDisplayValue('parent')
+			};
+
+			asmts.push(rowObj);
+		}
+
+        return {
+            asmts,
+			asmtIds,
+            groupName,
+			startDate,
+			endDate,
+			operationalWorkType
+        };
+    },
+
+    type: 'RMWorkspaceDataFetchSNC'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-07-24 12:12:27&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;18fb342c435431101326810d0bb8f235&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;661&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;RMWorkspaceDataFetchSNC&lt;/sys_name&gt;
+        &lt;sys_package display_value="Resource Management Workspace" source="sn_rm_ws"&gt;10504991430431101326810d0bb8f223&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Resource Management Workspace"&gt;10504991430431101326810d0bb8f223&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_18fb342c435431101326810d0bb8f235&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2025-03-12 11:08:42&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+    &lt;sys_es_latest_script action="INSERT_OR_UPDATE"&gt;
+        &lt;id&gt;18fb342c435431101326810d0bb8f235&lt;/id&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2025-01-30 06:08:20&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;afdc7e9f4357521075e26c6396b8f25b&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;0&lt;/sys_mod_count&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2025-01-30 06:08:20&lt;/sys_updated_on&gt;
+        &lt;table&gt;sys_script_include&lt;/table&gt;
+        &lt;use_es_latest&gt;true&lt;/use_es_latest&gt;
+    &lt;/sys_es_latest_script&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-08-25 05:59:42</sys_created_on>
+        <sys_id>8a48aca783768310a5875160ceaad332</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>RMWorkspaceDataFetchSNC</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_8a48aca783768310a5875160ceaad332</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-08-25 05:59:42</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

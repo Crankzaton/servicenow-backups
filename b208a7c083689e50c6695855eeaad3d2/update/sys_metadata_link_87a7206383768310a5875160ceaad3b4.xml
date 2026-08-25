@@ -1,0 +1,177 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>08b975ea1b48f1106ed00e1ad34bcb67</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;public&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;x_938076_now_utils.MSSCustodyCaseCreation&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Script include that creates stock and core cases when the expected transition time has elapsed and a case has not been created previously&lt;/description&gt;
+        &lt;mobile_callable&gt;false&lt;/mobile_callable&gt;
+        &lt;name&gt;MSSCustodyCaseCreation&lt;/name&gt;
+        &lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;
+        &lt;script&gt;&lt;![CDATA[var MSSCustodyCaseCreation = Class.create();
+MSSCustodyCaseCreation.prototype = {
+    initialize: function() {},
+
+    mssCustodyCoreCaseCreation: function() {
+
+        //Blanket the case creation logic with case suppression check, check is Case Suppression is ON (true) or OFF (false). Case is created only when the property value is set to false 
+        if (gs.getProperty("x_hsb11_mss_custod.isCustodyCaseSuppressionON") == "false") {
+
+            var bpInstance = new GlideRecord("x_hsb11_mss_custod_mss_custody_business_process_instance");
+            var sysTime = new GlideDateTime();
+            var createCaseAfterSuppTimestamp = new GlideDateTime(gs.getProperty('x_hsb11_mss_custod.createCaseAfterSuppressionTimestamp')); //fetches the date time from timestamp to be considered for creating cases
+
+            bpInstance.addQuery("is_case_created_core", false);
+            bpInstance.addQuery("is_core_status_exception", false);
+            bpInstance.addQuery("core_expected_transition_time", "&lt;", sysTime);
+            bpInstance.addQuery("core_expected_transition_time", "&gt;", createCaseAfterSuppTimestamp);
+            bpInstance.addQuery("core_expected_transition_time", "!=", "");
+            bpInstance.addQuery("is_core_terminal_status", 'false');
+
+            bpInstance.query();
+            while (bpInstance.next()) {
+
+                try {
+
+                    //MSSCUSTODY-5439 get real time information from BPI to check if case creation is still required on this BPI
+                    var bpiInLoop = new GlideRecord("x_hsb11_mss_custod_mss_custody_business_process_instance");
+                    bpiInLoop.get(bpInstance.sys_id);
+
+                    var nowTime = new GlideDateTime();
+                    var bpiUPdateTime = new GlideDateTime(bpiInLoop.sys_updated_on);
+                    var diffSeconds = (nowTime.getNumericValue() - bpiUPdateTime.getNumericValue()) / 1000;
+                    var timeElapsed = gs.getProperty('x_hsb11_mss_custod.timeElapsed');
+
+                    //MSSCUSTODY-5439 update the conditons to get the real-time BPI record to check
+                    //if ((bpInstance.is_case_created_core == false) &amp;&amp; (bpInstance.is_core_status_exception == false) &amp;&amp; (bpInstance.core_expected_transition_time &lt; sysTime) &amp;&amp; (bpInstance.core_expected_transition_time != sysTime) &amp;&amp; (diffSeconds &gt; timeElapsed)) {
+                    if ((bpiInLoop.is_case_created_core == false) &amp;&amp; (bpiInLoop.is_core_status_exception == false) &amp;&amp; (bpiInLoop.is_core_terminal_status == false) &amp;&amp; (bpiInLoop.core_expected_transition_time != '') &amp;&amp; (bpiInLoop.core_expected_transition_time != null) &amp;&amp; (bpiInLoop.core_expected_transition_time != undefined) &amp;&amp; (bpiInLoop.core_expected_transition_time &lt; nowTime) &amp;&amp; (diffSeconds &gt; timeElapsed)) { //MSSCUSTODY-8134 - Conditin Updated
+
+                        //MSSCUSTODY-5439 update the flag to true to lock the BPI only when case creation starts
+                        bpInstance.core_case_creation_in_progress = true;
+                        bpInstance.update();
+
+                        var custodyCase = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_case");
+                        custodyCase.initialize();
+                        custodyCase.short_description = "Investigate " + bpInstance.core_stage_reference.status;
+                        custodyCase.triggered_by = bpInstance.core_stage_reference; //Populating Triggered by field in Custody case record - MSSCUDTODY-705
+                        custodyCase.description = "This case is created when a Trade remains in " + bpInstance.core_stage_reference.status + " for longer than expected. This case will remain open until a new trade lifecycle status is received";
+                        custodyCase.u_fo_process_status = bpInstance.core_stage_reference;
+                        custodyCase.u_object_type = bpInstance.object_type;
+                        custodyCase.trade_id = bpInstance.trade_id;
+                        //var bpiValue = bpInstance.number;  MSSCUSTODY-5439 commented out this line as this variable is not in used
+                        //custodyCase.u_business_process_instance = current.sys_id;
+                        //MSSCUSTODY-5439 get sys_id from gliderecord instead of current
+                        custodyCase.u_business_process_instance = bpInstance.sys_id;
+                        custodyCase.u_source = bpInstance.source_system;
+                        var newobjectid = custodyCase.insert(); // this should be mapped somewhere
+
+                        //3733/3732 before the case type change to auto
+                        //new x_hsb11_mss_c_proc.MSSCustodyBulkUtils().updateAutomatedManulTask(current.trade_id, newobjectid);
+                        //MSSCUSTODY-5439 get trade_id from gliderecord instead of current
+                        new x_hsb11_mss_c_proc.MSSCustodyBulkUtils().updateAutomatedManulTask(bpInstance.trade_id, newobjectid);
+
+                        bpInstance.is_case_created_core = true;
+                        bpInstance.case_counter++;
+                        bpInstance.core_case_creation_in_progress = false;
+                        bpInstance.update();
+                        new x_hsb11_mss_c_proc.MSSCustodyBulkUtils().setTradeCaseType(bpInstance.trade_id, 'automated');
+                    }
+
+                } catch (err) {
+                    gs.error('Script Include - MSSCustodyCaseCreation - error when creating case for BPI ' + bpInstance.number + ': ' + err.message);
+                }
+
+            }
+        }
+    },
+
+    /*    mssCustodyStockCaseCreation: function() {
+
+            //Blanket the case creation logic with case suppression check, check is Case Suppression is ON (true) or OFF (false). Case is created only when the property value is set to false 
+            if (gs.getProperty("x_hsb11_mss_custod.isCustodyCaseSuppressionON") == "false") {
+
+                var sysTime = new GlideDateTime();
+                var createCaseAfterSuppTimestamp = new GlideDateTime(gs.getProperty('x_hsb11_mss_custod.createCaseAfterSuppressionTimestamp')); //fetches the date time from timestamp to be considered for creating cases
+
+                var bpInstance = new GlideRecord("x_hsb11_mss_custod_mss_custody_business_process_instance");
+                bpInstance.addQuery("is_case_created_stock", false);
+                bpInstance.addQuery("is_stock_status_exception", false);
+                bpInstance.addQuery("stock_expected_transition_time", "&lt;", sysTime);
+                bpInstance.addQuery("stock_expected_transition_time", "&gt;", createCaseAfterSuppTimestamp);
+                bpInstance.addQuery("stock_expected_transition_time", "!=", "");
+                bpInstance.addQuery("is_stock_terminal_status", 'false');
+                bpInstance.query();
+                while (bpInstance.next()) {
+    				{
+                        bpInstance.stock_case_creation_in_progress = true;
+                        bpInstance.update();
+                    }
+                    //Adding additional check so we check condition for real time values when this while loop is running
+                    var bpiUPdateTime = new GlideDateTime(bpInstance.sys_updated_on);
+                    var diffSeconds = (sysTime.getNumericValue() - bpiUPdateTime.getNumericValue()) / 1000;
+                    var timeElapsed = gs.getProperty('x_hsb11_mss_custod.timeElapsed');
+                    if ((bpInstance.is_case_created_stock == false) &amp;&amp; (bpInstance.is_stock_status_exception == false) &amp;&amp; (bpInstance.stock_expected_transition_time &lt; sysTime) &amp;&amp; (bpInstance.stock_expected_transition_time != sysTime) &amp;&amp; (diffSeconds &gt; timeElapsed)) {
+                        var custodyCase = new GlideRecord("x_hsb11_mss_c_proc_mss_custody_case");
+                        custodyCase.initialize();
+                        custodyCase.short_description = "Investigate " + bpInstance.stock_stage_reference.status;
+                        custodyCase.triggered_by = bpInstance.stock_stage_reference; // Populating Triggered by field in Custody Case record -MSSCUSTODY-705
+                        custodyCase.description = "This case is created when a Trade remains in " + bpInstance.stock_stage_reference.status + " for longer than expected. This case will remain open until a new trade lifecycle status is received";
+                        custodyCase.u_fo_process_status = bpInstance.stock_stage_reference;
+                        custodyCase.u_object_type = bpInstance.object_type;
+                        custodyCase.trade_id = bpInstance.trade_id;
+                        var bpiValue = bpInstance.number;
+                        custodyCase.u_business_process_instance = current.sys_id;
+                        custodyCase.u_source = bpInstance.source_system;
+                        var newobjectid = custodyCase.insert();
+
+    					//3733/3732 before the case type change to auto
+    					new x_hsb11_mss_c_proc.MSSCustodyBulkUtils().updateAutomatedManulTask(current.trade_id, newobjectid);
+    					
+                        bpInstance.is_case_created_stock = true;
+                        bpInstance.case_counter++;
+    					bpInstance.stock_case_creation_in_progress = false;
+                        bpInstance.update();
+    					new x_hsb11_mss_c_proc.MSSCustodyBulkUtils().setTradeCaseType(bpInstance.trade_id,'automated'); //MSSCUSTODY-3326 : Add case type as Automated during case creation.
+                    }
+    				
+                }
+            }
+        },
+    */
+    type: 'MSSCustodyCaseCreation'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;45336670@hsbc.com&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2023-07-18 11:37:29&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;08b975ea1b48f1106ed00e1ad34bcb67&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;170&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;MSSCustodyCaseCreation&lt;/sys_name&gt;
+        &lt;sys_package display_value="Now Utils" source="x_938076_now_utils"&gt;b208a7c083689e50c6695855eeaad3d2&lt;/sys_package&gt;
+        &lt;sys_policy&gt;read&lt;/sys_policy&gt;
+        &lt;sys_scope display_value="Now Utils"&gt;b208a7c083689e50c6695855eeaad3d2&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_08b975ea1b48f1106ed00e1ad34bcb67&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;44111348@hsbc.com&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2025-11-05 10:13:58&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-08-25 05:57:01</sys_created_on>
+        <sys_id>87a7206383768310a5875160ceaad3b4</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>MSSCustodyCaseCreation</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_87a7206383768310a5875160ceaad3b4</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-08-25 05:57:01</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

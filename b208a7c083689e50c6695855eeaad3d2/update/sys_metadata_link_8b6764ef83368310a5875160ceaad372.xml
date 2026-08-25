@@ -1,0 +1,198 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>01a577c8ffba121024f4ffffffffff01</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_uxa_req_manager.UXADAFilterService&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description&gt;Service for generating data for D.A filters.&lt;/description&gt;
+        &lt;mobile_callable&gt;false&lt;/mobile_callable&gt;
+        &lt;name&gt;UXADAFilterService&lt;/name&gt;
+        &lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;
+        &lt;script&gt;&lt;![CDATA[var UXADAFilterService = Class.create();
+UXADAFilterService.prototype = {
+    initialize: function() {
+        this.filterDetailsMap = {};
+        this.filterItems = [];
+        this.FILTER_TYPE = 'filter_type';
+        this.FILTER_ID = 'filter_id';
+        this.FIELDS = 'fields';
+    },
+
+    _getAllowedItemsForTargetPanel: function(source) {
+        const allowedItems = [];
+        // if type appsee get the filter ID directly.
+        if (source?.type === UXAConstants.APPSEE) {
+            allowedItems.push(source.payload.UXAFilterId);
+        } else {
+            allowedItems.push(source.payload.table);
+        }
+        return allowedItems;
+    },
+
+    _buildFilterMetadata: function(filterType, dataSource, source, mode) {
+        // get the list of available filters for 'appsee' source type
+        // if mode is taget then get the list of items to be selectable by user.
+        const allowedItems = (mode === UXAConstants.DA_MODE_TARGET) ? this._getAllowedItemsForTargetPanel(source) : [];
+        const gr = new GlideRecord(UXAConstants.UXA_FILTER_TABLE);
+        gr.addQuery('source_type', dataSource);
+        // if filterType is choice get the single and multi select filters
+        if (filterType &amp;&amp; (filterType === UXAConstants.CHOICE_FILTER_TYPE || filterType === UXAConstants.REFERENCE_FILTER_TYPE)) {
+            gr.addQuery(this.FILTER_TYPE, UXAConstants.SINGLE_SELCT_FILTER_TYPE).addOrCondition(this.FILTER_TYPE, UXAConstants.MULTI_SELECT_FILTER_TYPE);
+        }
+        gr.query();
+        while (gr.next()) {
+            this._generateMetadataItems(gr.getValue(this.FILTER_ID), gr.getValue('label'), mode === UXAConstants.DA_MODE_TARGET &amp;&amp; !allowedItems.includes(gr.getValue(this.FILTER_ID)), JSON.parse(gr.getValue('params') || '[]'));
+        }
+        // get custom user properties
+        new QueryServiceAPI().getCustomUserProperties().forEach(({
+            k: filterId,
+            v: label,
+            metadata
+        }) =&gt; {
+            const shoulDisableFilterItem = mode === UXAConstants.DA_MODE_TARGET &amp;&amp; !(allowedItems.includes(metadata?.table) || allowedItems.includes(filterId));
+            this._generateMetadataItems(filterId, label, shoulDisableFilterItem, []);
+            this.filterDetailsMap[filterId].metadata = metadata;
+        });
+    },
+
+    _generateInitialPayload: function(dataSource, payload) {
+        return {
+            fields: [{
+                id: UXAConstants.FILTER_SELECTED_KEY,
+                label: UXAConstants.DA_DATA_SOURCE_LABEL,
+                type: UXAConstants.DA_DATA_SOURCE_TYPE_SELECTOR,
+                placeholder: UXAConstants.DA_DATA_SOURCE_PLACE_HOLDER,
+                helperText: UXAConstants.DA_DATA_SOURCE_LABEL,
+                staticItems: this.filterItems,
+            }],
+            targetOverrides: [{
+                type: dataSource,
+                payload: payload
+            }],
+        };
+    },
+
+    _generateMetadataItems: function(filterId, label, disabled = false, params = []) {
+        if (UXAConstants.EXCLUDED_FILTERS_FOR_RESOLUION_API.includes(filterId)) {
+            return;
+        }
+        this.filterItems.push({
+            id: filterId,
+            label: label,
+            disabled
+        });
+        this.filterDetailsMap[filterId] = {
+            params: params,
+            label: label,
+            filterId: filterId,
+            disabled
+        };
+    },
+
+    _generateRendererForFilter: function(filterData) {
+        return {
+            'id': filterData['filterId'],
+            'label': filterData['label'],
+            'type': 'selector',
+            'placeholder': 'Select',
+            'helperText': 'UX Analytics',
+            'dataAPI': `/api/sn_uxa_req_manager/uxa_data/filter/data?filterId=${filterData['filterId']}`
+        };
+    },
+
+    handleResolutionApi: function(
+        payload,
+        filterType,
+        dataSource,
+        mode = 'source',
+        source = null
+    ) {
+        this._buildFilterMetadata(filterType, dataSource, mode, source);
+        const initialPayload = this._generateInitialPayload(dataSource, payload);
+        if (Object.keys(payload).length == 0 || !payload[UXAConstants.FILTER_SELECTED_KEY]) {
+            return initialPayload;
+        } else {
+            // get the details of each payload to render the next required content on source panel
+            // get the last selected filter
+            const selectedFilter = payload[UXAConstants.FILTER_SELECTED_KEY];
+            const filterDetails = this.filterDetailsMap[selectedFilter];
+
+            // check if associated filter has params to genrate next filtering field
+            if (filterDetails?.params?.length &gt; 0) {
+                // get the data for the filter defined in param.
+                const paramData = this.filterDetailsMap[filterDetails.params[0]];
+                const renderer = this._generateRendererForFilter(paramData);
+                initialPayload[this.FIELDS].push(renderer);
+            }
+
+            initialPayload['configPayload'] = this.getConfigPayload(payload, dataSource);
+            // setting the labels for each selected items
+            initialPayload[this.FIELDS] = initialPayload[this.FIELDS].map((field) =&gt; {
+                if (payload[field['id']]) {
+                    field['value'] = payload[field['id']];
+                }
+                return field; // Ensure the field object is returned for the map
+            });
+        }
+        return initialPayload;
+    },
+
+    getConfigPayload: function(payload, dataSource) {
+        const selectedFilter = payload[UXAConstants.FILTER_SELECTED_KEY];
+        if (selectedFilter.includes('UserProperties')) {
+            const filterDetails = this.filterDetailsMap[selectedFilter];
+            return {
+                type: 'table',
+                payload: {
+                    ...payload,
+                    ...filterDetails.metadata
+                }
+            };
+        }
+        return {
+            type: dataSource,
+            payload
+        };
+    },
+
+    handleLabelApi(payload) {
+        this._buildFilterMetadata(null, UXAConstants.APPSEE);
+        return this.filterDetailsMap[payload]?.label || payload;
+    },
+    type: 'UXADAFilterService'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;admin&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2024-12-26 11:30:45&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;01a577c8ffba121024f4ffffffffff01&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;56&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;UXADAFilterService&lt;/sys_name&gt;
+        &lt;sys_package display_value="Usage Insights Request Manager" source="sn_uxa_req_manager"&gt;b4048c109c7075a14eb853b12f61b5cd&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Usage Insights Request Manager"&gt;b4048c109c7075a14eb853b12f61b5cd&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_01a577c8ffba121024f4ffffffffff01&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2025-04-04 13:10:41&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-08-25 05:55:56</sys_created_on>
+        <sys_id>8b6764ef83368310a5875160ceaad372</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>UXADAFilterService</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_8b6764ef83368310a5875160ceaad372</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-08-25 05:55:56</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>

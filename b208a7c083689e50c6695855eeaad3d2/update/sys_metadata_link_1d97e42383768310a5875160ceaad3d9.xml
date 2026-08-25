@@ -1,0 +1,164 @@
+<?xml version="1.0" encoding="UTF-8"?><record_update table="sys_metadata_link">
+    <sys_metadata_link action="INSERT_OR_UPDATE">
+        <directory>update</directory>
+        <documentkey>05ef58c743e94210e777c91766b8f20b</documentkey>
+        <payload>&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;record_update table="sys_script_include"&gt;
+    &lt;sys_script_include action="INSERT_OR_UPDATE"&gt;
+        &lt;access&gt;package_private&lt;/access&gt;
+        &lt;active&gt;true&lt;/active&gt;
+        &lt;api_name&gt;sn_sub_man.CloudEntitlementInstanceTableProvider&lt;/api_name&gt;
+        &lt;caller_access/&gt;
+        &lt;client_callable&gt;false&lt;/client_callable&gt;
+        &lt;description/&gt;
+        &lt;mobile_callable&gt;false&lt;/mobile_callable&gt;
+        &lt;name&gt;CloudEntitlementInstanceTableProvider&lt;/name&gt;
+        &lt;sandbox_callable&gt;false&lt;/sandbox_callable&gt;
+        &lt;script&gt;&lt;![CDATA[var CloudEntitlementInstanceTableProvider = Class.create();
+CloudEntitlementInstanceTableProvider.prototype = {
+    initialize: function() {
+        this.cloudEntitlementDetailDAO = new CloudEntitlementDetailDAO();
+        this._cloudStorageInstanceConsumptionDAO = new CloudStorageInstanceConsumptionDAO();
+        this._mifTrustConfigDAO = new MifTrustConfigDAO();
+        this._mifInstanceDAO = new MifInstanceDAO();
+        this.NOT_AVAILABLE = sn_i18n.Message.getMessage('Subscription Management', 'Not available');
+        this.DATA_SHARING_RESTRICTED = sn_i18n.Message.getMessage('Subscription Management', 'Data sharing restricted');
+    },
+
+    getRows: function() {
+        const result = this._initializeResult();
+        const instanceGR = this.cloudEntitlementDetailDAO.getInstancesGR();
+        const consumptions = this._cloudStorageInstanceConsumptionDAO.getInstanceStorageConsumption();
+        const poolConsumptions = this._cloudStorageInstanceConsumptionDAO.getInstancePoolConsumption();
+        const isSharedCapacityType = this.cloudEntitlementDetailDAO.isSharedCapacityType();
+        while (instanceGR.next()) {
+            const instanceID = instanceGR.getValue('instance');
+            const mifAccess = this._mifTrustConfigDAO.getMifTrustConfigRecordByInstanceId(instanceID, true);
+            const isDataNotAvailable = this.cloudEntitlementDetailDAO.isDataNotAvailable(mifAccess, isSharedCapacityType, poolConsumptions.get(instanceGR.getValue('instance')), consumptions.get(instanceGR.getValue('instance')));
+            const isDataSharingRestricted = this._isDataSharingRestricted(mifAccess);
+            bucket = this._getBucket(instanceID, isDataSharingRestricted, instanceGR.getElement('instance.is_prod'), isDataNotAvailable);
+            const row = this._insertRow(instanceGR, consumptions.get(instanceGR.getValue('instance')), poolConsumptions.get(instanceGR.getValue('instance')), isSharedCapacityType);
+            this._addToResult(result, row, bucket);
+        }
+        this._addOrderField(result);
+        return this._flattenResult(result);
+    },
+
+
+    _insertRow: function(instanceGR, mifConsumption, poolConsumption, isSharedCapacityType) {
+        const storageCapacity = instanceGR.getDisplayValue('entitlement.storage_capacity');
+        const [consumption, usedPoolCapacity] = this._getConsumptionAndUsedPoolCapacity(instanceGR.getValue('instance'), isSharedCapacityType, mifConsumption, poolConsumption);
+        return {
+            'instance': instanceGR.getDisplayValue('instance.instance_name'),
+            'purpose': instanceGR.getElement('instance.is_prod') == true ? sn_i18n.Message.getMessage('Subscription Management', 'Production') : sn_i18n.Message.getMessage('Subscription Management', 'Subproduction'),
+            'type': instanceGR.getDisplayValue('entitlement.hosting_type'),
+            'last_updated': instanceGR.getDisplayValue('entitlement.sys_updated_on'),
+            'used_pool_capacity': usedPoolCapacity,
+            'used_capacity': consumption,
+            'included_capacity': storageCapacity,
+            'sys_id': gs.generateGUID()
+        };
+    },
+
+    _getConsumptionAndUsedPoolCapacity: function(instanceID, isSharedCapacityType, mifConsumption, poolConsumption) {
+        const mifAccess = this._mifTrustConfigDAO.getMifTrustConfigRecordByInstanceId(instanceID, true);
+        const isDataNotAvailable = this.cloudEntitlementDetailDAO.isDataNotAvailable(mifAccess, isSharedCapacityType, poolConsumption, mifConsumption);
+        const isDataSharingRestricted = this._isDataSharingRestricted(mifAccess);
+        let usedPoolCapacity = 0;
+        if (isDataSharingRestricted == 'true') {
+            mifConsumption = this.DATA_SHARING_RESTRICTED;
+            usedPoolCapacity = this.DATA_SHARING_RESTRICTED;
+        } else if (isDataNotAvailable == 'true') {
+            usedPoolCapacity = this.NOT_AVAILABLE;
+            mifConsumption = this.NOT_AVAILABLE;
+        } else {
+            usedPoolCapacity = this.cloudEntitlementDetailDAO.calculateUsedPoolCapacity(isSharedCapacityType, mifConsumption, poolConsumption);
+
+        }
+        return [mifConsumption, usedPoolCapacity];
+    },
+
+    _addToResult: function(result, row, bucket) {
+        result[bucket].push(row);
+    },
+
+    _getBucket: function(instanceID, is_data_restricted, isProd, isNotAvailable) {
+        if (is_data_restricted == 'false' &amp;&amp; isNotAvailable == 'true') return 'none';
+        else if (isProd == true) {
+            return is_data_restricted == 'false' ? 'prod_with_access' : 'prod_without_access';
+        } else {
+            return is_data_restricted == 'false' ? 'sub_prod_with_access' : 'sub_prod_without_access';
+        }
+    },
+
+    _initializeResult: function() {
+        return {
+            prod_with_access: [],
+            sub_prod_with_access: [],
+            prod_without_access: [],
+            sub_prod_without_access: [],
+            none: [],
+        };
+    },
+
+    _addOrderField: function(result) {
+        const sort_order = ['prod_with_access', 'sub_prod_with_access', 'prod_without_access', 'sub_prod_without_access', 'none'];
+        let sequence = 1;
+        sort_order.forEach(key =&gt; {
+            if (result.hasOwnProperty(key)) {
+                result[key].sort((a, b) =&gt; a.instance.localeCompare(b.instance));
+                result[key].forEach(row =&gt; {
+                    row.display_order = sequence++;
+                });
+            }
+        });
+    },
+
+    _flattenResult: function(result) {
+        let flattenedResult = [];
+        for (const key in result) {
+            if (result.hasOwnProperty(key)) {
+                flattenedResult = flattenedResult.concat(result[key]);
+            }
+        }
+        return flattenedResult;
+    },
+
+    _isDataSharingRestricted: function(mifAccess) {
+        if (mifAccess == undefined) return 'false';
+        if (mifAccess.hasOwnProperty('is_granting_access') &amp;&amp; mifAccess.is_granting_access == 'false') return 'true';
+        return 'false';
+
+    },
+
+    type: 'CloudEntitlementInstanceTableProvider'
+};]]&gt;&lt;/script&gt;
+        &lt;sys_class_name&gt;sys_script_include&lt;/sys_class_name&gt;
+        &lt;sys_created_by&gt;maint&lt;/sys_created_by&gt;
+        &lt;sys_created_on&gt;2024-04-18 04:05:15&lt;/sys_created_on&gt;
+        &lt;sys_id&gt;05ef58c743e94210e777c91766b8f20b&lt;/sys_id&gt;
+        &lt;sys_mod_count&gt;90&lt;/sys_mod_count&gt;
+        &lt;sys_name&gt;CloudEntitlementInstanceTableProvider&lt;/sys_name&gt;
+        &lt;sys_package display_value="Subscription Management v2" source="sn_sub_man"&gt;86d7bb63ff021110468365d7d3b8fe41&lt;/sys_package&gt;
+        &lt;sys_policy/&gt;
+        &lt;sys_scope display_value="Subscription Management v2"&gt;86d7bb63ff021110468365d7d3b8fe41&lt;/sys_scope&gt;
+        &lt;sys_update_name&gt;sys_script_include_05ef58c743e94210e777c91766b8f20b&lt;/sys_update_name&gt;
+        &lt;sys_updated_by&gt;admin&lt;/sys_updated_by&gt;
+        &lt;sys_updated_on&gt;2024-05-30 16:27:35&lt;/sys_updated_on&gt;
+    &lt;/sys_script_include&gt;
+&lt;/record_update&gt;
+</payload>
+        <sys_class_name>sys_metadata_link</sys_class_name>
+        <sys_created_by>admin</sys_created_by>
+        <sys_created_on>2026-08-25 05:56:38</sys_created_on>
+        <sys_id>1d97e42383768310a5875160ceaad3d9</sys_id>
+        <sys_mod_count>0</sys_mod_count>
+        <sys_name>CloudEntitlementInstanceTableProvider</sys_name>
+        <sys_package display_value="Now Utils" source="x_938076_now_utils">b208a7c083689e50c6695855eeaad3d2</sys_package>
+        <sys_policy/>
+        <sys_scope display_value="Now Utils">b208a7c083689e50c6695855eeaad3d2</sys_scope>
+        <sys_update_name>sys_metadata_link_1d97e42383768310a5875160ceaad3d9</sys_update_name>
+        <sys_updated_by>admin</sys_updated_by>
+        <sys_updated_on>2026-08-25 05:56:38</sys_updated_on>
+        <tablename>sys_script_include</tablename>
+    </sys_metadata_link>
+</record_update>
